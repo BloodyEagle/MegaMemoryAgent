@@ -27,6 +27,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("merge")}           Merge two knowledge.db files
   ${pc.cyan("conflicts")}       List unresolved merge conflicts
   ${pc.cyan("resolve")}         Resolve a merge conflict
+  ${pc.cyan("repair-ids")}      Fix legacy empty/trailing-slash node ids ${pc.dim("(default: dry-run)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -48,9 +49,10 @@ ${pc.bold("Examples:")}
   ${pc.dim("$")} megamemory merge main.db feature.db --into merged.db ${pc.dim("Merge two knowledge DBs")}
   ${pc.dim("$")} megamemory conflicts                                 ${pc.dim("View unresolved conflicts")}
   ${pc.dim("$")} megamemory resolve <group-id> --keep left            ${pc.dim("Resolve a conflict")}
+  ${pc.dim("$")} megamemory repair-ids --apply                        ${pc.dim("Rename broken ids after backup")}
 `.trim();
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string } {
   const portIdx = args.indexOf("--port");
@@ -108,6 +110,13 @@ switch (cmd) {
   case "resolve": {
     const { runResolve } = await import("./merge-cli.js");
     await runResolve(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "repair-ids": {
+    const { runRepairIds } = await import("./migrate-cli.js");
+    await runRepairIds(process.argv.slice(3));
     process.exit(0);
     break;
   }

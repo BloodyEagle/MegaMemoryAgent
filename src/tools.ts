@@ -1,4 +1,5 @@
 import { KnowledgeDB } from "./db.js";
+import { createHash } from "node:crypto";
 import { embed, embeddingText, findTopK } from "./embeddings.js";
 import type {
   UnderstandInput,
@@ -27,17 +28,51 @@ export function formatError(err: unknown): { content: Array<{ type: "text"; text
 }
 
 /**
+ * Remove diacritics without corrupting scripts that rely on combining marks.
+ * Per-character NFKD + mark stripping, but kana voicing marks (U+3099/U+309A)
+ * are preserved so the final NFC pass can rebuild the composed kana.
+ */
+const KEEP_MARKS = new Set(
+  [0x3099, 0x309a].map((cp) => String.fromCodePoint(cp))
+);
+
+function stripDiacritics(name: string): string {
+  let out = "";
+  for (const ch of name.normalize("NFKD")) {
+    if (/\p{M}/u.test(ch) && !KEEP_MARKS.has(ch)) continue;
+    out += ch;
+  }
+  return out.normalize("NFC");
+}
+
+/**
  * Generate a slug ID from a name, optionally prefixed with parent ID.
- * Converts underscores and spaces to hyphens, lowercases, strips non-alphanumeric.
+ * Unicode-aware: keeps letters and digits from any script (Cyrillic, CJK,
+ * Arabic, Hebrew...), strips Latin diacritics (cafe), collapses separators.
+ * Falls back to a name hash when nothing survives stripping (emoji-only,
+ * punctuation-only names) so the id is never empty.
  */
 export function makeId(name: string, parentId?: string): string {
-  const normalized = name
+  const slug = stripDiacritics(name)
     .toLowerCase()
-    .replace(/[_\s]+/g, "-")          // underscores/spaces → hyphens
-    .replace(/[^a-z0-9-]/g, "")       // strip everything else
-    .replace(/-+/g, "-")              // collapse multiple hyphens
-    .replace(/^-|-$/g, "");           // trim leading/trailing hyphens
-  return parentId ? `${parentId}/${normalized}` : normalized;
+    .replace(/[\s_]+/gu, "-")           // underscores/spaces to hyphens
+    .replace(/[^\p{L}\p{N}-]+/gu, "")  // letters/digits of ANY script
+    .replace(/-+/g, "-")                 // collapse multiple hyphens
+    .replace(/^-|-$/g, "");              // trim leading/trailing hyphens
+
+  const safe =
+    slug || "node-" + createHash("sha1").update(name).digest("hex").slice(0, 8);
+  return parentId ? `${parentId}/${safe}` : safe;
+}
+
+
+/**
+ * Collision disambiguator for createConcept: same slug, different name.
+ * Appends a short name-hash suffix so both concepts coexist.
+ */
+export function disambiguateId(id: string, name: string): string {
+  const suffix = createHash("sha1").update(name).digest("hex").slice(0, 4);
+  return `${id}-${suffix}`;
 }
 
 /**
@@ -152,11 +187,18 @@ export async function createConcept(
   input: CreateConceptInput
 ): Promise<{ id: string; message: string }> {
   const parentId = input.parent_id === "" ? undefined : input.parent_id;
-  const id = makeId(input.name, parentId);
+  let id = makeId(input.name, parentId);
 
-  // Check if node already exists
+  // Same slug but a different name → disambiguate with a name-hash suffix.
+  // Same slug and same name stays an "already exists" error (use update_concept).
   if (db.nodeExists(id)) {
-    throw new Error(`Concept "${id}" already exists. Use update_concept to modify it.`);
+    const existing = db.getNode(id);
+    if (existing && existing.name !== input.name) {
+      id = disambiguateId(id, input.name);
+    }
+    if (db.nodeExists(id)) {
+      throw new Error(`Concept "${id}" already exists. Use update_concept to modify it.`);
+    }
   }
 
   // Validate parent exists if specified
