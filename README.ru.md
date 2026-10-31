@@ -67,6 +67,8 @@ npm pack                      # megamemory-1.6.3-fork.1.tgz
 npm install -g ./megamemory-1.6.3-fork.1.tgz
 ```
 
+(после публикации пакета: `npm install -g @bloodyeagle/megamemory`)
+
 Дальше — либо установщик, либо регистрация MCP-сервера руками:
 
 ```bash

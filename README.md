@@ -67,6 +67,8 @@ npm pack                      # megamemory-1.6.3-fork.1.tgz
 npm install -g ./megamemory-1.6.3-fork.1.tgz
 ```
 
+(once the package is published: `npm install -g @bloodyeagle/megamemory`)
+
 Then either run the installer or register the MCP server by hand:
 
 ```bash
