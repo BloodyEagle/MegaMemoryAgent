@@ -316,7 +316,9 @@ export class KnowledgeDB {
       summary?: string;
       why?: string;
       file_refs?: string[];
-      embedding?: Buffer;
+      // null clears the vector (used when the embed model changes and
+      // reembed is pending); undefined leaves it untouched.
+      embedding?: Buffer | null;
     }
   ): boolean {
     const fields: string[] = [];
@@ -920,6 +922,18 @@ export class KnowledgeDB {
   execSqlFirst(sql: string, ...params: unknown[]): unknown {
     const stmt = this.db.prepare(sql);
     return stmt.get(...params);
+  }
+
+  /** Parameterized multi-row query for migration/reembed helpers. */
+  execSqlAll(sql: string, ...params: unknown[]): unknown[] {
+    const stmt = this.db.prepare(sql);
+    return stmt.all(...params) as unknown[];
+  }
+
+  /** Parameterized statement execution for migration/reembed helpers. */
+  execSqlRun(sql: string, ...params: unknown[]): void {
+    const stmt = this.db.prepare(sql);
+    stmt.run(...params);
   }
 
   /** Pragma access for migration helpers; returns libsql's pragma result. */

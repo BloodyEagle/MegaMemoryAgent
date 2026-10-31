@@ -1,6 +1,14 @@
 import { KnowledgeDB } from "./db.js";
 import { createHash } from "node:crypto";
-import { embed, embeddingText, findTopK } from "./embeddings.js";
+import {
+  embed,
+  embeddingText,
+  embedForStorage,
+  findTopK,
+  queryText,
+  vectorSearchEnabled,
+} from "./embeddings.js";
+import { basicSearch } from "./search.js";
 import type {
   UnderstandInput,
   GetConceptInput,
@@ -147,9 +155,6 @@ export async function understand(
 ): Promise<UnderstandOutput> {
   const topK = input.top_k ?? 10;
 
-  // Embed the query
-  const queryEmbedding = await embed(input.query);
-
   // Get all active nodes with embeddings
   const candidates = db.getAllActiveNodesWithEmbeddings();
 
@@ -157,8 +162,16 @@ export async function understand(
     return { matches: [] };
   }
 
-  // Find top-K by cosine similarity
-  const topMatches = findTopK(queryEmbedding, candidates, topK);
+  // Vector search only when all stored vectors came from the current model;
+  // otherwise (model changed, reembed pending) fall back to text search so
+  // vector spaces never get mixed.
+  let topMatches: Array<{ id: string; similarity: number }>;
+  if (vectorSearchEnabled(db)) {
+    const queryEmbedding = await embed(queryText(input.query));
+    topMatches = findTopK(queryEmbedding, candidates, topK);
+  } else {
+    topMatches = basicSearch(db, input.query, topK);
+  }
 
   // Build full context for each match
   const matches: NodeWithContext[] = [];
@@ -206,9 +219,9 @@ export async function createConcept(
     throw new Error(`Parent concept "${parentId}" does not exist.`);
   }
 
-  // Generate embedding
+  // Generate embedding (null when the vector path is disabled pending reembed)
   const text = embeddingText(input.name, input.kind, input.summary);
-  const embedding = await embed(text);
+  const embedding = await embedForStorage(db, text);
 
   db.insertNodeAndEdges(
     {
@@ -242,14 +255,15 @@ export async function updateConcept(
     throw new Error(`Concept "${input.id}" not found.`);
   }
 
-  // If summary or name changed, regenerate embedding
+  // If summary or name changed, regenerate embedding (skip when the vector
+  // path is disabled pending reembed — reembed will fill it in)
   let embedding: Buffer | undefined;
   if (input.changes.summary !== undefined || input.changes.name !== undefined) {
     const name = input.changes.name ?? existing.name;
     const kind = input.changes.kind ?? existing.kind;
     const summary = input.changes.summary ?? existing.summary;
     const text = embeddingText(name, kind, summary);
-    embedding = await embed(text);
+    embedding = (await embedForStorage(db, text)) ?? undefined;
   }
 
   const updated = db.updateNode(input.id, {
@@ -409,7 +423,7 @@ export async function resolveConflict(
   const originalId = stripMergeSuffix(base.id);
 
   const text = embeddingText(base.name, base.kind, input.resolved.summary);
-  const newEmbedding = await embed(text);
+  const newEmbedding = await embedForStorage(db, text);
 
   const changes: { summary?: string; why?: string; file_refs?: string[] } = {
     summary: input.resolved.summary,

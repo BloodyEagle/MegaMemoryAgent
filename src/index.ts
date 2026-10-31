@@ -29,6 +29,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("resolve")}         Resolve a merge conflict
   ${pc.cyan("repair-ids")}      Fix legacy empty/trailing-slash node ids ${pc.dim("(default: dry-run)")}
   ${pc.cyan("migrate")}         Upgrade an upstream v1.6.2 database to the fork schema ${pc.dim("(default: dry-run)")}
+  ${pc.cyan("reembed")}         Reindex node embeddings with the current model ${pc.dim("(--batch N)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -53,7 +54,7 @@ ${pc.bold("Examples:")}
   ${pc.dim("$")} megamemory repair-ids --apply                        ${pc.dim("Rename broken ids after backup")}
 `.trim();
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string } {
   const portIdx = args.indexOf("--port");
@@ -125,6 +126,13 @@ switch (cmd) {
   case "migrate": {
     const { runMigrate } = await import("./migrate-cli.js");
     await runMigrate(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "reembed": {
+    const { runReembed } = await import("./reembed-cli.js");
+    await runReembed(process.argv.slice(3));
     process.exit(0);
     break;
   }

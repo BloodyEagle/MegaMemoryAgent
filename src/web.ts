@@ -6,7 +6,7 @@ import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { buildNodeWithContext, understand } from "./tools.js";
 import { errorBold, askPort } from "./cli-utils.js";
-import { initializeEmbeddings } from "./embeddings.js";
+import { initializeEmbeddings, vectorSearchEnabled } from "./embeddings.js";
 import type { NodeRow } from "./types.js";
 
 const VERSION = JSON.parse(
@@ -617,7 +617,17 @@ export async function runServe(port: number): Promise<void> {
     if (pathname === "/api/stats" && req.method === "GET") {
       const stats = db.getStats();
       const kinds = db.getKindsBreakdown();
-      json(res, { ...stats, kinds });
+      // Embedding state: model, dimension, last reindex — surfaced in the
+      // explorer so "which model are my vectors from" is visible at a glance.
+      const embeddings = {
+        model: db.getMetaValue("embed_model") ?? null,
+        dim: db.getMetaValue("embed_dim")
+          ? Number(db.getMetaValue("embed_dim"))
+          : null,
+        last_reembed: db.getMetaValue("last_reembed") ?? null,
+        vector_search: vectorSearchEnabled(db),
+      };
+      json(res, { ...stats, kinds, embeddings });
       return;
     }
 
