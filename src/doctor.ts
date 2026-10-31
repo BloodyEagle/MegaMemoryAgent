@@ -124,5 +124,48 @@ export function runDoctor(db: KnowledgeDB): {
       : `${digestPending} module(s) without digest — run 'megamemory digest --apply'`
   );
 
+  // ---- В18: graph health (informational) ----
+
+  // Nodes without any edge — isolated facts, hard to navigate.
+  const noEdges = (db.execSqlFirst(`
+    SELECT count(*) AS n FROM nodes n
+    WHERE n.removed_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.from_id = n.id OR e.to_id = n.id)
+  `) as { n: number }).n;
+  add(
+    "edge coverage",
+    true,
+    `${noEdges} node(s) without edges`
+  );
+
+  // Stale share (superseded/deprecated).
+  const stale = (db.execSqlFirst(
+    hasStatus
+      ? `SELECT count(*) AS n FROM nodes WHERE removed_at IS NULL AND status != 'active'`
+      : "SELECT 0 AS n"
+  ) as { n: number }).n;
+  add("stale nodes", true, `${stale} superseded/deprecated`);
+
+  // М8: ids differing only by case collide on case-insensitive filesystems
+  // (macOS, Windows) in the markdown export.
+  const idRows = db.execSqlAll(
+    "SELECT id FROM nodes WHERE removed_at IS NULL"
+  ) as Array<{ id: string }>;
+  const seenLower = new Map<string, string>();
+  let caseClash = 0;
+  for (const { id } of idRows) {
+    const lower = id.toLowerCase();
+    const existing = seenLower.get(lower);
+    if (existing !== undefined && existing !== id) caseClash += 1;
+    else seenLower.set(lower, id);
+  }
+  add(
+    "id case clashes",
+    caseClash === 0,
+    caseClash === 0
+      ? "no ids differing only by case"
+      : `${caseClash} pair(s) — markdown export collides on case-insensitive filesystems`
+  );
+
   return { checks, problems: checks.filter((c) => !c.ok).length };
 }

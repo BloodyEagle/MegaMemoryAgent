@@ -769,6 +769,29 @@ export async function resolveConflict(
     }
 
     db.updateNode(originalId, { embedding: newEmbedding });
+    if (newEmbedding) {
+      // В17: keep the native vector copy in sync.
+      db.upsertVector(originalId, newEmbedding);
+    }
+
+    // Б10: lifecycle merge rule — superseded/deprecated beats active,
+    // skipped on legacy dbs without the status column.
+    // valid_until is the later of the versions in the group.
+    // Б10: lifecycle merge rule — superseded/deprecated beats active,
+    // valid_until is the later of the versions. Skipped on legacy dbs
+    // without the status column (merge flags below are cleared regardless).
+    if (db.hasStatusColumn) {
+      const lifecycle = KnowledgeDB.mergeLifecycleStatus(
+        { status: base.status, valid_until: base.valid_until },
+        nodes
+          .filter((n) => n.id !== base.id)
+          .reduce(
+            (acc, n) => KnowledgeDB.mergeLifecycleStatus(acc, n),
+            { status: "active", valid_until: null } as { status: string; valid_until: string | null }
+          )
+      );
+      db.setNodeStatus(originalId, lifecycle.status, lifecycle.valid_until ?? undefined);
+    }
 
     // Clear merge flags on the resolved node and any associated edges
     db.clearNodeMergeFlags(originalId);

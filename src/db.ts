@@ -15,7 +15,8 @@ export class KnowledgeDB {
    * Fork dbs have nodes.status (T0.5 migration); upstream dbs do not.
    * Queried once so read paths never break on an un-migrated database.
    */
-  private get hasStatusColumn(): boolean {
+  /** Fork lifecycle columns present (public: tools check before status writes). */
+  get hasStatusColumn(): boolean {
     if (this._hasStatusColumn === undefined) {
       const cols = this.db.pragma("table_info(nodes)") as Array<{ name: string }>;
       this._hasStatusColumn = cols.some((c) => c.name === "status");
@@ -905,16 +906,28 @@ export class KnowledgeDB {
     needs_merge?: number;
     source_branch?: string | null;
     merge_timestamp?: string | null;
+    // Б10: fork lifecycle columns — preserved across branch merges.
+    status?: string | null;
+    valid_from?: string | null;
+    valid_until?: string | null;
   }): void {
+    // Б10: fork columns exist only on migrated dbs — compose the column
+    // list conditionally so upstream dbs keep working.
+    const forkCols = this.hasStatusColumn
+      ? ", status, valid_from, valid_until"
+      : "";
+    const forkParams = this.hasStatusColumn
+      ? ", @status, @valid_from, @valid_until"
+      : "";
     const stmt = this.db.prepare(`
       INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task,
         created_at, updated_at, removed_at, removed_reason, embedding,
-        merge_group, needs_merge, source_branch, merge_timestamp)
+        merge_group, needs_merge, source_branch, merge_timestamp${forkCols})
       VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task,
         @created_at, @updated_at, @removed_at, @removed_reason, @embedding,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp)
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams})
     `);
-    stmt.run({
+    const values: Record<string, unknown> = {
       id: node.id,
       name: node.name,
       kind: node.kind,
@@ -932,7 +945,13 @@ export class KnowledgeDB {
       needs_merge: node.needs_merge ?? 0,
       source_branch: node.source_branch ?? null,
       merge_timestamp: node.merge_timestamp ?? null,
-    });
+    };
+    if (this.hasStatusColumn) {
+      values.status = node.status ?? "active";
+      values.valid_from = node.valid_from ?? null;
+      values.valid_until = node.valid_until ?? null;
+    }
+    stmt.run(values);
     this.syncNameNorm(node.id, node.name);
   }
 
@@ -1322,6 +1341,26 @@ export class KnowledgeDB {
       )
       .all(queryJson, limit) as Array<{ id: string; d: number }>;
     return rows.map((r) => ({ id: r.id, similarity: 1 - r.d }));
+  }
+
+
+  /**
+   * Б10: lifecycle merge rule — superseded/deprecated beats active (losing
+   * the fact that a node is outdated is worse than keeping it), valid_until
+   * is the later of the two.
+   */
+  static mergeLifecycleStatus(
+    a: { status?: string; valid_until?: string | null },
+    b: { status?: string; valid_until?: string | null }
+  ): { status: string; valid_until: string | null } {
+    const rank = (s?: string): number => (s === "superseded" ? 2 : s === "deprecated" ? 1 : 0);
+    const status = rank(a.status) >= rank(b.status) ? (a.status ?? "active") : (b.status ?? "active");
+    const valid_until =
+      [a.valid_until, b.valid_until]
+        .filter((v): v is string => Boolean(v))
+        .sort()
+        .pop() ?? null;
+    return { status, valid_until };
   }
 
   close(): void {

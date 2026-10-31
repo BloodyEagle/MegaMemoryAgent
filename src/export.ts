@@ -18,6 +18,8 @@ export interface ExportDiff {
   missing: string[];
   differing: string[];
   extra: string[];
+  /** М8: extra files removed by --check. */
+  pruned?: number;
 }
 
 function nodeFileName(id: string): string {
@@ -116,7 +118,8 @@ export function checkMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
     if (onDisk !== content) differing.push(rel);
   }
 
-  // Extra .md files on disk that the graph no longer produces.
+  // Extra .md files on disk that the graph no longer produces — pruned
+  // right away (М8): --check leaves the directory exactly in sync.
   const walk = (d: string): void => {
     for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
       const full = path.join(d, entry.name);
@@ -124,11 +127,14 @@ export function checkMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
         walk(full);
       } else if (entry.name.endsWith(".md")) {
         const rel = path.relative(dir, full).split(path.sep).join("/");
-        if (!expected.has(rel)) extra.push(rel);
+        if (!expected.has(rel)) {
+          fs.unlinkSync(full);
+          extra.push(rel);
+        }
       }
     }
   };
   if (fs.existsSync(dir)) walk(dir);
 
-  return { written: 0, missing, differing, extra };
+  return { written: 0, missing, differing, extra, pruned: extra.length };
 }

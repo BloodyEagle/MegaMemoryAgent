@@ -98,3 +98,16 @@ describe("nameSimilarity", () => {
     expect(nameSimilarity("Payment Module", "Logging")).toBeLessThan(0.5);
   });
 });
+
+describe("М7: digest excluded from consolidation", () => {
+  it("digest nodes are never candidates even with identical vectors", () => {
+    const db = freshDb();
+    db.insertNode({ id: "m", name: "Module", kind: "module", summary: "m" });
+    db.insertNode({ id: "m/d1", name: "Digest one", kind: "digest", summary: "digest payload", parent_id: "m" });
+    db.insertNode({ id: "m/d2", name: "Digest two", kind: "digest", summary: "digest payload 2", parent_id: "m" });
+    setEmbedding(db, "m/d1", [1, 0, 0, 0]);
+    setEmbedding(db, "m/d2", [1, 0, 0, 0]);
+    const candidates = findDuplicates(db, { threshold: 0.9 });
+    expect(candidates).toHaveLength(0);
+  });
+});

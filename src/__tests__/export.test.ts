@@ -52,7 +52,7 @@ describe("markdown export", () => {
     exportMarkdown(db, outDir);
 
     // Everything in sync.
-    expect(checkMarkdown(db, outDir)).toEqual({ written: 0, missing: [], differing: [], extra: [] });
+    expect(checkMarkdown(db, outDir)).toEqual({ written: 0, missing: [], differing: [], extra: [], pruned: 0 });
 
     // Change one file on disk.
     fs.writeFileSync(path.join(outDir, "alpha.md"), "tampered", "utf8");
@@ -70,5 +70,16 @@ describe("markdown export", () => {
     expect(fs.existsSync(path.join(outDir, "модуль", "поиск.md"))).toBe(true);
     // The nested file round-trips through check.
     expect(checkMarkdown(db, outDir).differing).toEqual([]);
+  });
+
+  it("--check prunes orphan .md files (М8)", () => {
+    const db = freshDb();
+    db.insertNode({ id: "solo", name: "Solo", kind: "feature", summary: "one" });
+    exportMarkdown(db, outDir);
+    fs.writeFileSync(path.join(outDir, "orphan.md"), "stale", "utf8");
+    const diff = checkMarkdown(db, outDir);
+    expect(diff.extra).toEqual(["orphan.md"]);
+    expect(diff.pruned).toBe(1);
+    expect(fs.existsSync(path.join(outDir, "orphan.md"))).toBe(false);
   });
 });

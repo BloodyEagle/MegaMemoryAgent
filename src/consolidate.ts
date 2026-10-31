@@ -82,7 +82,11 @@ export function findDuplicates(
   const threshold = opts.threshold ?? 0.95;
   const limit = opts.limit ?? 100;
 
-  const rows = db.getAllNodesRaw().filter((n) => n.removed_at === null);
+  // М7: digest nodes are derived summaries — never consolidation candidates
+  // (merging two digests would corrupt the derived payload).
+  const rows = db
+    .getAllNodesRaw()
+    .filter((n) => n.removed_at === null && n.kind !== "digest");
   const groups = new Map<string, NodeRow[]>();
   for (const row of rows) {
     const key = row.parent_id ?? "__root__";
