@@ -184,6 +184,11 @@ export interface UnderstandOutput {
    * empty/legacy for backward compatibility with older consumers.
    */
   compact?: CompactMatch[];
+  /**
+   * В14: relations between the returned nodes — graph structure without
+   * pulling every node's full context.
+   */
+  edges_between?: Array<{ from: string; to: string; relation: string }>;
   meta?: UnderstandMeta;
 }
 

@@ -137,18 +137,32 @@ export function ftsSearch(
 
   // А5: LIKE fallback. name_norm is JS-normalized (case-insensitive for
   // cyrillic); summary/why keep the raw case-sensitive scan as a bonus.
-  const likeNorm = `%${normalizeName(trimmed)}%`;
+  // Degrade gracefully on dbs without the fork column.
+  const hasNorm = (db.pragma("table_info(nodes)") as Array<{ name: string }>).some(
+    (c) => c.name === "name_norm"
+  );
   const likeRaw = `%${trimmed}%`;
-  const rows = db.execSqlAll(
-    `SELECT id FROM nodes
-     WHERE name_norm LIKE ? OR summary LIKE ? OR why LIKE ?
-     ORDER BY id
-     LIMIT ?`,
-    likeNorm,
-    likeRaw,
-    likeRaw,
-    limit
-  ) as Array<{ id: string }>;
+  const rows = hasNorm
+    ? (db.execSqlAll(
+        `SELECT id FROM nodes
+         WHERE name_norm LIKE ? OR summary LIKE ? OR why LIKE ?
+         ORDER BY id
+         LIMIT ?`,
+        `%${normalizeName(trimmed)}%`,
+        likeRaw,
+        likeRaw,
+        limit
+      ) as Array<{ id: string }>)
+    : (db.execSqlAll(
+        `SELECT id FROM nodes
+         WHERE name LIKE ? OR summary LIKE ? OR why LIKE ?
+         ORDER BY id
+         LIMIT ?`,
+        likeRaw,
+        likeRaw,
+        likeRaw,
+        limit
+      ) as Array<{ id: string }>);
   return rows.map((r) => ({ id: r.id, via: "fts" }));
 }
 

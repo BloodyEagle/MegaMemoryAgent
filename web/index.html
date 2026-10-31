@@ -892,7 +892,7 @@ function renderTokensPanel(usage) {
   }).join('');
   panel.innerHTML = `<div style="color:#4ade80;margin-bottom:4px">Tokens (7d)</div>` +
     `<div style="display:flex;gap:6px;align-items:flex-end;margin-bottom:4px">${bars || '<span style="color:#64748b">no queries yet</span>'}</div>` +
-    `<div>${usage.total_queries} queries · avg ~${usage.avg_tokens} tokens · total ~${usage.total_tokens}</div>`;
+    `<div>${usage.total_queries} queries · avg ~${usage.avg_tokens} tokens · total ~${usage.total_tokens}${usage.saved_tokens > 0 ? ` · saved ~${usage.saved_tokens} vs full` : ""}</div>`;
 }
 
 async function openConsolidate() {

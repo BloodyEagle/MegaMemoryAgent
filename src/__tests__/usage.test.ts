@@ -51,8 +51,17 @@ describe("usage accounting", () => {
     expect(stats.total_tokens).toBeLessThanOrEqual(1500);
   });
 
-  it("estimateTokens is conservative for cyrillic", () => {
-    const text = "привет".repeat(100); // 600 chars
-    expect(estimateTokens(text)).toBe(200);
+  it("estimateTokens is conservative (utf8 bytes, А6)", () => {
+    const text = "привет".repeat(100); // 600 chars = 1200 bytes
+    expect(estimateTokens(text)).toBe(400);
+  });
+
+  it("usage rows carry estimated_full_tokens and saved_tokens (В15)", async () => {
+    const db = freshDb();
+    db.insertNode({ id: "x1", name: "X", kind: "feature", summary: "summary text" });
+    const result = await understand(db, { query: "summary" });
+    const stats = db.getUsageStats(7);
+    expect(stats.saved_tokens).toBeGreaterThanOrEqual(0);
+    expect(stats.total_tokens).toBe(result.meta!.tokens_estimated);
   });
 });

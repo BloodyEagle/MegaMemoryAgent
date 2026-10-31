@@ -536,6 +536,13 @@ export class KnowledgeDB {
         returned_tokens INTEGER NOT NULL\
       )"
     );
+    // В15: compact-vs-full economy measured in the same row.
+    const cols = this.db.pragma("table_info(usage)") as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "estimated_full_tokens")) {
+      this.db.exec(
+        "ALTER TABLE usage ADD COLUMN estimated_full_tokens INTEGER NOT NULL DEFAULT 0"
+      );
+    }
     this.usageReady = true;
   }
 
@@ -545,19 +552,22 @@ export class KnowledgeDB {
     nodes: number;
     returnedChars: number;
     returnedTokens: number;
+    /** В15: what the full-mode answer would have cost. */
+    estimatedFullTokens?: number;
   }): void {
     this.ensureUsageTable();
     this.db
       .prepare(
-        `INSERT INTO usage (tool, query, nodes, returned_chars, returned_tokens)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT INTO usage (tool, query, nodes, returned_chars, returned_tokens, estimated_full_tokens)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
       .run(
         entry.tool,
         entry.query ?? null,
         entry.nodes,
         entry.returnedChars,
-        entry.returnedTokens
+        entry.returnedTokens,
+        entry.estimatedFullTokens ?? entry.returnedTokens
       );
   }
 
@@ -571,6 +581,7 @@ export class KnowledgeDB {
     total_queries: number;
     total_tokens: number;
     avg_tokens: number;
+    saved_tokens: number;
     top_queries: Array<{ query: string; n: number }>;
     daily: Array<{ day: string; queries: number; tokens: number }>;
   } {
@@ -578,16 +589,27 @@ export class KnowledgeDB {
       .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage'")
       .get();
     if (!hasUsage) {
-      return { total_queries: 0, total_tokens: 0, avg_tokens: 0, top_queries: [], daily: [] };
+      return { total_queries: 0, total_tokens: 0, avg_tokens: 0, saved_tokens: 0, top_queries: [], daily: [] };
     }
     const since = `datetime('now', '-${Number(days)} days')`;
 
-    const totals = this.db
-      .prepare(
-        `SELECT count(*) AS q, COALESCE(sum(returned_tokens), 0) AS t
-         FROM usage WHERE at >= ${since}`
-      )
-      .get() as { q: number; t: number };
+    const hasFull = (this.db.pragma("table_info(usage)") as Array<{ name: string }>).some(
+      (c) => c.name === "estimated_full_tokens"
+    );
+    const totals = hasFull
+      ? (this.db
+          .prepare(
+            `SELECT count(*) AS q, COALESCE(sum(returned_tokens), 0) AS t,
+                    COALESCE(sum(estimated_full_tokens), 0) AS f
+             FROM usage WHERE at >= ${since}`
+          )
+          .get() as { q: number; t: number; f: number })
+      : ((this.db
+          .prepare(
+            `SELECT count(*) AS q, COALESCE(sum(returned_tokens), 0) AS t
+             FROM usage WHERE at >= ${since}`
+          )
+          .get() as { q: number; t: number }) as { q: number; t: number; f: number });
 
     const top = this.db
       .prepare(
@@ -609,6 +631,8 @@ export class KnowledgeDB {
       total_queries: totals.q,
       total_tokens: totals.t,
       avg_tokens: totals.q > 0 ? Math.round(totals.t / totals.q) : 0,
+      // В15: how many tokens compact answers saved vs the full estimate.
+      saved_tokens: Math.max(0, totals.f - totals.t),
       top_queries: top,
       daily,
     };

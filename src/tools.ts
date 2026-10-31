@@ -1,6 +1,7 @@
 import { KnowledgeDB } from "./db.js";
 import { createHash } from "node:crypto";
 import {
+  cosineSimilarity,
   embed,
   embeddingText,
   embedForStorage,
@@ -8,7 +9,8 @@ import {
   queryText,
   vectorSearchEnabled,
 } from "./embeddings.js";
-import { basicSearch, hybridSearch, type SearchVia } from "./search.js";
+import { basicSearch, ftsSearch, hybridSearch, type SearchVia } from "./search.js";
+import { normalizeName } from "./norm.js";
 import type {
   UnderstandInput,
   GetConceptInput,
@@ -151,7 +153,10 @@ export function buildNodeWithContext(
  * worse than English in most tokenizers, so this stays on the safe side.
  */
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 3);
+  // Bytes, not JS chars (patch А6): CJK is ~1 token per char but 3 bytes,
+  // so chars/3 underestimates ~3x for Chinese. In bytes the estimate is
+  // conservative for every script (latin ~4 B/token, cyrillic ~5, CJK ~3).
+  return Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 }
 
 /**
@@ -265,6 +270,7 @@ export async function understand(
       nodes: matches.length,
       returnedChars: payload.length,
       returnedTokens: estimateTokens(payload),
+      estimatedFullTokens: estimateTokens(payload), // full mode IS the full cost
     });
     return {
       matches,
@@ -279,6 +285,10 @@ export async function understand(
 
   // compact: keep adding nodes while the serialized result fits the budget.
   // First 3 nodes get children+edges; the rest stay bare.
+  // В15: the would-be full-mode cost for the same hits, measured once.
+  const fullProjection = nodes.map(({ node }) => buildNodeWithContext(db, node));
+  const estimatedFullTokens = estimateTokens(JSON.stringify(fullProjection));
+
   const compact: CompactMatch[] = [];
   let tokensEstimated = 0;
   for (let i = 0; i < nodes.length; i++) {
@@ -317,11 +327,28 @@ export async function understand(
     nodes: compact.length,
     returnedChars: payload.length,
     returnedTokens: tokensEstimated,
+    estimatedFullTokens,
   });
+
+  // В14: relations between the returned nodes only.
+  const ids = compact.map((m) => m.id);
+  const edgesBetween =
+    ids.length >= 2
+      ? (db.execSqlAll(
+          `SELECT DISTINCT from_id, to_id, relation FROM edges
+           WHERE from_id IN (${ids.map(() => "?").join(",")})
+             AND to_id IN (${ids.map(() => "?").join(",")})`,
+          ...ids,
+          ...ids
+        ) as Array<{ from_id: string; to_id: string; relation: string }>).map(
+          (e) => ({ from: e.from_id, to: e.to_id, relation: e.relation })
+        )
+      : [];
 
   return {
     matches: [],
     compact,
+    edges_between: edgesBetween,
     meta: {
       returned: compact.length,
       dropped: 0,
@@ -350,6 +377,46 @@ export function getConcept(
     returnedTokens: estimateTokens(payload),
   });
   return ctx;
+}
+
+/**
+ * В16: detect a likely duplicate among existing nodes — same normalized
+ * name or cosine >= 0.95 against the freshly computed embedding.
+ * Returns a warning string ("" when nothing similar found).
+ */
+function findDuplicateNote(
+  db: KnowledgeDB,
+  node: { id: string; name: string; embedding: Buffer | null }
+): string {
+  for (const hit of ftsSearch(db, node.name, 3)) {
+    if (hit.id === node.id) continue;
+    const other = db.getNode(hit.id);
+    if (!other) continue;
+    const sameName =
+      normalizeName(other.name) === normalizeName(node.name);
+    let similar = sameName;
+    if (!similar && node.embedding) {
+      const row = db.execSqlFirst(
+        "SELECT embedding FROM nodes WHERE id = ?",
+        hit.id
+      ) as { embedding: Buffer | ArrayBuffer | null } | undefined;
+      const raw = row?.embedding;
+      if (raw) {
+        const buf = raw instanceof ArrayBuffer ? Buffer.from(raw) : raw;
+        if (buf.length === node.embedding.length) {
+          try {
+            similar = cosineSimilarity(node.embedding, buf) >= 0.95;
+          } catch {
+            similar = false;
+          }
+        }
+      }
+    }
+    if (similar) {
+      return ` Warning: similar node exists: "${hit.id}" (${other.name}) — prefer update_concept.`;
+    }
+  }
+  return "";
 }
 
 export async function createConcept(
@@ -402,6 +469,18 @@ export async function createConcept(
       description: edge.description ?? null,
     }))
   );
+  if (embedding) {
+    // В17: keep the native vector copy in sync.
+    db.upsertVector(id, embedding);
+  }
+
+  // В16: warn (never block) when a near-duplicate already exists — cheaper
+  // than cleaning up afterwards with consolidate.
+  const duplicateNote = findDuplicateNote(db, {
+    id,
+    name: input.name,
+    embedding,
+  });
 
   // T4: mark replaced concepts — edges new--supersedes-->old, old nodes
   // become superseded with valid_until = now.
@@ -417,7 +496,10 @@ export async function createConcept(
     supersededNote = ` Superseded: ${superseded.join(", ")}.`;
   }
 
-  return { id, message: `Created concept "${id}"${supersededNote}` };
+  return {
+    id,
+    message: `Created concept "${id}"${supersededNote}${duplicateNote}`,
+  };
 }
 
 export async function updateConcept(
@@ -445,6 +527,11 @@ export async function updateConcept(
     ...input.changes,
     embedding,
   });
+
+  if (updated && embedding) {
+    // В17: keep the native vector copy in sync.
+    db.upsertVector(input.id, embedding);
+  }
 
   if (!updated) {
     return { message: `No changes applied to "${input.id}"` };
