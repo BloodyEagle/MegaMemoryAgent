@@ -16,3 +16,5 @@ npm-ci.log
 graph-deps.json
 .graph-deps-cache.json
 .kilo-edit-body.txt
+*.db-shm
+*.db-wal

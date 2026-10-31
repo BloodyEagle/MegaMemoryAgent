@@ -1,109 +1,77 @@
 <p align="center">
-  <h1 align="center">MegaMemory</h1>
+  <h1 align="center">MegaMemory <sub><sup>fork</sup></sub></h1>
 </p>
-<p align="center">Persistent project knowledge graph for coding agents.</p>
-<p align="center">
-  <a href="https://www.npmjs.com/package/megamemory"><img alt="npm" src="https://img.shields.io/npm/v/megamemory?style=flat-square" /></a>
-  <a href="./LICENSE"><img alt="license" src="https://img.shields.io/npm/l/megamemory?style=flat-square" /></a>
-  <a href="https://nodejs.org"><img alt="node" src="https://img.shields.io/node/v/megamemory?style=flat-square" /></a>
-  <a href="https://www.npmjs.com/package/megamemory"><img alt="npm downloads" src="https://img.shields.io/npm/dm/megamemory?style=flat-square" /></a>
-  <a href="https://x.com/M3ruH4sh"><img alt="Twitter Follow" src="https://img.shields.io/twitter/follow/M3ruH4sh?style=social" /></a>
-</p>
+<p align="center">Persistent project knowledge graph for coding agents — multilingual, token-economical, visible in the UI.</p>
 
 <p align="center">
-  <img src="./assets/preview.png" alt="MegaMemory web explorer" width="800" />
+  <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-1.6.3--fork.1-orange?style=flat-square" />
 </p>
+
+> **Fork of [0xK3vin/MegaMemory](https://github.com/0xK3vin/MegaMemory) v1.6.2 (MIT).**
+> Upstream keeps the concept, this fork fixes multilingual IDs, adds hybrid search,
+> a context budget, fact freshness, digests, export and token accounting.
+> Русская версия: [README.ru.md](./README.ru.md).
+
+An [MCP](https://modelcontextprotocol.io/) server that lets your coding agent build and query a
+graph of concepts, architecture, and decisions — so it **remembers across sessions**.
+
+The LLM is the indexer. No AST parsing, no static analysis: the agent reads code, writes concepts
+in its own words, and queries them before future tasks. The graph stores **concepts** — features,
+modules, patterns, decisions — not code symbols. Everything persists in a per-project SQLite
+database at `.megamemory/knowledge.db`.
 
 ---
 
-An [MCP](https://modelcontextprotocol.io/) server that lets your coding agent build and query a graph of concepts, architecture, and decisions — so it **remembers across sessions**.
+## What this fork changes
 
-The LLM is the indexer. No AST parsing. No static analysis. Your agent reads code, writes concepts in its own words, and queries them before future tasks. The graph stores **concepts** — features, modules, patterns, decisions — not code symbols.
+| Area | Upstream 1.6.2 | This fork |
+|---|---|---|
+| Node IDs | slug strips everything outside `[a-z0-9-]`; Cyrillic, CJK, Greek, emoji names collapse to `""` and the second such node is lost | Unicode-safe slug: letters of any script, diacritics stripped only after Latin/Cyrillic/Greek/Hebrew bases (katakana dakuten and Hangul jamo are preserved), `/` becomes `-`, NFC output, hash fallback for emoji-only names, `-<hash8>` on collisions |
+| Embeddings | `all-MiniLM-L6-v2`, English-only, dimension hardcoded | `Xenova/multilingual-e5-small` by default (`MEGAMEMORY_EMBED_MODEL`), e5 `passage:`/`query:` prefixes, dimension read from the model, vector search disabled on model mismatch until `megamemory reembed` |
+| Search | cosine similarity only | hybrid: FTS5 + vector fused with RRF, per-hit `via: vector \| fts \| both`, query sanitization for `MATCH`, short-CJK routing, optional trigram index, `name_norm` LIKE fallback |
+| Context | `understand` returns everything it found | `mode: "compact"` by default, bounded by `max_tokens` (1500), summaries trimmed to 240 chars, edges between returned nodes only, `meta.returned / dropped / tokens_estimated` |
+| Freshness | delete or nothing | node `status` (`active`/`superseded`/`deprecated`), `supersedes` and `contradicts` edges, outdated nodes hidden from answers but visible in the graph |
+| Duplicates | manual merge | `megamemory consolidate` finds embedding-similar pairs (≥ 0.95) and merges them with edge transfer |
+| Long modules | every child read separately | `digest` nodes: one per module, rebuilt after the 5th child, lower search weight |
+| Portability | DB only | `megamemory export --md <dir>` writes one markdown file per node (frontmatter + wiki-links), `--check` for CI |
+| Cost visibility | none | every `understand` / `list_roots` / `get_concept` is measured; 7-day aggregates in `megamemory stats`, `/api/stats` and the explorer's **Tokens** panel |
+| Migration | — | `megamemory migrate --dry-run/--apply` upgrades an upstream database in place, additively, with backups and a downgrade-safe schema |
 
-### The Loop
+---
 
-<p align="center">
-  <img src="./assets/how-it-works.svg" alt="How MegaMemory works" width="800" />
-</p>
+## The loop
 
 `understand → work → update`
 
-1. **Session start** — agent calls `list_roots` to orient itself
-2. **Before a task** — agent calls `understand` with a natural language query (or `get_concept` for exact ID lookup)
-3. **After a task** — agent calls `create_concept` or `update_concept` to record what it built
-
-Everything persists in a per-project SQLite database at `.megamemory/knowledge.db`.
+1. **Session start** — the agent calls `list_roots` (budgeted) to orient itself.
+2. **Before a task** — `understand` with a natural-language query, or `get_concept` for an exact ID.
+3. **After a task** — `create_concept` / `update_concept`, then `link` for relationships.
 
 ---
 
-### Installation
+## Install
+
+Requires Node.js >= 18. The embedding model (~120 MB, multilingual) downloads on first use and is
+cached in `~/.cache/huggingface`.
+
+The fork is not published to npm — install from a tarball or a checkout:
 
 ```bash
-npm install -g megamemory
+git clone https://github.com/BloodyEagle/MegaMemoryAgent.git
+cd MegaMemoryAgent
+npm ci
+npm run build
+npm pack                      # megamemory-1.6.3-fork.1.tgz
+npm install -g ./megamemory-1.6.3-fork.1.tgz
 ```
 
-> [!NOTE]
-> Requires Node.js >= 18. The embedding model (~23MB) downloads automatically on first use.
-
-### Quick Start
+Then either run the installer or register the MCP server by hand:
 
 ```bash
-megamemory install
+megamemory install            # interactive: opencode / [CC] / Codex / Antigravity
 ```
-
-Run the interactive installer and choose your editor:
-
-> [!NOTE]
-> The installer only updates config files after a successful read/merge, and it will not overwrite existing plugin/command files unless they are already marked as MegaMemory-managed.
-
-#### With [opencode](https://opencode.ai)
-
-```bash
-megamemory install --target opencode
-```
-
-One command configures:
-- MCP server in `~/.config/opencode/opencode.json`
-- Workflow instructions in `~/.config/opencode/AGENTS.md`
-- Skill tool plugin at `~/.config/opencode/tool/megamemory.ts`
-- Bootstrap command `/user:bootstrap-memory` for initial graph population
-- Save command `/user:save-memory` to persist session knowledge
-
-Restart opencode after running install.
-
-#### With [Claude Code](https://code.claude.com)
-
-```bash
-megamemory install --target claudecode
-```
-
-Configures:
-- MCP server in `~/.claude.json`
-- Workflow instructions in `~/.claude/CLAUDE.md`
-- Commands in `~/.claude/commands/`
-
-#### With [Antigravity](https://idx.google.com)
-
-```bash
-megamemory install --target antigravity
-```
-
-Configures:
-- MCP server in `./mcp_config.json` (workspace-level)
-
-#### With [Codex](https://openai.com/codex)
-
-```bash
-megamemory install --target codex
-```
-
-Configures:
-- MCP server in `~/.codex/config.toml`
-- Workflow instructions in `~/.codex/AGENTS.md`
-
-#### With other MCP clients
-
-Add megamemory as a stdio MCP server. The command is just `megamemory` (no arguments). It reads/writes `.megamemory/knowledge.db` relative to the working directory, or set `MEGAMEMORY_DB_PATH` to override.
 
 ```json
 {
@@ -115,141 +83,113 @@ Add megamemory as a stdio MCP server. The command is just `megamemory` (no argum
 }
 ```
 
+The server reads `.megamemory/knowledge.db` relative to the working directory; override with
+`MEGAMEMORY_DB_PATH`.
+
+### Upgrading an existing upstream database
+
+```bash
+megamemory migrate --dry-run    # prints the plan, changes nothing
+megamemory migrate --apply      # backs up knowledge.db.bak-<ts>, applies the additive schema
+megamemory reembed              # only needed if the embedding model changed
+megamemory doctor               # health check, exit code 1 on problems
+```
+
+The migration never drops or renames a column, so upstream v1.6.2 still opens a migrated database.
+Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports them explicitly.
+
 ---
 
-### MCP Tools
+## MCP tools
 
 | Tool | Description |
-|------|-------------|
-| `understand` | Semantic search over the knowledge graph. Returns matched concepts with children, edges, and parent context. |
-| `get_concept` | Look up a concept by its exact ID. Returns full context including children, edges, incoming edges, and parent. |
-| `create_concept` | Add a new concept with optional edges and file references. |
-| `update_concept` | Update fields on an existing concept. Regenerates embeddings automatically. |
-| `link` | Create a typed relationship between two concepts. |
-| `remove_concept` | Soft-delete a concept with a reason. History preserved. |
-| `list_roots` | List all top-level concepts with direct children. |
-| `list_conflicts` | List unresolved merge conflicts grouped by merge group. |
-| `resolve_conflict` | Resolve a merge conflict by providing verified, correct content based on the current codebase. |
+|---|---|
+| `understand` | Hybrid search over the graph. `top_k`, `max_tokens`, `mode: "compact" \| "full"`, `include_inactive`. |
+| `get_concept` | Exact-ID lookup with children, edges, incoming edges, parent. |
+| `create_concept` | Add a concept with edges, file refs and `supersedes`. |
+| `update_concept` | Update fields; embeddings are regenerated. |
+| `link` | Typed relationship between concepts. |
+| `remove_concept` | Soft-delete with a reason; history kept, status set to `deprecated`. |
+| `list_roots` | Top-level concepts with direct children (budgeted). |
+| `list_conflicts` | Unresolved merge conflicts, plus `contradicts` pairs. |
+| `resolve_conflict` | Resolve a conflict with verified content. |
 
-**Concept kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component`
+**Kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest`
 
-**Relationship types:** `connects_to` · `depends_on` · `implements` · `calls` · `configured_by`
-
-### Knowledge Graph
-
-<p align="center">
-  <img src="./assets/knowledge-graph.svg" alt="MegaMemory knowledge graph example" width="800" />
-</p>
+**Relations:** `connects_to` · `depends_on` · `implements` · `calls` · `configured_by` · `supersedes` · `contradicts`
 
 ---
 
-### Web Explorer
+## CLI
 
-Visualize the knowledge graph in your browser:
-
-```bash
-megamemory serve
-```
-
-- Nodes are colored by kind and sized by edge count
-- Dashed edges show parent-child links; solid edges show relationships
-- Click any node to inspect summary, files, and edges
-- Search supports highlight/dim filtering
-- If port `4321` is taken, you'll be prompted to pick another
-
-```bash
-megamemory serve --port 8080   # custom port
-```
-
----
-
-### How It Works
-
-<p align="center">
-  <img src="./assets/architecture.svg" alt="MegaMemory architecture diagram" width="800" />
-</p>
-
-```
-src/
-  index.ts       CLI entry + MCP server (9 tools)
-  tools.ts       Tool handlers (understand, get_concept, create, update, link, remove, list_conflicts, resolve_conflict)
-  db.ts          SQLite persistence (libsql, WAL mode, schema v3)
-  embeddings.ts  In-process embeddings (all-MiniLM-L6-v2, 384 dims)
-  merge.ts       Two-way merge engine for knowledge.db files
-  merge-cli.ts   CLI handlers for merge, conflicts, resolve commands
-  types.ts       TypeScript types
-  cli-utils.ts   Colored output + interactive prompts
-  install.ts     multi-target installer (opencode, Claude Code, Antigravity, Codex)
-  web.ts         HTTP server for graph explorer
-plugin/
-  megamemory.ts  Opencode skill tool plugin
-commands/
-  bootstrap-memory.md  /user command for initial population
-  save-memory.md       /user command to save session knowledge
-web/
-  index.html     Single-file graph visualization (d3-force + Canvas)
-```
-
-- **Embeddings** — In-process via [Xenova/all-MiniLM-L6-v2](https://huggingface.co/Xenova/all-MiniLM-L6-v2) (ONNX, quantized). No API keys, and no network calls after the first model download.
-- **Storage** — SQLite with WAL mode, soft-delete history, and schema migrations (currently v3).
-- **Search** — Brute-force cosine similarity over node embeddings; fast enough for graphs with <10k nodes.
-- **Merge** — Two-way merge with conflict detection by concept ID, with AI-assisted conflict resolution via MCP tools.
+| Command | What it does |
+|---|---|
+| `megamemory install` | Configure an MCP client |
+| `megamemory serve [--port N]` | Web explorer (graph, search, node cards, Tokens panel, consolidate tab) |
+| `megamemory migrate [--dry-run\|--apply]` | Upgrade an upstream database |
+| `megamemory repair-ids [--apply]` | Rebuild empty / trailing-slash IDs from names |
+| `megamemory reembed` | Recompute embeddings (resumable, batched) |
+| `megamemory doctor` | Health check: schema, model, FTS, IDs, vectors, orphans, digests |
+| `megamemory stats` | Graph and token statistics |
+| `megamemory eval` | recall@10 over `fixtures/eval.jsonl` |
+| `megamemory consolidate [--dry-run\|--apply]` | Find and merge near-duplicate nodes |
+| `megamemory digest [--apply]` | Build or rebuild digest nodes |
+| `megamemory export --md <dir> [--check]` | Markdown export, CI-friendly drift check |
+| `megamemory merge`, `conflicts`, `resolve` | Two-way merge of graphs across branches |
 
 ---
 
-### CLI Commands
+## Environment
 
-| Command | Description |
-|---------|-------------|
-| `megamemory` | Start the MCP stdio server |
-| `megamemory install` | Configure editor/agent integration |
-| `megamemory serve` | Launch the web graph explorer |
-| `megamemory merge` | Merge two knowledge.db files |
-| `megamemory conflicts` | List unresolved merge conflicts |
-| `megamemory resolve` | Resolve a merge conflict |
-| `megamemory --help` | Show help |
-| `megamemory --version` | Show version |
+| Variable | Default | Meaning |
+|---|---|---|
+| `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Database location |
+| `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Embedding model (any transformers.js ONNX model) |
+| `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid` / `fts` / `vector` |
+| `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` adds a second index for CJK |
+| `MEGAMEMORY_AUTO_DIGEST` | on | `0` disables auto-digest after the 5th child |
 
 ---
 
-### Merging Knowledge Graphs
-
-When branches diverge, each may update `.megamemory/knowledge.db` independently. Since SQLite files cannot be auto-merged by git, megamemory provides dedicated merge commands.
-
-#### Merge two databases
+## Web explorer
 
 ```bash
-megamemory merge main.db feature.db --into merged.db
+megamemory serve --port 8080
 ```
 
-Concepts are compared by ID: identical nodes are deduplicated, and conflicting nodes are kept as `::left`/`::right` variants under one merge group UUID. Use `--left-label` and `--right-label` to replace default side labels with branch names.
-
-```bash
-megamemory merge main.db feature.db --into merged.db --left-label main --right-label feature-xyz
-```
-
-#### View conflicts
-
-```bash
-megamemory conflicts            # human-readable summary
-megamemory conflicts --json     # machine-readable output
-megamemory conflicts --db path  # specify database path
-```
-
-#### Resolve conflicts manually
-
-```bash
-megamemory resolve <merge-group-uuid> --keep left    # keep the left version
-megamemory resolve <merge-group-uuid> --keep right   # keep the right version
-megamemory resolve <merge-group-uuid> --keep both    # keep both as separate concepts
-```
-
-#### AI-assisted resolution
-
-When an AI agent runs `/merge`, it calls `list_conflicts`, verifies both versions against current source files, then calls `resolve_conflict` with `resolved: {summary, why?, file_refs?}` plus a verification `reason`. It does not pick a side blindly; it resolves to what the codebase currently reflects.
+- nodes colored by kind, sized by edge count; `digest` nodes and outdated (`superseded`) nodes are visually distinct
+- `supersedes` edges drawn dashed, status badges in the node card, "show outdated" toggle
+- search hits carry a `via` badge (vector / fts / both) and a budget line: `N nodes, ~X tokens, dropped M`
+- **Tokens** panel: average answer size and saved tokens over 7 days
+- **Consolidate** tab: duplicate candidates with apply
 
 ---
 
-### License
+## Tests
 
-[MIT](./LICENSE)
+```bash
+npm run build
+npx vitest run src/__tests__/id-generation.test.ts --reporter=dot     # targeted
+npx vitest run                                                       # full suite (slow: model download)
+```
+
+`fixtures/demo.db` is a ready-made graph (ru/en/zh/emoji, one `superseded`, one `digest`, one
+duplicate pair) for manual checks in the explorer.
+
+---
+
+## Compatibility and limits
+
+- Upstream v1.6.2 keeps working against a migrated database: new columns have defaults, FTS
+  triggers maintain the index for upstream inserts. Backups `knowledge.db.bak-<ts>`, last 3 kept.
+- FTS5 requires libsql's local file mode — MegaMemory is local-only; remote Turso forbids virtual tables.
+- After any `VACUUM`, run `megamemory migrate --apply` to rebuild the FTS index (rowids are not stable).
+- Russian text is not stemmed by FTS5's `unicode61`; the vector channel compensates, prefix queries help.
+
+---
+
+## Credits and license
+
+Based on [MegaMemory](https://github.com/0xK3vin/MegaMemory) by 0xK3vin (MIT).
+Fork maintained by [BloodyEagle](https://github.com/BloodyEagle). MIT, see [LICENSE](./LICENSE).
+Differences and sync instructions: [docs/FORK.md](./docs/FORK.md).
