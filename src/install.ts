@@ -282,11 +282,19 @@ function upsertAgentsMdBlock(filePath: string, block: string): "created" | "repl
     return "appended";
   }
 
-  // Versioned block: replace marker..END inclusive.
-  const endIdx = content.indexOf(AGENTS_MD_END, markerIdx);
+  // A previous v2 run left a version comment right before the heading —
+  // start there, or the old comment survives and the marker duplicates.
+  const versionIdx = content.indexOf("<!-- megamemory-snippet:");
+  const blockStart =
+    versionIdx !== -1 && versionIdx < markerIdx ? versionIdx : markerIdx;
+
+  // Versioned block: replace blockStart..END inclusive.
+  const endIdx = content.indexOf(AGENTS_MD_END, blockStart);
   if (endIdx !== -1) {
     const updated =
-      content.slice(0, markerIdx) + block + content.slice(endIdx + AGENTS_MD_END.length);
+      content.slice(0, blockStart) +
+      block +
+      content.slice(endIdx + AGENTS_MD_END.length).replace(/^\n+/, "");
     fs.writeFileSync(filePath, updated);
     return "replaced";
   }
