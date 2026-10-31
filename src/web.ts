@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { buildNodeWithContext, understand } from "./tools.js";
+import { findDuplicates, mergeNodes } from "./consolidate.js";
 import { errorBold, askPort } from "./cli-utils.js";
 import { initializeEmbeddings, vectorSearchEnabled } from "./embeddings.js";
 import type { NodeRow } from "./types.js";
@@ -644,6 +645,43 @@ export async function runServe(port: number): Promise<void> {
         created_by_task: node.created_by_task,
       };
       json(res, result);
+      return;
+    }
+
+    if (pathname === "/api/consolidate" && req.method === "GET") {
+      // T5 DoD: explorer tab lists duplicate candidates without mutating.
+      const threshold = Number.parseFloat(url.searchParams.get("threshold") ?? "0.95");
+      const candidates = findDuplicates(db, {
+        threshold: Number.isFinite(threshold) ? threshold : 0.95,
+      });
+      json(res, { candidates });
+      return;
+    }
+
+    if (pathname === "/api/consolidate" && req.method === "POST") {
+      let raw = "";
+      req.on("data", (chunk) => {
+        raw += chunk;
+      });
+      req.on("end", () => {
+        let body: { survivor?: string; other?: string } = {};
+        try {
+          body = JSON.parse(raw) as { survivor?: string; other?: string };
+        } catch {
+          json(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        if (!body.survivor || !body.other) {
+          json(res, { error: "survivor and other are required" }, 400);
+          return;
+        }
+        try {
+          const result = mergeNodes(db, body.survivor, body.other);
+          json(res, { ok: true, ...result });
+        } catch (err) {
+          json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+        }
+      });
       return;
     }
 

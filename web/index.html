@@ -865,7 +865,54 @@ function renderStats(stats) {
   parts.push(`<span class="stat"><span class="dot" style="background:#d97706"></span>superseded</span>`);
   parts.push(`<span class="stat"><span class="dot" style="background:#ef4444"></span>deprecated</span>`);
   parts.push(`<label class="stat" style="cursor:pointer"><input type="checkbox" id="toggle-outdated" ${hideOutdated ? '' : 'checked'} onchange="hideOutdated = !this.checked"> show outdated</label>`);
+  // T5: consolidation tab.
+  parts.push(`<button class="stat" id="consolidate-btn" onclick="openConsolidate()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">consolidate…</button>`);
   el.innerHTML = parts.join('');
+}
+
+async function openConsolidate() {
+  const el = document.getElementById('stats');
+  el.innerHTML = '<span class="stat">scanning for duplicates…</span>';
+  try {
+    const res = await fetch('/api/consolidate');
+    const data = await res.json();
+    const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+    if (!candidates.length) {
+      el.innerHTML = '<span class="stat">no duplicates found — graph is clean</span>' +
+        '<button class="stat" onclick="location.reload()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">close</button>';
+      return;
+    }
+    const rows = candidates.map(c =>
+      `<div class="stat" style="display:flex;gap:8px;align-items:center;border:1px solid #64748b44;border-radius:10px;padding:4px 8px">` +
+      `<span style="color:#38bdf8">${esc(c.a)}</span> ≈ <span style="color:#38bdf8">${esc(c.b)}</span>` +
+      `<span style="color:#4ade80">${(c.similarity * 100).toFixed(1)}%</span>` +
+      `<button onclick="applyConsolidate('${esc(c.older)}','${esc(c.older === c.a ? c.b : c.a)}')" ` +
+      `style="cursor:pointer;background:#22c55e22;border:1px solid #22c55e55;color:#4ade80;border-radius:8px;padding:2px 8px">merge into ${esc(c.older)}</button></div>`
+    ).join('');
+    el.innerHTML = `<div style="display:flex;flex-direction:column;gap:4px;width:100%">` +
+      `<span class="stat">${candidates.length} duplicate candidate(s)</span>${rows}` +
+      `<button class="stat" onclick="location.reload()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">close</button></div>`;
+  } catch (err) {
+    el.innerHTML = `<span class="stat">consolidate failed: ${esc(String(err))}</span>`;
+  }
+}
+
+async function applyConsolidate(survivor, other) {
+  try {
+    const res = await fetch('/api/consolidate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ survivor, other }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      alert('merge failed: ' + data.error);
+      return;
+    }
+    location.reload();
+  } catch (err) {
+    alert('merge failed: ' + String(err));
+  }
 }
 
 // ---- Data model + simulation ----
