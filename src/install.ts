@@ -50,9 +50,14 @@ const CODEX_CONFIG_PATH = path.join(CODEX_DIR, "config.toml");
 const CODEX_AGENTS_MD_PATH = path.join(CODEX_DIR, "AGENTS.md");
 
 const AGENTS_MD_MARKER = "## Project Knowledge Graph";
+// F8.2: versioned block markers — repeated installs UPDATE the snippet
+// instead of skipping it, so agents always read the current workflow rules.
+const AGENTS_MD_VERSION = "<!-- megamemory-snippet:v2 -->";
+const AGENTS_MD_END = "<!-- /megamemory-snippet -->";
 const MANAGED_FILE_MARKER = "MegaMemory-managed file. Safe for megamemory install to update.";
 
 const AGENTS_MD_SNIPPET = `
+${AGENTS_MD_VERSION}
 ## Project Knowledge Graph
 
 You have access to a project knowledge graph via the \`megamemory\` MCP server and skill tool. You have no implicit memory of this project between sessions, so this graph is your only continuity for concepts, architecture, decisions, and relationships.
@@ -64,6 +69,17 @@ You have access to a project knowledge graph via the \`megamemory\` MCP server a
 3. **After each task:** You must call \`megamemory\` with action \`record\` to create/update/link concepts for what you built.
 
 Be specific in summaries: include parameter names, defaults, file locations, and rationale. Keep concepts max 3 levels deep.
+
+4. **Budget:** \`understand\` is compact by default and bounded by \`max_tokens\` (1500).
+   Use \`mode:"full"\` only when you need \`why\` and full children/edges.
+5. **Freshness:** when a decision replaces an older one, pass \`supersedes: [old_id]\` to
+   \`create_concept\` instead of deleting. If a search finds nothing, retry with
+   \`include_inactive: true\` — the concept may be marked superseded.
+6. **Digests:** \`digest\` nodes are per-module summaries rebuilt from children. Read the digest
+   first, children second. Never create digests by hand.
+7. **After changing the embedding model:** run \`megamemory reembed\`. Until it finishes, vector
+   search is off and results are FTS-only.
+${AGENTS_MD_END}
 `;
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -246,22 +262,55 @@ async function detectCodexCli(): Promise<boolean> {
   }
 }
 
+/**
+ * Upsert the versioned megamemory block (F8.2):
+ * - no marker -> append the whole block;
+ * - marker present -> replace from the marker to the end marker (or to the
+ *   next "## " heading when upgrading from an unmarked legacy snippet).
+ * Repeated installs refresh the text instead of duplicating it.
+ */
+function upsertAgentsMdBlock(filePath: string, block: string): "created" | "replaced" | "appended" {
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, block);
+    return "created";
+  }
+
+  const content = fs.readFileSync(filePath, "utf-8");
+  const markerIdx = content.indexOf(AGENTS_MD_MARKER);
+  if (markerIdx === -1) {
+    fs.writeFileSync(filePath, content.replace(/\r?\n*$/, "\n\n") + block);
+    return "appended";
+  }
+
+  // Versioned block: replace marker..END inclusive.
+  const endIdx = content.indexOf(AGENTS_MD_END, markerIdx);
+  if (endIdx !== -1) {
+    const updated =
+      content.slice(0, markerIdx) + block + content.slice(endIdx + AGENTS_MD_END.length);
+    fs.writeFileSync(filePath, updated);
+    return "replaced";
+  }
+
+  // Legacy unmarked snippet: cut to the next "## " heading (exclusive).
+  const nextHeading = content.indexOf("\n## ", markerIdx);
+  const cutEnd = nextHeading === -1 ? content.length : nextHeading + 1;
+  const updated = content.slice(0, markerIdx) + block + content.slice(cutEnd);
+  fs.writeFileSync(filePath, updated);
+  return "replaced";
+}
+
 function setupInstructionFile(filePath: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 
-  if (fs.existsSync(filePath)) {
-    const content = fs.readFileSync(filePath, "utf-8");
-    if (content.includes(AGENTS_MD_MARKER)) {
-      skip(`Already contains knowledge graph instructions`);
-      return;
-    }
-    fs.appendFileSync(filePath, "\n" + AGENTS_MD_SNIPPET.trimStart());
+  const block = AGENTS_MD_SNIPPET.trimStart();
+  const outcome = upsertAgentsMdBlock(filePath, block);
+  if (outcome === "created") {
+    success(`Created ${pc.dim(filePath)}`);
+  } else if (outcome === "replaced") {
+    success(`Updated knowledge graph instructions (v2) in ${pc.dim(filePath)}`);
+  } else {
     success(`Appended knowledge graph instructions to ${pc.dim(filePath)}`);
-    return;
   }
-
-  fs.writeFileSync(filePath, AGENTS_MD_SNIPPET.trimStart());
-  success(`Created ${pc.dim(filePath)}`);
 }
 
 function setupToolPlugin(): void {

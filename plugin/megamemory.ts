@@ -26,9 +26,29 @@ Your persistent memory of the codebase. You have no implicit memory of this proj
 3. **Be specific.** Include parameter names, defaults, file paths, rationale.
 4. **Keep it shallow.** Max 3 levels deep. Useful beats exhaustive.
 
+## Budget and modes
+
+- \`understand\` is compact by default: summaries trimmed to 240 chars, edges only between
+  returned nodes, answer bounded by \`max_tokens\`. Token budget: 1500 by default. Use \`mode:"full"\` only for a deep
+  dive where you need \`why\` and full children.
+- \`list_roots\` is budgeted too; treat it as an index, not as content.
+
+## Freshness
+
+- Replacing a decision: pass \`supersedes: [old_id]\` to \`create_concept\`. Never delete the old
+  node — it stays in the graph as \`superseded\` with \`valid_until\`.
+- Nothing found? Retry with \`include_inactive: true\` before concluding the knowledge is missing.
+- \`remove_concept\` is for things that are gone from the code, not for things that changed.
+
+## Digests
+
+- A \`digest\` node is a per-module summary rebuilt from its children (after the 5th child).
+  Read the digest first; open children only when the digest is not enough.
+- Do not create digests by hand — \`megamemory digest\` and the auto-builder own them.
+
 ## Concept Kinds
 
-\`feature\` | \`module\` | \`pattern\` | \`config\` | \`decision\` | \`component\`
+\`feature\` | \`module\` | \`pattern\` | \`config\` | \`decision\` | \`component\` | \`digest\`
 
 ## Relationship Types
 
@@ -37,12 +57,14 @@ Your persistent memory of the codebase. You have no implicit memory of this proj
 - \`calls\` — A invokes B at runtime
 - \`connects_to\` — A and B interact or share data
 - \`configured_by\` — A's behavior is controlled by B
+- \`supersedes\` — A replaces B; B becomes superseded and leaves default answers
+- \`contradicts\` — A and B disagree; surfaced by list_conflicts
 
 ## MCP Tools Reference
 
 | Tool | When | What it does |
 |---|---|---|
-| \`megamemory:understand\` | Before tasks | Semantic search — returns matching concepts with children, edges, parent |
+| \`megamemory:understand\` | Before tasks | Hybrid search (FTS + vector). Returns a compact, token-budgeted answer; \`mode:"full"\` for why/children/edges |
 | \`megamemory:create_concept\` | After tasks | Add new concept with summary, kind, edges, file refs |
 | \`megamemory:update_concept\` | After tasks | Patch existing concept fields |
 | \`megamemory:link\` | After tasks | Create relationship between two concepts |
@@ -105,7 +127,8 @@ Use the returned context instead of re-reading source files when possible. If no
    - why: rationale for this design
    - parent_id: parent concept slug (for nesting)
    - file_refs: relevant file paths + line ranges
-   - edges: [{to: "concept-id", relation: "depends_on|implements|calls|connects_to|configured_by", description: "why"}]
+   - edges: [{to: "concept-id", relation: "depends_on|implements|calls|connects_to|configured_by|supersedes|contradicts", description: "why"}]
+   - supersedes: [old_id] — when this concept replaces an older decision
    - created_by_task: what task/prompt created this
 
 2. **Changed concepts** → megamemory:update_concept

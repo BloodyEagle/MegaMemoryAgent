@@ -46,3 +46,6 @@ configured_by.
   /auth/login, validated in middleware, refresh tokens in Redis with 7d TTL" is useful.
 - Focus on the top 10-15 most important concepts first. The graph grows over time.
 - Don't document trivial things. If it's obvious from the file name, skip it.
+
+- When a concept replaces an earlier decision, pass `supersedes: [old_id]` instead of deleting.
+- Do not create digest nodes manually — they are built from children automatically.
