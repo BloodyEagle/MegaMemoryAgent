@@ -81,6 +81,46 @@ function ensureFts(db: KnowledgeDB, report: MigrationReport): void {
   report.applied.push("created nodes_fts + triggers, rebuilt index");
 }
 
+/**
+ * Optional trigram companion table for CJK (plan T2): unicode61 keeps a
+ * hieroglyph run as one token, trigram splits it — but only for >=3 chars.
+ * Created when MEGAMEMORY_FTS_TOKENIZER=trigram; both tables may coexist.
+ */
+function ensureTrigramFts(db: KnowledgeDB, report: MigrationReport): void {
+  if (
+    (process.env.MEGAMEMORY_FTS_TOKENIZER ?? "").toLowerCase() !== "trigram"
+  ) {
+    return;
+  }
+  if (tableExists(db, "nodes_fts_tri")) {
+    report.alreadyOk.push("nodes_fts_tri");
+    return;
+  }
+  db.execSql(`
+    CREATE VIRTUAL TABLE nodes_fts_tri USING fts5(
+      name, summary, why,
+      content='nodes', content_rowid='rowid',
+      tokenize="trigram"
+    );
+    CREATE TRIGGER IF NOT EXISTS nodes_tri_ai AFTER INSERT ON nodes BEGIN
+      INSERT INTO nodes_fts_tri(rowid, name, summary, why)
+      VALUES (new.rowid, new.name, new.summary, new.why);
+    END;
+    CREATE TRIGGER IF NOT EXISTS nodes_tri_ad AFTER DELETE ON nodes BEGIN
+      INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
+      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
+    END;
+    CREATE TRIGGER IF NOT EXISTS nodes_tri_au AFTER UPDATE ON nodes BEGIN
+      INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
+      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
+      INSERT INTO nodes_fts_tri(rowid, name, summary, why)
+      VALUES (new.rowid, new.name, new.summary, new.why);
+    END;
+  `);
+  db.execSql("INSERT INTO nodes_fts_tri(nodes_fts_tri) VALUES('rebuild')");
+  report.applied.push("created nodes_fts_tri (trigram), rebuilt index");
+}
+
 /** Additive schema steps: meta table, fork columns, indexes, FTS, usage. */
 export function ensureSchema(
   db: KnowledgeDB,
@@ -121,8 +161,9 @@ export function ensureSchema(
   db.execSql("CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id)");
   report.alreadyOk.push("fork indexes");
 
-  // Step 5: FTS index + sync triggers.
+  // Step 5: FTS index + sync triggers (+ optional trigram table for CJK).
   ensureFts(db, report);
+  ensureTrigramFts(db, report);
 
   // Step 6: usage table (token accounting, T8).
   db.execSql(`

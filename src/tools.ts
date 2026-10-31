@@ -8,7 +8,7 @@ import {
   queryText,
   vectorSearchEnabled,
 } from "./embeddings.js";
-import { basicSearch } from "./search.js";
+import { basicSearch, hybridSearch, type SearchVia } from "./search.js";
 import type {
   UnderstandInput,
   GetConceptInput,
@@ -158,15 +158,21 @@ export async function understand(
   // Get all active nodes with embeddings
   const candidates = db.getAllActiveNodesWithEmbeddings();
 
-  if (candidates.length === 0) {
-    return { matches: [] };
-  }
-
-  // Vector search only when all stored vectors came from the current model;
-  // otherwise (model changed, reembed pending) fall back to text search so
-  // vector spaces never get mixed.
+  // Search mode (plan T2): hybrid by default — RRF over FTS + vector.
+  // Vector-only runs when MEGAMEMORY_SEARCH=vector; text-only for fts, or
+  // when vectors are disabled (model mismatch pending reembed).
+  const mode = process.env.MEGAMEMORY_SEARCH ?? "hybrid";
   let topMatches: Array<{ id: string; similarity: number }>;
-  if (vectorSearchEnabled(db)) {
+  const viaById = new Map<string, SearchVia>();
+
+  if (mode === "hybrid") {
+    const hits = await hybridSearch(db, input.query, { topK });
+    topMatches = hits.map((h) => ({ id: h.id, similarity: h.score }));
+    for (const h of hits) viaById.set(h.id, h.via);
+  } else if (mode === "vector" && vectorSearchEnabled(db)) {
+    if (candidates.length === 0) {
+      return { matches: [] };
+    }
     const queryEmbedding = await embed(queryText(input.query));
     topMatches = findTopK(queryEmbedding, candidates, topK);
   } else {
@@ -178,7 +184,10 @@ export async function understand(
   for (const match of topMatches) {
     const node = db.getNode(match.id);
     if (!node) continue;
-    matches.push(buildNodeWithContext(db, node, match.similarity));
+    const ctx = buildNodeWithContext(db, node, match.similarity);
+    const via = viaById.get(match.id);
+    if (via) ctx.via = via;
+    matches.push(ctx);
   }
 
   return { matches };

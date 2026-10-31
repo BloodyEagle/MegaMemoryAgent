@@ -66,7 +66,12 @@ export async function reembed(
       );
       const buffer = await embedFn(text);
       dim = dimOf(buffer);
-      db.execSqlRun("UPDATE nodes SET embedding = ? WHERE id = ?", buffer, row.id);
+      // Named params: libsql panics on single-POSITIONAL-param statements
+      // with a Buffer argument (statement.rs unwrap), named binding is safe.
+      db.execSqlRun(
+        "UPDATE nodes SET embedding = @embedding WHERE id = @id",
+        { embedding: buffer, id: row.id }
+      );
       cursor = row.rowid;
       processed += 1;
     }

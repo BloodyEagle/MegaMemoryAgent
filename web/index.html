@@ -163,6 +163,19 @@
     color: var(--text-dim);
   }
 
+  .search-via {
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 8px;
+    border: 1px solid #64748b55;
+    color: #94a3b8;
+    background: #64748b18;
+  }
+
+  .search-via[data-via="vector"] { border-color: #8b5cf655; color: #a78bfa; background: #8b5cf618; }
+  .search-via[data-via="fts"] { border-color: #0ea5e955; color: #38bdf8; background: #0ea5e918; }
+  .search-via[data-via="both"] { border-color: #22c55e55; color: #4ade80; background: #22c55e18; }
+
   .search-empty {
     padding: 12px;
     font-size: 12px;
@@ -1605,13 +1618,17 @@ function renderSearchResults(query, matches, mode) {
     const score = hasScore ? Math.max(0, Math.min(1, m.similarity)) : 0;
     const scorePct = (score * 100).toFixed(1);
     const metric = hasScore
-      ? `similarity: ${scorePct}%`
+      ? `rrf: ${scorePct}%`
       : (mode === 'keyword-fallback' ? 'keyword fallback' : '');
+    const viaBadge = m.via
+      ? `<span class="search-via" data-via="${esc(m.via)}">via ${esc(m.via)}</span>`
+      : '';
     return `
       <button class="search-result" type="button" data-index="${i}" data-id="${esc(m.id)}">
         <div class="search-row">
           <span class="search-name">${esc(m.name)}</span>
           <span class="search-kind" style="background:${color}22;color:${color};border:1px solid ${color}44">${esc(m.kind)}</span>
+          ${viaBadge}
         </div>
         <div class="search-summary">${esc(m.summary || '')}</div>
         ${metric ? `<div class="search-similarity">${metric}</div>` : ''}

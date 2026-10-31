@@ -121,6 +121,8 @@ export interface NodeWithContext {
   }>;
   parent: { id: string; name: string } | null;
   similarity?: number;
+  /** Why this node was found: hybrid search channel (T2). */
+  via?: "vector" | "fts" | "both";
 }
 
 export interface UnderstandOutput {
