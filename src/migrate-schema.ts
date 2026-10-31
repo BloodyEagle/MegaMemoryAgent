@@ -230,10 +230,10 @@ export function markMigrated(db: KnowledgeDB): void {
  * apply = backup + schema + id repair + meta, then marks schema_version=2.
  * Idempotent: a second apply reports "alreadyOk" and changes nothing.
  */
-export function runMigration(
+export async function runMigration(
   db: KnowledgeDB,
   opts: { apply: boolean; backup?: (dbPath: string) => string | null; dbPath?: string }
-): MigrationReport {
+): Promise<MigrationReport> {
   const report = emptyReport();
 
   // Read-only previews (also shown in dry-run).
@@ -269,10 +269,17 @@ export function runMigration(
     report.applied.push(`repaired ${result.renamed} legacy id(s)`);
   }
 
-  // Step 9: digest building arrives with T6; report pending count for now.
-  if (report.digestPending > 0) {
+  // Step 9: build digests for parents with >=5 children (T6).
+  try {
+    const { rebuildDigests } = await import("./digest.js");
+    // embed:false — migration must not trigger a model download; reembed covers vectors later.
+    const { built } = await rebuildDigests(db, undefined, { embed: false });
+    if (built.length > 0) {
+      report.applied.push(`built ${built.length} module digest(s)`);
+    }
+  } catch (err) {
     report.warnings.push(
-      `${report.digestPending} module(s) with >=5 children have no digest yet (digest building lands in T6)`
+      `digest building failed: ${err instanceof Error ? err.message : String(err)}`
     );
   }
 

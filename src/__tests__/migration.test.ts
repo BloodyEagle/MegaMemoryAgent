@@ -101,12 +101,12 @@ function freshDir(): { dir: string; dbPath: string } {
 }
 
 describe("fork migration from upstream v1.6.2", () => {
-  it("dry run does not change the database file", () => {
+  it("dry run does not change the database file", async () => {
     const { dbPath } = freshDir();
     const before = sha256(dbPath);
     const db = new KnowledgeDB(dbPath);
     try {
-      const report = runMigration(db, { apply: false });
+      const report = await runMigration(db, { apply: false });
       expect(report.warnings.join(" ")).toContain("2 id(s) would be renamed");
     } finally {
       db.close();
@@ -114,11 +114,11 @@ describe("fork migration from upstream v1.6.2", () => {
     expect(sha256(dbPath)).toBe(before);
   });
 
-  it("apply preserves counts, fills FTS, sets status, repairs ids", () => {
+  it("apply preserves counts, fills FTS, sets status, repairs ids", async () => {
     const { dbPath } = freshDir();
     const db = new KnowledgeDB(dbPath);
     try {
-      const report = runMigration(db, { apply: true, backup: () => null });
+      const report = await runMigration(db, { apply: true, backup: () => null });
       expect(report.repairedIds).toBe(2);
 
       const raw = db.getAllNodesRaw();
@@ -154,11 +154,11 @@ describe("fork migration from upstream v1.6.2", () => {
     }
   });
 
-  it("second apply changes nothing (idempotent)", () => {
+  it("second apply changes nothing (idempotent)", async () => {
     const { dbPath } = freshDir();
     const db = new KnowledgeDB(dbPath);
     try {
-      runMigration(db, { apply: true, backup: () => null });
+      await runMigration(db, { apply: true, backup: () => null });
       const nodesBefore = db.getAllNodesRaw().length;
       const edgesBefore = db.getAllEdgesRaw().length;
     } finally {
@@ -168,7 +168,7 @@ describe("fork migration from upstream v1.6.2", () => {
 
     const db2 = new KnowledgeDB(dbPath);
     try {
-      const report2 = runMigration(db2, { apply: true, backup: () => null });
+      const report2 = await runMigration(db2, { apply: true, backup: () => null });
       expect(report2.applied.join("; ")).not.toContain("created meta table");
       expect(report2.applied.join("; ")).not.toContain("nodes_fts");
       expect(report2.repairedIds).toBe(0);
@@ -180,11 +180,11 @@ describe("fork migration from upstream v1.6.2", () => {
     expect(sha256(dbPath)).toBe(hashBefore);
   });
 
-  it("upstream-shaped INSERT after migration lands in FTS", () => {
+  it("upstream-shaped INSERT after migration lands in FTS", async () => {
     const { dbPath } = freshDir();
     const db = new KnowledgeDB(dbPath);
     try {
-      runMigration(db, { apply: true, backup: () => null });
+      await runMigration(db, { apply: true, backup: () => null });
 
       // Exactly the column list upstream's insertNode uses — no fork columns.
       db.execSql(`

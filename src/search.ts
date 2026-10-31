@@ -1,6 +1,9 @@
 import type { KnowledgeDB } from "./db.js";
 import { embed, findTopK, queryText, vectorSearchEnabled } from "./embeddings.js";
 
+/** Digest nodes weigh less in search so they never displace concrete nodes. */
+export const DIGEST_SEARCH_WEIGHT = 0.8;
+
 /**
  * Hybrid search (plan T2): FTS + optional vector channel merged with
  * Reciprocal Rank Fusion. Works for any language:
@@ -191,7 +194,18 @@ export async function hybridSearch(
 
   if (pools.length === 0) return [];
 
-  return rrfMerge(pools, k, topK);
+  const merged = rrfMerge(pools, k, topK);
+
+  // T6: digest nodes weigh less so they never displace concrete nodes.
+  for (const hit of merged) {
+    const node = db.getNode(hit.id);
+    if (node?.kind === "digest") {
+      hit.score *= DIGEST_SEARCH_WEIGHT;
+    }
+  }
+  merged.sort((a, b) => b.score - a.score);
+
+  return merged;
 }
 
 /**

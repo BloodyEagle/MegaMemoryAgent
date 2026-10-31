@@ -31,6 +31,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("migrate")}         Upgrade an upstream v1.6.2 database to the fork schema ${pc.dim("(default: dry-run)")}
   ${pc.cyan("reembed")}         Reindex node embeddings with the current model ${pc.dim("(--batch N)")}
   ${pc.cyan("consolidate")}     Find and merge near-duplicate nodes ${pc.dim("(default: dry-run)")}
+  ${pc.cyan("digest")}          Rebuild module digest nodes ${pc.dim("(default: dry-run)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -55,7 +56,7 @@ ${pc.bold("Examples:")}
   ${pc.dim("$")} megamemory repair-ids --apply                        ${pc.dim("Rename broken ids after backup")}
 `.trim();
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string } {
   const portIdx = args.indexOf("--port");
@@ -127,6 +128,13 @@ switch (cmd) {
   case "migrate": {
     const { runMigrate } = await import("./migrate-cli.js");
     await runMigrate(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "digest": {
+    const { runDigest } = await import("./digest-cli.js");
+    await runDigest(process.argv.slice(3));
     process.exit(0);
     break;
   }
@@ -249,7 +257,7 @@ async function startMcpServer() {
 
   // ---- Zod schemas ----
   const NodeKindEnum = z.enum([
-    "feature", "module", "pattern", "config", "decision", "component",
+    "feature", "module", "pattern", "config", "decision", "component", "digest",
   ]);
   const RelationEnum = z.enum([
     "connects_to", "depends_on", "implements", "calls", "configured_by", "supersedes", "contradicts",
@@ -366,6 +374,16 @@ async function startMcpServer() {
           supersedes: params.supersedes,
           created_by_task: params.created_by_task,
         });
+        // T6: auto-digest the parent when it gained its 5th+ child.
+        let digestNote = "";
+        try {
+          const { maybeAutoDigest } = await import("./digest.js");
+          const digest = await maybeAutoDigest(db, params.parent_id ?? null);
+          if (digest) digestNote = ` Digest built: ${digest.digestId}`;
+        } catch {
+          // digest building must never fail the create
+        }
+
         timeline.log({
           tool: "create_concept",
           params: { name: params.name, kind: params.kind, parent_id: params.parent_id },
@@ -374,7 +392,7 @@ async function startMcpServer() {
           is_error: false,
           affected_ids: [result.id],
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ...result, message: result.message + digestNote }, null, 2) }] };
       } catch (err) {
         timeline.log({
           tool: "create_concept",

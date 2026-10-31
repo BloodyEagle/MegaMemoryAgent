@@ -25,7 +25,9 @@ export type NodeKind =
   | "pattern"
   | "config"
   | "decision"
-  | "component";
+  | "component"
+  /** T6: derived node compressing a module's children into one payload. */
+  | "digest";
 
 export interface Edge {
   id: number;

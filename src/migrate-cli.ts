@@ -14,7 +14,7 @@ function dbPath(): string {
 }
 
 function printReport(
-  report: ReturnType<typeof runMigration>,
+  report: Awaited<ReturnType<typeof runMigration>>,
   dryRun: boolean
 ): void {
   heading(
@@ -65,7 +65,7 @@ export async function runMigrate(args: string[]): Promise<void> {
 
   const db = new KnowledgeDB(p);
   try {
-    const report = runMigration(db, {
+    const report = await runMigration(db, {
       apply: !dryRun,
       dbPath: p,
       backup: backupDb,
