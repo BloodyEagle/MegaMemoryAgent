@@ -25,7 +25,7 @@ export interface RepairPlan {
   dataLossEmptyIds: number;
 }
 
-function isBrokenId(id: string): boolean {
+export function isBrokenId(id: string): boolean {
   return id === "" || id.endsWith("/");
 }
 
