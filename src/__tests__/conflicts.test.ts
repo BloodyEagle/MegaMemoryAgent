@@ -5,7 +5,7 @@ import { listConflicts, resolveConflict } from "../tools.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { closeAndCleanup } from "./helpers/cleanup.js";
+import { closeAndCleanup, cleanupDir } from "./helpers/cleanup.js";
 
 let tmpDir: string;
 
@@ -45,7 +45,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  await cleanupDir(tmpDir);
 });
 
 describe("listConflicts tool", () => {

@@ -13,7 +13,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { NodeRow, EdgeRow } from "../types.js";
-import { closeAndCleanup } from "./helpers/cleanup.js";
+import { closeAndCleanup, cleanupDir } from "./helpers/cleanup.js";
 
 let tmpDir: string;
 
@@ -53,7 +53,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  await cleanupDir(tmpDir);
 });
 
 describe("merge helpers", () => {

@@ -1,5 +1,11 @@
-import { describe, it, expect } from "vitest";
-import { makeId, disambiguateId } from "../tools.js";
+import { describe, it, expect, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { makeId, disambiguateId, createConcept } from "../tools.js";
+import { KnowledgeDB } from "../db.js";
+import { ensureSchema } from "../migrate-schema.js";
+import { closeAndCleanup } from "./helpers/cleanup.js";
 
 describe("makeId", () => {
   it("converts a simple name to a slug", () => {
@@ -92,5 +98,57 @@ describe("makeId", () => {
     expect(a).toMatch(/^еж-[0-9a-f]{4}$/);
     expect(a).not.toBe(b);
     expect(disambiguateId("еж", "Ёж")).toBe(a);
+  });
+});
+
+describe("makeId language matrix (T10 hardening)", () => {
+  const cases: Array<[string, string]> = [
+    ["Привет Мир", "привет-мир"],
+    ["Hello World", "hello-world"],
+    ["模块设计", "模块设计"],
+    ["日本語のモジュール", "日本語のモジュール"],
+    ["وحدة عربية", "وحدة-عربية"],
+    ["מודול עברית", "מודול-עברית"],
+    ["한국어 모듈", "한국어-모듈"],
+    ["ประเทศไทย", "ประเทศไทย"],
+    ["café crème", "cafe-creme"],
+    ["naïve façade", "naive-facade"],
+    ["mixed язык 模块 café", "mixed-язык-模块-cafe"],
+    ["🚀 rocket 🌙", "rocket"],
+  ];
+
+  for (const [input, expected] of cases) {
+    it(`slugifies ${JSON.stringify(input)}`, () => {
+      expect(makeId(input)).toBe(expected);
+    });
+  }
+});
+
+describe("createConcept collision handling (T10 hardening)", () => {
+  let tmpDir: string;
+  let db: KnowledgeDB;
+
+  afterEach(async () => {
+    if (db) await closeAndCleanup(db, tmpDir);
+  });
+
+  it("Ёж and Еж coexist: same slug, second gets a hash suffix", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-collide-"));
+    db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
+    ensureSchema(db);
+
+    const a = await createConcept(db, { name: "Ёж", kind: "feature", summary: "с колючками" });
+    const b = await createConcept(db, { name: "Еж", kind: "feature", summary: "без ё" });
+
+    expect(a.id).toBe("еж");
+    expect(b.id).toMatch(/^еж-[0-9a-f]{4}$/);
+    expect(b.id).not.toBe(a.id);
+    expect(db.getNode(a.id)?.name).toBe("Ёж");
+    expect(db.getNode(b.id)?.name).toBe("Еж");
+
+    // Same name again → "already exists" (update_concept path).
+    await expect(
+      createConcept(db, { name: "Еж", kind: "feature", summary: "dup" })
+    ).rejects.toThrow(/already exists/);
   });
 });

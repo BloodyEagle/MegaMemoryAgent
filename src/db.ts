@@ -8,6 +8,19 @@ const SCHEMA_VERSION = 4;
 export class KnowledgeDB {
   private db: Database.Database;
   private _txDepth = 0;
+  private _hasStatusColumn: boolean | undefined;
+
+  /**
+   * Fork dbs have nodes.status (T0.5 migration); upstream dbs do not.
+   * Queried once so read paths never break on an un-migrated database.
+   */
+  private get hasStatusColumn(): boolean {
+    if (this._hasStatusColumn === undefined) {
+      const cols = this.db.pragma("table_info(nodes)") as Array<{ name: string }>;
+      this._hasStatusColumn = cols.some((c) => c.name === "status");
+    }
+    return this._hasStatusColumn;
+  }
 
   constructor(dbPath: string) {
     // Ensure directory exists
@@ -479,6 +492,25 @@ export class KnowledgeDB {
 
   // ---- Token usage accounting (fork T8) ----
 
+  private usageReady = false;
+
+  /** Usage table appears with the fork migration; self-heal for older dbs. */
+  private ensureUsageTable(): void {
+    if (this.usageReady) return;
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS usage (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        at TEXT DEFAULT (datetime('now')),\
+        tool TEXT NOT NULL,\
+        query TEXT,\
+        nodes INTEGER NOT NULL,\
+        returned_chars INTEGER NOT NULL,\
+        returned_tokens INTEGER NOT NULL\
+      )"
+    );
+    this.usageReady = true;
+  }
+
   insertUsage(entry: {
     tool: string;
     query?: string | null;
@@ -486,6 +518,7 @@ export class KnowledgeDB {
     returnedChars: number;
     returnedTokens: number;
   }): void {
+    this.ensureUsageTable();
     this.db
       .prepare(
         `INSERT INTO usage (tool, query, nodes, returned_chars, returned_tokens)
@@ -513,6 +546,12 @@ export class KnowledgeDB {
     top_queries: Array<{ query: string; n: number }>;
     daily: Array<{ day: string; queries: number; tokens: number }>;
   } {
+    const hasUsage = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage'")
+      .get();
+    if (!hasUsage) {
+      return { total_queries: 0, total_tokens: 0, avg_tokens: 0, top_queries: [], daily: [] };
+    }
     const since = `datetime('now', '-${Number(days)} days')`;
 
     const totals = this.db
@@ -637,8 +676,7 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT id, name, kind, summary, why, file_refs, parent_id,
-                created_by_task, created_at, updated_at, removed_at, removed_reason,
-                status
+                created_by_task, created_at, updated_at, removed_at, removed_reason${this.hasStatusColumn ? ", status" : ""}
          FROM nodes WHERE removed_at IS NULL ORDER BY name`
       )
       .all() as Array<Omit<NodeRow, "embedding">>;
