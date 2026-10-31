@@ -846,6 +846,9 @@ function handleEdgeRemoved(data) {
 
 // ---- Stats footer ----
 
+// T4: legend toggle — hide superseded/deprecated nodes entirely.
+let hideOutdated = false;
+
 function renderStats(stats) {
   const el = document.getElementById('stats');
   const parts = [
@@ -858,6 +861,10 @@ function renderStats(stats) {
       parts.push(`<span class="stat"><span class="dot" style="background:${c}"></span>${kind}: ${count}</span>`);
     }
   }
+  // T4: status legend + "show outdated" toggle.
+  parts.push(`<span class="stat"><span class="dot" style="background:#d97706"></span>superseded</span>`);
+  parts.push(`<span class="stat"><span class="dot" style="background:#ef4444"></span>deprecated</span>`);
+  parts.push(`<label class="stat" style="cursor:pointer"><input type="checkbox" id="toggle-outdated" ${hideOutdated ? '' : 'checked'} onchange="hideOutdated = !this.checked"> show outdated</label>`);
   el.innerHTML = parts.join('');
 }
 
@@ -869,6 +876,9 @@ function buildGraphData(data) {
 
   nodes = data.nodes.map((n, i) => {
     const radius = Math.max(7, 7 + (n.edge_count || 0) * 1.5);
+    // T4: superseded/deprecated nodes keep their kind color but render muted.
+    const status = n.status || 'active';
+    const muted = status !== 'active';
     return {
       id: n.id,
       name: n.name,
@@ -876,6 +886,8 @@ function buildGraphData(data) {
       summary: n.summary,
       parent_id: n.parent_id,
       edge_count: n.edge_count || 0,
+      status,
+      muted,
       x: width / 2 + (Math.random() - 0.5) * 120,
       y: height / 2 + (Math.random() - 0.5) * 120,
       vx: 0,
@@ -1060,6 +1072,8 @@ function drawEdges(now) {
     const source = pair.source;
     const target = pair.target;
     if (!source || !target) continue;
+    // T4: hide edges touching nodes hidden by the outdated toggle.
+    if (hideOutdated && ((source.status && source.status !== 'active') || (target.status && target.status !== 'active'))) continue;
 
     const sx = source.x;
     const sy = source.y;
@@ -1081,9 +1095,16 @@ function drawEdges(now) {
     const pulse = computePulse(edge.pulseTime, now);
     edge.drawProgress = progress;
     const alpha = Math.min(1, dimAlpha * (0.25 + progress * 0.75) + pulse * 0.35);
-    const lineColor = edge.isParentEdge
-      ? '#2a2e42'
-      : (pulse > 0 ? source.color : '#3d4460');
+    // T4: supersedes edges are dashed and amber; contradicts red.
+    const isSupersedes = edge.relation === 'supersedes';
+    const isContradicts = edge.relation === 'contradicts';
+    const lineColor = isSupersedes
+      ? '#d97706'
+      : isContradicts
+        ? '#ef4444'
+        : edge.isParentEdge
+          ? '#2a2e42'
+          : (pulse > 0 ? source.color : '#3d4460');
     const lineWidth = edge.isParentEdge ? 1 : (1.5 + pulse);
 
     const p01x = sx + (cx - sx) * progress;
@@ -1097,7 +1118,7 @@ function drawEdges(now) {
     ctx.globalAlpha = alpha;
     ctx.strokeStyle = lineColor;
     ctx.lineWidth = lineWidth;
-    ctx.setLineDash(edge.isParentEdge ? [4, 4] : []);
+    ctx.setLineDash(edge.isParentEdge || isSupersedes ? [4, 4] : []);
     ctx.beginPath();
     ctx.moveTo(sx, sy);
     if (progress < 1) {
@@ -1194,7 +1215,11 @@ function drawNodes(now) {
     const radius = node.radius * entrance.scale;
     if (radius <= 0) continue;
 
-    const baseAlpha = node.dimmed ? 0.12 : 1;
+    // T4: superseded/deprecated nodes render at half alpha — visibly muted
+    // but still on the graph; the legend toggle can hide them entirely.
+    const outdatedHidden = hideOutdated && node.status && node.status !== 'active';
+    if (outdatedHidden) continue;
+    const baseAlpha = node.dimmed ? 0.12 : (node.muted ? 0.4 : 1);
     ctx.save();
     ctx.globalAlpha = baseAlpha * entrance.opacity;
     ctx.fillStyle = node.color;
@@ -1453,6 +1478,16 @@ function showPanel(d) {
   h += `<button id="panel-close" onclick="closePanel()">&times;</button>`;
   h += `<div class="panel-name">${esc(d.name)}</div>`;
   h += `<span class="kind-badge" style="background:${color}22;color:${color};border:1px solid ${color}44">${d.kind}</span>`;
+  // T4: lifecycle status badge — outdated facts visible without reading the db.
+  const status = d.status || 'active';
+  if (status !== 'active') {
+    const statusColors = { superseded: '#f59e0b', deprecated: '#ef4444' };
+    const sc = statusColors[status] || '#888';
+    h += ` <span class="kind-badge" style="background:${sc}22;color:${sc};border:1px solid ${sc}44">${status}</span>`;
+    if (d.valid_until) {
+      h += `<div style="font-size:10px;color:#888;margin-top:4px">valid until ${esc(String(d.valid_until))}</div>`;
+    }
+  }
 
   // Parent breadcrumb
   if (d.parent) {

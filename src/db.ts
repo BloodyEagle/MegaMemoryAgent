@@ -403,13 +403,78 @@ export class KnowledgeDB {
     };
   }
 
-  deleteEdge(fromId: string, toId: string, relation: string): boolean {
+  deleteEdge(fromId: string, to_id: string, relation: string): boolean {
     const result = this.db
       .prepare(
         "DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?"
       )
-      .run(fromId, toId, relation);
+      .run(fromId, to_id, relation);
     return result.changes > 0;
+  }
+
+  // ---- Lifecycle status (fork T4) ----
+
+  /**
+   * Set a node's lifecycle status. Only superseded nodes get valid_until.
+   * Idempotent: setting the same status again is a harmless rewrite.
+   */
+  setNodeStatus(id: string, status: string, validUntil?: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE nodes SET status = @status,
+           valid_until = COALESCE(@validUntil, valid_until),
+           updated_at = datetime('now')
+         WHERE id = @id`
+      )
+      .run({ status, validUntil: validUntil ?? null, id });
+    return result.changes > 0;
+  }
+
+  /**
+   * Mark old nodes superseded and link them from the replacement
+   * (new --supersedes--> old). Returns the ids that were actually
+   * superseded; unknown ids are reported and skipped.
+   */
+  supersedeNodes(newId: string, oldIds: string[]): { superseded: string[]; missing: string[] } {
+    const superseded: string[] = [];
+    const missing: string[] = [];
+    this.runInTransaction(() => {
+      for (const oldId of oldIds) {
+        if (!this.nodeExists(oldId)) {
+          missing.push(oldId);
+          continue;
+        }
+        this.insertEdge({
+          from_id: newId,
+          to_id: oldId,
+          relation: "supersedes",
+        });
+        this.setNodeStatus(oldId, "superseded", new Date().toISOString());
+        superseded.push(oldId);
+      }
+    });
+    return { superseded, missing };
+  }
+
+  /** Nodes with incoming `contradicts` edges — contradicted facts. */
+  getContradictedNodes(): NodeRow[] {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT n.* FROM nodes n
+         JOIN edges e ON e.to_id = n.id
+         WHERE e.relation = 'contradicts' AND n.removed_at IS NULL`
+      )
+      .all() as NodeRow[];
+  }
+
+  /** Status breakdown for stats/doctor. */
+  getStatusCounts(): Record<string, number> {
+    const rows = this.db
+      .prepare("SELECT status, count(*) AS n FROM nodes GROUP BY status")
+      .all() as Array<{ status: string; n: number }>;
+    const counts: Record<string, number> = {};
+    for (const row of rows) counts[row.status] = row.n;
+    return counts;
   }
 
   // ---- Query methods ----
@@ -502,7 +567,8 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT id, name, kind, summary, why, file_refs, parent_id,
-                created_by_task, created_at, updated_at, removed_at, removed_reason
+                created_by_task, created_at, updated_at, removed_at, removed_reason,
+                status
          FROM nodes WHERE removed_at IS NULL ORDER BY name`
       )
       .all() as Array<Omit<NodeRow, "embedding">>;

@@ -146,6 +146,9 @@ export function buildNodeWithContext(
     edges: outgoing,
     incoming_edges: incoming,
     parent,
+    // T4: lifecycle status surfaces in the node card.
+    status: node.status ?? "active",
+    valid_until: node.valid_until ?? null,
     ...(similarity !== undefined ? { similarity } : {}),
   };
 }
@@ -245,11 +248,15 @@ export async function understand(
 
   // T4 will filter superseded/deprecated here unless include_inactive.
 
-  // Resolve nodes once, in rank order.
+  // Resolve nodes once, in rank order. T4: superseded/deprecated nodes are
+  // hidden by default (include_inactive: true shows them with their status).
+  const includeInactive = input.include_inactive ?? false;
   const nodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
   for (const match of topMatches) {
     const node = db.getNode(match.id);
     if (!node) continue;
+    const status = node.status ?? "active";
+    if (!includeInactive && status !== "active") continue;
     nodes.push({ node, score: match.similarity, via: viaById.get(match.id) });
   }
 
@@ -373,7 +380,21 @@ export async function createConcept(
     }))
   );
 
-  return { id, message: `Created concept "${id}"` };
+  // T4: mark replaced concepts — edges new--supersedes-->old, old nodes
+  // become superseded with valid_until = now.
+  let supersededNote = "";
+  if (input.supersedes && input.supersedes.length > 0) {
+    const { superseded, missing } = db.supersedeNodes(id, input.supersedes);
+    if (missing.length > 0) {
+      throw new Error(
+        `Created "${id}", but supersedes targets not found: ${missing.join(", ")}. ` +
+          `Superseded: ${superseded.join(", ") || "none"}.`
+      );
+    }
+    supersededNote = ` Superseded: ${superseded.join(", ")}.`;
+  }
+
+  return { id, message: `Created concept "${id}"${supersededNote}` };
 }
 
 export async function updateConcept(
@@ -456,6 +477,9 @@ export function removeConcept(
     throw new Error(`Failed to remove concept "${input.id}".`);
   }
 
+  // T4: soft-delete also deprecates the lifecycle status.
+  db.setNodeStatus(input.id, "deprecated");
+
   return {
     message: `Removed concept "${input.id}". Reason: ${input.reason}`,
   };
@@ -520,8 +544,21 @@ export function listRoots(
 export function listConflicts(db: KnowledgeDB): ListConflictsOutput {
   const conflictNodes = db.getConflictNodes();
 
+  // T4: facts with incoming `contradicts` edges — a different kind of
+  // "conflict" the agent should know about even with no merge groups.
+  const contradictedNodes = db.getContradictedNodes();
+  const contradicted = contradictedNodes.map((n) => ({
+    id: n.id,
+    name: n.name,
+    summary: n.summary,
+    contradicted_by: db
+      .getIncomingEdges(n.id)
+      .filter((e) => e.relation === "contradicts")
+      .map((e) => e.from_id),
+  }));
+
   if (conflictNodes.length === 0) {
-    return { conflicts: [] };
+    return { conflicts: [], contradicted };
   }
 
   // Group by merge_group
@@ -565,7 +602,7 @@ export function listConflicts(db: KnowledgeDB): ListConflictsOutput {
     });
   }
 
-  return { conflicts };
+  return { conflicts, contradicted };
 }
 
 export async function resolveConflict(

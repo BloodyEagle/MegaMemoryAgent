@@ -244,7 +244,7 @@ async function startMcpServer() {
     "feature", "module", "pattern", "config", "decision", "component",
   ]);
   const RelationEnum = z.enum([
-    "connects_to", "depends_on", "implements", "calls", "configured_by",
+    "connects_to", "depends_on", "implements", "calls", "configured_by", "supersedes", "contradicts",
   ]);
 
   // ---- Register tools ----
@@ -337,6 +337,7 @@ async function startMcpServer() {
       why: z.string().optional().describe("Why this exists or was built this way"),
       parent_id: z.string().optional().describe("Parent concept ID for nesting; empty string is treated as omitted"),
       file_refs: z.array(z.string()).optional().describe("Relevant file paths + optional line ranges"),
+      supersedes: z.array(z.string()).optional().describe("Concept IDs this one replaces — creates supersedes edges and marks the old nodes superseded (T4)"),
       edges: z.array(z.object({
         to: z.string().describe("Target concept ID"),
         relation: RelationEnum.describe("Relationship type"),
@@ -354,6 +355,7 @@ async function startMcpServer() {
           parent_id: params.parent_id,
           file_refs: params.file_refs,
           edges: params.edges?.map((e) => ({ ...e, relation: e.relation as RelationType })),
+          supersedes: params.supersedes,
           created_by_task: params.created_by_task,
         });
         timeline.log({

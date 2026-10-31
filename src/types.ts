@@ -45,7 +45,12 @@ export type RelationType =
   | "depends_on"
   | "implements"
   | "calls"
-  | "configured_by";
+  | "configured_by"
+  | "supersedes"
+  | "contradicts";
+
+/** Node lifecycle (fork T4): active by default, soft-invalidated otherwise. */
+export type NodeStatus = "active" | "superseded" | "deprecated";
 
 // ---- Tool input types ----
 
@@ -61,6 +66,11 @@ export interface CreateConceptInput {
     relation: RelationType;
     description?: string;
   }>;
+  /**
+   * IDs this concept replaces (T4): creates supersedes edges and marks the
+   * old nodes superseded with valid_until = now.
+   */
+  supersedes?: string[];
   created_by_task?: string;
 }
 
@@ -118,6 +128,9 @@ export interface NodeWithContext {
   similarity?: number;
   /** Why this node was found: hybrid search channel (T2). */
   via?: "vector" | "fts" | "both";
+  /** Lifecycle status (T4); absent only in not-yet-migrated dbs. */
+  status?: string;
+  valid_until?: string | null;
 }
 
 export interface UnderstandOutput {
@@ -263,6 +276,13 @@ export interface ConflictGroup {
 
 export interface ListConflictsOutput {
   conflicts: ConflictGroup[];
+  /** T4: nodes with incoming `contradicts` edges and who contradicts them. */
+  contradicted?: Array<{
+    id: string;
+    name: string;
+    summary: string;
+    contradicted_by: string[];
+  }>;
 }
 
 export interface ResolveConflictInput {

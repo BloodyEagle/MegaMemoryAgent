@@ -135,6 +135,7 @@ export async function runServe(port: number): Promise<void> {
       summary: string;
       parent_id: string | null;
       edge_count: number;
+      status: string;
     }>;
     edges: Array<{
       from: string;
@@ -150,6 +151,7 @@ export async function runServe(port: number): Promise<void> {
       summary: n.summary,
       parent_id: n.parent_id,
       edge_count: 0,
+      status: (n as { status?: string }).status ?? "active",
     }));
 
     const edges = db.getAllEdges().map((e) => ({
@@ -556,8 +558,22 @@ export async function runServe(port: number): Promise<void> {
     }
 
     if (pathname === "/api/graph" && req.method === "GET") {
+      // T4: status filter — "active" hides superseded/deprecated nodes and
+      // their supersedes edges; "all" (default) shows everything.
+      const statusFilter = url.searchParams.get("status") ?? "all";
       const { nodes, edges } = buildGraphPayload();
-      json(res, { nodes, edges });
+      let filteredNodes = nodes;
+      let filteredEdges = edges;
+      if (statusFilter === "active") {
+        const allowed = new Set(
+          nodes.filter((n) => (n.status ?? "active") === "active").map((n) => n.id)
+        );
+        filteredNodes = nodes.filter((n) => allowed.has(n.id));
+        filteredEdges = edges.filter(
+          (e) => allowed.has(e.from) && allowed.has(e.to)
+        );
+      }
+      json(res, { nodes: filteredNodes, edges: filteredEdges });
       return;
     }
 
