@@ -39,37 +39,28 @@ export function formatError(err: unknown): { content: Array<{ type: "text"; text
 }
 
 /**
- * Remove diacritics without corrupting scripts that rely on combining marks.
- * Per-character NFKD + mark stripping, but kana voicing marks (U+3099/U+309A)
- * are preserved so the final NFC pass can rebuild the composed kana.
- */
-const KEEP_MARKS = new Set(
-  [0x3099, 0x309a].map((cp) => String.fromCodePoint(cp))
-);
-
-function stripDiacritics(name: string): string {
-  let out = "";
-  for (const ch of name.normalize("NFKD")) {
-    if (/\p{M}/u.test(ch) && !KEEP_MARKS.has(ch)) continue;
-    out += ch;
-  }
-  return out.normalize("NFC");
-}
-
-/**
  * Generate a slug ID from a name, optionally prefixed with parent ID.
  * Unicode-aware: keeps letters and digits from any script (Cyrillic, CJK,
- * Arabic, Hebrew...), strips Latin diacritics (cafe), collapses separators.
- * Falls back to a name hash when nothing survives stripping (emoji-only,
- * punctuation-only names) so the id is never empty.
+ * Arabic, Hebrew...), strips diacritics only after Latin/Cyrillic/Greek/
+ * Hebrew bases (katakana dakuten ジ = シ + U+3099 and Hangul jamo are NOT
+ * diacritics — stripping them silently changes the syllable), turns '/' into
+ * a dash (a/b and ab must not collide), collapses separators, and never
+ * emits decomposed forms (final NFC). Falls back to a name hash when
+ * nothing survives stripping (emoji-only, punctuation-only names).
  */
 export function makeId(name: string, parentId?: string): string {
-  const slug = stripDiacritics(name)
+  const slug = name
+    .normalize("NFKD")
+    .replace(
+      /(?<=[\p{Script=Latin}\p{Script=Cyrillic}\p{Script=Greek}\p{Script=Hebrew}])\p{M}+/gu,
+      ""
+    )
     .toLowerCase()
-    .replace(/[\s_]+/gu, "-")           // underscores/spaces to hyphens
-    .replace(/[^\p{L}\p{N}-]+/gu, "")  // letters/digits of ANY script
+    .replace(/[\s_/]+/gu, "-")          // spaces, underscores AND slashes
+    .replace(/[^\p{L}\p{N}\p{M}-]+/gu, "")  // letters/digits/marks of ANY script (NFC recomposes)
     .replace(/-+/g, "-")                 // collapse multiple hyphens
-    .replace(/^-|-$/g, "");              // trim leading/trailing hyphens
+    .replace(/^-|-$/g, "")               // trim leading/trailing hyphens
+    .normalize("NFC");                   // never emit decomposed ids
 
   const safe =
     slug || "node-" + createHash("sha1").update(name).digest("hex").slice(0, 8);
@@ -82,7 +73,7 @@ export function makeId(name: string, parentId?: string): string {
  * Appends a short name-hash suffix so both concepts coexist.
  */
 export function disambiguateId(id: string, name: string): string {
-  const suffix = createHash("sha1").update(name).digest("hex").slice(0, 4);
+  const suffix = createHash("sha1").update(name).digest("hex").slice(0, 8);
   return `${id}-${suffix}`;
 }
 
@@ -363,6 +354,10 @@ export async function createConcept(
   db: KnowledgeDB,
   input: CreateConceptInput
 ): Promise<{ id: string; message: string }> {
+  if (!input.name || input.name.trim().length === 0) {
+    throw new Error("Concept name must be a non-empty string.");
+  }
+
   const parentId = input.parent_id === "" ? undefined : input.parent_id;
   let id = makeId(input.name, parentId);
 

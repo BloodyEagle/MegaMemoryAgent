@@ -79,8 +79,9 @@ describe("makeId", () => {
     expect(makeId("   ")).toMatch(/^node-[0-9a-f]{8}$/);
   });
 
-  it("strips slashes from nested names", () => {
-    expect(makeId("a/b")).toBe("ab");
+  it("turns slashes into dashes (a/b != ab)", () => {
+    expect(makeId("a/b")).toBe("a-b");
+    expect(makeId("a/b")).not.toBe(makeId("ab")); // А3: slash must become a dash
   });
 
   it("builds a child id from a Cyrillic parent", () => {
@@ -95,7 +96,7 @@ describe("makeId", () => {
   it("disambiguateId appends a deterministic 4-char hash suffix", () => {
     const a = disambiguateId("еж", "Ёж");
     const b = disambiguateId("еж", "Еж");
-    expect(a).toMatch(/^еж-[0-9a-f]{4}$/);
+    expect(a).toMatch(/^еж-[0-9a-f]{8}$/);
     expect(a).not.toBe(b);
     expect(disambiguateId("еж", "Ёж")).toBe(a);
   });
@@ -141,7 +142,7 @@ describe("createConcept collision handling (T10 hardening)", () => {
     const b = await createConcept(db, { name: "Еж", kind: "feature", summary: "без ё" });
 
     expect(a.id).toBe("еж");
-    expect(b.id).toMatch(/^еж-[0-9a-f]{4}$/);
+    expect(b.id).toMatch(/^еж-[0-9a-f]{8}$/);
     expect(b.id).not.toBe(a.id);
     expect(db.getNode(a.id)?.name).toBe("Ёж");
     expect(db.getNode(b.id)?.name).toBe("Еж");
@@ -150,5 +151,24 @@ describe("createConcept collision handling (T10 hardening)", () => {
     await expect(
       createConcept(db, { name: "Еж", kind: "feature", summary: "dup" })
     ).rejects.toThrow(/already exists/);
+  });
+});
+
+// Patches v1.1 (А1): katakana dakuten and Hangul must survive intact.
+describe("makeId script safety (А1)", () => {
+  it("keeps dakuten: ジ != シ, パ != ハ", () => {
+    expect(makeId("ジ")).not.toBe(makeId("シ"));
+    expect(makeId("パ")).not.toBe(makeId("ハ"));
+    expect(makeId("ガ")).not.toBe(makeId("カ"));
+  });
+
+  it("does not distort 日本語のモジュール", () => {
+    expect(makeId("日本語のモジュール")).toBe("日本語のモジュール");
+  });
+
+  it("emits NFC for decomposed Hangul input", () => {
+    const id = makeId("각한국어");
+    expect(id).toBe(id.normalize("NFC"));
+    expect(makeId("각한국어")).toBe("각한국어");
   });
 });
