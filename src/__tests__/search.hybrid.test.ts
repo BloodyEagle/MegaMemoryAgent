@@ -118,3 +118,56 @@ describe("hasCjk", () => {
     expect(hasCjk("book")).toBe(false);
   });
 });
+
+describe("patches v1.1: prefix morphology (М3), sanitization (М1), native vectors (В17)", () => {
+  it("prefix query finds nodes by incomplete word: книг -> Книга", async () => {
+    const db = freshDb();
+    insertNode(db, "книга", "Книга", "рецепты и заметки");
+    const hits = await hybridSearch(db, "книг", { topK: 5 });
+    expect(hits[0]?.id).toBe("книга");
+  });
+
+  it("raw quotes in query do not throw (М1 sanitization)", async () => {
+    const db = freshDb();
+    insertNode(db, "quoted", 'Say "hi" now', "greeting");
+    const hits = await hybridSearch(db, 'say "hi"', { topK: 5 });
+    expect(hits[0]?.id).toBe("quoted");
+  });
+
+  it("native SQL vector path drives the vector channel (В17)", async () => {
+    const db = freshDb();
+    insertNode(db, "alpha", "Alpha Book", "reading");
+    insertNode(db, "beta", "Beta Pen", "writing");
+    const v1 = new Float32Array([1, 0, 0, 0]);
+    const v2 = new Float32Array([0, 1, 0, 0]);
+    const toBuf = (v: Float32Array) =>
+      Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+    db.execSqlRun("UPDATE nodes SET embedding = @e WHERE id = @id", {
+      e: toBuf(v1),
+      id: "alpha",
+    });
+    db.execSqlRun("UPDATE nodes SET embedding = @e WHERE id = @id", {
+      e: toBuf(v2),
+      id: "beta",
+    });
+    db.setMetaValue("embed_model", MODEL_NAME);
+    db.setMetaValue("embed_dim", "4");
+
+    // Populate the native shadow table — the SQL path must serve the hits.
+    db.upsertVector("alpha", toBuf(v1));
+    db.upsertVector("beta", toBuf(v2));
+    expect(db.vectorTableCount()).toBe(2);
+    expect(db.vectorTableCount()).toBeGreaterThanOrEqual(
+      db.countActiveWithEmbeddings()
+    );
+
+    const hits = await hybridSearch(db, "book", {
+      topK: 5,
+      embedFn: fakeEmbed([1, 0, 0, 0]),
+    });
+    const alpha = hits.find((h) => h.id === "alpha");
+    const beta = hits.find((h) => h.id === "beta");
+    expect(alpha?.via).toBe("both"); // fts + vector
+    expect(beta?.via).toBe("vector"); // vector only, orthogonal to the query
+  });
+});

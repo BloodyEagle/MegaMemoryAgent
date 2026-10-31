@@ -854,6 +854,7 @@ export class KnowledgeDB {
     let changed = false;
     this.runInTransaction(() => {
       this.deleteEdgesForNode(id);
+      this.deleteVector(id);
       const result = this.db
         .prepare("DELETE FROM nodes WHERE id = ?")
         .run(id);
@@ -1208,6 +1209,95 @@ export class KnowledgeDB {
       current = row.new_id;
     }
     return current;
+  }
+
+
+  // ---- Native vector search (patch В17): libsql F32_BLOB + vector_distance_cos ----
+  // Keeps the JS cosine as a fallback; the SQL path scales past thousands of nodes.
+
+  private _vectorSupport: boolean | undefined;
+
+  /** One-shot probe of libsql's native vector functions. */
+  vectorSupportOk(): boolean {
+    if (this._vectorSupport === undefined) {
+      try {
+        this.db
+          .prepare("SELECT vector_distance_cos(vector32('[0.5]'), vector32('[0.5]')) AS d")
+          .get();
+        this._vectorSupport = true;
+      } catch {
+        this._vectorSupport = false;
+      }
+    }
+    return this._vectorSupport;
+  }
+
+  private vectorTableReady(dim: number): boolean {
+    if (!this.vectorSupportOk() || dim <= 0) return false;
+    const has = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_vec'")
+      .get();
+    if (!has) {
+      this.db.exec(
+        `CREATE TABLE nodes_vec (id TEXT PRIMARY KEY, embedding F32_BLOB(${dim}))`
+      );
+    }
+    return true;
+  }
+
+  /** Upsert the native vector copy (buffer = float32 bytes). */
+  upsertVector(id: string, buffer: Buffer): void {
+    const dim = buffer.length / Float32Array.BYTES_PER_ELEMENT;
+    if (!this.vectorTableReady(dim)) return;
+    // buffer may be a pooled Buffer with unaligned byteOffset — copy via ArrayBuffer.slice
+    const clean = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    const json = JSON.stringify([...new Float32Array(clean)]);
+    this.db
+      .prepare(
+        "INSERT INTO nodes_vec (id, embedding) VALUES (?, vector32(?)) ON CONFLICT(id) DO UPDATE SET embedding = vector32(?)"
+      )
+      .run(id, json, json);
+  }
+
+  deleteVector(id: string): void {
+    if (!this.vectorSupportOk()) return;
+    const has = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_vec'")
+      .get();
+    if (!has) return;
+    this.db.prepare("DELETE FROM nodes_vec WHERE id = ?").run(id);
+  }
+
+  vectorTableCount(): number {
+    if (!this.vectorSupportOk()) return -1;
+    const has = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_vec'")
+      .get();
+    if (!has) return 0;
+    return (this.db.prepare("SELECT count(*) AS n FROM nodes_vec").get() as { n: number }).n;
+  }
+
+  countActiveWithEmbeddings(): number {
+    return (
+      this.db
+        .prepare("SELECT count(*) AS n FROM nodes WHERE embedding IS NOT NULL AND removed_at IS NULL")
+        .get() as { n: number }
+    ).n;
+  }
+
+  /**
+   * Native top-k by cosine distance. Returns null when the shadow table is
+   * not populated for every embedded node — caller falls back to JS cosine.
+   */
+  vectorTopK(queryJson: string, limit: number): Array<{ id: string; similarity: number }> | null {
+    const count = this.vectorTableCount();
+    if (count <= 0 || count < this.countActiveWithEmbeddings()) return null;
+    const rows = this.db
+      .prepare(
+        "SELECT id, vector_distance_cos(embedding, vector32(?)) AS d FROM nodes_vec ORDER BY d LIMIT ?"
+      )
+      .all(queryJson, limit) as Array<{ id: string; d: number }>;
+    return rows.map((r) => ({ id: r.id, similarity: 1 - r.d }));
   }
 
   close(): void {
