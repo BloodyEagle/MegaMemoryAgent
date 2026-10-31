@@ -19,9 +19,12 @@ import type {
   ResolveConflictInput,
   NodeWithContext,
   UnderstandOutput,
+  ListRootsInput,
   ListRootsOutput,
   ListConflictsOutput,
   ConflictGroup,
+  CompactMatch,
+  UnderstandMeta,
   NodeRow,
   RelationType,
 } from "./types.js";
@@ -149,14 +152,74 @@ export function buildNodeWithContext(
 
 // ---- Tool handlers ----
 
+/**
+ * Conservative token estimate: ~3 chars per token. Cyrillic/CJK encode
+ * worse than English in most tokenizers, so this stays on the safe side.
+ */
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3);
+}
+
+/**
+ * Truncate to maxChars at a word boundary with an ellipsis. Operates on
+ * UTF-16 code units but never splits a surrogate pair.
+ */
+export function trimSummary(text: string, maxChars = 240): string {
+  if (text.length <= maxChars) return text;
+  let cut = maxChars - 1;
+  // Do not cut inside a surrogate pair.
+  const low = text.charCodeAt(cut);
+  if (low >= 0xdc00 && low <= 0xdfff) cut -= 1;
+  const space = text.lastIndexOf(" ", cut);
+  if (space > maxChars / 2) cut = space;
+  return text.slice(0, cut).trimEnd() + "…";
+}
+
+/** Compact per-node payload (plan T3): no why, trimmed summary. */
+function compactMatch(
+  db: KnowledgeDB,
+  node: NodeRow,
+  opts: { score?: number; via?: SearchVia; withContext: boolean }
+): CompactMatch {
+  const fileRefs = parseFileRefs(node.file_refs);
+  const match: CompactMatch = {
+    id: node.id,
+    name: node.name,
+    kind: node.kind as CompactMatch["kind"],
+    status: node.status ?? "active",
+    summary: trimSummary(node.summary),
+    file_refs: fileRefs,
+    ...(opts.score !== undefined
+      ? { score: opts.score, similarity: opts.score }
+      : {}),
+    ...(opts.via ? { via: opts.via } : {}),
+  };
+  if (opts.withContext) {
+    match.children = db
+      .getChildren(node.id)
+      .map((c) => ({
+        id: c.id,
+        name: c.name,
+        kind: c.kind as CompactMatch["kind"],
+      }));
+    match.edges = db
+      .getOutgoingEdges(node.id)
+      .map((e) => ({
+        to: e.to_id,
+        to_name: e.to_name,
+        relation: e.relation as RelationType,
+      }));
+  }
+  return match;
+}
+
 export async function understand(
   db: KnowledgeDB,
   input: UnderstandInput
 ): Promise<UnderstandOutput> {
   const topK = input.top_k ?? 10;
-
-  // Get all active nodes with embeddings
-  const candidates = db.getAllActiveNodesWithEmbeddings();
+  const maxTokens = input.max_tokens ?? 1500;
+  const outputMode = input.mode ?? "compact";
 
   // Search mode (plan T2): hybrid by default — RRF over FTS + vector.
   // Vector-only runs when MEGAMEMORY_SEARCH=vector; text-only for fts, or
@@ -170,8 +233,9 @@ export async function understand(
     topMatches = hits.map((h) => ({ id: h.id, similarity: h.score }));
     for (const h of hits) viaById.set(h.id, h.via);
   } else if (mode === "vector" && vectorSearchEnabled(db)) {
+    const candidates = db.getAllActiveNodesWithEmbeddings();
     if (candidates.length === 0) {
-      return { matches: [] };
+      return { matches: [], compact: [], meta: { returned: 0, dropped: 0, tokens_estimated: 0 } };
     }
     const queryEmbedding = await embed(queryText(input.query));
     topMatches = findTopK(queryEmbedding, candidates, topK);
@@ -179,18 +243,76 @@ export async function understand(
     topMatches = basicSearch(db, input.query, topK);
   }
 
-  // Build full context for each match
-  const matches: NodeWithContext[] = [];
+  // T4 will filter superseded/deprecated here unless include_inactive.
+
+  // Resolve nodes once, in rank order.
+  const nodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
   for (const match of topMatches) {
     const node = db.getNode(match.id);
     if (!node) continue;
-    const ctx = buildNodeWithContext(db, node, match.similarity);
-    const via = viaById.get(match.id);
-    if (via) ctx.via = via;
-    matches.push(ctx);
+    nodes.push({ node, score: match.similarity, via: viaById.get(match.id) });
   }
 
-  return { matches };
+  if (outputMode === "full") {
+    const matches: NodeWithContext[] = [];
+    for (const { node, score, via } of nodes) {
+      const ctx = buildNodeWithContext(db, node, score);
+      if (via) ctx.via = via;
+      matches.push(ctx);
+    }
+    return {
+      matches,
+      compact: undefined,
+      meta: {
+        returned: matches.length,
+        dropped: 0,
+        tokens_estimated: estimateTokens(JSON.stringify(matches)),
+      },
+    };
+  }
+
+  // compact: keep adding nodes while the serialized result fits the budget.
+  // First 3 nodes get children+edges; the rest stay bare.
+  const compact: CompactMatch[] = [];
+  let tokensEstimated = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    const candidate = compactMatch(db, nodes[i].node, {
+      score: nodes[i].score,
+      via: nodes[i].via,
+      withContext: compact.length < 3,
+    });
+    const projection = {
+      matches: [],
+      compact: [...compact, candidate],
+      meta: { returned: compact.length + 1, dropped: 0, tokens_estimated: 0 },
+    };
+    const projected = estimateTokens(JSON.stringify(projection));
+    // Always return at least one node, budget or not.
+    if (compact.length > 0 && projected > maxTokens) {
+      const dropped = nodes.length - compact.length;
+      return {
+        matches: [],
+        compact,
+        meta: {
+          returned: compact.length,
+          dropped,
+          tokens_estimated: tokensEstimated,
+        },
+      };
+    }
+    compact.push(candidate);
+    tokensEstimated = projected;
+  }
+
+  return {
+    matches: [],
+    compact,
+    meta: {
+      returned: compact.length,
+      dropped: 0,
+      tokens_estimated: tokensEstimated,
+    },
+  };
 }
 
 export function getConcept(
@@ -339,12 +461,48 @@ export function removeConcept(
   };
 }
 
-export function listRoots(db: KnowledgeDB): ListRootsOutput & { hint?: string } {
+export function listRoots(
+  db: KnowledgeDB,
+  input: ListRootsInput = {}
+): ListRootsOutput & { hint?: string } {
+  const maxTokens = input.max_tokens ?? 1500;
   const rootRows = db.getRootNodes();
 
+  const stats = db.getStats();
+  const hint =
+    stats.nodes === 0
+      ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
+      : undefined;
+
+  // Budgeted overview (plan T3): id/name/kind + child count, no summary.
+  const rootsCompact = rootRows.map((root) => ({
+    id: root.id,
+    name: root.name,
+    kind: root.kind as NodeWithContext["kind"],
+    child_count: db.getChildren(root.id).length,
+  }));
+  const compactProjection = JSON.stringify({
+    roots_compact: rootsCompact,
+    ...(hint ? { hint } : {}),
+  });
+  if (estimateTokens(compactProjection) <= maxTokens) {
+    return {
+      roots: [],
+      compact: true,
+      roots_compact: rootsCompact,
+      ...(hint ? { hint } : {}),
+      meta: {
+        returned: rootsCompact.length,
+        dropped: 0,
+        tokens_estimated: estimateTokens(compactProjection),
+      },
+    };
+  }
+
+  // Legacy verbose shape when the compact overview alone busts the budget —
+  // trim the list, never return nothing.
   const roots = rootRows.map((root) => {
     const children = db.getChildren(root.id).map((c) => c.name);
-
     return {
       id: root.id,
       name: root.name,
@@ -353,12 +511,6 @@ export function listRoots(db: KnowledgeDB): ListRootsOutput & { hint?: string } 
       children,
     };
   });
-
-  const stats = db.getStats();
-  const hint =
-    stats.nodes === 0
-      ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
-      : undefined;
 
   return { roots, ...(hint ? { hint } : {}) };
 }

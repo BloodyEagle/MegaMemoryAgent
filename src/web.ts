@@ -591,7 +591,24 @@ export async function runServe(port: number): Promise<void> {
       }
 
       const results = await understand(db, { query, top_k: topK });
-      json(res, results);
+      // compact mode (fork default) returns rows in `compact` with a budget
+      // meta; map them back onto `matches` so the explorer keeps one shape.
+      const matches =
+        results.compact ??
+        results.matches.map((m) => ({
+          id: m.id,
+          name: m.name,
+          kind: m.kind,
+          status: "active",
+          summary: m.summary,
+          file_refs: m.file_refs,
+          similarity: m.similarity,
+          via: m.via,
+        }));
+      json(res, {
+        matches,
+        meta: results.meta ?? null,
+      });
       return;
     }
 

@@ -251,21 +251,34 @@ async function startMcpServer() {
 
   server.tool(
     "understand",
-    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts with their children, edges, and parent context.",
+    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node.",
     {
       query: z.string().describe("Natural language query describing what you want to understand about the project"),
       top_k: z.number().int().min(1).max(50).optional().describe("Number of top results to return (default: 10)"),
+      max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the answer (default: 1500)"),
+      mode: z.enum(["compact", "full"]).optional().describe("compact (default) trims each node to essentials under the budget; full returns legacy verbose output"),
+      include_inactive: z.boolean().optional().describe("Include superseded/deprecated nodes (default: false)"),
     },
     async (params) => {
       try {
-        const result = await understand(db, { query: params.query, top_k: params.top_k });
+        const result = await understand(db, {
+          query: params.query,
+          top_k: params.top_k,
+          max_tokens: params.max_tokens,
+          mode: params.mode,
+          include_inactive: params.include_inactive,
+        });
+        const returned = result.meta?.returned ?? result.matches.length;
+        const ids = result.compact
+          ? result.compact.map((m) => m.id)
+          : result.matches.map((match) => match.id);
         timeline.log({
           tool: "understand",
           params: { query: params.query, top_k: params.top_k },
-          result_summary: `${result.matches.length} matches`,
+          result_summary: `${returned} matches`,
           is_write: false,
           is_error: false,
-          affected_ids: result.matches.map((match) => match.id),
+          affected_ids: ids,
         });
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       } catch (err) {
@@ -482,15 +495,18 @@ async function startMcpServer() {
 
   server.tool(
     "list_roots",
-    "List all top-level concepts in the knowledge graph with their direct children. Call this at the start of a session to get a high-level project overview.",
-    {},
-    async () => {
+    "List all top-level concepts in the knowledge graph. Budgeted overview: id, name, kind and child count per root (roots_compact), no summaries — pass max_tokens to control the budget.",
+    {
+      max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the overview (default: 1500)"),
+    },
+    async (params) => {
       try {
-        const result = listRoots(db);
+        const result = listRoots(db, { max_tokens: params.max_tokens });
+        const returned = result.meta?.returned ?? result.roots.length;
         timeline.log({
           tool: "list_roots",
           params: {},
-          result_summary: `${result.roots.length} roots`,
+          result_summary: `${returned} roots`,
           is_write: false,
           is_error: false,
           affected_ids: [],

@@ -176,6 +176,13 @@
   .search-via[data-via="fts"] { border-color: #0ea5e955; color: #38bdf8; background: #0ea5e918; }
   .search-via[data-via="both"] { border-color: #22c55e55; color: #4ade80; background: #22c55e18; }
 
+  .search-budget {
+    padding: 6px 12px;
+    font-size: 10px;
+    color: #4ade80;
+    border-bottom: 1px solid #22c55e33;
+  }
+
   .search-empty {
     padding: 12px;
     font-size: 12px;
@@ -1596,7 +1603,7 @@ function setActiveSearchResult(index) {
   row.scrollIntoView({ block: 'nearest' });
 }
 
-function renderSearchResults(query, matches, mode) {
+function renderSearchResults(query, matches, mode, meta) {
   const resultsEl = document.getElementById('search-results');
 
   if (!query) {
@@ -1614,8 +1621,8 @@ function renderSearchResults(query, matches, mode) {
 
   const rows = matches.map((m, i) => {
     const color = KIND_COLORS[m.kind] || '#888';
-    const hasScore = Number.isFinite(m.similarity);
-    const score = hasScore ? Math.max(0, Math.min(1, m.similarity)) : 0;
+    const hasScore = Number.isFinite(m.score ?? m.similarity);
+    const score = hasScore ? Math.max(0, Math.min(1, m.score ?? m.similarity)) : 0;
     const scorePct = (score * 100).toFixed(1);
     const metric = hasScore
       ? `rrf: ${scorePct}%`
@@ -1636,7 +1643,10 @@ function renderSearchResults(query, matches, mode) {
     `;
   });
 
-  resultsEl.innerHTML = rows.join('');
+  const metaLine = data.meta
+    ? `<div class="search-budget">${esc(String(data.meta.returned))} nodes, ~${esc(String(data.meta.tokens_estimated))} tokens, dropped ${esc(String(data.meta.dropped))}</div>`
+    : '';
+  resultsEl.innerHTML = metaLine + rows.join('');
   resultsEl.classList.add('open');
   setActiveSearchResult(0);
 }
@@ -1735,7 +1745,7 @@ function setupSearch() {
       }
 
       searchResults = semanticMatches;
-      renderSearchResults(query, searchResults);
+      renderSearchResults(query, searchResults, '', response.data.meta ?? null);
       highlightSearchMatches(searchResults);
     } catch (err) {
       if (requestId !== searchRequestId) return;
