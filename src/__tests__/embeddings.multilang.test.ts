@@ -66,7 +66,7 @@ describe("vector search gating", () => {
 });
 
 describe("reembed", () => {
-  it("fills embeddings in batches, stamps meta, resumable after failure", async () => {
+  it("nulls old vectors on model switch, fills WHERE embedding IS NULL, stamps meta", async () => {
     const db = freshDb();
     for (let i = 1; i <= 7; i++) {
       db.insertNode({
@@ -76,9 +76,14 @@ describe("reembed", () => {
         summary: `summary ${i}`,
       });
     }
-    db.setMetaValue("embed_model", "Xenova/all-MiniLM-L6-v2"); // mismatch
+    // Old-model vectors present.
+    db.setMetaValue("embed_model", "Xenova/all-MiniLM-L6-v2");
+    const stale = new Float32Array(FAKE_DIM).fill(99);
+    db.execSqlRun("UPDATE nodes SET embedding = @e", {
+      e: Buffer.from(stale.buffer, stale.byteOffset, stale.byteLength),
+    });
 
-    // First attempt dies mid-way (after 3 nodes) — like an interrupted run.
+    // First attempt dies mid-way — like an interrupted run.
     let calls = 0;
     const failing = async (text: string): Promise<Buffer> => {
       calls += 1;
@@ -89,28 +94,27 @@ describe("reembed", () => {
     await expect(
       reembed(db, { batch: 2, embedFn: failing })
     ).rejects.toThrow("interrupted");
-    // Cursor persisted up to the last COMPLETED batch (nodes 1-2); node 3
-    // was mid-batch and will be re-embedded on resume (idempotent).
-    expect(db.getMetaValue("reembed_cursor")).toBe("2");
-    // Model not stamped yet — vector search stays disabled.
-    expect(vectorSearchEnabled(db)).toBe(false);
 
-    // Resume: re-embeds node 3, completes the rest, stamps meta.
+    // Old vectors were nulled up front; the 3 filled rows are new-model.
+    const withVec = db.getAllActiveNodesWithEmbeddings();
+    expect(withVec).toHaveLength(3);
+    expect(db.getMetaValue("embed_model")).toBe(MODEL_NAME);
+    expect(vectorSearchEnabled(db)).toBe(true);
+
+    // Resume: fills the remaining 4 and stamps meta.
     const fake = fakeEmbed("passage: ");
     const result = await reembed(db, { batch: 2, embedFn: fake.fn });
-    expect(result.processed).toBe(5);
+    expect(result.processed).toBe(4);
     expect(result.total).toBe(7);
     expect(result.dim).toBe(FAKE_DIM);
     expect(result.model).toBe(MODEL_NAME);
-    expect(db.getMetaValue("embed_model")).toBe(MODEL_NAME);
     expect(db.getMetaValue("embed_dim")).toBe(String(FAKE_DIM));
-    expect(db.getMetaValue("reembed_cursor")).toBeUndefined();
     expect(db.getMetaValue("last_reembed")).toBeTruthy();
     expect(vectorSearchEnabled(db)).toBe(true);
 
-    // All 7 embeddings now exist and are FAKE_DIM floats (Buffer-normalized).
-    const withVec = db.getAllActiveNodesWithEmbeddings();
-    expect(withVec).toHaveLength(7);
-    expect(withVec.every((n) => n.embedding.length === FAKE_DIM * 4)).toBe(true);
+    // All 7 embeddings exist and are FAKE_DIM floats (Buffer-normalized).
+    const all = db.getAllActiveNodesWithEmbeddings();
+    expect(all).toHaveLength(7);
+    expect(all.every((n) => n.embedding.length === FAKE_DIM * 4)).toBe(true);
   });
 });

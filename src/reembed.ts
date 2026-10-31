@@ -8,7 +8,7 @@ import {
 } from "./embeddings.js";
 
 export interface ReembedOptions {
-  /** Nodes per batch (default 64). Each batch commits its cursor. */
+  /** Nodes per batch (default 64). Each batch commits its progress. */
   batch?: number;
   /** Injectable embedder for tests; defaults to the real model. */
   embedFn?: (text: string) => Promise<Buffer>;
@@ -23,12 +23,14 @@ export interface ReembedResult {
 }
 
 /**
- * Recompute embeddings for every node with the current model.
+ * Recompute embeddings for every node with the current model (М6).
  *
- * Resumable: progress lives in meta.reembed_cursor (last processed rowid),
- * so an interrupted run continues where it stopped. meta.embed_model is
- * stamped only after the final batch — until then vector search stays
- * disabled and old/new vectors never mix.
+ * On a model switch the old vectors are nulled once, then the run simply
+ * fills `WHERE embedding IS NULL` — natural resumability (an interrupted
+ * run continues where it stopped) and idempotency with no cursor
+ * bookkeeping. meta.embed_model is stamped up front: from that moment
+ * every stored vector belongs to the new model, so the vector channel can
+ * serve the already-filled rows safely.
  */
 export async function reembed(
   db: KnowledgeDB,
@@ -37,19 +39,24 @@ export async function reembed(
   const batch = opts.batch ?? 64;
   const embedFn =
     opts.embedFn ?? ((text: string) => embed(passageText(text)));
+
+  // М6: model switch — drop old-space vectors once.
+  if (db.getMetaValue("embed_model") !== MODEL_NAME) {
+    db.execSqlRun("UPDATE nodes SET embedding = NULL");
+    db.setMetaValue("embed_model", MODEL_NAME);
+  }
+
   const totalRow = db.execSqlFirst("SELECT count(*) AS n FROM nodes") as {
     n: number;
   };
   const total = totalRow.n;
 
-  let cursor = Number(db.getMetaValue("reembed_cursor") ?? 0);
   let processed = 0;
   let dim = Number(db.getMetaValue("embed_dim") ?? 0);
 
   for (;;) {
     const rows = db.execSqlAll(
-      "SELECT rowid, id, name, kind, summary FROM nodes WHERE rowid > ? ORDER BY rowid LIMIT ?",
-      cursor,
+      "SELECT rowid, id, name, kind, summary FROM nodes WHERE embedding IS NULL ORDER BY rowid LIMIT ?",
       batch
     ) as Array<{
       rowid: number;
@@ -66,22 +73,20 @@ export async function reembed(
       );
       const buffer = await embedFn(text);
       dim = dimOf(buffer);
-      // Named params: libsql panics on single-POSITIONAL-param statements
-      // with a Buffer argument (statement.rs unwrap), named binding is safe.
+      // Named params: libsql panics on single-positional Buffer statements.
       db.execSqlRun(
         "UPDATE nodes SET embedding = @embedding WHERE id = @id",
         { embedding: buffer, id: row.id }
       );
-      cursor = row.rowid;
+      db.upsertVector(row.id, buffer);
       processed += 1;
     }
-    db.setMetaValue("reembed_cursor", String(cursor));
     opts.onProgress?.(processed, total);
   }
 
-  db.setMetaValue("embed_model", MODEL_NAME);
   db.setMetaValue("embed_dim", String(dim));
   db.setMetaValue("last_reembed", new Date().toISOString());
+  // Legacy cursor from the previous scheme is no longer used.
   db.execSql("DELETE FROM meta WHERE key = 'reembed_cursor'");
 
   return { processed, total, dim, model: MODEL_NAME };

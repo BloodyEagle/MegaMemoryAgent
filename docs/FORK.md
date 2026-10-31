@@ -55,10 +55,24 @@ Upstream двигает те же функции (`understand`, `createConcept`,
 | Переменная | По умолчанию | Значение |
 |---|---|---|
 | `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Модель эмбеддингов (~120 МБ при первом запуске, кеш в `~/.cache/huggingface`) |
+
+**Лицензия модели (М11).** `intfloat/multilingual-e5-small` — MIT; ONNX-экспорт
+`Xenova/multilingual-e5-small` распространяется под той же лицензией. Альтернатива без
+prefix-механики (`query:`/`passage:`), если она не нужна: `Xenova/paraphrase-multilingual-MiniLM-L12-v2`
+(Apache-2.0, ONNX-версия существует) — префиксы к ней не применяются автоматически
+(имя модели не содержит "e5").
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid` / `fts` / `vector` |
 | `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` — вторая FTS-таблица для CJK |
 | `MEGAMEMORY_AUTO_DIGEST` | вкл (`0` — выкл) | Автосборка digest после 5-го ребёнка |
 | `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Путь к базе |
+
+## Ограничения хостов (А7)
+
+FTS5/virtual tables работают в **локальном** file-режиме libsql (единственный режим
+MegaMemory). На удалённых хостах Turso виртуальные таблицы запрещены — если форк когда-нибудь
+переводят на remote-хранилище, гибридный поиск теряет FTS-половину (остаётся LIKE-fallback
+и векторный канал). Также после любого VACUUM нужен `megamemory migrate --apply`
+(пересборка FTS — SQLite не гарантирует стабильность rowid, М5).
 
 ## Установка из tarball
 

@@ -1,4 +1,4 @@
-import { pipeline, type FeatureExtractionPipeline } from "@xenova/transformers";
+import { pipeline, type FeatureExtractionPipeline } from "@huggingface/transformers";
 import type { KnowledgeDB } from "./db.js";
 import { CURRENT_EMBED_MODEL } from "./embed-model.js";
 
@@ -42,7 +42,7 @@ let extractor: FeatureExtractionPipeline | null = null;
 async function getExtractor(): Promise<FeatureExtractionPipeline> {
   if (!extractor) {
     extractor = await pipeline("feature-extraction", MODEL_NAME, {
-      quantized: true,
+      dtype: "q8",
     });
   }
   return extractor;
