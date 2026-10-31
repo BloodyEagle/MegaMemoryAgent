@@ -34,6 +34,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("digest")}          Rebuild module digest nodes ${pc.dim("(default: dry-run)")}
   ${pc.cyan("export --md <dir>")} Export the graph to markdown files ${pc.dim("(--check for CI)")}
   ${pc.cyan("doctor")}          Health check of the current database ${pc.dim("(exit 1 on problems)")}
+  ${pc.cyan("eval")}            Measure search recall@k on the eval set ${pc.dim("(fixtures/eval.jsonl)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -58,7 +59,7 @@ ${pc.bold("Examples:")}
   ${pc.dim("$")} megamemory repair-ids --apply                        ${pc.dim("Rename broken ids after backup")}
 `.trim();
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string } {
   const portIdx = args.indexOf("--port");
@@ -130,6 +131,13 @@ switch (cmd) {
   case "migrate": {
     const { runMigrate } = await import("./migrate-cli.js");
     await runMigrate(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "eval": {
+    const { runEvalCli } = await import("./eval-cli.js");
+    await runEvalCli(process.argv.slice(3));
     process.exit(0);
     break;
   }

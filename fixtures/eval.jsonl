@@ -1,0 +1,25 @@
+{"query": "Книга", "expected_id": "книга", "lang": "ru"}
+{"query": "поиск по книге", "expected_id": "книга/поиск", "lang": "ru"}
+{"query": "глава", "expected_id": "книга/глава-1", "lang": "ru"}
+{"query": "авторизация", "expected_id": "auth-v2", "lang": "ru"}
+{"query": "платежи", "expected_id": "dup-a", "lang": "ru"}
+{"query": "Book Reader", "expected_id": "book", "lang": "en"}
+{"query": "rocket", "expected_id": "node-rocket", "lang": "en"}
+{"query": "cafe", "expected_id": "cafe", "lang": "en"}
+{"query": "jwt tokens", "expected_id": "auth-v2", "lang": "en"}
+{"query": "epub", "expected_id": "book", "lang": "en"}
+{"query": "模块", "expected_id": "模块", "lang": "zh"}
+{"query": "模块设计", "expected_id": "模块", "lang": "zh"}
+{"query": "支付网关", "expected_id": "模块/支付", "lang": "zh"}
+{"query": "支付", "expected_id": "模块/支付", "lang": "zh"}
+{"query": "处理支付请求", "expected_id": "模块/支付", "lang": "zh"}
+{"query": "数据", "expected_id": "模块", "lang": "zh"}
+{"query": "rocket 🚀", "expected_id": "node-rocket", "lang": "mixed"}
+{"query": "книга поиск", "expected_id": "книга/поиск", "lang": "mixed"}
+{"query": "payments module", "expected_id": "dup-a", "lang": "mixed"}
+{"query": "模块 支付", "expected_id": "模块/支付", "lang": "mixed"}
+{"query": "поиск", "expected_id": "книга/поиск", "lang": "ru"}
+{"query": "Auth Decision", "expected_id": "auth-v2", "lang": "en"}
+{"query": "заметки о книгах", "expected_id": "книга", "lang": "ru"}
+{"query": "支付模块的总体设计", "expected_id": "模块", "lang": "zh"}
+{"query": "diacritics slug", "expected_id": "cafe", "lang": "en"}
