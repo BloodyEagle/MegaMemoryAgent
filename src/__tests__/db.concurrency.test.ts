@@ -5,6 +5,7 @@ import os from "os";
 import path from "path";
 import Database from "libsql";
 import { KnowledgeDB } from "../db.js";
+import { cleanupDir } from "./helpers/cleanup.js";
 
 const TEST_TIMEOUT_MS = 30000;
 const FRESH_OPEN_WORKERS = [1, 2, 3, 4];
@@ -39,9 +40,9 @@ interface WorkerResult {
 
 const tmpDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const tmpDir of tmpDirs.splice(0)) {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    await cleanupDir(tmpDir);
   }
 });
 

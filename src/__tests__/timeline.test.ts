@@ -4,6 +4,7 @@ import { KnowledgeDB } from "../db.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { closeAndCleanup } from "./helpers/cleanup.js";
 
 let db: KnowledgeDB;
 let dbPath: string;
@@ -15,9 +16,8 @@ beforeEach(() => {
   db = new KnowledgeDB(dbPath);
 });
 
-afterEach(() => {
-  db.close();
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+afterEach(async () => {
+  await closeAndCleanup(db, tmpDir);
 });
 
 function setTimelineTimestamp(seq: number, timestamp: string): void {

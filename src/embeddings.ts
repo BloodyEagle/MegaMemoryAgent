@@ -1,7 +1,38 @@
-import { pipeline, type FeatureExtractionPipeline } from "@xenova/transformers";
+import { pipeline, type FeatureExtractionPipeline } from "@huggingface/transformers";
+import type { KnowledgeDB } from "./db.js";
+import { CURRENT_EMBED_MODEL } from "./embed-model.js";
 
-const MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
-const EMBEDDING_DIM = 384;
+/**
+ * Embedding model — env-configurable via MEGAMEMORY_EMBED_MODEL
+ * (single source of truth lives in embed-model.ts). The fork default is
+ * multilingual (trained on 100+ languages); all-MiniLM-L6-v2 stays
+ * available for Latin-only projects or offline machines that already
+ * downloaded it. ~120 MB is downloaded once and cached in ~/.cache/huggingface.
+ */
+export const MODEL_NAME = CURRENT_EMBED_MODEL;
+
+// e5-family models were trained with "passage: "/"query: " input prefixes;
+// feeding raw text degrades quality noticeably. Other models get none.
+const EMBED_PREFIXES: Record<string, { passage: string; query: string }> = {
+  e5: { passage: "passage: ", query: "query: " },
+};
+
+function prefixFor(model: string, kind: "passage" | "query"): string {
+  const key = Object.keys(EMBED_PREFIXES).find((k) =>
+    model.toLowerCase().includes(k)
+  );
+  return key ? EMBED_PREFIXES[key][kind] : "";
+}
+
+/** Add the model's passage prefix (used when indexing node text). */
+export function passageText(text: string, model: string = MODEL_NAME): string {
+  return prefixFor(model, "passage") + text;
+}
+
+/** Add the model's query prefix (used when embedding a search query). */
+export function queryText(text: string, model: string = MODEL_NAME): string {
+  return prefixFor(model, "query") + text;
+}
 
 let extractor: FeatureExtractionPipeline | null = null;
 
@@ -11,7 +42,7 @@ let extractor: FeatureExtractionPipeline | null = null;
 async function getExtractor(): Promise<FeatureExtractionPipeline> {
   if (!extractor) {
     extractor = await pipeline("feature-extraction", MODEL_NAME, {
-      quantized: true,
+      dtype: "q8",
     });
   }
   return extractor;
@@ -23,10 +54,11 @@ export async function initializeEmbeddings(): Promise<void> {
 
 /**
  * Generate an embedding vector for given text.
- * Returns a Buffer containing float32 values.
+ * Returns a Buffer containing float32 values. Dimension depends on the
+ * model (384 for MiniLM, 384 for multilingual-e5-small) — the actual value
+ * is stored in meta.embed_dim, never hardcoded.
  */
 export async function embed(text: string): Promise<Buffer> {
-  // Validate input text
   if (!text || text.trim().length === 0) {
     throw new Error(`Cannot embed empty text`);
   }
@@ -34,15 +66,39 @@ export async function embed(text: string): Promise<Buffer> {
   const ext = await getExtractor();
   const output = await ext(text, { pooling: "mean", normalize: true });
   const data = output.data as Float32Array;
-  const buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
 
-  // Validate embedding has correct dimensions
-  if (buffer.length !== EMBEDDING_DIM * Float32Array.BYTES_PER_ELEMENT) {
-    throw new Error(
-      `Invalid embedding dimension: expected ${EMBEDDING_DIM} floats (${EMBEDDING_DIM * Float32Array.BYTES_PER_ELEMENT} bytes), got ${data.length} floats (${buffer.length} bytes). Text: "${text.substring(0, 50)}..."`
-    );
+/** Embedding dimensionality of a float32 buffer. */
+export function dimOf(buffer: Buffer): number {
+  return buffer.length / Float32Array.BYTES_PER_ELEMENT;
+}
+
+/**
+ * Vector search is safe only when every stored vector came from the same
+ * model. meta.embed_model records that; a mismatch (or an upstream database
+ * with vectors but no meta at all) disables the vector path until
+ * `megamemory reembed` reindexes everything.
+ */
+export function vectorSearchEnabled(db: KnowledgeDB): boolean {
+  return db.getMetaValue("embed_model") === MODEL_NAME;
+}
+
+/**
+ * Embed text for indexing/storing, or null when the vector path is disabled
+ * (model mismatch — writes must not mix vector spaces). Stamps
+ * meta.embed_model/embed_dim on the first successful embed.
+ */
+export async function embedForStorage(
+  db: KnowledgeDB,
+  text: string
+): Promise<Buffer | null> {
+  if (!vectorSearchEnabled(db)) return null;
+  const buffer = await embed(passageText(text));
+  if (db.getMetaValue("embed_model") === undefined) {
+    db.setMetaValue("embed_model", MODEL_NAME);
+    db.setMetaValue("embed_dim", String(dimOf(buffer)));
   }
-
   return buffer;
 }
 
@@ -118,5 +174,3 @@ export function findTopK(
 
   return scored.slice(0, topK);
 }
-
-export { EMBEDDING_DIM };

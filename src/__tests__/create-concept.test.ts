@@ -4,6 +4,7 @@ import { createConcept } from "../tools.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { closeAndCleanup } from "./helpers/cleanup.js";
 
 vi.mock("../embeddings.js", () => ({
   embed: vi.fn(async () => {
@@ -14,6 +15,11 @@ vi.mock("../embeddings.js", () => ({
     `${kind}: ${name} — ${summary}`
   ),
   findTopK: vi.fn(),
+  embedForStorage: vi.fn(async () => {
+    const embedding = new Float32Array([1, 0, 0]);
+    return Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+  }),
+  vectorSearchEnabled: vi.fn(() => true),
 }));
 
 let db: KnowledgeDB;
@@ -24,9 +30,8 @@ beforeEach(() => {
   db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
 });
 
-afterEach(() => {
-  db.close();
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+afterEach(async () => {
+  await closeAndCleanup(db, tmpDir);
 });
 
 describe("createConcept tool", () => {

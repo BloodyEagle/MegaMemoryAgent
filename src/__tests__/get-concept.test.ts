@@ -4,6 +4,7 @@ import { getConcept } from "../tools.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { closeAndCleanup, cleanupDir } from "./helpers/cleanup.js";
 
 let tmpDir: string;
 
@@ -42,8 +43,8 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "megamemory-get-concept-test-"));
 });
 
-afterEach(() => {
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+afterEach(async () => {
+  await cleanupDir(tmpDir);
 });
 
 describe("getConcept tool", () => {

@@ -5,8 +5,9 @@ import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { buildNodeWithContext, understand } from "./tools.js";
+import { findDuplicates, mergeNodes } from "./consolidate.js";
 import { errorBold, askPort } from "./cli-utils.js";
-import { initializeEmbeddings } from "./embeddings.js";
+import { initializeEmbeddings, vectorSearchEnabled } from "./embeddings.js";
 import type { NodeRow } from "./types.js";
 
 const VERSION = JSON.parse(
@@ -135,6 +136,7 @@ export async function runServe(port: number): Promise<void> {
       summary: string;
       parent_id: string | null;
       edge_count: number;
+      status: string;
     }>;
     edges: Array<{
       from: string;
@@ -150,6 +152,7 @@ export async function runServe(port: number): Promise<void> {
       summary: n.summary,
       parent_id: n.parent_id,
       edge_count: 0,
+      status: (n as { status?: string }).status ?? "active",
     }));
 
     const edges = db.getAllEdges().map((e) => ({
@@ -532,15 +535,23 @@ export async function runServe(port: number): Promise<void> {
   let embeddingsReady = false;
   let embeddingInitError: string | null = null;
 
-  console.log(pc.dim("  Loading embedding model..."));
-  try {
-    await initializeEmbeddings();
-    embeddingsReady = true;
-    console.log(pc.dim("  Embedding model ready."));
-  } catch (err) {
-    embeddingInitError = err instanceof Error ? err.message : String(err);
-    console.log(pc.yellow("  Warning: Embedding model failed to preload."));
-    console.log(pc.dim("  Semantic search will retry on demand."));
+  // Warm the model in the background: serve must not block on a ~120 MB
+  // first-run download, and there is nothing to preload at all when the
+  // vector channel is disabled (model mismatch pending reembed).
+  if (vectorSearchEnabled(db)) {
+    console.log(pc.dim("  Loading embedding model in background..."));
+    void initializeEmbeddings()
+      .then(() => {
+        embeddingsReady = true;
+        console.log(pc.dim("  Embedding model ready."));
+      })
+      .catch((err: unknown) => {
+        embeddingInitError = err instanceof Error ? err.message : String(err);
+        console.log(pc.yellow("  Warning: Embedding model failed to preload."));
+        console.log(pc.dim("  Semantic search will retry on demand."));
+      });
+  } else {
+    console.log(pc.dim("  Vector search disabled — text search only (run megamemory reembed)."));
   }
 
   const server = http.createServer((req, res) => {
@@ -556,8 +567,22 @@ export async function runServe(port: number): Promise<void> {
     }
 
     if (pathname === "/api/graph" && req.method === "GET") {
+      // T4: status filter — "active" hides superseded/deprecated nodes and
+      // their supersedes edges; "all" (default) shows everything.
+      const statusFilter = url.searchParams.get("status") ?? "all";
       const { nodes, edges } = buildGraphPayload();
-      json(res, { nodes, edges });
+      let filteredNodes = nodes;
+      let filteredEdges = edges;
+      if (statusFilter === "active") {
+        const allowed = new Set(
+          nodes.filter((n) => (n.status ?? "active") === "active").map((n) => n.id)
+        );
+        filteredNodes = nodes.filter((n) => allowed.has(n.id));
+        filteredEdges = edges.filter(
+          (e) => allowed.has(e.from) && allowed.has(e.to)
+        );
+      }
+      json(res, { nodes: filteredNodes, edges: filteredEdges });
       return;
     }
 
@@ -591,13 +616,31 @@ export async function runServe(port: number): Promise<void> {
       }
 
       const results = await understand(db, { query, top_k: topK });
-      json(res, results);
+      // compact mode (fork default) returns rows in `compact` with a budget
+      // meta; map them back onto `matches` so the explorer keeps one shape.
+      const matches =
+        results.compact ??
+        results.matches.map((m) => ({
+          id: m.id,
+          name: m.name,
+          kind: m.kind,
+          status: "active",
+          summary: m.summary,
+          file_refs: m.file_refs,
+          similarity: m.similarity,
+          via: m.via,
+        }));
+      json(res, {
+        matches,
+        meta: results.meta ?? null,
+      });
       return;
     }
 
     if (pathname.startsWith("/api/node/") && req.method === "GET") {
       const id = decodeURIComponent(pathname.slice("/api/node/".length));
-      const node = db.getNode(id);
+      // Б12: resolve ids renamed by repair-ids.
+      const node = db.getNode(db.getAliasTarget(id) ?? id);
       if (!node) {
         json(res, { error: `Concept "${id}" not found` }, 404);
         return;
@@ -614,10 +657,57 @@ export async function runServe(port: number): Promise<void> {
       return;
     }
 
+    if (pathname === "/api/consolidate" && req.method === "GET") {
+      // T5 DoD: explorer tab lists duplicate candidates without mutating.
+      const threshold = Number.parseFloat(url.searchParams.get("threshold") ?? "0.95");
+      const candidates = findDuplicates(db, {
+        threshold: Number.isFinite(threshold) ? threshold : 0.95,
+      });
+      json(res, { candidates });
+      return;
+    }
+
+    if (pathname === "/api/consolidate" && req.method === "POST") {
+      let raw = "";
+      req.on("data", (chunk) => {
+        raw += chunk;
+      });
+      req.on("end", () => {
+        let body: { survivor?: string; other?: string } = {};
+        try {
+          body = JSON.parse(raw) as { survivor?: string; other?: string };
+        } catch {
+          json(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        if (!body.survivor || !body.other) {
+          json(res, { error: "survivor and other are required" }, 400);
+          return;
+        }
+        try {
+          const result = mergeNodes(db, body.survivor, body.other);
+          json(res, { ok: true, ...result });
+        } catch (err) {
+          json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+        }
+      });
+      return;
+    }
+
     if (pathname === "/api/stats" && req.method === "GET") {
       const stats = db.getStats();
       const kinds = db.getKindsBreakdown();
-      json(res, { ...stats, kinds });
+      // Embedding state: model, dimension, last reindex — surfaced in the
+      // explorer so "which model are my vectors from" is visible at a glance.
+      const embeddings = {
+        model: db.getMetaValue("embed_model") ?? null,
+        dim: db.getMetaValue("embed_dim")
+          ? Number(db.getMetaValue("embed_dim"))
+          : null,
+        last_reembed: db.getMetaValue("last_reembed") ?? null,
+        vector_search: vectorSearchEnabled(db),
+      };
+      json(res, { ...stats, kinds, embeddings, usage: db.getUsageStats(7) });
       return;
     }
 

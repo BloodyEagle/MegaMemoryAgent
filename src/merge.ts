@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import { KnowledgeDB } from "./db.js";
+import { ensureSchema } from "./migrate-schema.js";
 import type { NodeRow, EdgeRow, MergeResult } from "./types.js";
 
 export const MERGE_SUFFIX_LEFT = "::left";
@@ -100,6 +101,9 @@ export class MergeEngine {
     const leftDb = new KnowledgeDB(leftPath);
     const rightDb = new KnowledgeDB(rightPath);
     const outputDb = new KnowledgeDB(outputPath);
+    // Б10: the merged output must carry the fork schema (status/valid_from/
+    // valid_until), otherwise lifecycle data is dropped during branch merges.
+    ensureSchema(outputDb);
 
     try {
       return this.performMerge(leftDb, rightDb, outputDb, leftLabel, rightLabel);
@@ -422,6 +426,10 @@ export class MergeEngine {
       needs_merge: node.needs_merge,
       source_branch: node.source_branch,
       merge_timestamp: node.merge_timestamp,
+      // Б10: lifecycle columns travel with the row.
+      status: node.status,
+      valid_from: node.valid_from,
+      valid_until: node.valid_until,
     });
   }
 
@@ -451,6 +459,10 @@ export class MergeEngine {
       needs_merge: 1,
       source_branch: sourceLabel,
       merge_timestamp: timestamp,
+      // Б10: lifecycle columns travel with the row.
+      status: node.status,
+      valid_from: node.valid_from,
+      valid_until: node.valid_until,
     });
   }
 

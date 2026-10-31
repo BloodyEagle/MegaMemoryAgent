@@ -9,3 +9,10 @@ dist/
 .osgrep
 coverage/
 debug/
+vitest.log
+build.log
+npm-ci.log
+.idea/
+graph-deps.json
+.graph-deps-cache.json
+.kilo-edit-body.txt

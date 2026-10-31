@@ -4,7 +4,7 @@ import {
   embeddingText,
   cosineSimilarity,
   findTopK,
-  EMBEDDING_DIM,
+  dimOf,
 } from "../embeddings.js";
 
 /**
@@ -15,9 +15,9 @@ function mockEmbedding(values: number[]): Buffer {
   return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength);
 }
 
-describe("EMBEDDING_DIM", () => {
-  it("is 384", () => {
-    expect(EMBEDDING_DIM).toBe(384);
+describe("dimOf", () => {
+  it("derives dimension from the buffer size", () => {
+    expect(dimOf(mockEmbedding([1, 2, 3]))).toBe(3);
   });
 });
 

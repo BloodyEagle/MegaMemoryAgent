@@ -27,6 +27,14 @@ ${pc.bold("Commands:")}
   ${pc.cyan("merge")}           Merge two knowledge.db files
   ${pc.cyan("conflicts")}       List unresolved merge conflicts
   ${pc.cyan("resolve")}         Resolve a merge conflict
+  ${pc.cyan("repair-ids")}      Fix legacy empty/trailing-slash node ids ${pc.dim("(default: dry-run)")}
+  ${pc.cyan("migrate")}         Upgrade an upstream v1.6.2 database to the fork schema ${pc.dim("(default: dry-run)")}
+  ${pc.cyan("reembed")}         Reindex node embeddings with the current model ${pc.dim("(--batch N)")}
+  ${pc.cyan("consolidate")}     Find and merge near-duplicate nodes ${pc.dim("(default: dry-run)")}
+  ${pc.cyan("digest")}          Rebuild module digest nodes ${pc.dim("(default: dry-run)")}
+  ${pc.cyan("export --md <dir>")} Export the graph to markdown files ${pc.dim("(--check for CI)")}
+  ${pc.cyan("doctor")}          Health check of the current database ${pc.dim("(exit 1 on problems)")}
+  ${pc.cyan("eval")}            Measure search recall@k on the eval set ${pc.dim("(fixtures/eval.jsonl)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -48,9 +56,10 @@ ${pc.bold("Examples:")}
   ${pc.dim("$")} megamemory merge main.db feature.db --into merged.db ${pc.dim("Merge two knowledge DBs")}
   ${pc.dim("$")} megamemory conflicts                                 ${pc.dim("View unresolved conflicts")}
   ${pc.dim("$")} megamemory resolve <group-id> --keep left            ${pc.dim("Resolve a conflict")}
+  ${pc.dim("$")} megamemory repair-ids --apply                        ${pc.dim("Rename broken ids after backup")}
 `.trim();
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string } {
   const portIdx = args.indexOf("--port");
@@ -112,6 +121,62 @@ switch (cmd) {
     break;
   }
 
+  case "repair-ids": {
+    const { runRepairIds } = await import("./migrate-cli.js");
+    await runRepairIds(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "migrate": {
+    const { runMigrate } = await import("./migrate-cli.js");
+    await runMigrate(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "eval": {
+    const { runEvalCli } = await import("./eval-cli.js");
+    await runEvalCli(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "doctor": {
+    const { runDoctorCli } = await import("./doctor-cli.js");
+    await runDoctorCli(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "export": {
+    const { runExport } = await import("./export-cli.js");
+    await runExport(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "digest": {
+    const { runDigest } = await import("./digest-cli.js");
+    await runDigest(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "consolidate": {
+    const { runConsolidate } = await import("./consolidate-cli.js");
+    await runConsolidate(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "reembed": {
+    const { runReembed } = await import("./reembed-cli.js");
+    await runReembed(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
   case "--help":
   case "-h":
     console.log(HELP);
@@ -166,6 +231,28 @@ async function startMcpServer() {
     path.join(process.cwd(), ".megamemory", "knowledge.db");
 
   const db = new KnowledgeDB(DB_PATH);
+
+  // Fork: additive-only schema migration on startup (meta, columns, FTS).
+  // Never destructive — data-changing id repair runs only via `migrate --apply`.
+  try {
+    const { ensureSchema, ensureEmbedMeta, emptyReport } = await import(
+      "./migrate-schema.js"
+    );
+    const report = ensureSchema(db, emptyReport());
+    ensureEmbedMeta(db, report);
+    if (report.applied.length > 0) {
+      console.error(
+        `megamemory: applied fork schema migration (${report.applied.join("; ")})`
+      );
+    }
+  } catch (err) {
+    console.error(
+      `MEGAMEMORY_ERROR: startup schema migration failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+
   const timeline = createTimelineLogger(db);
 
   let dbClosed = false;
@@ -194,31 +281,44 @@ async function startMcpServer() {
 
   // ---- Zod schemas ----
   const NodeKindEnum = z.enum([
-    "feature", "module", "pattern", "config", "decision", "component",
+    "feature", "module", "pattern", "config", "decision", "component", "digest",
   ]);
   const RelationEnum = z.enum([
-    "connects_to", "depends_on", "implements", "calls", "configured_by",
+    "connects_to", "depends_on", "implements", "calls", "configured_by", "supersedes", "contradicts",
   ]);
 
   // ---- Register tools ----
 
   server.tool(
     "understand",
-    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts with their children, edges, and parent context.",
+    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node.",
     {
       query: z.string().describe("Natural language query describing what you want to understand about the project"),
       top_k: z.number().int().min(1).max(50).optional().describe("Number of top results to return (default: 10)"),
+      max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the answer (default: 1500)"),
+      mode: z.enum(["compact", "full"]).optional().describe("compact (default) trims each node to essentials under the budget; full returns legacy verbose output"),
+      include_inactive: z.boolean().optional().describe("Include superseded/deprecated nodes (default: false)"),
     },
     async (params) => {
       try {
-        const result = await understand(db, { query: params.query, top_k: params.top_k });
+        const result = await understand(db, {
+          query: params.query,
+          top_k: params.top_k,
+          max_tokens: params.max_tokens,
+          mode: params.mode,
+          include_inactive: params.include_inactive,
+        });
+        const returned = result.meta?.returned ?? result.matches.length;
+        const ids = result.compact
+          ? result.compact.map((m) => m.id)
+          : result.matches.map((match) => match.id);
         timeline.log({
           tool: "understand",
           params: { query: params.query, top_k: params.top_k },
-          result_summary: `${result.matches.length} matches`,
+          result_summary: `${returned} matches`,
           is_write: false,
           is_error: false,
-          affected_ids: result.matches.map((match) => match.id),
+          affected_ids: ids,
         });
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       } catch (err) {
@@ -277,6 +377,7 @@ async function startMcpServer() {
       why: z.string().optional().describe("Why this exists or was built this way"),
       parent_id: z.string().optional().describe("Parent concept ID for nesting; empty string is treated as omitted"),
       file_refs: z.array(z.string()).optional().describe("Relevant file paths + optional line ranges"),
+      supersedes: z.array(z.string()).optional().describe("Concept IDs this one replaces — creates supersedes edges and marks the old nodes superseded (T4)"),
       edges: z.array(z.object({
         to: z.string().describe("Target concept ID"),
         relation: RelationEnum.describe("Relationship type"),
@@ -294,8 +395,19 @@ async function startMcpServer() {
           parent_id: params.parent_id,
           file_refs: params.file_refs,
           edges: params.edges?.map((e) => ({ ...e, relation: e.relation as RelationType })),
+          supersedes: params.supersedes,
           created_by_task: params.created_by_task,
         });
+        // T6: auto-digest the parent when it gained its 5th+ child.
+        let digestNote = "";
+        try {
+          const { maybeAutoDigest } = await import("./digest.js");
+          const digest = await maybeAutoDigest(db, params.parent_id ?? null);
+          if (digest) digestNote = ` Digest built: ${digest.digestId}`;
+        } catch {
+          // digest building must never fail the create
+        }
+
         timeline.log({
           tool: "create_concept",
           params: { name: params.name, kind: params.kind, parent_id: params.parent_id },
@@ -304,7 +416,7 @@ async function startMcpServer() {
           is_error: false,
           affected_ids: [result.id],
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ...result, message: result.message + digestNote }, null, 2) }] };
       } catch (err) {
         timeline.log({
           tool: "create_concept",
@@ -435,15 +547,18 @@ async function startMcpServer() {
 
   server.tool(
     "list_roots",
-    "List all top-level concepts in the knowledge graph with their direct children. Call this at the start of a session to get a high-level project overview.",
-    {},
-    async () => {
+    "List all top-level concepts in the knowledge graph. Budgeted overview: id, name, kind and child count per root (roots_compact), no summaries — pass max_tokens to control the budget.",
+    {
+      max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the overview (default: 1500)"),
+    },
+    async (params) => {
       try {
-        const result = listRoots(db);
+        const result = listRoots(db, { max_tokens: params.max_tokens });
+        const returned = result.meta?.returned ?? result.roots.length;
         timeline.log({
           tool: "list_roots",
           params: {},
-          result_summary: `${result.roots.length} roots`,
+          result_summary: `${returned} roots`,
           is_write: false,
           is_error: false,
           affected_ids: [],
