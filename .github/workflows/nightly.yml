@@ -1,0 +1,17 @@
+name: nightly
+on:
+  schedule: [{ cron: "0 3 * * *" }]
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: npm }
+      - run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-multilingual-e5-small
+      # Full suite (includes model-backed tests); non-blocking for PRs by design
+      - run: npm test
