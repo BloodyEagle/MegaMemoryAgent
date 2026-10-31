@@ -2,6 +2,7 @@ import Database from "libsql";
 import path from "path";
 import fs from "fs";
 import type { NodeRow, EdgeRow } from "./types.js";
+import { normalizeName } from "./norm.js";
 
 const SCHEMA_VERSION = 4;
 
@@ -20,6 +21,29 @@ export class KnowledgeDB {
       this._hasStatusColumn = cols.some((c) => c.name === "status");
     }
     return this._hasStatusColumn;
+  }
+
+  private _hasNameNormColumn: boolean | undefined;
+
+  private get hasNameNormColumn(): boolean {
+    if (this._hasNameNormColumn === undefined) {
+      const cols = this.db.pragma("table_info(nodes)") as Array<{ name: string }>;
+      this._hasNameNormColumn = cols.some((c) => c.name === "name_norm");
+    }
+    return this._hasNameNormColumn;
+  }
+
+  /**
+   * Keep the JS-normalized copy of the name in sync (patch А5): SQL lower()
+   * is ASCII-only, so case-insensitive LIKE for cyrillic needs this column.
+   * No-op on dbs where the fork migration has not added the column yet.
+   */
+  private syncNameNorm(id: string, name: string): void {
+    if (!this.hasNameNormColumn) return;
+    const norm = normalizeName(name);
+    this.db
+      .prepare("UPDATE nodes SET name_norm = ? WHERE id = ?")
+      .run(norm, id);
   }
 
   constructor(dbPath: string) {
@@ -265,6 +289,7 @@ export class KnowledgeDB {
       created_by_task: node.created_by_task ?? null,
       embedding: node.embedding ?? null,
     });
+    this.syncNameNorm(node.id, node.name);
   }
 
   insertNodeAndEdges(
@@ -370,6 +395,9 @@ export class KnowledgeDB {
       `UPDATE nodes SET ${fields.join(", ")} WHERE id = @id AND removed_at IS NULL`
     );
     const result = stmt.run(values);
+    if (changes.name !== undefined) {
+      this.syncNameNorm(id, changes.name);
+    }
     return result.changes > 0;
   }
 
@@ -880,6 +908,7 @@ export class KnowledgeDB {
       source_branch: node.source_branch ?? null,
       merge_timestamp: node.merge_timestamp ?? null,
     });
+    this.syncNameNorm(node.id, node.name);
   }
 
   insertEdgeRaw(edge: {
@@ -1143,6 +1172,42 @@ export class KnowledgeDB {
         "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
       )
       .run(key, value);
+  }
+
+
+  // ---- Id aliases (patch Б12): old ids stay resolvable after repair ----
+
+  /** Remember old_id -> new_id; chains are followed at resolve time. */
+  recordAlias(oldId: string, newId: string): void {
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS aliases (\
+        old_id TEXT PRIMARY KEY,\
+        new_id TEXT NOT NULL,\
+        renamed_at TEXT NOT NULL DEFAULT (datetime('now'))\
+      )"
+    );
+    this.db
+      .prepare(
+        "INSERT INTO aliases(old_id, new_id) VALUES (?, ?) ON CONFLICT(old_id) DO UPDATE SET new_id = excluded.new_id"
+      )
+      .run(oldId, newId);
+  }
+
+  /** Resolve an old id through the aliases table (up to 8 hops). */
+  getAliasTarget(oldId: string): string | undefined {
+    const hasAliases = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='aliases'")
+      .get();
+    if (!hasAliases) return undefined;
+    let current = oldId;
+    for (let hop = 0; hop < 8; hop++) {
+      const row = this.db
+        .prepare("SELECT new_id FROM aliases WHERE old_id = ?")
+        .get(current) as { new_id: string } | undefined;
+      if (!row) return current === oldId ? undefined : current;
+      current = row.new_id;
+    }
+    return current;
   }
 
   close(): void {

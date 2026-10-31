@@ -86,6 +86,27 @@ export function planIdRepair(db: KnowledgeDB): RepairPlan {
     }
   }
 
+  // Б12.2: descendants of renamed ids follow the rename (path prefix),
+  // longest prefix first so nested chains resolve correctly.
+  const byOld = [...idMap.entries()].sort((a, b) => b[0].length - a[0].length);
+  if (byOld.length > 0) {
+    for (const row of db.getAllNodesRaw()) {
+      if (isBrokenId(row.id)) continue;
+      // Map keys may already carry the trailing slash (broken ids like "svc/").
+      const hit = byOld.find(([old]) => {
+        const prefix = old.endsWith("/") ? old : old + "/";
+        return row.id.startsWith(prefix);
+      });
+      if (!hit) continue;
+      // Keep the "/" separator between the new parent id and the tail.
+      const tail = row.id.slice(hit[0].length);
+      const newId = hit[1] + (tail.startsWith("/") ? tail : "/" + tail);
+      if (newId !== row.id) {
+        entries.push({ oldId: row.id, newId, name: row.name });
+      }
+    }
+  }
+
   return { entries, conflicts, dataLossEmptyIds };
 }
 
@@ -112,6 +133,8 @@ export function applyIdRepair(
     }
     if (db.renameNodeId(entry.oldId, entry.newId)) {
       claimed.add(entry.newId);
+      // Б12.3: old ids stay resolvable through the aliases table.
+      db.recordAlias(entry.oldId, entry.newId);
       renamed += 1;
     } else {
       console.error(

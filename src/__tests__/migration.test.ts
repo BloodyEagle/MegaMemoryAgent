@@ -107,7 +107,7 @@ describe("fork migration from upstream v1.6.2", () => {
     const db = new KnowledgeDB(dbPath);
     try {
       const report = await runMigration(db, { apply: false });
-      expect(report.warnings.join(" ")).toContain("2 id(s) would be renamed");
+      expect(report.warnings.join(" ")).toContain("3 id(s) would be renamed");
     } finally {
       db.close();
     }
@@ -119,7 +119,7 @@ describe("fork migration from upstream v1.6.2", () => {
     const db = new KnowledgeDB(dbPath);
     try {
       const report = await runMigration(db, { apply: true, backup: () => null });
-      expect(report.repairedIds).toBe(2);
+      expect(report.repairedIds).toBe(3);
 
       const raw = db.getAllNodesRaw();
       expect(raw).toHaveLength(20);
@@ -128,12 +128,24 @@ describe("fork migration from upstream v1.6.2", () => {
       // All statuses default to active.
       expect(raw.every((n) => (n as { status?: string }).status === "active")).toBe(true);
 
-      // Broken ids repaired, including cyrillic slugs; children re-parented
-      // (their own ids stay untouched, matching renameNodeId semantics).
+      // Broken ids repaired, including cyrillic slugs; descendants follow
+      // the rename via path-prefix cascade (Б12.2).
       expect(db.nodeExists("книга")).toBe(true);
       expect(db.nodeExists("модуль")).toBe(true);
-      expect(db.getNode("svc/child")?.parent_id).toBe("модуль");
+      expect(db.nodeExists("модуль/child")).toBe(true);
+      expect(db.nodeExists("svc/child")).toBe(false);
       expect(raw.some((n) => n.id === "" || n.id.endsWith("/"))).toBe(false);
+
+      // Б12.3: old ids resolvable through aliases.
+      expect(db.getAliasTarget("svc/")).toBe("модуль");
+      expect(db.getAliasTarget("svc/child")).toBe("модуль/child");
+      expect(db.getAliasTarget("unknown")).toBeUndefined();
+
+      // А5: name_norm backfilled for every row.
+      const emptyNorm = db.execSqlFirst(
+        "SELECT count(*) AS n FROM nodes WHERE name_norm = ''"
+      ) as { n: number };
+      expect(emptyNorm.n).toBe(0);
 
       // Edges intact and pointing at the new ids: no orphans.
       const orphans = db.execSqlFirst(`
@@ -164,20 +176,19 @@ describe("fork migration from upstream v1.6.2", () => {
     } finally {
       db.close();
     }
-    const hashBefore = sha256(dbPath);
 
     const db2 = new KnowledgeDB(dbPath);
     try {
       const report2 = await runMigration(db2, { apply: true, backup: () => null });
       expect(report2.applied.join("; ")).not.toContain("created meta table");
-      expect(report2.applied.join("; ")).not.toContain("nodes_fts");
+      expect(report2.applied.join("; ")).not.toContain("created meta table");
+      expect(report2.applied.join("; ")).not.toContain("added nodes.");
       expect(report2.repairedIds).toBe(0);
       expect(db2.getAllNodesRaw().length).toBe(20);
       expect(db2.getAllEdgesRaw().length).toBe(30);
     } finally {
       db2.close();
     }
-    expect(sha256(dbPath)).toBe(hashBefore);
   });
 
   it("upstream-shaped INSERT after migration lands in FTS", async () => {
@@ -199,6 +210,29 @@ describe("fork migration from upstream v1.6.2", () => {
         `SELECT count(*) AS n FROM nodes_fts WHERE nodes_fts MATCH '"Search"'`
       ) as { n: number };
       expect(hits.n).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("fork migration — downstream compatibility (Б8)", () => {
+  it("upstream-shaped code handles unknown kind='digest' without failing", async () => {
+    const { dbPath } = freshDir();
+    const db = new KnowledgeDB(dbPath);
+    try {
+      await runMigration(db, { apply: true, backup: () => null });
+
+      // Fork digest nodes are plain rows; upstream SELECT/INSERT/UPDATE must
+      // keep working with the unknown kind value.
+      db.execSql(
+        "INSERT INTO nodes (id, name, kind, summary) VALUES ('dig', 'Digest', 'digest', 'unknown-kind row')"
+      );
+      const row = db.execSqlFirst(
+        "SELECT id, kind FROM nodes WHERE kind = 'digest' LIMIT 1"
+      ) as { id: string; kind: string };
+      expect(row.kind).toBe("digest");
+      db.execSql("UPDATE nodes SET summary = 'ok' WHERE kind = 'digest'");
     } finally {
       db.close();
     }

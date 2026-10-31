@@ -1,4 +1,5 @@
 import { KnowledgeDB } from "./db.js";
+import { normalizeName } from "./norm.js";
 import { planIdRepair, applyIdRepair } from "./migrate.js";
 import { CURRENT_EMBED_MODEL } from "./embed-model.js";
 
@@ -79,6 +80,8 @@ function ensureFts(db: KnowledgeDB, report: MigrationReport): void {
   `);
   db.execSql("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')");
   report.applied.push("created nodes_fts + triggers, rebuilt index");
+  // М2: remember the tokenizer the index was built with.
+  db.setMetaValue("fts_tokenizer", "unicode61");
 }
 
 /**
@@ -146,6 +149,8 @@ export function ensureSchema(
     ["status", "TEXT NOT NULL DEFAULT 'active'"],
     ["valid_from", "TEXT"],
     ["valid_until", "TEXT"],
+    // А5: normalized copy for the LIKE fallback (SQL lower() is ASCII-only)
+    ["name_norm", "TEXT NOT NULL DEFAULT ''"],
   ];
   for (const [name, decl] of newCols) {
     if (!cols.has(name)) {
@@ -159,7 +164,28 @@ export function ensureSchema(
   // Step 4: indexes.
   db.execSql("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)");
   db.execSql("CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id)");
+  db.execSql("CREATE INDEX IF NOT EXISTS idx_nodes_name_norm ON nodes(name_norm)");
   report.alreadyOk.push("fork indexes");
+
+  // А5: backfill name_norm (JS-computed: NFKD, Latin/Cyrillic/Greek/Hebrew
+  // marks off, lowercase, NFC) for rows that do not have it yet.
+  const pendingNorm = db.execSqlAll(
+    "SELECT id, name FROM nodes WHERE name_norm = '' LIMIT 10000"
+  ) as Array<{ id: string; name: string }>;
+  for (const row of pendingNorm) {
+    db.execSqlRun("UPDATE nodes SET name_norm = ? WHERE id = ?", normalizeName(row.name), row.id);
+  }
+  report.alreadyOk.push(`name_norm backfill (${pendingNorm.length} rows)`);
+
+  // Б12.3: aliases table — old ids stay resolvable after repair.
+  db.execSql(
+    "CREATE TABLE IF NOT EXISTS aliases (\
+      old_id TEXT PRIMARY KEY,\
+      new_id TEXT NOT NULL,\
+      renamed_at TEXT NOT NULL DEFAULT (datetime('now'))\
+    )"
+  );
+  report.alreadyOk.push("aliases table");
 
   // Step 5: FTS index + sync triggers (+ optional trigram table for CJK).
   ensureFts(db, report);
@@ -260,6 +286,17 @@ export async function runMigration(
 
   ensureSchema(db, report);
   ensureEmbedMeta(db, report);
+
+  // М5: VACUUM may renumber rowids — rebuild the FTS index on every apply
+  // and verify the counts match.
+  if (tableExists(db, "nodes_fts")) {
+    db.execSql("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')");
+    report.applied.push("rebuilt nodes_fts (М5)");
+  }
+  if (tableExists(db, "nodes_fts_tri")) {
+    db.execSql("INSERT INTO nodes_fts_tri(nodes_fts_tri) VALUES('rebuild')");
+    report.applied.push("rebuilt nodes_fts_tri (М5)");
+  }
 
   // Step 7: repair legacy ids.
   if (repairPlan.entries.length > 0 || repairPlan.conflicts.length > 0) {

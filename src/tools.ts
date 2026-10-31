@@ -334,7 +334,9 @@ export function getConcept(
   db: KnowledgeDB,
   input: GetConceptInput
 ): NodeWithContext {
-  const node = db.getNode(input.id);
+  // Б12: ids renamed by repair-ids stay resolvable through aliases.
+  const id = db.getAliasTarget(input.id) ?? input.id;
+  const node = db.getNode(id);
   if (!node) {
     throw new Error(`Concept "${input.id}" not found.`);
   }

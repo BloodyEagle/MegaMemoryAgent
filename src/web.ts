@@ -631,7 +631,8 @@ export async function runServe(port: number): Promise<void> {
 
     if (pathname.startsWith("/api/node/") && req.method === "GET") {
       const id = decodeURIComponent(pathname.slice("/api/node/".length));
-      const node = db.getNode(id);
+      // Б12: resolve ids renamed by repair-ids.
+      const node = db.getNode(db.getAliasTarget(id) ?? id);
       if (!node) {
         json(res, { error: `Concept "${id}" not found` }, 404);
         return;
