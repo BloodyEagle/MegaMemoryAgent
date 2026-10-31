@@ -4,6 +4,7 @@ import { createConcept } from "../tools.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { closeAndCleanup } from "./helpers/cleanup.js";
 
 vi.mock("../embeddings.js", () => ({
   embed: vi.fn(async () => {
@@ -24,9 +25,8 @@ beforeEach(() => {
   db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
 });
 
-afterEach(() => {
-  db.close();
-  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+afterEach(async () => {
+  await closeAndCleanup(db, tmpDir);
 });
 
 describe("createConcept tool", () => {

@@ -911,6 +911,52 @@ export class KnowledgeDB {
     return stmt.all({ timestamp }) as EdgeRow[];
   }
 
+  /** Direct SQL access for migration helpers (DDL, FTS setup). */
+  execSql(sql: string): void {
+    this.db.exec(sql);
+  }
+
+  /** Parameterized single-row query for migration/doctor helpers. */
+  execSqlFirst(sql: string, ...params: unknown[]): unknown {
+    const stmt = this.db.prepare(sql);
+    return stmt.get(...params);
+  }
+
+  /** Pragma access for migration helpers; returns libsql's pragma result. */
+  pragma(sql: string): unknown {
+    return this.db.pragma(sql);
+  }
+
+  private metaTableExists(): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+      )
+      .get();
+    return row !== undefined;
+  }
+
+  /** Value from the fork meta table, or undefined when absent. */
+  getMetaValue(key: string): string | undefined {
+    if (!this.metaTableExists()) return undefined;
+    const row = this.db
+      .prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value: string } | undefined;
+    return row?.value;
+  }
+
+  /** Upsert into the fork meta table (creates it when missing). */
+  setMetaValue(key: string, value: string): void {
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    );
+    this.db
+      .prepare(
+        "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(key, value);
+  }
+
   close(): void {
     this.db.close();
   }

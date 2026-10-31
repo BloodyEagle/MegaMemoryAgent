@@ -5,6 +5,7 @@ import { listConflicts, resolveConflict } from "../tools.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { closeAndCleanup } from "./helpers/cleanup.js";
 
 let tmpDir: string;
 
@@ -43,7 +44,7 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "megamemory-conflicts-test-"));
 });
 
-afterEach(() => {
+afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 

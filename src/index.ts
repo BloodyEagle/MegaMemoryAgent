@@ -28,6 +28,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("conflicts")}       List unresolved merge conflicts
   ${pc.cyan("resolve")}         Resolve a merge conflict
   ${pc.cyan("repair-ids")}      Fix legacy empty/trailing-slash node ids ${pc.dim("(default: dry-run)")}
+  ${pc.cyan("migrate")}         Upgrade an upstream v1.6.2 database to the fork schema ${pc.dim("(default: dry-run)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -52,7 +53,7 @@ ${pc.bold("Examples:")}
   ${pc.dim("$")} megamemory repair-ids --apply                        ${pc.dim("Rename broken ids after backup")}
 `.trim();
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string } {
   const portIdx = args.indexOf("--port");
@@ -121,6 +122,13 @@ switch (cmd) {
     break;
   }
 
+  case "migrate": {
+    const { runMigrate } = await import("./migrate-cli.js");
+    await runMigrate(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
   case "--help":
   case "-h":
     console.log(HELP);
@@ -175,6 +183,28 @@ async function startMcpServer() {
     path.join(process.cwd(), ".megamemory", "knowledge.db");
 
   const db = new KnowledgeDB(DB_PATH);
+
+  // Fork: additive-only schema migration on startup (meta, columns, FTS).
+  // Never destructive — data-changing id repair runs only via `migrate --apply`.
+  try {
+    const { ensureSchema, ensureEmbedMeta, emptyReport } = await import(
+      "./migrate-schema.js"
+    );
+    const report = ensureSchema(db, emptyReport());
+    ensureEmbedMeta(db, report);
+    if (report.applied.length > 0) {
+      console.error(
+        `megamemory: applied fork schema migration (${report.applied.join("; ")})`
+      );
+    }
+  } catch (err) {
+    console.error(
+      `MEGAMEMORY_ERROR: startup schema migration failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+
   const timeline = createTimelineLogger(db);
 
   let dbClosed = false;

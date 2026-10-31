@@ -3,13 +3,82 @@ import path from "node:path";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { planIdRepair, applyIdRepair, backupDb } from "./migrate.js";
-import { errorBold, success, info, heading, skip } from "./cli-utils.js";
+import { runMigration, emptyReport } from "./migrate-schema.js";
+import { errorBold, success, info, heading, skip, warn } from "./cli-utils.js";
 
 function dbPath(): string {
   return (
     process.env.MEGAMEMORY_DB_PATH ??
     path.join(process.cwd(), ".megamemory", "knowledge.db")
   );
+}
+
+function printReport(
+  report: ReturnType<typeof runMigration>,
+  dryRun: boolean
+): void {
+  heading(
+    `  Migration report: ${report.applied.length} step(s) applied, ` +
+      `${report.alreadyOk.length} already in place`
+  );
+  for (const step of report.applied) {
+    console.log(`  ${pc.green("+")} ${step}`);
+  }
+  if (report.alreadyOk.length > 0 && !dryRun) {
+    info("already in place: " + report.alreadyOk.join(", "));
+  }
+  if (report.repairedIds > 0) {
+    success(`repaired ${report.repairedIds} legacy id(s)`);
+  }
+  if (report.skippedIdConflicts > 0) {
+    skip(`${report.skippedIdConflicts} id repair conflict(s) skipped`);
+  }
+  for (const w of report.warnings) {
+    warn(w);
+  }
+  if (report.reembedNeeded) {
+    info(`reembed required: run ${pc.cyan("megamemory reembed")}`);
+  }
+  if (report.digestPending > 0) {
+    info(`digest pending for ${report.digestPending} module(s)`);
+  }
+}
+
+/**
+ * `megamemory migrate [--dry-run|--apply]`
+ *
+ * Upgrades an upstream v1.6.2 database to the fork schema: meta table, fork
+ * columns, FTS index, id repair. Dry-run is the default: nothing is written
+ * without --apply. Idempotent — safe to run repeatedly.
+ */
+export async function runMigrate(args: string[]): Promise<void> {
+  const apply = args.includes("--apply");
+  const dryRun = args.includes("--dry-run") || !apply;
+
+  const p = dbPath();
+  if (!fs.existsSync(p)) {
+    errorBold(
+      `No database at ${p}. Run inside a project with .megamemory/knowledge.db.`
+    );
+    process.exit(1);
+  }
+
+  const db = new KnowledgeDB(p);
+  try {
+    const report = runMigration(db, {
+      apply: !dryRun,
+      dbPath: p,
+      backup: backupDb,
+    });
+    printReport(report, dryRun);
+    if (dryRun) {
+      info("dry run: nothing written. Pass --apply to migrate.");
+    } else {
+      success("migration complete.");
+    }
+  } finally {
+    db.close();
+  }
 }
 
 /**

@@ -13,6 +13,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { NodeRow, EdgeRow } from "../types.js";
+import { closeAndCleanup } from "./helpers/cleanup.js";
 
 let tmpDir: string;
 
@@ -51,7 +52,7 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "megamemory-merge-test-"));
 });
 
-afterEach(() => {
+afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
