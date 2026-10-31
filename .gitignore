@@ -9,3 +9,7 @@ dist/
 .osgrep
 coverage/
 debug/
+vitest.log
+build.log
+npm-ci.log
+.idea/

@@ -41,7 +41,7 @@ const tmpDirs: string[] = [];
 
 afterEach(() => {
   for (const tmpDir of tmpDirs.splice(0)) {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
 

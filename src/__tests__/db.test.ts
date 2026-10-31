@@ -16,7 +16,7 @@ beforeEach(() => {
 
 afterEach(() => {
   db.close();
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
 describe("KnowledgeDB", () => {
