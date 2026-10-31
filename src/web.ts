@@ -535,15 +535,23 @@ export async function runServe(port: number): Promise<void> {
   let embeddingsReady = false;
   let embeddingInitError: string | null = null;
 
-  console.log(pc.dim("  Loading embedding model..."));
-  try {
-    await initializeEmbeddings();
-    embeddingsReady = true;
-    console.log(pc.dim("  Embedding model ready."));
-  } catch (err) {
-    embeddingInitError = err instanceof Error ? err.message : String(err);
-    console.log(pc.yellow("  Warning: Embedding model failed to preload."));
-    console.log(pc.dim("  Semantic search will retry on demand."));
+  // Warm the model in the background: serve must not block on a ~120 MB
+  // first-run download, and there is nothing to preload at all when the
+  // vector channel is disabled (model mismatch pending reembed).
+  if (vectorSearchEnabled(db)) {
+    console.log(pc.dim("  Loading embedding model in background..."));
+    void initializeEmbeddings()
+      .then(() => {
+        embeddingsReady = true;
+        console.log(pc.dim("  Embedding model ready."));
+      })
+      .catch((err: unknown) => {
+        embeddingInitError = err instanceof Error ? err.message : String(err);
+        console.log(pc.yellow("  Warning: Embedding model failed to preload."));
+        console.log(pc.dim("  Semantic search will retry on demand."));
+      });
+  } else {
+    console.log(pc.dim("  Vector search disabled — text search only (run megamemory reembed)."));
   }
 
   const server = http.createServer((req, res) => {
