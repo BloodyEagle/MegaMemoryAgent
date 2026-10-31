@@ -477,6 +477,76 @@ export class KnowledgeDB {
     return counts;
   }
 
+  // ---- Token usage accounting (fork T8) ----
+
+  insertUsage(entry: {
+    tool: string;
+    query?: string | null;
+    nodes: number;
+    returnedChars: number;
+    returnedTokens: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO usage (tool, query, nodes, returned_chars, returned_tokens)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(
+        entry.tool,
+        entry.query ?? null,
+        entry.nodes,
+        entry.returnedChars,
+        entry.returnedTokens
+      );
+  }
+
+  /**
+   * Usage aggregates for the last `days` days: totals, average tokens per
+   * answer, top-5 queries and a per-day series for the explorer chart.
+   */
+  getUsageStats(
+    days = 7
+  ): {
+    total_queries: number;
+    total_tokens: number;
+    avg_tokens: number;
+    top_queries: Array<{ query: string; n: number }>;
+    daily: Array<{ day: string; queries: number; tokens: number }>;
+  } {
+    const since = `datetime('now', '-${Number(days)} days')`;
+
+    const totals = this.db
+      .prepare(
+        `SELECT count(*) AS q, COALESCE(sum(returned_tokens), 0) AS t
+         FROM usage WHERE at >= ${since}`
+      )
+      .get() as { q: number; t: number };
+
+    const top = this.db
+      .prepare(
+        `SELECT query, count(*) AS n FROM usage
+         WHERE query IS NOT NULL AND at >= ${since}
+         GROUP BY query ORDER BY n DESC LIMIT 5`
+      )
+      .all() as Array<{ query: string; n: number }>;
+
+    const daily = this.db
+      .prepare(
+        `SELECT date(at) AS day, count(*) AS queries, COALESCE(sum(returned_tokens), 0) AS tokens
+         FROM usage WHERE at >= ${since}
+         GROUP BY date(at) ORDER BY day`
+      )
+      .all() as Array<{ day: string; queries: number; tokens: number }>;
+
+    return {
+      total_queries: totals.q,
+      total_tokens: totals.t,
+      avg_tokens: totals.q > 0 ? Math.round(totals.t / totals.q) : 0,
+      top_queries: top,
+      daily,
+    };
+  }
+
   // ---- Query methods ----
 
   getChildren(parentId: string): NodeRow[] {

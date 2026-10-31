@@ -698,7 +698,7 @@ export async function runServe(port: number): Promise<void> {
         last_reembed: db.getMetaValue("last_reembed") ?? null,
         vector_search: vectorSearchEnabled(db),
       };
-      json(res, { ...stats, kinds, embeddings });
+      json(res, { ...stats, kinds, embeddings, usage: db.getUsageStats(7) });
       return;
     }
 

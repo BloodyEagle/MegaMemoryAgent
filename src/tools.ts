@@ -267,13 +267,21 @@ export async function understand(
       if (via) ctx.via = via;
       matches.push(ctx);
     }
+    const payload = JSON.stringify(matches);
+    db.insertUsage({
+      tool: "understand",
+      query: input.query,
+      nodes: matches.length,
+      returnedChars: payload.length,
+      returnedTokens: estimateTokens(payload),
+    });
     return {
       matches,
       compact: undefined,
       meta: {
         returned: matches.length,
         dropped: 0,
-        tokens_estimated: estimateTokens(JSON.stringify(matches)),
+        tokens_estimated: estimateTokens(payload),
       },
     };
   }
@@ -311,6 +319,15 @@ export async function understand(
     tokensEstimated = projected;
   }
 
+  const payload = JSON.stringify({ compact, meta: { returned: compact.length, dropped: 0, tokens_estimated: tokensEstimated } });
+  db.insertUsage({
+    tool: "understand",
+    query: input.query,
+    nodes: compact.length,
+    returnedChars: payload.length,
+    returnedTokens: tokensEstimated,
+  });
+
   return {
     matches: [],
     compact,
@@ -330,7 +347,16 @@ export function getConcept(
   if (!node) {
     throw new Error(`Concept "${input.id}" not found.`);
   }
-  return buildNodeWithContext(db, node);
+  const ctx = buildNodeWithContext(db, node);
+  const payload = JSON.stringify(ctx);
+  db.insertUsage({
+    tool: "get_concept",
+    query: input.id,
+    nodes: 1,
+    returnedChars: payload.length,
+    returnedTokens: estimateTokens(payload),
+  });
+  return ctx;
 }
 
 export async function createConcept(
@@ -510,6 +536,13 @@ export function listRoots(
     ...(hint ? { hint } : {}),
   });
   if (estimateTokens(compactProjection) <= maxTokens) {
+    db.insertUsage({
+      tool: "list_roots",
+      query: null,
+      nodes: rootsCompact.length,
+      returnedChars: compactProjection.length,
+      returnedTokens: estimateTokens(compactProjection),
+    });
     return {
       roots: [],
       compact: true,

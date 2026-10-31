@@ -869,6 +869,30 @@ function renderStats(stats) {
   // T5: consolidation tab.
   parts.push(`<button class="stat" id="consolidate-btn" onclick="openConsolidate()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">consolidate…</button>`);
   el.innerHTML = parts.join('');
+  renderTokensPanel(stats.usage);
+}
+
+// T8: Tokens panel — daily bars + averages, economy visible at a glance.
+function renderTokensPanel(usage) {
+  const el = document.getElementById('stats');
+  if (!el || !usage) return;
+  let panel = document.getElementById('tokens-panel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'tokens-panel';
+    panel.style.cssText = 'position:fixed;right:12px;bottom:52px;background:#161a26ee;border:1px solid #64748b44;border-radius:12px;padding:10px 14px;font-size:10px;color:#94a3b8;max-width:340px;z-index:50;font-family:inherit';
+    document.body.appendChild(panel);
+  }
+  const maxTokens = Math.max(1, ...usage.daily.map(d => d.tokens));
+  const bars = usage.daily.map(d => {
+    const h = Math.max(2, Math.round((d.tokens / maxTokens) * 36));
+    return `<div style="display:flex;flex-direction:column;align-items:center;gap:2px">` +
+      `<div style="width:14px;height:${h}px;background:#4ade8088;border:1px solid #4ade80;border-radius:2px" title="${esc(d.day)}: ${d.queries} queries, ${d.tokens} tokens"></div>` +
+      `<span style="font-size:8px;color:#64748b">${esc(d.day.slice(5))}</span></div>`;
+  }).join('');
+  panel.innerHTML = `<div style="color:#4ade80;margin-bottom:4px">Tokens (7d)</div>` +
+    `<div style="display:flex;gap:6px;align-items:flex-end;margin-bottom:4px">${bars || '<span style="color:#64748b">no queries yet</span>'}</div>` +
+    `<div>${usage.total_queries} queries · avg ~${usage.avg_tokens} tokens · total ~${usage.total_tokens}</div>`;
 }
 
 async function openConsolidate() {

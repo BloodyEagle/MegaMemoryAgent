@@ -164,6 +164,19 @@ export async function runStats(args: string[]): Promise<void> {
     } else {
       printRow("Smallest", "N/A");
     }
+
+    // T8: token usage accounting.
+    const usage = db.getUsageStats(7);
+    if (usage.total_queries > 0) {
+      console.log();
+      console.log(`  ${pc.bold("Usage (7 days)")}`);
+      printRow("Queries", formatNumber(usage.total_queries));
+      printRow("Tokens returned", `~${formatNumber(usage.total_tokens)}`);
+      printRow("Avg per answer", `~${formatNumber(usage.avg_tokens)} tokens`);
+      for (const tq of usage.top_queries) {
+        printRow("Top query", `"${tq.query.slice(0, 40)}"`, `${formatNumber(tq.n)}x`);
+      }
+    }
   } finally {
     db.close();
   }
