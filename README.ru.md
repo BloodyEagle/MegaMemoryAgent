@@ -60,7 +60,13 @@
 Нужен Node.js >= 18. Для чисто русских проектов подойдёт значительно меньшая модель (`cointegrated/rubert-tiny2`, 312-мерная) после конвертации в ONNX; модель выгружается после 5 минут простоя (`MEGAMEMORY_EMBED_IDLE_MS=0` отключает выгрузку), а `MEGAMEMORY_SEARCH=fts` не загружает её вовсе. Модель эмбеддингов (~120 МБ, мультиязычная) скачивается при первом
 запуске и кешируется в `~/.cache/huggingface`.
 
-Форк не публикуется в npm — ставится из tarball или из чекаута:
+Установка глобально из npm:
+
+```bash
+npm install -g @bloodyeagle/megamemory
+```
+
+Или сборка из чекаута (для разработки):
 
 ```bash
 git clone https://github.com/BloodyEagle/MegaMemoryAgent.git
