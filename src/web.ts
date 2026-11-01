@@ -647,6 +647,18 @@ export async function runServe(port: number): Promise<void> {
       return;
     }
 
+    // U5: status transitions of one node.
+    if (pathname.startsWith("/api/node/") && pathname.endsWith("/history") && req.method === "GET") {
+      const raw = decodeURIComponent(pathname.slice("/api/node/".length, -"/history".length));
+      const id = db.getAliasTarget(raw) ?? raw;
+      if (!db.getNode(id)) {
+        json(res, { error: `Concept "${raw}" not found` }, 404);
+        return;
+      }
+      json(res, { id, history: db.getStatusHistory(id, 20) });
+      return;
+    }
+
     // U2: single-node markdown download (no file writes — browser gets it).
     if (pathname.startsWith("/api/node/") && pathname.endsWith(".md") && req.method === "GET") {
       const id = decodeURIComponent(pathname.slice("/api/node/".length, -".md".length));
@@ -844,6 +856,28 @@ export async function runServe(port: number): Promise<void> {
       }));
       json(res, { ticks, source: merged.source });
       return;
+    }
+
+    // U5: status lifecycle history — kind=status, tools, or all (default).
+    if (pathname === "/api/timeline" && req.method === "GET") {
+      const kind = (url.searchParams.get("kind") ?? "all").trim();
+      if (kind === "status") {
+        const limit = clampInt(url.searchParams.get("limit"), 200, 1, 50000);
+        json(res, { kind: "status", entries: db.getAllStatusHistory(limit) });
+        return;
+      }
+      if (kind === "all") {
+        const limit = clampInt(url.searchParams.get("limit"), 200, 1, 50000);
+        const merged = buildMergedTimelineEntries({ limit });
+        json(res, {
+          kind: "all",
+          entries: merged.entries,
+          status_changes: db.getAllStatusHistory(limit),
+          source: merged.source,
+        });
+        return;
+      }
+      // kind === "tools" falls through to the legacy handler below.
     }
 
     if (pathname === "/api/timeline" && req.method === "GET") {

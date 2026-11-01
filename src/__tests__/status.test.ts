@@ -109,3 +109,51 @@ describe("status counts", () => {
     expect(counts["superseded"]).toBe(1);
   });
 });
+
+describe("status history (U5)", () => {
+  it("supersedes writes active -> superseded with a reason", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "Old Auth", kind: "decision", summary: "cookies" });
+    await createConcept(db, {
+      name: "New Auth",
+      kind: "decision",
+      summary: "jwt",
+      supersedes: ["old-auth"],
+    });
+
+    const hist = db.getStatusHistory("old-auth");
+    expect(hist).toHaveLength(1);
+    expect(hist[0].from_status).toBe("active");
+    expect(hist[0].to_status).toBe("superseded");
+    expect(hist[0].reason).toContain("new-auth");
+  });
+
+  it("removeConcept writes active -> deprecated with the given reason", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "Temp", kind: "feature", summary: "t" });
+    removeConcept(db, { id: "temp", reason: "gone from code" });
+
+    const hist = db.getStatusHistory("temp");
+    expect(hist).toHaveLength(1);
+    expect(hist[0].from_status).toBe("active");
+    expect(hist[0].to_status).toBe("deprecated");
+    expect(hist[0].reason).toBe("gone from code");
+  });
+
+  it("no row when the status does not change", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "Same", kind: "feature", summary: "s" });
+    db.setNodeStatus("same", "active");
+    expect(db.getStatusHistory("same")).toHaveLength(0);
+  });
+
+  it("getAllStatusHistory feeds the timeline (newest first)", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "A", kind: "feature", summary: "a" });
+    await createConcept(db, { name: "B", kind: "feature", summary: "b", supersedes: ["a"] });
+    removeConcept(db, { id: "b", reason: "cleanup" });
+    const all = db.getAllStatusHistory(10);
+    expect(all.length).toBeGreaterThanOrEqual(2);
+    expect(all[0].node_id).toBe("b"); // newest first
+  });
+});

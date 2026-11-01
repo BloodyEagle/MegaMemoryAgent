@@ -520,6 +520,11 @@
   <input id="timeline-slider" type="range" min="0" max="1" value="1" step="1" style="display:none" />
   <span id="timeline-display"></span>
   <span id="timeline-summary"></span>
+  <select id="timeline-kind" title="What to show on the timeline" style="display:none;margin-left:8px;background:#1e2333;color:#94a3b8;border:1px solid #64748b55;border-radius:8px;font-size:11px;padding:2px 6px">
+    <option value="tools">tool calls</option>
+    <option value="status">status changes</option>
+    <option value="all" selected>all</option>
+  </select>
 </div>
 
 <footer id="stats"></footer>
@@ -1659,6 +1664,27 @@ function showPanel(d) {
     }
   }
 
+  // U5: status history (last 5 transitions), fetched lazily.
+  if (d.id) {
+    fetch('/api/node/' + encodeURIComponent(d.id) + '/history')
+      .then((r) => r.json())
+      .then((payload) => {
+        const hist = Array.isArray(payload.history) ? payload.history : [];
+        if (!hist.length) return;
+        const el = document.getElementById('panel-content');
+        if (!el) return;
+        let block = '<div class="panel-section"><div class="panel-label">Status history</div><div class="panel-body">';
+        for (const h of hist) {
+          block += '<div>' + (h.from_status || '∅') + ' → <b>' + h.to_status + '</b>' +
+            (h.reason ? ' — ' + esc(String(h.reason)) : '') +
+            ' <span style="color:#64748b">' + esc(String(h.at)) + '</span></div>';
+        }
+        block += '</div></div>';
+        el.innerHTML += block;
+      })
+      .catch(() => undefined);
+  }
+
   // U2: single-node markdown download.
   h += `<a class="stat" href="/api/node/${encodeURIComponent(d.id)}.md" style="font-size:10px;color:#38bdf8;margin-left:8px">download .md</a>`;
 
@@ -2196,8 +2222,19 @@ async function enterTimelineMode() {
     return;
   }
 
-  const payload = await fetchTimelineSteps();
-  const steps = Array.isArray(payload.entries) ? payload.entries : [];
+  // U5: the kind selector switches the timeline data source.
+  const kind = document.getElementById('timeline-kind')?.value || 'all';
+  let steps = [];
+  let source = 'none';
+  if (kind === 'status') {
+    const sj = await (await fetch('/api/timeline?kind=status&limit=50000')).json();
+    steps = Array.isArray(sj.entries) ? sj.entries : [];
+    source = 'status_history';
+  } else {
+    const payload = await fetchTimelineSteps();
+    steps = Array.isArray(payload.entries) ? payload.entries : [];
+    source = payload.source || 'none';
+  }
   if (steps.length === 0) {
     timelineMode = false;
     alert('No timeline entries available yet.');
@@ -2205,16 +2242,18 @@ async function enterTimelineMode() {
   }
 
   timelineSteps = steps;
-  timelineSource = payload.source || 'none';
+  timelineSource = source;
 
   slider.min = '0';
   slider.max = String(steps.length);
   slider.value = String(steps.length);
   slider.style.display = '';
   controls.style.display = 'flex';
+  const kindSelect = document.getElementById('timeline-kind');
+  if (kindSelect) kindSelect.style.display = '';
 
   toggle.classList.remove('live');
-  toggle.textContent = '◷ Timeline';
+  toggle.textContent = kind === 'status' ? '◷ Status' : '◷ Timeline';
   toggle.title = `Timeline source: ${timelineSource}`;
 
   if (evtSource) {
@@ -2324,6 +2363,10 @@ function setupTimeline() {
       return;
     }
     void enterTimelineMode();
+  });
+
+  document.getElementById('timeline-kind')?.addEventListener('change', () => {
+    if (timelineMode) { void exitTimelineMode(); void enterTimelineMode(); }
   });
 
   slider.addEventListener('input', () => {

@@ -589,8 +589,8 @@ export function removeConcept(
     throw new Error(`Failed to remove concept "${input.id}".`);
   }
 
-  // T4: soft-delete also deprecates the lifecycle status.
-  db.setNodeStatus(input.id, "deprecated");
+  // T4: soft-delete also deprecates the lifecycle status (U5: with reason).
+  db.setNodeStatus(input.id, "deprecated", undefined, input.reason);
 
   return {
     message: `Removed concept "${input.id}". Reason: ${input.reason}`,

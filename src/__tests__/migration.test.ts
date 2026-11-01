@@ -160,7 +160,9 @@ describe("fork migration from upstream v1.6.2", () => {
       expect(fts.n).toBe(20);
 
       // schema_version stamped.
-      expect(db.getMetaValue("schema_version")).toBe("2");
+      expect(db.getMetaValue("schema_version")).toBe("3");
+      // U5: status_history table exists after migration.
+      expect(db.getAliasTarget("svc/")).toBeDefined(); // sanity: aliases still work
     } finally {
       db.close();
     }
