@@ -9,6 +9,10 @@
   <img alt="version" src="https://img.shields.io/badge/version-1.6.3--fork.1-orange?style=flat-square" />
 </p>
 
+<p align="center">
+  <img src="./assets/preview.png" alt="Веб-обозреватель MegaMemory" width="800" />
+</p>
+
 > **Форк [0xK3vin/MegaMemory](https://github.com/0xK3vin/MegaMemory) v1.6.2 (MIT).**
 > Идея и база — upstream. В форке: исправлены идентификаторы для любых языков, добавлены
 > гибридный поиск, бюджет контекста, актуальность фактов, digest-узлы, экспорт и учёт токенов.

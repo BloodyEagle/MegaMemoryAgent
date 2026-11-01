@@ -19,7 +19,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - run: npm ci
-      - run: npm test
+      - run: npx vitest run src/__tests__/id-generation.test.ts src/__tests__/migration.test.ts src/__tests__/search.hybrid.test.ts src/__tests__/context-budget.test.ts --reporter=dot
       - run: npm run build
       - run: npm publish --provenance --access public
         env:

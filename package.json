@@ -1,5 +1,5 @@
 {
-  "name": "megamemory",
+  "name": "@bloodyeagle/megamemory",
   "version": "1.6.3-fork.1",
   "description": "MCP server that gives coding agents persistent project understanding via a knowledge graph",
   "type": "module",
@@ -11,7 +11,13 @@
     "dist/",
     "plugin/",
     "commands/",
-    "web/"
+    "web/",
+    "docs/",
+    "fixtures/eval.jsonl",
+    "fixtures/demo.db",
+    "README.md",
+    "README.ru.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",

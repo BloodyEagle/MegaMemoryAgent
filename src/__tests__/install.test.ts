@@ -217,4 +217,48 @@ describe("runInstall", () => {
     expect(firstBootstrap).toBe(fs.readFileSync(BOOTSTRAP_SOURCE_PATH, "utf-8"));
     expect(firstSave).toBe(fs.readFileSync(SAVE_SOURCE_PATH, "utf-8"));
   });
+
+  it("writes a v2-marked block with supersedes rules into a fresh AGENTS.md", async () => {
+    const sandbox = makeSandbox();
+    const { runInstall } = await loadInstallModule(sandbox);
+    await runInstall(["--target", "opencode"]);
+
+    const agents = fs.readFileSync(path.join(sandbox.opencodeDir, "AGENTS.md"), "utf-8");
+    expect(agents).toContain("megamemory-snippet:v2");
+    expect(agents).toContain("/megamemory-snippet");
+    expect(agents).toContain("supersedes");
+    expect(agents).toContain("max_tokens");
+    expect(agents).toContain("reembed");
+  });
+
+  it("replaces a legacy unmarked block instead of skipping or duplicating", async () => {
+    const sandbox = makeSandbox();
+    const agentsPath = path.join(sandbox.opencodeDir, "AGENTS.md");
+    fs.mkdirSync(sandbox.opencodeDir, { recursive: true });
+    fs.writeFileSync(
+      agentsPath,
+      "# My agents file\n\n## Project Knowledge Graph\n\nOLD TEXT without any version markers.\n\n## Something Else\n\nKeep me.\n"
+    );
+
+    const { runInstall } = await loadInstallModule(sandbox);
+    await runInstall(["--target", "opencode"]);
+
+    const agents = fs.readFileSync(agentsPath, "utf-8");
+    expect(agents).not.toContain("OLD TEXT");
+    expect(agents).toContain("megamemory-snippet:v2");
+    expect(agents).toContain("## Something Else"); // untouched sibling section
+    expect(agents).toContain("Keep me.");
+    expect(agents.match(/## Project Knowledge Graph/g)).toHaveLength(1);
+  });
+
+  it("repeated install refreshes the block byte-for-byte idempotently", async () => {
+    const sandbox = makeSandbox();
+    const { runInstall } = await loadInstallModule(sandbox);
+    await runInstall(["--target", "opencode"]);
+    const first = fs.readFileSync(path.join(sandbox.opencodeDir, "AGENTS.md"), "utf-8");
+    await runInstall(["--target", "opencode"]);
+    const second = fs.readFileSync(path.join(sandbox.opencodeDir, "AGENTS.md"), "utf-8");
+    expect(second).toBe(first);
+    expect(second.match(/megamemory-snippet:v2/g)).toHaveLength(1);
+  });
 });

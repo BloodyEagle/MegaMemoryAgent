@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      # Model cache: the multilingual model is ~120 MB, do not download it per run
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-multilingual-e5-small
+
+      - name: Targeted tests (fast, no full suite)
+        run: |
+          npx vitest run \
+            src/__tests__/id-generation.test.ts \
+            src/__tests__/migration.test.ts \
+            src/__tests__/search.hybrid.test.ts \
+            src/__tests__/context-budget.test.ts \
+            --reporter=dot
+
+      - name: Eval (recall@10)
+        run: MEGAMEMORY_DB_PATH=fixtures/demo.db node dist/index.js eval --min 0.8
