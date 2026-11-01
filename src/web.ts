@@ -13,6 +13,7 @@ import {
   isTextOnlySearchMode,
   vectorSearchEnabled,
 } from "./embeddings.js";
+import { healthReport } from "./doctor.js";
 import type { NodeRow } from "./types.js";
 
 const VERSION = JSON.parse(
@@ -661,6 +662,12 @@ export async function runServe(port: number): Promise<void> {
         created_by_task: node.created_by_task,
       };
       json(res, result);
+      return;
+    }
+
+    if (pathname === "/api/health" && req.method === "GET") {
+      // U3: same metrics the CLI doctor prints, for the explorer header chip.
+      json(res, healthReport(db));
       return;
     }
 

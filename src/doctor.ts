@@ -14,6 +14,95 @@ export interface DoctorCheck {
  * consistency, FTS presence, legacy ids, pending reembed, digest sync,
  * orphan edges. Problems set exitCode 1 in the CLI (CI-friendly).
  */
+
+// ---- U3: machine-readable health metrics (shared by doctor and web) ----
+
+export interface HealthReport {
+  schema_version: string;
+  embed_model: string;
+  embed_dim: number;
+  nodes: number;
+  vectors: { have: number; total: number };
+  fts: { rows: number; nodes: number; in_sync: boolean };
+  digests: { count: number; stale: number };
+  empty_ids: number;
+  orphan_edges: number;
+  model_loaded: boolean;
+  rss_mb: number;
+}
+
+/** Collect all metrics in one pass — read-only, safe on any db state. */
+export function healthReport(db: KnowledgeDB): HealthReport {
+  const nodesCount = (
+    db.execSqlFirst(
+      "SELECT count(*) AS n FROM nodes WHERE removed_at IS NULL"
+    ) as { n: number }
+  ).n;
+
+  const vectorsHave = (
+    db.execSqlFirst(
+      "SELECT count(*) AS n FROM nodes WHERE embedding IS NOT NULL AND removed_at IS NULL"
+    ) as { n: number }
+  ).n;
+
+  const ftsExists =
+    db.execSqlFirst(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+    ) !== undefined;
+  const ftsRows = ftsExists
+    ? (db.execSqlFirst("SELECT count(*) AS n FROM nodes_fts") as { n: number }).n
+    : 0;
+
+  const digestCount = (
+    db.execSqlFirst(
+      "SELECT count(*) AS n FROM nodes WHERE kind = 'digest' AND removed_at IS NULL"
+    ) as { n: number }
+  ).n;
+  // Stale digest: some child was updated after the digest itself.
+  const digestStale = (
+    db.execSqlFirst(`
+      SELECT count(*) AS n FROM nodes d
+      WHERE d.kind = 'digest' AND d.removed_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM nodes c
+          WHERE c.parent_id = d.parent_id AND c.id != d.id
+            AND c.removed_at IS NULL AND c.kind != 'digest'
+            AND c.updated_at > d.updated_at
+        )
+    `) as { n: number }
+  ).n;
+
+  const emptyIds = (
+    db.execSqlFirst(
+      "SELECT count(*) AS n FROM nodes WHERE removed_at IS NULL AND (id = '' OR id LIKE '%/')"
+    ) as { n: number }
+  ).n;
+
+  const orphanEdges = (
+    db.execSqlFirst(
+      `SELECT count(*) AS n FROM edges
+       WHERE from_id NOT IN (SELECT id FROM nodes)
+          OR to_id NOT IN (SELECT id FROM nodes)`
+    ) as { n: number }
+  ).n;
+
+  const mem = process.memoryUsage();
+
+  return {
+    schema_version: db.getMetaValue("schema_version") ?? "",
+    embed_model: db.getMetaValue("embed_model") ?? "",
+    embed_dim: Number(db.getMetaValue("embed_dim") ?? 0),
+    nodes: nodesCount,
+    vectors: { have: vectorsHave, total: nodesCount },
+    fts: { rows: ftsRows, nodes: nodesCount, in_sync: ftsRows === nodesCount },
+    digests: { count: digestCount, stale: digestStale },
+    empty_ids: emptyIds,
+    orphan_edges: orphanEdges,
+    model_loaded: isModelLoaded(),
+    rss_mb: Math.round(mem.rss / (1024 * 1024)),
+  };
+}
+
 export function runDoctor(db: KnowledgeDB): {
   checks: DoctorCheck[];
   problems: number;
