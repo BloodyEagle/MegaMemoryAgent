@@ -9,6 +9,10 @@
   <img alt="version" src="https://img.shields.io/badge/version-1.6.3--fork.1-orange?style=flat-square" />
 </p>
 
+<p align="center">
+  <img src="./assets/preview.png" alt="MegaMemory web explorer" width="800" />
+</p>
+
 > **Fork of [0xK3vin/MegaMemory](https://github.com/0xK3vin/MegaMemory) v1.6.2 (MIT).**
 > Upstream keeps the concept, this fork fixes multilingual IDs, adds hybrid search,
 > a context budget, fact freshness, digests, export and token accounting.
@@ -66,8 +70,6 @@ npm run build
 npm pack                      # megamemory-1.6.3-fork.1.tgz
 npm install -g ./megamemory-1.6.3-fork.1.tgz
 ```
-
-(once the package is published: `npm install -g @bloodyeagle/megamemory`)
 
 Then either run the installer or register the MCP server by hand:
 
