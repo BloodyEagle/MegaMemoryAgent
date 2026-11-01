@@ -860,7 +860,23 @@ function toggleKind(kind, on) {
   localStorage.setItem('mm.hiddenKinds', JSON.stringify([...hiddenKinds]));
 }
 
+// U4: temporary focus — show only the digest and its source concepts.
+let focusSet = null;
+let focusCenterId = null;
+
+function toggleFocus(centerId, childIds) {
+  if (focusCenterId === centerId) {
+    focusSet = null;
+    focusCenterId = null;
+  } else {
+    focusSet = new Set([centerId, ...childIds]);
+    focusCenterId = centerId;
+  }
+  updateVisibleCounter();
+}
+
 function nodeVisible(node) {
+  if (focusSet && !focusSet.has(node.id)) return false;
   if (hideOutdated && node.status && node.status !== 'active') return false;
   if (hiddenKinds.has(node.kind)) return false;
   return true;
@@ -1663,6 +1679,22 @@ function showPanel(d) {
   if (d.file_refs && d.file_refs.length) {
     h += `<div class="panel-section"><div class="panel-label">Files</div><div class="panel-body">`;
     h += d.file_refs.map(f => `<span class="file-ref">${esc(f)}</span>`).join('');
+    h += `</div></div>`;
+  }
+
+  // U4: digest card — source concepts, stale badge, focus toggle.
+  if (d.kind === 'digest' && d.digest_children) {
+    const childIds = d.digest_children.map(c => c.id);
+    const focused = focusCenterId === d.id;
+    if (d.stale) {
+      const sc = '#f59e0b';
+      h += ` <span class="kind-badge" style="background:${sc}22;color:${sc};border:1px solid ${sc}44">stale</span>`;
+    }
+    h += `<button class="stat" onclick='toggleFocus("${esc(d.id)}", ${JSON.stringify(childIds).replace(/"/g, "&quot;")})' style="cursor:pointer;background:#eab30822;border:1px solid #eab30855;color:#eab308;border-radius:10px;padding:2px 10px;margin-left:8px">${focused ? 'unfocus' : 'focus'}</button>`;
+    h += `<div class="panel-section"><div class="panel-label">Source concepts (${d.digest_children.length})${d.stale ? ' — <span style="color:#f59e0b">a source is newer than the digest</span>' : ''}</div><div class="panel-body">`;
+    h += d.digest_children.map(c =>
+      `<span class="child-link" onclick="navigateTo('${esc(c.id)}')">${esc(c.name)}</span>`
+    ).join('');
     h += `</div></div>`;
   }
 

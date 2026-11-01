@@ -3,7 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
-import { buildDigest, planDigests, maybeAutoDigest, DIGEST_MIN_CHILDREN } from "../digest.js";
+import {
+  buildDigest,
+  planDigests,
+  maybeAutoDigest,
+  digestSourceChildren,
+  DIGEST_MIN_CHILDREN,
+} from "../digest.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { hybridSearch } from "../search.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
@@ -155,5 +161,33 @@ describe("digest in search", () => {
     if (childIndex !== -1) {
       expect(digestIndex).toBeGreaterThan(childIndex);
     }
+  });
+});
+
+describe("digestSourceChildren (U4)", () => {
+  it("returns sibling source concepts, never the digest itself; stale on newer child", async () => {
+    const db = freshDb();
+    makeModuleWithChildren(db, 5);
+    const built = await buildDigest(db, "mod", { embed: false });
+    const digestId = built.digestId;
+
+    let info = digestSourceChildren(db, digestId);
+    expect(info.children).toHaveLength(5);
+    expect(info.children.some((c) => c.id === "mod/digest")).toBe(false);
+    expect(info.children.every((c) => c.kind !== "digest")).toBe(true);
+    expect(info.stale).toBe(false);
+
+    // A sibling updated after the digest -> stale.
+    db.execSqlRun(
+      "UPDATE nodes SET updated_at = datetime('now', '+1 hour') WHERE id = 'mod/child-1'"
+    );
+    info = digestSourceChildren(db, digestId);
+    expect(info.stale).toBe(true);
+  });
+
+  it("throws for a non-digest node", () => {
+    const db = freshDb();
+    db.insertNode({ id: "plain", name: "Plain", kind: "feature", summary: "x" });
+    expect(() => digestSourceChildren(db, "plain")).toThrow(/not a digest/);
   });
 });

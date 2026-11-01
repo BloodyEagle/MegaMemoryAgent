@@ -6,6 +6,7 @@ import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { buildNodeWithContext, understand } from "./tools.js";
 import { findDuplicates, mergeNodes } from "./consolidate.js";
+import { digestSourceChildren } from "./digest.js";
 import { errorBold, askPort } from "./cli-utils.js";
 import {
   initializeEmbeddings,
@@ -654,6 +655,12 @@ export async function runServe(port: number): Promise<void> {
         return;
       }
       const ctx = buildNodeWithContext(db, node);
+      // U4: digests expose their source concepts and staleness.
+      if (node.kind === "digest") {
+        const info = digestSourceChildren(db, node.id);
+        (ctx as unknown as Record<string, unknown>).digest_children = info.children;
+        (ctx as unknown as Record<string, unknown>).stale = info.stale;
+      }
       // Add timestamps
       const result = {
         ...ctx,
