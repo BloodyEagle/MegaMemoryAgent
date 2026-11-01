@@ -131,6 +131,20 @@ export async function runServe(port: number): Promise<void> {
   }
 
   const db = new KnowledgeDB(dbPath);
+
+  // F14: convert a legacy database on first open (same as the MCP path).
+  try {
+    const { autoMigrateIfNeeded, describeAutoMigration } = await import(
+      "./auto-migrate.js"
+    );
+    const result = await autoMigrateIfNeeded(db, dbPath);
+    const line = describeAutoMigration(result);
+    if (line) console.log(pc.dim(`  ${line}`));
+    for (const w of result.warnings) console.log(pc.yellow(`  ${w}`));
+  } catch (err) {
+    errorBold(`Auto-migration failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
   let sseClients: http.ServerResponse[] = [];
   let lastKnownNodeIds = new Set<string>();
   let lastKnownNodeUpdates = new Map<string, string>(); // id → updated_at

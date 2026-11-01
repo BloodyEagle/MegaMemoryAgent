@@ -3,6 +3,21 @@ import { MODEL_NAME, isModelLoaded, vectorSearchEnabled } from "./embeddings.js"
 import { MIGRATION_TARGET_SCHEMA_VERSION } from "./migrate-schema.js";
 import { isBrokenId } from "./migrate.js";
 
+/**
+ * F13 helper: turn probe counts into a drift message. Exported for tests —
+ * libsql auto-syncs external-content FTS on writes, so real drift is hard
+ * to reproduce in a fixture.
+ */
+export function summarizeFtsProbe(
+  probes: number,
+  misses: number
+): string | null {
+  if (probes === 0 || misses === 0) return null;
+  return misses === probes
+    ? `all ${probes} sampled node(s) missing from the index`
+    : `${misses}/${probes} sampled node(s) missing from the index`;
+}
+
 export interface DoctorCheck {
   name: string;
   ok: boolean;
@@ -135,14 +150,19 @@ export function runDoctor(db: KnowledgeDB): {
   const model = db.getMetaValue("embed_model");
   const dim = db.getMetaValue("embed_dim");
   const vectorOk = vectorSearchEnabled(db);
+  // F10: unknown-model vectors are a problem, not a note — exit 1 makes CI
+  // and the acceptance flow catch a mixed vector space before it is served.
+  const vectors = healthReport(db).vectors;
   add(
     "embedding model",
     model === MODEL_NAME,
-    model
-      ? model === MODEL_NAME
-        ? `${model} (dim=${dim ?? "?"}, vector search on)`
-        : `${model} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`
-      : "not recorded — run 'megamemory migrate --apply'"
+    model === "unknown"
+      ? `model unknown · vectors ${vectors.have}/${vectors.total} · run 'megamemory reembed'`
+      : model
+        ? model === MODEL_NAME
+          ? `${model} (dim=${dim ?? "?"}, vector search on)`
+          : `${model} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`
+        : "not recorded — run 'megamemory migrate --apply'"
   );
 
   // FTS index
@@ -157,10 +177,45 @@ export function runDoctor(db: KnowledgeDB): {
       "SELECT count(*) AS n FROM nodes WHERE removed_at IS NULL"
     ) as { n: number }).n;
   }
+  // F13: count equality is not enough after a VACUUM (rowids can shift).
+  // FTS5 ships a built-in verification command that compares the index
+  // with the content table and throws on any mismatch (stale rowids too).
+  let ftsDrift: string | null = null;
+  if (fts) {
+    // Sample nodes: a MATCH on the name's first token must surface the
+    // node's own rowid. After a VACUUM the index keeps stale rowids,
+    // so the probe misses the moved node.
+    const sample = db.execSqlAll(
+      "SELECT rowid, name FROM nodes WHERE removed_at IS NULL ORDER BY rowid DESC LIMIT 20"
+    ) as Array<{ rowid: number; name: string }>;
+    let probes = 0;
+    let misses = 0;
+    for (const node of sample) {
+      const token = node.name.trim().split(/\s+/)[0];
+      if (!token) continue;
+      try {
+        const phrase = `"\${token.replace(/\"/g, '""')}"*`;
+        const hits = db.execSqlAll(
+          "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT 1000",
+          phrase
+        ) as Array<{ rowid: number }>;
+        probes += 1;
+        if (!hits.some((h) => h.rowid === node.rowid)) misses += 1;
+      } catch {
+        // an unparseable token is not a drift signal
+      }
+    }
+    ftsDrift = summarizeFtsProbe(probes, misses);
+  }
+  const ftsOk = Boolean(fts) && ftsCount === nodesCount && ftsDrift === null;
   add(
     "FTS index",
-    Boolean(fts) && ftsCount === nodesCount,
-    fts ? `${ftsCount}/${nodesCount} rows indexed` : "missing — run 'megamemory migrate --apply'"
+    ftsOk,
+    !fts
+      ? "missing — run 'megamemory migrate --apply'"
+      : ftsDrift
+        ? `${ftsDrift} — run 'megamemory migrate --apply' (rebuilds the index)`
+        : `${ftsCount}/${nodesCount} rows indexed`
   );
 
   // legacy ids

@@ -21,6 +21,14 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+      - name: Version badge matches package.json
+        run: |
+          PKG=$(node -p 'require("./package.json").version')
+          for f in README.md README.ru.md; do
+            BADGE=$(grep -o "version-[0-9.]*--fork.[0-9]*" "$f" | head -1 | sed "s/version-//; s/--/-/")
+            test "$PKG" = "$BADGE" || { echo "$f badge $BADGE != package.json $PKG"; exit 1; }
+          done
+
       # Model cache: the multilingual model is ~120 MB, do not download it per run
       - uses: actions/cache@v4
         with:

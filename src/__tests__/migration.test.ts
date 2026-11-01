@@ -5,7 +5,9 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import Database from "libsql";
 import { KnowledgeDB } from "../db.js";
-import { runMigration } from "../migrate-schema.js";
+import { runMigration, ensureEmbedMeta, emptyReport } from "../migrate-schema.js";
+import { vectorSearchEnabled, MODEL_NAME } from "../embeddings.js";
+import { runDoctor } from "../doctor.js";
 import { cleanupDir } from "./helpers/cleanup.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
@@ -235,6 +237,62 @@ describe("fork migration — downstream compatibility (Б8)", () => {
       ) as { id: string; kind: string };
       expect(row.kind).toBe("digest");
       db.execSql("UPDATE nodes SET summary = 'ok' WHERE kind = 'digest'");
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("embedding meta on migration (F10)", () => {
+  it("stamps 'unknown' when an upstream db carries vectors without meta", () => {
+    const { dbPath } = freshDir();
+    // Upstream shape: MiniLM vectors present, no meta table at all.
+    const raw = new Database(dbPath);
+    const buf = Buffer.alloc(384 * 4, 0);
+    raw
+      .prepare("UPDATE nodes SET embedding = @e WHERE id = @i")
+      .run({ e: buf, i: "node-01" });
+    raw.pragma("user_version = 4");
+    raw.close();
+
+    const db = new KnowledgeDB(dbPath);
+    try {
+      ensureEmbedMeta(db, emptyReport());
+      expect(db.getMetaValue("embed_model")).toBe("unknown");
+      expect(vectorSearchEnabled(db)).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("clean db without vectors claims the current model immediately", () => {
+    const { dbPath } = freshDir();
+    const db = new KnowledgeDB(dbPath);
+    try {
+      ensureEmbedMeta(db, emptyReport());
+      expect(db.getMetaValue("embed_model")).toBe(MODEL_NAME);
+      expect(vectorSearchEnabled(db)).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("doctor exits with a problem on unknown model (F10.4)", () => {
+    const { dbPath } = freshDir();
+    const raw = new Database(dbPath);
+    raw
+      .prepare("UPDATE nodes SET embedding = @e WHERE id = @i")
+      .run({ e: Buffer.alloc(384 * 4, 0), i: "node-01" });
+    raw.pragma("user_version = 4");
+    raw.close();
+
+    const db = new KnowledgeDB(dbPath);
+    try {
+      ensureEmbedMeta(db, emptyReport());
+      const { checks, problems } = runDoctor(db);
+      const embedCheck = checks.find((c) => c.name === "embedding model");
+      expect(embedCheck?.detail).toContain("unknown");
+      expect(problems).toBeGreaterThan(0);
     } finally {
       db.close();
     }

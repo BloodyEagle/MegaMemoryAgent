@@ -1,6 +1,6 @@
 {
   "name": "@bloodyeagle/megamemory",
-  "version": "1.6.3-fork.2",
+  "version": "1.6.3-fork.3",
   "description": "MCP server that gives coding agents persistent project understanding via a knowledge graph",
   "type": "module",
   "main": "dist/index.js",

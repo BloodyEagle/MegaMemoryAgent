@@ -232,25 +232,35 @@ async function startMcpServer() {
 
   const db = new KnowledgeDB(DB_PATH);
 
-  // Fork: additive-only schema migration on startup (meta, columns, FTS).
-  // Never destructive — data-changing id repair runs only via `migrate --apply`.
+  // F14: a legacy database converts itself on first open (backup, schema,
+  // id repair with aliases, FTS rebuild, name_norm, embed meta) and is
+  // verified before serving. MEGAMEMORY_AUTO_MIGRATE=0 opts out — then
+  // only the additive schema steps run and id repair stays manual.
   try {
-    const { ensureSchema, ensureEmbedMeta, emptyReport } = await import(
-      "./migrate-schema.js"
+    const { autoMigrateIfNeeded, describeAutoMigration } = await import(
+      "./auto-migrate.js"
     );
-    const report = ensureSchema(db, emptyReport());
-    ensureEmbedMeta(db, report);
-    if (report.applied.length > 0) {
-      console.error(
-        `megamemory: applied fork schema migration (${report.applied.join("; ")})`
-      );
+    if (process.env.MEGAMEMORY_AUTO_MIGRATE === "0") {
+      const { ensureSchema, emptyReport } = await import("./migrate-schema.js");
+      ensureSchema(db, emptyReport());
+    } else {
+      const result = await autoMigrateIfNeeded(db, DB_PATH);
+      const line = describeAutoMigration(result);
+      if (line) console.error(`megamemory: ${line}`);
+      if (result.report_file) {
+        console.error(`megamemory: migration report ${result.report_file}`);
+      }
+      for (const w of result.warnings) {
+        console.error(`megamemory: ${w}`);
+      }
     }
   } catch (err) {
     console.error(
-      `MEGAMEMORY_ERROR: startup schema migration failed: ${
+      `MEGAMEMORY_ERROR: startup migration failed: ${
         err instanceof Error ? err.message : String(err)
       }`
     );
+    process.exit(1);
   }
 
   const timeline = createTimelineLogger(db);
