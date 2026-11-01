@@ -20,6 +20,17 @@
 | T8 | Token accounting: what and how much `understand`/`list_roots`/`get_concept` returned over 7 days, savings vs full mode | Tokens panel in the explorer, `megamemory stats` |
 | T9 | Doctor: database health check, exit code 1 on problems | `megamemory doctor` |
 
+## Explorer UI (U1-U6)
+
+| Task | What it gives | Where |
+|---|---|---|
+| U1 | Per-kind filter checkboxes (persisted in localStorage), visible/total counter | legend in the footer |
+| U2 | Markdown export from the explorer: `/api/export.json` bundle and per-node `/api/node/:id.md` (RFC 5987 filenames), no disk writes | «export bundle» button, «download .md» in the node card |
+| U3 | `healthReport(db)` + `GET /api/health`; health chip in the explorer with remedy hints | `megamemory doctor`, footer chip |
+| U4 | Digest cards list source concepts (siblings), `stale` badge, focus toggle | node card |
+| U5 | `status_history` table (schema v3), timeline «status changes» mode, node history via `/api/node/:id/history` | timeline selector, node card |
+| U6 | Search budget line shows «saved ~Z vs full» from `estimated_full_tokens` | search results |
+
 Native vector search (no JS cosine loop): embeddings are mirrored into a `nodes_vec`
 shadow table (`F32_BLOB`) and top-k is computed by SQLite via `vector_distance_cos`;
 JS cosine remains as a fallback when the shadow table is not fully populated.
