@@ -520,6 +520,11 @@
   <input id="timeline-slider" type="range" min="0" max="1" value="1" step="1" style="display:none" />
   <span id="timeline-display"></span>
   <span id="timeline-summary"></span>
+  <select id="timeline-kind" title="What to show on the timeline" style="display:none;margin-left:8px;background:#1e2333;color:#94a3b8;border:1px solid #64748b55;border-radius:8px;font-size:11px;padding:2px 6px">
+    <option value="tools">tool calls</option>
+    <option value="status">status changes</option>
+    <option value="all" selected>all</option>
+  </select>
 </div>
 
 <footer id="stats"></footer>
@@ -850,6 +855,45 @@ function handleEdgeRemoved(data) {
 // T4: legend toggle — hide superseded/deprecated nodes entirely.
 let hideOutdated = false;
 
+// U1: per-kind visibility filter, persisted across reloads.
+const KIND_ORDER = ['feature', 'module', 'pattern', 'config', 'decision', 'component', 'digest'];
+let hiddenKinds = new Set(JSON.parse(localStorage.getItem('mm.hiddenKinds') || '[]'));
+
+function toggleKind(kind, on) {
+  if (on) hiddenKinds.delete(kind);
+  else hiddenKinds.add(kind);
+  localStorage.setItem('mm.hiddenKinds', JSON.stringify([...hiddenKinds]));
+}
+
+// U4: temporary focus — show only the digest and its source concepts.
+let focusSet = null;
+let focusCenterId = null;
+
+function toggleFocus(centerId, childIds) {
+  if (focusCenterId === centerId) {
+    focusSet = null;
+    focusCenterId = null;
+  } else {
+    focusSet = new Set([centerId, ...childIds]);
+    focusCenterId = centerId;
+  }
+  updateVisibleCounter();
+}
+
+function nodeVisible(node) {
+  if (focusSet && !focusSet.has(node.id)) return false;
+  if (hideOutdated && node.status && node.status !== 'active') return false;
+  if (hiddenKinds.has(node.kind)) return false;
+  return true;
+}
+
+function updateVisibleCounter() {
+  const el = document.getElementById('visible-counter');
+  if (!el) return;
+  const visible = nodes.filter(nodeVisible).length;
+  el.textContent = visible + ' / ' + nodes.length + ' visible';
+}
+
 function renderStats(stats) {
   const el = document.getElementById('stats');
   const parts = [
@@ -862,14 +906,74 @@ function renderStats(stats) {
       parts.push(`<span class="stat"><span class="dot" style="background:${c}"></span>${kind}: ${count}</span>`);
     }
   }
+  // U1: per-kind filter checkboxes.
+  parts.push(KIND_ORDER.map(k =>
+    `<label class="stat" style="cursor:pointer">
+       <input type="checkbox" ${hiddenKinds.has(k) ? '' : 'checked'}
+              onchange="toggleKind('${k}', this.checked)">
+       <span style="color:${KIND_COLORS[k] || '#888'}">■</span> ${k}
+     </label>`).join(''));
+  // U1: visible/total counter.
+  parts.push(`<span class="stat" id="visible-counter"></span>`);
   // T4: status legend + "show outdated" toggle.
   parts.push(`<span class="stat"><span class="dot" style="background:#d97706"></span>superseded</span>`);
   parts.push(`<span class="stat"><span class="dot" style="background:#ef4444"></span>deprecated</span>`);
   parts.push(`<label class="stat" style="cursor:pointer"><input type="checkbox" id="toggle-outdated" ${hideOutdated ? '' : 'checked'} onchange="hideOutdated = !this.checked"> show outdated</label>`);
   // T5: consolidation tab.
   parts.push(`<button class="stat" id="consolidate-btn" onclick="openConsolidate()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">consolidate…</button>`);
+  // U2: whole-graph export download.
+  parts.push(`<button class="stat" onclick="location.href=/'api/export.json'" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">export bundle</button>`);
+  // U3: health chip (async — fetches /api/health once per stats render).
+  parts.push(`<span class="stat" id="health-chip">health: …</span>`);
   el.innerHTML = parts.join('');
   renderTokensPanel(stats.usage);
+  refreshHealthChip();
+}
+
+
+// U3: health chip + expandable panel (same pattern as the Tokens panel).
+async function refreshHealthChip() {
+  const chip = document.getElementById('health-chip');
+  if (!chip) return;
+  try {
+    const res = await fetch('/api/health');
+    const h = await res.json();
+    const issues = [];
+    if (!h.fts || !h.fts.in_sync) issues.push('fts out of sync');
+    if (h.empty_ids > 0) issues.push(h.empty_ids + ' empty id(s)');
+    if (h.orphan_edges > 0) issues.push(h.orphan_edges + ' orphan edge(s)');
+    if (h.vectors && h.vectors.have < h.vectors.total) issues.push('vectors ' + h.vectors.have + '/' + h.vectors.total);
+    if (h.digests && h.digests.stale > 0) issues.push(h.digests.stale + ' stale digest(s)');
+    chip.textContent = 'health: ' + (issues.length ? issues.length + ' issue' + (issues.length > 1 ? 's' : '') : 'ok');
+    chip.style.color = issues.length ? '#f59e0b' : '#4ade80';
+    chip.style.cursor = 'pointer';
+    chip.onclick = () => toggleHealthPanel(h, issues);
+  } catch {
+    chip.textContent = 'health: n/a';
+  }
+}
+
+function toggleHealthPanel(h, issues) {
+  let panel = document.getElementById('health-panel');
+  if (panel) { panel.remove(); return; }
+  panel = document.createElement('div');
+  panel.id = 'health-panel';
+  panel.style.cssText = 'position:fixed;right:12px;bottom:52px;background:#161a26ee;border:1px solid #64748b44;border-radius:12px;padding:10px 14px;font-size:10px;color:#94a3b8;max-width:360px;z-index:50;font-family:inherit';
+  const issueSet = new Set(issues);
+  const row = (label, ok, value, hint) =>
+    '<div style="' + (ok ? '' : 'color:#f59e0b') + '">' + label + ': ' + value +
+    (ok ? '' : ' — ' + hint) + '</div>';
+  panel.innerHTML =
+    '<div style="color:#4ade80;margin-bottom:4px">Health' +
+    ' <span style="color:#64748b">schema v' + (h.schema_version || '?') + '</span></div>' +
+    row('vectors', h.vectors.have === h.vectors.total, h.vectors.have + '/' + h.vectors.total, 'run megamemory reembed') +
+    row('fts', h.fts.in_sync, h.fts.rows + '/' + h.fts.nodes, 'run megamemory migrate --apply') +
+    row('digests', h.digests.stale === 0, h.digests.count + (h.digests.stale ? ' (stale ' + h.digests.stale + ')' : ''), 'run megamemory digest --apply') +
+    row('empty ids', h.empty_ids === 0, h.empty_ids, 'run megamemory repair-ids --apply') +
+    row('orphans', h.orphan_edges === 0, h.orphan_edges, 'run megamemory migrate --apply') +
+    '<div>model loaded: ' + (h.model_loaded ? 'yes' : 'no') + '</div>' +
+    '<div>rss: ' + h.rss_mb + ' MB</div>';
+  document.body.appendChild(panel);
 }
 
 // T8: Tokens panel — daily bars + averages, economy visible at a glance.
@@ -1145,7 +1249,8 @@ function drawEdges(now) {
     const target = pair.target;
     if (!source || !target) continue;
     // T4: hide edges touching nodes hidden by the outdated toggle.
-    if (hideOutdated && ((source.status && source.status !== 'active') || (target.status && target.status !== 'active'))) continue;
+    // T4/U1: hide edges touching nodes filtered out of the graph.
+    if (!nodeVisible(source) || !nodeVisible(target)) continue;
 
     const sx = source.x;
     const sy = source.y;
@@ -1287,10 +1392,8 @@ function drawNodes(now) {
     const radius = node.radius * entrance.scale;
     if (radius <= 0) continue;
 
-    // T4: superseded/deprecated nodes render at half alpha — visibly muted
-    // but still on the graph; the legend toggle can hide them entirely.
-    const outdatedHidden = hideOutdated && node.status && node.status !== 'active';
-    if (outdatedHidden) continue;
+    // T4/U1: muted for outdated, fully hidden when filtered out.
+    if (!nodeVisible(node)) continue;
     const baseAlpha = node.dimmed ? 0.12 : (node.muted ? 0.4 : 1);
     ctx.save();
     ctx.globalAlpha = baseAlpha * entrance.opacity;
@@ -1561,6 +1664,30 @@ function showPanel(d) {
     }
   }
 
+  // U5: status history (last 5 transitions), fetched lazily.
+  if (d.id) {
+    fetch('/api/node/' + encodeURIComponent(d.id) + '/history')
+      .then((r) => r.json())
+      .then((payload) => {
+        const hist = Array.isArray(payload.history) ? payload.history : [];
+        if (!hist.length) return;
+        const el = document.getElementById('panel-content');
+        if (!el) return;
+        let block = '<div class="panel-section"><div class="panel-label">Status history</div><div class="panel-body">';
+        for (const h of hist) {
+          block += '<div>' + (h.from_status || '∅') + ' → <b>' + h.to_status + '</b>' +
+            (h.reason ? ' — ' + esc(String(h.reason)) : '') +
+            ' <span style="color:#64748b">' + esc(String(h.at)) + '</span></div>';
+        }
+        block += '</div></div>';
+        el.innerHTML += block;
+      })
+      .catch(() => undefined);
+  }
+
+  // U2: single-node markdown download.
+  h += `<a class="stat" href="/api/node/${encodeURIComponent(d.id)}.md" style="font-size:10px;color:#38bdf8;margin-left:8px">download .md</a>`;
+
   // Parent breadcrumb
   if (d.parent) {
     h += `<div style="margin-bottom:12px">`;
@@ -1583,6 +1710,22 @@ function showPanel(d) {
   if (d.file_refs && d.file_refs.length) {
     h += `<div class="panel-section"><div class="panel-label">Files</div><div class="panel-body">`;
     h += d.file_refs.map(f => `<span class="file-ref">${esc(f)}</span>`).join('');
+    h += `</div></div>`;
+  }
+
+  // U4: digest card — source concepts, stale badge, focus toggle.
+  if (d.kind === 'digest' && d.digest_children) {
+    const childIds = d.digest_children.map(c => c.id);
+    const focused = focusCenterId === d.id;
+    if (d.stale) {
+      const sc = '#f59e0b';
+      h += ` <span class="kind-badge" style="background:${sc}22;color:${sc};border:1px solid ${sc}44">stale</span>`;
+    }
+    h += `<button class="stat" onclick='toggleFocus("${esc(d.id)}", ${JSON.stringify(childIds).replace(/"/g, "&quot;")})' style="cursor:pointer;background:#eab30822;border:1px solid #eab30855;color:#eab308;border-radius:10px;padding:2px 10px;margin-left:8px">${focused ? 'unfocus' : 'focus'}</button>`;
+    h += `<div class="panel-section"><div class="panel-label">Source concepts (${d.digest_children.length})${d.stale ? ' — <span style="color:#f59e0b">a source is newer than the digest</span>' : ''}</div><div class="panel-body">`;
+    h += d.digest_children.map(c =>
+      `<span class="child-link" onclick="navigateTo('${esc(c.id)}')">${esc(c.name)}</span>`
+    ).join('');
     h += `</div></div>`;
   }
 
@@ -2079,8 +2222,19 @@ async function enterTimelineMode() {
     return;
   }
 
-  const payload = await fetchTimelineSteps();
-  const steps = Array.isArray(payload.entries) ? payload.entries : [];
+  // U5: the kind selector switches the timeline data source.
+  const kind = document.getElementById('timeline-kind')?.value || 'all';
+  let steps = [];
+  let source = 'none';
+  if (kind === 'status') {
+    const sj = await (await fetch('/api/timeline?kind=status&limit=50000')).json();
+    steps = Array.isArray(sj.entries) ? sj.entries : [];
+    source = 'status_history';
+  } else {
+    const payload = await fetchTimelineSteps();
+    steps = Array.isArray(payload.entries) ? payload.entries : [];
+    source = payload.source || 'none';
+  }
   if (steps.length === 0) {
     timelineMode = false;
     alert('No timeline entries available yet.');
@@ -2088,16 +2242,18 @@ async function enterTimelineMode() {
   }
 
   timelineSteps = steps;
-  timelineSource = payload.source || 'none';
+  timelineSource = source;
 
   slider.min = '0';
   slider.max = String(steps.length);
   slider.value = String(steps.length);
   slider.style.display = '';
   controls.style.display = 'flex';
+  const kindSelect = document.getElementById('timeline-kind');
+  if (kindSelect) kindSelect.style.display = '';
 
   toggle.classList.remove('live');
-  toggle.textContent = '◷ Timeline';
+  toggle.textContent = kind === 'status' ? '◷ Status' : '◷ Timeline';
   toggle.title = `Timeline source: ${timelineSource}`;
 
   if (evtSource) {
@@ -2175,6 +2331,7 @@ async function exitTimelineMode() {
   refreshSimulation(0.15);
   setEmptyStateVisible(graphData.nodes.length === 0);
   renderStats(stats);
+  updateVisibleCounter();
   connectSSE();
 }
 
@@ -2206,6 +2363,10 @@ function setupTimeline() {
       return;
     }
     void enterTimelineMode();
+  });
+
+  document.getElementById('timeline-kind')?.addEventListener('change', () => {
+    if (timelineMode) { void exitTimelineMode(); void enterTimelineMode(); }
   });
 
   slider.addEventListener('input', () => {

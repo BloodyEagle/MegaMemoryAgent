@@ -130,3 +130,43 @@ describe("serve integration", () => {
     }
   );
 });
+
+describe("serve export endpoints (U2)", () => {
+  it(
+    "serves the bundle and single-node markdown with attachment headers",
+    { timeout: 45000 },
+    async () => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-export-serve-"));
+      const dbFile = path.join(tmpDir, "knowledge.db");
+      const db = new KnowledgeDB(dbFile);
+      ensureSchema(db);
+      db.insertNode({ id: "книга", name: "Книга", kind: "module", summary: "заметки" });
+      db.insertNode({
+        id: "книга/поиск",
+        name: "Поиск",
+        kind: "feature",
+        summary: "полнотекстовый поиск",
+        parent_id: "книга",
+      });
+      db.close();
+
+      const port = await startServe(dbFile);
+
+      // Bundle: one file per node + attachment header.
+      const bundleRes = await fetch(`http://127.0.0.1:${port}/api/export.json`);
+      expect(bundleRes.headers.get("content-disposition")).toContain("megamemory-export.json");
+      const bundle = (await bundleRes.json()) as { generated_at: string; files: Record<string, string> };
+      expect(Object.keys(bundle.files)).toHaveLength(2);
+      expect(Object.values(bundle.files)[0]).toContain("---"); // frontmatter present
+
+      // Single node: attachment, valid markdown.
+      const mdRes = await fetch(
+        `http://127.0.0.1:${port}/api/node/${encodeURIComponent("книга/поиск")}.md`
+      );
+      expect(mdRes.headers.get("content-disposition")).toContain(".md");
+      const md = await mdRes.text();
+      expect(md.startsWith("---")).toBe(true);
+      expect(md).toContain("полнотекстовый поиск");
+    }
+  );
+});

@@ -33,11 +33,20 @@ function frontmatterValue(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-export function renderNodeMarkdown(db: KnowledgeDB, node: NodeRow): string {
-  const children = db
-    .getChildren(node.id)
-    .filter((c) => c.kind !== "digest");
-  const outgoing = db.getOutgoingEdges(node.id);
+export interface MarkdownEdge {
+  relation: string;
+  to_id: string;
+}
+
+/**
+ * U2: pure single-node render — one source of truth for the CLI export and
+ * the explorer's download endpoints.
+ */
+export function renderNodeMarkdown(
+  node: NodeRow,
+  outgoing: MarkdownEdge[],
+  children: NodeRow[]
+): string {
   const parentLine = node.parent_id ? `parent: ${frontmatterValue(node.parent_id)}` : null;
   const edgesLine =
     outgoing.length > 0
@@ -82,7 +91,16 @@ export function renderAllMarkdown(db: KnowledgeDB): Map<string, string> {
   const rows = [...db.getAllNodesRaw()].sort((a, b) => (a.id < b.id ? -1 : 1));
   for (const node of rows) {
     if (node.removed_at !== null) continue;
-    files.set(nodeFileName(node.id), renderNodeMarkdown(db, node));
+    const children = db
+      .getChildren(node.id)
+      .filter((c) => c.kind !== "digest");
+    const outgoing = db
+      .getOutgoingEdges(node.id)
+      .map((e) => ({ relation: e.relation, to_id: e.to_id }));
+    files.set(
+      nodeFileName(node.id),
+      renderNodeMarkdown(node, outgoing, children)
+    );
   }
   return files;
 }

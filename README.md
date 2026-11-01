@@ -169,9 +169,13 @@ megamemory serve --port 8080
 
 - nodes colored by kind, sized by edge count; `digest` nodes and outdated (`superseded`) nodes are visually distinct
 - `supersedes` edges drawn dashed, status badges in the node card, "show outdated" toggle
-- search hits carry a `via` badge (vector / fts / both) and a budget line: `N nodes, ~X tokens, dropped M`
+- search hits carry a `via` badge (vector / fts / both) and a budget line: `N nodes, ~X tokens, dropped M · saved ~Z vs full`
 - **Tokens** panel: average answer size and saved tokens over 7 days
 - **Consolidate** tab: duplicate candidates with apply
+- per-kind filter checkboxes (persisted), visible/total counter, **export bundle** button and per-node `download .md`
+- **Health** chip: vectors, FTS sync, digests, empty ids, orphans, memory — with remedy hints
+- digest cards list source concepts with a `stale` badge and a **focus** toggle
+- timeline **status changes** mode; node cards show recent status transitions with reasons
 
 ---
 

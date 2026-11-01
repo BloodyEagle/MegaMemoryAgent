@@ -6,6 +6,8 @@ import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { buildNodeWithContext, understand } from "./tools.js";
 import { findDuplicates, mergeNodes } from "./consolidate.js";
+import { renderAllMarkdown, renderNodeMarkdown } from "./export.js";
+import { digestSourceChildren } from "./digest.js";
 import { errorBold, askPort } from "./cli-utils.js";
 import {
   initializeEmbeddings,
@@ -13,6 +15,7 @@ import {
   isTextOnlySearchMode,
   vectorSearchEnabled,
 } from "./embeddings.js";
+import { healthReport } from "./doctor.js";
 import type { NodeRow } from "./types.js";
 
 const VERSION = JSON.parse(
@@ -644,6 +647,59 @@ export async function runServe(port: number): Promise<void> {
       return;
     }
 
+    // U5: status transitions of one node.
+    if (pathname.startsWith("/api/node/") && pathname.endsWith("/history") && req.method === "GET") {
+      const raw = decodeURIComponent(pathname.slice("/api/node/".length, -"/history".length));
+      const id = db.getAliasTarget(raw) ?? raw;
+      if (!db.getNode(id)) {
+        json(res, { error: `Concept "${raw}" not found` }, 404);
+        return;
+      }
+      json(res, { id, history: db.getStatusHistory(id, 20) });
+      return;
+    }
+
+    // U2: single-node markdown download (no file writes — browser gets it).
+    if (pathname.startsWith("/api/node/") && pathname.endsWith(".md") && req.method === "GET") {
+      const id = decodeURIComponent(pathname.slice("/api/node/".length, -".md".length));
+      const node = db.getNode(db.getAliasTarget(id) ?? id);
+      if (!node) {
+        json(res, { error: `Concept "${id}" not found` }, 404);
+        return;
+      }
+      const outgoing = db.getOutgoingEdges(node.id).map((e) => ({ relation: e.relation, to_id: e.to_id }));
+      const children = db.getChildren(node.id).filter((c) => c.kind !== "digest");
+      const md = renderNodeMarkdown(node, outgoing, children);
+      // HTTP headers must stay ASCII: provide a sanitized fallback name
+      // plus an RFC 5987 filename* with the full unicode slug.
+      const slug = node.id.split("/").join("-");
+      const asciiName =
+        slug.replace(/[^a-zA-Z0-9._-]/g, "").replace(/^-+/, "") || "node.md";
+      const utf8Name = encodeURIComponent(slug + ".md");
+      res.writeHead(200, {
+        "Content-Type": "text/markdown; charset=utf-8",
+        "Content-Disposition":
+          `attachment; filename="${asciiName}"; filename*=UTF-8''${utf8Name}`,
+      });
+      res.end(md);
+      return;
+    }
+
+    // U2: whole-graph export bundle (JSON map of markdown files).
+    if (pathname === "/api/export.json" && req.method === "GET") {
+      const files = renderAllMarkdown(db);
+      const bundle = {
+        generated_at: new Date().toISOString(),
+        files: Object.fromEntries(files),
+      };
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="megamemory-export.json"`,
+      });
+      res.end(JSON.stringify(bundle, null, 2));
+      return;
+    }
+
     if (pathname.startsWith("/api/node/") && req.method === "GET") {
       const id = decodeURIComponent(pathname.slice("/api/node/".length));
       // Б12: resolve ids renamed by repair-ids.
@@ -653,6 +709,12 @@ export async function runServe(port: number): Promise<void> {
         return;
       }
       const ctx = buildNodeWithContext(db, node);
+      // U4: digests expose their source concepts and staleness.
+      if (node.kind === "digest") {
+        const info = digestSourceChildren(db, node.id);
+        (ctx as unknown as Record<string, unknown>).digest_children = info.children;
+        (ctx as unknown as Record<string, unknown>).stale = info.stale;
+      }
       // Add timestamps
       const result = {
         ...ctx,
@@ -661,6 +723,12 @@ export async function runServe(port: number): Promise<void> {
         created_by_task: node.created_by_task,
       };
       json(res, result);
+      return;
+    }
+
+    if (pathname === "/api/health" && req.method === "GET") {
+      // U3: same metrics the CLI doctor prints, for the explorer header chip.
+      json(res, healthReport(db));
       return;
     }
 
@@ -788,6 +856,28 @@ export async function runServe(port: number): Promise<void> {
       }));
       json(res, { ticks, source: merged.source });
       return;
+    }
+
+    // U5: status lifecycle history — kind=status, tools, or all (default).
+    if (pathname === "/api/timeline" && req.method === "GET") {
+      const kind = (url.searchParams.get("kind") ?? "all").trim();
+      if (kind === "status") {
+        const limit = clampInt(url.searchParams.get("limit"), 200, 1, 50000);
+        json(res, { kind: "status", entries: db.getAllStatusHistory(limit) });
+        return;
+      }
+      if (kind === "all") {
+        const limit = clampInt(url.searchParams.get("limit"), 200, 1, 50000);
+        const merged = buildMergedTimelineEntries({ limit });
+        json(res, {
+          kind: "all",
+          entries: merged.entries,
+          status_changes: db.getAllStatusHistory(limit),
+          source: merged.source,
+        });
+        return;
+      }
+      // kind === "tools" falls through to the legacy handler below.
     }
 
     if (pathname === "/api/timeline" && req.method === "GET") {

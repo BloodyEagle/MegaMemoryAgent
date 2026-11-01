@@ -460,7 +460,40 @@ export class KnowledgeDB {
    * Set a node's lifecycle status. Only superseded nodes get valid_until.
    * Idempotent: setting the same status again is a harmless rewrite.
    */
-  setNodeStatus(id: string, status: string, validUntil?: string): boolean {
+  private statusHistoryReady = false;
+
+  private ensureStatusHistoryTable(): void {
+    if (this.statusHistoryReady) return;
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS status_history (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        node_id TEXT NOT NULL,\
+        from_status TEXT,\
+        to_status TEXT NOT NULL,\
+        reason TEXT,\
+        at TEXT NOT NULL DEFAULT (datetime('now'))\
+      )"
+    );
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_status_history_node ON status_history(node_id)"
+    );
+    this.statusHistoryReady = true;
+  }
+
+  setNodeStatus(
+    id: string,
+    status: string,
+    validUntil?: string,
+    reason?: string
+  ): boolean {
+    // U5: record every real transition (active -> superseded, ...).
+    const previous = (
+      this.execSqlFirst(
+        "SELECT status FROM nodes WHERE id = ?",
+        id
+      ) as { status?: string } | undefined
+    )?.status;
+
     const result = this.db
       .prepare(
         `UPDATE nodes SET status = @status,
@@ -469,7 +502,74 @@ export class KnowledgeDB {
          WHERE id = @id`
       )
       .run({ status, validUntil: validUntil ?? null, id });
+
+    if (result.changes > 0 && previous !== status) {
+      this.recordStatusHistory(id, previous ?? null, status, reason);
+    }
     return result.changes > 0;
+  }
+
+  /** U5: append a status transition row (table self-heals on legacy dbs). */
+  recordStatusHistory(
+    nodeId: string,
+    fromStatus: string | null,
+    toStatus: string,
+    reason?: string
+  ): void {
+    this.ensureStatusHistoryTable();
+    this.db
+      .prepare(
+        "INSERT INTO status_history (node_id, from_status, to_status, reason) VALUES (?, ?, ?, ?)"
+      )
+      .run(nodeId, fromStatus, toStatus, reason ?? null);
+  }
+
+  /** U5: transitions of one node, newest first. */
+  getStatusHistory(nodeId: string, limit = 5): Array<{
+    from_status: string | null;
+    to_status: string;
+    reason: string | null;
+    at: string;
+  }> {
+    const has = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='status_history'")
+      .get();
+    if (!has) return [];
+    return this.db
+      .prepare(
+        "SELECT from_status, to_status, reason, at FROM status_history WHERE node_id = ? ORDER BY id DESC LIMIT ?"
+      )
+      .all(nodeId, limit) as Array<{
+      from_status: string | null;
+      to_status: string;
+      reason: string | null;
+      at: string;
+    }>;
+  }
+
+  /** U5: all status transitions, newest first (timeline). */
+  getAllStatusHistory(limit = 200): Array<{
+    node_id: string;
+    from_status: string | null;
+    to_status: string;
+    reason: string | null;
+    at: string;
+  }> {
+    const has = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='status_history'")
+      .get();
+    if (!has) return [];
+    return this.db
+      .prepare(
+        "SELECT node_id, from_status, to_status, reason, at FROM status_history ORDER BY id DESC LIMIT ?"
+      )
+      .all(limit) as Array<{
+      node_id: string;
+      from_status: string | null;
+      to_status: string;
+      reason: string | null;
+      at: string;
+    }>;
   }
 
   /**
@@ -491,7 +591,12 @@ export class KnowledgeDB {
           to_id: oldId,
           relation: "supersedes",
         });
-        this.setNodeStatus(oldId, "superseded", new Date().toISOString());
+        this.setNodeStatus(
+          oldId,
+          "superseded",
+          new Date().toISOString(),
+          `superseded by ${newId}`
+        );
         superseded.push(oldId);
       }
     });

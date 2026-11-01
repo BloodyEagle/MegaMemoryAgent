@@ -37,6 +37,39 @@ function existingDigest(db: KnowledgeDB, moduleId: string): string | undefined {
   return row?.id;
 }
 
+export interface DigestChild {
+  id: string;
+  name: string;
+  kind: string;
+  updated_at: string;
+}
+
+/**
+ * U4: the source concepts behind a digest — its SIBLINGS in the module
+ * (the digest is itself a child of the module). stale = any source concept
+ * was updated after the digest, i.e. the summary may be out of date.
+ */
+export function digestSourceChildren(
+  db: KnowledgeDB,
+  digestId: string
+): { children: DigestChild[]; stale: boolean } {
+  const digest = db.getNode(digestId);
+  if (!digest || digest.kind !== "digest") {
+    throw new Error(`Node "${digestId}" is not a digest.`);
+  }
+  const children = db
+    .getChildren(digest.parent_id ?? "")
+    .filter((c) => c.kind !== "digest" && c.id !== digestId)
+    .map((c) => ({
+      id: c.id,
+      name: c.name,
+      kind: c.kind,
+      updated_at: c.updated_at,
+    }));
+  const stale = children.some((c) => c.updated_at > digest.updated_at);
+  return { children, stale };
+}
+
 /** Build or refresh the digest of one module. */
 export async function buildDigest(
   db: KnowledgeDB,

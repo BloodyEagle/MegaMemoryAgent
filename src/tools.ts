@@ -313,6 +313,7 @@ export async function understand(
           returned: compact.length,
           dropped,
           tokens_estimated: tokensEstimated,
+          estimated_full_tokens: estimatedFullTokens,
         },
       };
     }
@@ -353,6 +354,7 @@ export async function understand(
       returned: compact.length,
       dropped: 0,
       tokens_estimated: tokensEstimated,
+      estimated_full_tokens: estimatedFullTokens,
     },
   };
 }
@@ -587,8 +589,8 @@ export function removeConcept(
     throw new Error(`Failed to remove concept "${input.id}".`);
   }
 
-  // T4: soft-delete also deprecates the lifecycle status.
-  db.setNodeStatus(input.id, "deprecated");
+  // T4: soft-delete also deprecates the lifecycle status (U5: with reason).
+  db.setNodeStatus(input.id, "deprecated", undefined, input.reason);
 
   return {
     message: `Removed concept "${input.id}". Reason: ${input.reason}`,

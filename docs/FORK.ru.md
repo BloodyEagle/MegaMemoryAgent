@@ -20,6 +20,17 @@ English version of this document: [docs/FORK.md](./FORK.md).
 | T8 | Учёт токенов: что и сколько вернули `understand`/`list_roots`/`get_concept` за 7 дней, экономия против full-режима | панель Tokens в explorer, `megamemory stats` |
 | T9 | Doctor: health-check базы с кодом выхода 1 при проблемах | `megamemory doctor` |
 
+## UI обозревателя (U1-U6)
+
+| Задача | Что даёт | Где |
+|---|---|---|
+| U1 | Чекбоксы фильтра по типам (с сохранением в localStorage), счётчик видимых | легенда в футере |
+| U2 | Markdown-экспорт из обозревателя: `/api/export.json` бандл и `/api/node/:id.md` (RFC 5987 имена), без записи на диск | кнопка «export bundle», «download .md» в карточке |
+| U3 | `healthReport(db)` + `GET /api/health`; чип health в обозревателе с подсказками | `megamemory doctor`, чип в футере |
+| U4 | Карточка digest показывает исходные концепции (соседей), бейдж `stale`, фокус | карточка узла |
+| U5 | Таблица `status_history` (схема v3), режим «status changes» в таймлайне, история узла через `/api/node/:id/history` | селектор таймлайна, карточка узла |
+| U6 | Строка бюджета поиска показывает «saved ~Z vs full» из `estimated_full_tokens` | результаты поиска |
+
 Нативный векторный поиск (без JS-перебора): эмбеддинги дублируются в теневую таблицу
 `nodes_vec` (`F32_BLOB`), top-k считает SQLite через `vector_distance_cos`; JS-косинус
 остаётся фолбэком на случай неполной таблицы.

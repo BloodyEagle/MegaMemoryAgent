@@ -13,7 +13,7 @@ import { CURRENT_EMBED_MODEL } from "./embed-model.js";
  * - every step is idempotent: re-running changes nothing.
  */
 
-export const MIGRATION_TARGET_SCHEMA_VERSION = "2";
+export const MIGRATION_TARGET_SCHEMA_VERSION = "3";
 
 export interface MigrationReport {
   applied: string[];
@@ -176,6 +176,22 @@ export function ensureSchema(
     db.execSqlRun("UPDATE nodes SET name_norm = ? WHERE id = ?", normalizeName(row.name), row.id);
   }
   report.alreadyOk.push(`name_norm backfill (${pendingNorm.length} rows)`);
+
+  // U5: status lifecycle history (active -> superseded/deprecated, ...).
+  db.execSql(
+    "CREATE TABLE IF NOT EXISTS status_history (\
+      id INTEGER PRIMARY KEY AUTOINCREMENT,\
+      node_id TEXT NOT NULL,\
+      from_status TEXT,\
+      to_status TEXT NOT NULL,\
+      reason TEXT,\
+      at TEXT NOT NULL DEFAULT (datetime('now'))\
+    )"
+  );
+  db.execSql(
+    "CREATE INDEX IF NOT EXISTS idx_status_history_node ON status_history(node_id)"
+  );
+  report.alreadyOk.push("status_history table");
 
   // Б12.3: aliases table — old ids stay resolvable after repair.
   db.execSql(
