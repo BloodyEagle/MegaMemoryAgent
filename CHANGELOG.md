@@ -1,5 +1,18 @@
 # Changelog
 
+## Fork (1.6.3-fork.2)
+
+### Explorer UI (U1-U6)
+
+- per-kind node filter with persistence and a visible/total counter
+- markdown export from the explorer: bundle JSON and per-node .md downloads
+- Health chip and /api/health: vectors, FTS sync, digests, empty ids, orphans, memory
+- digest cards reveal source concepts, staleness badge, focus toggle
+- status lifecycle history: status_history table (schema v3), timeline status mode, node history
+- search budget line shows saved tokens vs full mode
+- docs: FORK.md in english, russian version alongside (docs/FORK.ru.md)
+- package metadata: repository/homepage/bugs point at the fork; published as @bloodyeagle/megamemory
+
 ## Fork (1.6.3-fork.1)
 
 ### Behaviour changes (Б11)
