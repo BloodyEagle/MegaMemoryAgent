@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
-import { exportMarkdown, checkMarkdown, renderAllMarkdown } from "../export.js";
+import { exportMarkdown, checkMarkdown, renderAllMarkdown, renderNodeMarkdown } from "../export.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
@@ -81,5 +81,22 @@ describe("markdown export", () => {
     expect(diff.extra).toEqual(["orphan.md"]);
     expect(diff.pruned).toBe(1);
     expect(fs.existsSync(path.join(outDir, "orphan.md"))).toBe(false);
+  });
+
+  it("renderNodeMarkdown is deterministic (two calls, same bytes)", () => {
+    const db = freshDb();
+    db.insertNode({ id: "det", name: "Det", kind: "feature", summary: "deterministic body" });
+    db.insertNode({ id: "peer", name: "Peer", kind: "feature", summary: "p" });
+    db.insertEdge({ from_id: "det", to_id: "peer", relation: "connects_to" });
+
+    const node = db.getNode("det")!;
+    const outgoing = db.getOutgoingEdges("det").map((e) => ({ relation: e.relation, to_id: e.to_id }));
+    const children = db.getChildren("det");
+
+    const a = renderNodeMarkdown(node, outgoing, children);
+    const b = renderNodeMarkdown(node, outgoing, children);
+    expect(a).toBe(b);
+    expect(a).toContain('id: "det"');
+    expect(a).toContain("connects_to");
   });
 });

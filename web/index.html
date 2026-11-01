@@ -916,6 +916,8 @@ function renderStats(stats) {
   parts.push(`<label class="stat" style="cursor:pointer"><input type="checkbox" id="toggle-outdated" ${hideOutdated ? '' : 'checked'} onchange="hideOutdated = !this.checked"> show outdated</label>`);
   // T5: consolidation tab.
   parts.push(`<button class="stat" id="consolidate-btn" onclick="openConsolidate()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">consolidate…</button>`);
+  // U2: whole-graph export download.
+  parts.push(`<button class="stat" onclick="location.href=/'api/export.json'" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">export bundle</button>`);
   // U3: health chip (async — fetches /api/health once per stats render).
   parts.push(`<span class="stat" id="health-chip">health: …</span>`);
   el.innerHTML = parts.join('');
@@ -1656,6 +1658,9 @@ function showPanel(d) {
       h += `<div style="font-size:10px;color:#888;margin-top:4px">valid until ${esc(String(d.valid_until))}</div>`;
     }
   }
+
+  // U2: single-node markdown download.
+  h += `<a class="stat" href="/api/node/${encodeURIComponent(d.id)}.md" style="font-size:10px;color:#38bdf8;margin-left:8px">download .md</a>`;
 
   // Parent breadcrumb
   if (d.parent) {

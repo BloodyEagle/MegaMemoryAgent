@@ -6,6 +6,7 @@ import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { buildNodeWithContext, understand } from "./tools.js";
 import { findDuplicates, mergeNodes } from "./consolidate.js";
+import { renderAllMarkdown, renderNodeMarkdown } from "./export.js";
 import { digestSourceChildren } from "./digest.js";
 import { errorBold, askPort } from "./cli-utils.js";
 import {
@@ -643,6 +644,47 @@ export async function runServe(port: number): Promise<void> {
         matches,
         meta: results.meta ?? null,
       });
+      return;
+    }
+
+    // U2: single-node markdown download (no file writes — browser gets it).
+    if (pathname.startsWith("/api/node/") && pathname.endsWith(".md") && req.method === "GET") {
+      const id = decodeURIComponent(pathname.slice("/api/node/".length, -".md".length));
+      const node = db.getNode(db.getAliasTarget(id) ?? id);
+      if (!node) {
+        json(res, { error: `Concept "${id}" not found` }, 404);
+        return;
+      }
+      const outgoing = db.getOutgoingEdges(node.id).map((e) => ({ relation: e.relation, to_id: e.to_id }));
+      const children = db.getChildren(node.id).filter((c) => c.kind !== "digest");
+      const md = renderNodeMarkdown(node, outgoing, children);
+      // HTTP headers must stay ASCII: provide a sanitized fallback name
+      // plus an RFC 5987 filename* with the full unicode slug.
+      const slug = node.id.split("/").join("-");
+      const asciiName =
+        slug.replace(/[^a-zA-Z0-9._-]/g, "").replace(/^-+/, "") || "node.md";
+      const utf8Name = encodeURIComponent(slug + ".md");
+      res.writeHead(200, {
+        "Content-Type": "text/markdown; charset=utf-8",
+        "Content-Disposition":
+          `attachment; filename="${asciiName}"; filename*=UTF-8''${utf8Name}`,
+      });
+      res.end(md);
+      return;
+    }
+
+    // U2: whole-graph export bundle (JSON map of markdown files).
+    if (pathname === "/api/export.json" && req.method === "GET") {
+      const files = renderAllMarkdown(db);
+      const bundle = {
+        generated_at: new Date().toISOString(),
+        files: Object.fromEntries(files),
+      };
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="megamemory-export.json"`,
+      });
+      res.end(JSON.stringify(bundle, null, 2));
       return;
     }
 
