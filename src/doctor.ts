@@ -135,14 +135,19 @@ export function runDoctor(db: KnowledgeDB): {
   const model = db.getMetaValue("embed_model");
   const dim = db.getMetaValue("embed_dim");
   const vectorOk = vectorSearchEnabled(db);
+  // F10: unknown-model vectors are a problem, not a note — exit 1 makes CI
+  // and the acceptance flow catch a mixed vector space before it is served.
+  const vectors = healthReport(db).vectors;
   add(
     "embedding model",
     model === MODEL_NAME,
-    model
-      ? model === MODEL_NAME
-        ? `${model} (dim=${dim ?? "?"}, vector search on)`
-        : `${model} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`
-      : "not recorded — run 'megamemory migrate --apply'"
+    model === "unknown"
+      ? `model unknown · vectors ${vectors.have}/${vectors.total} · run 'megamemory reembed'`
+      : model
+        ? model === MODEL_NAME
+          ? `${model} (dim=${dim ?? "?"}, vector search on)`
+          : `${model} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`
+        : "not recorded — run 'megamemory migrate --apply'"
   );
 
   // FTS index
