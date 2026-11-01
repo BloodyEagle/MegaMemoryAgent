@@ -57,7 +57,7 @@ database at `.megamemory/knowledge.db`.
 
 ## Install
 
-Requires Node.js >= 18. The embedding model (~120 MB, multilingual) downloads on first use and is
+Requires Node.js >= 18. For Russian-only projects a much smaller model (`cointegrated/rubert-tiny2`, 312-dim) works after an ONNX conversion; the model unloads after 5 minutes idle (`MEGAMEMORY_EMBED_IDLE_MS=0` disables that), and `MEGAMEMORY_SEARCH=fts` avoids loading it at all. The embedding model (~120 MB, multilingual) downloads on first use and is
 cached in `~/.cache/huggingface`.
 
 The fork is not published to npm — install from a tarball or a checkout:

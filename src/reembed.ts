@@ -8,7 +8,7 @@ import {
 } from "./embeddings.js";
 
 export interface ReembedOptions {
-  /** Nodes per batch (default 64). Each batch commits its progress. */
+  /** Nodes per batch (default 16 — F9.5: memory over speed). */
   batch?: number;
   /** Injectable embedder for tests; defaults to the real model. */
   embedFn?: (text: string) => Promise<Buffer>;
@@ -36,7 +36,7 @@ export async function reembed(
   db: KnowledgeDB,
   opts: ReembedOptions = {}
 ): Promise<ReembedResult> {
-  const batch = opts.batch ?? 64;
+  const batch = opts.batch ?? 16;
   const embedFn =
     opts.embedFn ?? ((text: string) => embed(passageText(text)));
 

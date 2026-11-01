@@ -1,5 +1,5 @@
 import type { KnowledgeDB } from "./db.js";
-import { MODEL_NAME, vectorSearchEnabled } from "./embeddings.js";
+import { MODEL_NAME, isModelLoaded, vectorSearchEnabled } from "./embeddings.js";
 import { MIGRATION_TARGET_SCHEMA_VERSION } from "./migrate-schema.js";
 import { isBrokenId } from "./migrate.js";
 
@@ -165,6 +165,22 @@ export function runDoctor(db: KnowledgeDB): {
     caseClash === 0
       ? "no ids differing only by case"
       : `${caseClash} pair(s) — markdown export collides on case-insensitive filesystems`
+  );
+
+  // ---- F9.8: memory metrics ----
+
+  const mem = process.memoryUsage();
+  const modelLoaded = isModelLoaded();
+  const rssMb = Math.round(mem.rss / (1024 * 1024));
+  // RSS far above the model+graph budget with the session loaded smells like
+  // a leak or an oversized batch.
+  const memoryOk = !modelLoaded || rssMb <= 800;
+  add(
+    "memory",
+    memoryOk,
+    "rss " + rssMb + " MB, heapUsed " + Math.round(mem.heapUsed / (1024 * 1024)) +
+      " MB, external " + Math.round(mem.external / (1024 * 1024)) +
+      " MB, model loaded: " + (modelLoaded ? "yes" : "no")
   );
 
   return { checks, problems: checks.filter((c) => !c.ok).length };

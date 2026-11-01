@@ -24,7 +24,7 @@ function dbPath(): string {
  */
 export async function runReembed(args: string[]): Promise<void> {
   const batchFlag = args.indexOf("--batch");
-  const batch = batchFlag !== -1 ? parseInt(args[batchFlag + 1], 10) : 64;
+  const batch = batchFlag !== -1 ? parseInt(args[batchFlag + 1], 10) : 16;
   if (isNaN(batch) || batch < 1) {
     errorBold("Invalid --batch value. Must be a positive integer.");
     process.exit(1);

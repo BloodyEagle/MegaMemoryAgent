@@ -7,7 +7,12 @@ import { KnowledgeDB } from "./db.js";
 import { buildNodeWithContext, understand } from "./tools.js";
 import { findDuplicates, mergeNodes } from "./consolidate.js";
 import { errorBold, askPort } from "./cli-utils.js";
-import { initializeEmbeddings, vectorSearchEnabled } from "./embeddings.js";
+import {
+  initializeEmbeddings,
+  isModelLoaded,
+  isTextOnlySearchMode,
+  vectorSearchEnabled,
+} from "./embeddings.js";
 import type { NodeRow } from "./types.js";
 
 const VERSION = JSON.parse(
@@ -538,7 +543,9 @@ export async function runServe(port: number): Promise<void> {
   // Warm the model in the background: serve must not block on a ~120 MB
   // first-run download, and there is nothing to preload at all when the
   // vector channel is disabled (model mismatch pending reembed).
-  if (vectorSearchEnabled(db)) {
+  if (isTextOnlySearchMode()) {
+    console.log(pc.dim("  MEGAMEMORY_SEARCH=fts — text search only, model not loaded."));
+  } else if (vectorSearchEnabled(db)) {
     console.log(pc.dim("  Loading embedding model in background..."));
     void initializeEmbeddings()
       .then(() => {
@@ -596,7 +603,7 @@ export async function runServe(port: number): Promise<void> {
         return;
       }
 
-      if (!embeddingsReady) {
+      if (!embeddingsReady && !isTextOnlySearchMode()) {
         try {
           await initializeEmbeddings();
           embeddingsReady = true;
@@ -707,7 +714,19 @@ export async function runServe(port: number): Promise<void> {
         last_reembed: db.getMetaValue("last_reembed") ?? null,
         vector_search: vectorSearchEnabled(db),
       };
-      json(res, { ...stats, kinds, embeddings, usage: db.getUsageStats(7) });
+      const mem = process.memoryUsage();
+      json(res, {
+        ...stats,
+        kinds,
+        embeddings,
+        usage: db.getUsageStats(7),
+        memory: {
+          rss_mb: Math.round(mem.rss / (1024 * 1024)),
+          heap_used_mb: Math.round(mem.heapUsed / (1024 * 1024)),
+          external_mb: Math.round(mem.external / (1024 * 1024)),
+          model_loaded: isModelLoaded(),
+        },
+      });
       return;
     }
 
