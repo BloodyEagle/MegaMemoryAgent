@@ -1,5 +1,11 @@
 # Changelog
 
+## Fork (1.6.3-fork.4)
+
+- Explorer больше не ходит в CDN: d3 7.9.0 вендорится в `web/vendor/` и раздаётся
+  локально через `/vendor/*` (защита от path traversal). Источник настраивается
+  env-переменной `MEGAMEMORY_D3_URL` (любой абсолютный URL, по умолчанию — локальный файл).
+
 ## Fork (1.6.3-fork.2)
 
 ### Explorer UI (U1-U6)

@@ -165,6 +165,7 @@ megamemory doctor               # проверка здоровья, код вы
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid` / `fts` / `vector` |
 | `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` добавляет второй индекс для CJK |
 | `MEGAMEMORY_AUTO_DIGEST` | включено | `0` отключает автосборку digest после 5-го ребёнка |
+| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | Источник D3 для explorer; укажите URL CDN, чтобы грузить его извне вместо локальной копии |
 
 ---
 
