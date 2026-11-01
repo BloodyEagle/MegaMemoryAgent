@@ -66,6 +66,12 @@ Install globally from npm:
 npm install -g @bloodyeagle/megamemory
 ```
 
+
+Or download the tarball from GitHub Releases (no build needed):
+
+```bash
+npm install -g ./megamemory-1.6.3-fork.3.tgz
+```
 Or build from a checkout (for development):
 
 ```bash
@@ -73,8 +79,8 @@ git clone https://github.com/BloodyEagle/MegaMemoryAgent.git
 cd MegaMemoryAgent
 npm ci
 npm run build
-npm pack                      # megamemory-1.6.3-fork.1.tgz
-npm install -g ./megamemory-1.6.3-fork.1.tgz
+npm pack                      # bloodyeagle-megamemory-1.6.3-fork.3.tgz
+npm install -g ./bloodyeagle-megamemory-1.6.3-fork.3.tgz
 ```
 
 Then either run the installer or register the MCP server by hand:

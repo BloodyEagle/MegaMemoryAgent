@@ -66,6 +66,12 @@
 npm install -g @bloodyeagle/megamemory
 ```
 
+
+Или скачайте tarball из GitHub Releases (без сборки):
+
+```bash
+npm install -g ./megamemory-1.6.3-fork.3.tgz
+```
 Или сборка из чекаута (для разработки):
 
 ```bash
@@ -73,8 +79,8 @@ git clone https://github.com/BloodyEagle/MegaMemoryAgent.git
 cd MegaMemoryAgent
 npm ci
 npm run build
-npm pack                      # megamemory-1.6.3-fork.1.tgz
-npm install -g ./megamemory-1.6.3-fork.1.tgz
+npm pack                      # bloodyeagle-megamemory-1.6.3-fork.3.tgz
+npm install -g ./bloodyeagle-megamemory-1.6.3-fork.3.tgz
 ```
 
 Дальше — либо установщик, либо регистрация MCP-сервера руками:
