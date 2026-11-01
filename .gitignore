@@ -18,3 +18,4 @@ graph-deps.json
 .kilo-edit-body.txt
 *.db-shm
 *.db-wal
+tmp-upstream-acc/
