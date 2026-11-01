@@ -204,4 +204,4 @@ npx vitest run                                                       # всё (�
 
 Основа — [MegaMemory](https://github.com/0xK3vin/MegaMemory), автор 0xK3vin (MIT).
 Форк поддерживает [BloodyEagle](https://github.com/BloodyEagle). MIT, см. [LICENSE](./LICENSE).
-Отличия и порядок синхронизации с upstream: [docs/FORK.md](./docs/FORK.md).
+Отличия и порядок синхронизации с upstream: [docs/FORK.ru.md](./docs/FORK.ru.md) (english: [docs/FORK.md](./docs/FORK.md)).

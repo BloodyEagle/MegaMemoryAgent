@@ -1,94 +1,107 @@
-# MegaMemory Fork — что отличается от upstream / What differs from upstream
+# MegaMemory Fork — what differs from upstream
 
 База: upstream [0xK3vin/MegaMemory](https://github.com/0xK3vin/MegaMemory) v1.6.2 (MIT).
-Ветка форка: `feat/multilang`. `main` остаётся зеркалом upstream.
+Русская версия этого документа: [docs/FORK.ru.md](./FORK.ru.md).
 
-## Возможности форка / Fork features
+## Fork features
 
-| Задача | Что даёт | Где видно |
+| Task | What it gives | Where it is visible |
 |---|---|---|
-| T0 | Unicode-`makeId`: кириллица/CJK/арабский/эмодзи дают корректные id; hash-фолбэк для пустых slug; коллизии имён решаются суффиксом `-<hash4>` | любые id узлов; `repair-ids` чинит старые базы |
-| T0.5 | Миграция с upstream v1.6.2: аддитивная схема (meta, status-колонки, FTS-индекс, usage), бэкапы, `migrate --dry-run/--apply`, автомиграция при старте MCP | `megamemory migrate`, лог старта |
-| T1 | Мультиязычные эмбеддинги: `Xenova/multilingual-e5-small` по умолчанию (env `MEGAMEMORY_EMBED_MODEL`), e5-префиксы, resumable `reembed`, векторный поиск отключается при смене модели | `/api/stats → embeddings`, `megamemory reembed` |
-| T2 | Гибридный поиск: FTS5 + вектор через RRF, `via: vector/fts/both`, trigram-таблица для CJK (`MEGAMEMORY_FTS_TOKENIZER=trigram`), LIKE-фолбэк | бейджи `via` в поиске explorer, env `MEGAMEMORY_SEARCH` |
-| T3 | Бюджет контекста: `understand` в режиме `compact` (по умолчанию) укладывает выдачу в `max_tokens` (1500), обрезка summary до 240 символов, `meta.returned/dropped/tokens_estimated`; `list_roots` с `roots_compact` | зелёная строка «N nodes, ~X tokens, dropped M» в explorer |
-| T4 | Жизненный цикл: `status` (active/superseded/deprecated), `supersedes`, `contradicts`; устаревшее скрыто из выдачи, но видно в графе | бейдж статуса в карточке, пунктирные янтарные рёбра `supersedes`, тумблер «show outdated» |
-| T5 | Консолидация дублей: косинус эмбеддингов ≥ 0.95, merge в старший узел с переносом рёбер | `megamemory consolidate`, вкладка «consolidate…» в explorer |
-| T6 | Digest-узлы: один узел на модуль со сводкой по детям (≥5), вес 0.8 в поиске, автосборка после 5-го ребёнка | жёлтые узлы `digest`, `megamemory digest` |
-| T7 | Markdown-экспорт: файл на узел, frontmatter, wiki-ссылки, детерминированный порядок | `megamemory export --md <dir> [--check]` |
-| T8 | Учёт токенов: что и сколько вернули `understand`/`list_roots`/`get_concept` за 7 дней | панель Tokens в explorer, `megamemory stats` |
-| T9 | Doctor: health-check базы с кодом выхода 1 | `megamemory doctor` |
+| T0 | Unicode `makeId`: Cyrillic/CJK/Arabic/Hebrew/emoji produce correct ids; diacritics stripped only after Latin/Cyrillic/Greek/Hebrew bases (katakana dakuten and Hangul jamo survive); `/` becomes `-`; NFC output; hash fallback for empty slugs; 8-hex suffix on name collisions | any node id; `repair-ids` fixes legacy databases |
+| T0.5 | Migration from upstream v1.6.2: additive schema (meta, status columns, `name_norm`, aliases, FTS index, usage), backups, `migrate --dry-run/--apply`, auto-migration at MCP startup | `megamemory migrate`, startup log |
+| T1 | Multilingual embeddings: `Xenova/multilingual-e5-small` by default (env `MEGAMEMORY_EMBED_MODEL`), e5 prefixes, resumable `reembed` (fills `WHERE embedding IS NULL`), vector search disabled on model mismatch | `/api/stats → embeddings`, `megamemory reembed` |
+| T2 | Hybrid search: FTS5 + vector fused with RRF, per-hit `via: vector/fts/both`, per-token quoted prefix queries (`"ток"*` — safe input, morphology compensation), trigram table for CJK ≥3 chars (`MEGAMEMORY_FTS_TOKENIZER=trigram`), `name_norm` LIKE fallback for short CJK and case-insensitive Cyrillic | `via` badges in the explorer search, env `MEGAMEMORY_SEARCH` |
+| T2.5 | Eval harness: `megamemory eval` measures recall@10 over `fixtures/eval.jsonl`, per language | `megamemory eval`, CI |
+| T3 | Context budget: `understand` answers in `compact` mode (default) bounded by `max_tokens` (1500), summaries trimmed to 240 chars, `meta.returned/dropped/tokens_estimated`, `edges_between` for returned nodes; budgeted `list_roots` | green line «N nodes, ~X tokens, dropped M» in the explorer |
+| T4 | Fact freshness: node `status` (active/superseded/deprecated), `supersedes`, `contradicts`; outdated facts hidden from answers but visible in the graph | status badge in the node card, dashed amber `supersedes` edges, «show outdated» toggle |
+| T5 | Duplicate consolidation: embedding cosine ≥ 0.95, merge into the older node with edge transfer, digests excluded | `megamemory consolidate`, the «consolidate…» tab in the explorer |
+| T6 | Digest nodes: one summary node per module (≥5 children), weighted 0.8 in search, its children dropped from results, auto-built after the 5th child | yellow `digest` nodes, `megamemory digest` |
+| T7 | Markdown export: one file per node, frontmatter, wiki-links, deterministic order, `--check` prunes orphans | `megamemory export --md <dir> [--check]` |
+| T8 | Token accounting: what and how much `understand`/`list_roots`/`get_concept` returned over 7 days, savings vs full mode | Tokens panel in the explorer, `megamemory stats` |
+| T9 | Doctor: database health check, exit code 1 on problems | `megamemory doctor` |
 
-## Обновление из upstream / Syncing with upstream
+Native vector search (no JS cosine loop): embeddings are mirrored into a `nodes_vec`
+shadow table (`F32_BLOB`) and top-k is computed by SQLite via `vector_distance_cos`;
+JS cosine remains as a fallback when the shadow table is not fully populated.
+
+## Syncing with upstream
 
 ```bash
 git remote add upstream https://github.com/0xK3vin/MegaMemory.git
 git fetch upstream
-git checkout feat/multilang
 git rebase upstream/main
-# при конфликте — resolve и продолжить
+# resolve conflicts, then
 git rebase --continue
 ```
 
-### Конфликты в `src/tools.ts`
+### Conflicts in `src/tools.ts`
 
-Upstream двигает те же функции (`understand`, `createConcept`, `makeId`). Правила:
+Upstream touches the same functions (`understand`, `createConcept`, `makeId`). Rules:
 
-1. Не принимать upstream-версию целиком: в форке `understand` — compact-режим + фильтр статусов,
-   `createConcept` — коллизии + `supersedes`, `makeId` — Unicode.
-2. После rebase прогнать: `npm run build` и `npx vitest run src/__tests__/id-generation.test.ts src/__tests__/context-budget.test.ts src/__tests__/status.test.ts --reporter=dot`.
-3. Если upstream поменял схему БД — поднять аддитивную миграцию в `src/migrate-schema.ts`
-   (новая версия `schema_version`), никогда не менять/удалять существующие колонки.
+1. Never take the upstream version wholesale: in this fork `understand` is compact-mode +
+   status filter, `createConcept` has collision suffixes + `supersedes`, `makeId` is
+   Unicode-aware (lookbehind diacritic stripping, NFC).
+2. After a rebase run: `npm run build` and
+   `npx vitest run src/__tests__/id-generation.test.ts src/__tests__/context-budget.test.ts src/__tests__/status.test.ts --reporter=dot`.
+3. If upstream changed the DB schema — add an additive migration in `src/migrate-schema.ts`
+   (bump `schema_version`); never alter or drop existing columns.
 
-## Обратная совместимость / Compatibility
+## Compatibility
 
-- База upstream v1.6.2 открывается форком: при старте применяется аддитивная миграция
-  (без потери данных; `migrate --dry-run` покажет план, включая узлы, потерянные upstream'ом до миграции).
-- Обратный откат: upstream v1.6.2 продолжает работать с мигрированной базой — новые колонки имеют
-  DEFAULT, FTS-триггеры поддерживают индекс при вставках upstream. Бэкапы: `knowledge.db.bak-<ts>`,
-  хранятся 3 последних.
-- Старые вызовы MCP-инструментов работают без изменений; новые параметры (`max_tokens`, `mode`,
-  `include_inactive`, `supersedes`) опциональны.
+- An upstream v1.6.2 database opens in the fork: an additive migration runs at startup
+  (no data loss; `migrate --dry-run` prints the plan, including nodes lost upstream before
+  the migration).
+- Downgrade: upstream v1.6.2 keeps working with a migrated database — new columns have
+  DEFAULTs, FTS triggers keep the index in sync for upstream inserts, `usage` self-heals.
+  Backups: `knowledge.db.bak-<ts>`, the 3 most recent are kept.
+- Old MCP tool calls work unchanged; new parameters (`max_tokens`, `mode`,
+  `include_inactive`, `supersedes`) are optional.
+- Ids renamed by `repair-ids` stay resolvable through the `aliases` table
+  (in `getConcept` and `/api/node/:id`).
 
-## Переменные окружения
+## Environment variables
 
-| Переменная | По умолчанию | Значение |
+| Variable | Default | Meaning |
 |---|---|---|
-| `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Модель эмбеддингов (~120 МБ при первом запуске, кеш в `~/.cache/huggingface`) |
+| `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Embedding model (~120 MB on first use, cached in `~/.cache/huggingface`) |
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid` / `fts` / `vector` |
-| `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` — вторая FTS-таблица для CJK |
-| `MEGAMEMORY_AUTO_DIGEST` | вкл (`0` — выкл) | Автосборка digest после 5-го ребёнка |
-| `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Путь к базе |
+| `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` — second FTS table for CJK |
+| `MEGAMEMORY_AUTO_DIGEST` | on (`0` — off) | Auto-build digests after the 5th child |
+| `MEGAMEMORY_EMBED_IDLE_MS` | `300000` | Unload the model after this idle time; `0` disables unloading |
+| `MEGAMEMORY_EMBED_THREADS` | `1` | Intra-op threads of the ONNX session |
+| `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Database path |
 
-**Лицензия модели (М11).** `intfloat/multilingual-e5-small` — MIT; ONNX-экспорт
-`Xenova/multilingual-e5-small` распространяется под той же лицензией. Альтернатива без
-prefix-механики (`query:`/`passage:`), если она не нужна: `Xenova/paraphrase-multilingual-MiniLM-L12-v2`
-(Apache-2.0, ONNX-версия существует) — префиксы к ней не применяются автоматически
-(имя модели не содержит "e5").
+**Model license.** `intfloat/multilingual-e5-small` is MIT; the ONNX export
+`Xenova/multilingual-e5-small` ships under the same license. A prefix-free alternative
+(no `query:`/`passage:` mechanics): `Xenova/paraphrase-multilingual-MiniLM-L12-v2`
+(Apache-2.0, ONNX export exists) — prefixes are not applied to it automatically
+(its name does not contain "e5").
 
-**Меньшая модель (F9.7).** Для чисто русских проектов `cointegrated/rubert-tiny2`
-(29M параметров, 312 измерений) — в 4–5 раз меньше памяти и в 4–6 раз быстрее e5-small.
-ONNX-экспорта под transformers.js может не быть — тогда требуется конвертация (отдельная задача);
-префиксы `passage:`/`query:` к ней не применяются автоматически.
+**Smaller model.** For Russian-only projects `cointegrated/rubert-tiny2`
+(29M parameters, 312 dimensions) is 4–5× lighter and 4–6× faster than e5-small.
+There may be no transformers.js ONNX export — conversion is a separate task;
+prefixes are not applied to it automatically.
 
-**Память (F9.1–F9.2).** Модель выгружается после `MEGAMEMORY_EMBED_IDLE_MS` простоя
-(по умолчанию 5 минут, `0` — не выгружать), сессия ONNX создаётся без memory-арены,
-потоки — `MEGAMEMORY_EMBED_THREADS` (по умолчанию 1). Режим `MEGAMEMORY_SEARCH=fts`
-вообще не загружает модель. Текущее потребление — `megamemory doctor` и `/api/stats → memory`.
+**Memory.** The model unloads after `MEGAMEMORY_EMBED_IDLE_MS` of idle time
+(5 minutes by default), the ONNX session is created without a memory arena,
+threads via `MEGAMEMORY_EMBED_THREADS`. `MEGAMEMORY_SEARCH=fts` never loads the
+model at all. Current usage: `megamemory doctor` and `/api/stats → memory`.
 
-## Ограничения хостов (А7)
+## Host limitations
 
-FTS5/virtual tables работают в **локальном** file-режиме libsql (единственный режим
-MegaMemory). На удалённых хостах Turso виртуальные таблицы запрещены — если форк когда-нибудь
-переводят на remote-хранилище, гибридный поиск теряет FTS-половину (остаётся LIKE-fallback
-и векторный канал). Также после любого VACUUM нужен `megamemory migrate --apply`
-(пересборка FTS — SQLite не гарантирует стабильность rowid, М5).
+FTS5/virtual tables work in the **local** file mode of libsql (the only mode
+MegaMemory uses). Remote Turso hosts disallow virtual tables — if the fork is ever
+moved to remote storage, hybrid search loses its FTS half (the LIKE fallback and the
+vector channel remain). Also, after any VACUUM run `megamemory migrate --apply`
+(rebuilds FTS — SQLite does not guarantee rowid stability).
 
-## Установка из tarball
+## Install
+
+Primary: `npm install -g @bloodyeagle/megamemory` (see README). From a tarball:
 
 ```bash
-npm run build && npm pack   # megamemory-1.6.3-fork.1.tgz
-npx ./megamemory-1.6.3-fork.1.tgz migrate --apply   # в проекте с .megamemory
-npx ./megamemory-1.6.3-fork.1.tgz reembed   # после смены модели
-npx ./megamemory-1.6.3-fork.1.tgz doctor    # проверка
+npm run build && npm pack   # bloodyeagle-megamemory-<version>.tgz
+npx ./bloodyeagle-megamemory-1.6.3-fork.1.tgz migrate --apply   # in a project with .megamemory
+npx ./bloodyeagle-megamemory-1.6.3-fork.1.tgz reembed   # after changing the model
+npx ./bloodyeagle-megamemory-1.6.3-fork.1.tgz doctor    # health check
 ```
