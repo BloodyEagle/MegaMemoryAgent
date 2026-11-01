@@ -850,6 +850,29 @@ function handleEdgeRemoved(data) {
 // T4: legend toggle — hide superseded/deprecated nodes entirely.
 let hideOutdated = false;
 
+// U1: per-kind visibility filter, persisted across reloads.
+const KIND_ORDER = ['feature', 'module', 'pattern', 'config', 'decision', 'component', 'digest'];
+let hiddenKinds = new Set(JSON.parse(localStorage.getItem('mm.hiddenKinds') || '[]'));
+
+function toggleKind(kind, on) {
+  if (on) hiddenKinds.delete(kind);
+  else hiddenKinds.add(kind);
+  localStorage.setItem('mm.hiddenKinds', JSON.stringify([...hiddenKinds]));
+}
+
+function nodeVisible(node) {
+  if (hideOutdated && node.status && node.status !== 'active') return false;
+  if (hiddenKinds.has(node.kind)) return false;
+  return true;
+}
+
+function updateVisibleCounter() {
+  const el = document.getElementById('visible-counter');
+  if (!el) return;
+  const visible = nodes.filter(nodeVisible).length;
+  el.textContent = visible + ' / ' + nodes.length + ' visible';
+}
+
 function renderStats(stats) {
   const el = document.getElementById('stats');
   const parts = [
@@ -862,6 +885,15 @@ function renderStats(stats) {
       parts.push(`<span class="stat"><span class="dot" style="background:${c}"></span>${kind}: ${count}</span>`);
     }
   }
+  // U1: per-kind filter checkboxes.
+  parts.push(KIND_ORDER.map(k =>
+    `<label class="stat" style="cursor:pointer">
+       <input type="checkbox" ${hiddenKinds.has(k) ? '' : 'checked'}
+              onchange="toggleKind('${k}', this.checked)">
+       <span style="color:${KIND_COLORS[k] || '#888'}">■</span> ${k}
+     </label>`).join(''));
+  // U1: visible/total counter.
+  parts.push(`<span class="stat" id="visible-counter"></span>`);
   // T4: status legend + "show outdated" toggle.
   parts.push(`<span class="stat"><span class="dot" style="background:#d97706"></span>superseded</span>`);
   parts.push(`<span class="stat"><span class="dot" style="background:#ef4444"></span>deprecated</span>`);
@@ -1145,7 +1177,8 @@ function drawEdges(now) {
     const target = pair.target;
     if (!source || !target) continue;
     // T4: hide edges touching nodes hidden by the outdated toggle.
-    if (hideOutdated && ((source.status && source.status !== 'active') || (target.status && target.status !== 'active'))) continue;
+    // T4/U1: hide edges touching nodes filtered out of the graph.
+    if (!nodeVisible(source) || !nodeVisible(target)) continue;
 
     const sx = source.x;
     const sy = source.y;
@@ -1287,10 +1320,8 @@ function drawNodes(now) {
     const radius = node.radius * entrance.scale;
     if (radius <= 0) continue;
 
-    // T4: superseded/deprecated nodes render at half alpha — visibly muted
-    // but still on the graph; the legend toggle can hide them entirely.
-    const outdatedHidden = hideOutdated && node.status && node.status !== 'active';
-    if (outdatedHidden) continue;
+    // T4/U1: muted for outdated, fully hidden when filtered out.
+    if (!nodeVisible(node)) continue;
     const baseAlpha = node.dimmed ? 0.12 : (node.muted ? 0.4 : 1);
     ctx.save();
     ctx.globalAlpha = baseAlpha * entrance.opacity;
@@ -2175,6 +2206,7 @@ async function exitTimelineMode() {
   refreshSimulation(0.15);
   setEmptyStateVisible(graphData.nodes.length === 0);
   renderStats(stats);
+  updateVisibleCounter();
   connectSSE();
 }
 
