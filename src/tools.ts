@@ -313,6 +313,7 @@ export async function understand(
           returned: compact.length,
           dropped,
           tokens_estimated: tokensEstimated,
+          estimated_full_tokens: estimatedFullTokens,
         },
       };
     }
@@ -353,6 +354,7 @@ export async function understand(
       returned: compact.length,
       dropped: 0,
       tokens_estimated: tokensEstimated,
+      estimated_full_tokens: estimatedFullTokens,
     },
   };
 }

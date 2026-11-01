@@ -175,6 +175,8 @@ export interface UnderstandMeta {
   returned: number;
   dropped: number;
   tokens_estimated: number;
+  /** U6: what the full-mode answer would have cost — drives "saved vs full". */
+  estimated_full_tokens?: number;
 }
 
 export interface UnderstandOutput {

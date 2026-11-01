@@ -69,6 +69,8 @@ describe("understand compact mode budget", () => {
     expect(result.meta!.returned).toBeGreaterThanOrEqual(1);
     expect(result.meta!.dropped).toBeGreaterThan(0);
     expect(result.meta!.returned + result.meta!.dropped).toBe(20);
+    // U6: the explorer derives "saved vs full" from this pair.
+    expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);
     expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500);
     expect(result.compact!.length).toBe(result.meta!.returned);
     // Every compact node is trimmed to <=240 chars.
