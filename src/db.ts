@@ -5,8 +5,8 @@ import { createHash } from "node:crypto";
 import type { NodeRow, EdgeRow } from "./types.js";
 import { normalizeName } from "./norm.js";
 
-/** Plan 2 (workflow: trails, slots, task board). Exported for the doctor check. */
-export const SCHEMA_VERSION = 6;
+/** Plan 4 (informed_by provenance slice, schema v7). Exported for the doctor check. */
+export const SCHEMA_VERSION = 7;
 
 export class KnowledgeDB {
   private db: Database.Database;
@@ -307,6 +307,18 @@ export class KnowledgeDB {
         `);
       }
 
+      if (currentVersion < 7) {
+        // Plan 4 (v7): provenance slice — the informed_by cycle check hops per
+        // (relation, endpoint); these composite indexes keep it and the node
+        // cards off full edge scans. No new columns: relation is TEXT,
+        // idx_edges_unique(from_id,to_id,relation) exists since v4 and
+        // removed_at since v5.
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_edges_relation_from ON edges(relation, from_id);
+          CREATE INDEX IF NOT EXISTS idx_edges_relation_to   ON edges(relation, to_id);
+        `);
+      }
+
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       this.db.exec("COMMIT");
     } catch (err) {
@@ -432,7 +444,17 @@ export class KnowledgeDB {
       });
 
       for (const edge of edges) {
-        if (this.nodeExists(edge.to_id)) {
+        if (edge.relation === "informed_by") {
+          // Plan 4 §2 (invariant 6): never a silent skip for informed_by —
+          // the validation inside insertEdge rejects a missing/removed target
+          // (and any other violation) and the whole batch rolls back.
+          this.insertEdge({
+            from_id: node.id,
+            to_id: edge.to_id,
+            relation: edge.relation,
+            description: edge.description,
+          });
+        } else if (this.nodeExists(edge.to_id)) {
           this.insertEdge({
             from_id: node.id,
             to_id: edge.to_id,
@@ -538,7 +560,107 @@ export class KnowledgeDB {
 
   // ---- Edge CRUD ----
 
+  /**
+   * Plan 4 §2 (invariant 1): for informed_by the validation and the write
+   * share one BEGIN IMMEDIATE — otherwise two parallel batches could both
+   * pass on the same snapshot and both commit a cycle. runInTransaction
+   * nests, so batch callers (insertNodeAndEdges, supersedeNodes, ...) join
+   * their already-open transaction instead of opening a second one.
+   */
   insertEdge(edge: {
+    from_id: string;
+    to_id: string;
+    relation: string;
+    description?: string | null;
+  }): { id: number; inserted: boolean } {
+    if (edge.relation === "informed_by") {
+      return this.runInTransaction(() => {
+        this.assertInformedByWritable(edge.from_id, edge.to_id, edge.description);
+        return this.insertEdgeRow(edge);
+      });
+    }
+    return this.insertEdgeRow(edge);
+  }
+
+  /**
+   * Plan 4 §1/§2, carried over as-is: informed_by is a strict DAG over live
+   * edges with a mandatory rationale.
+   *   - self-loop u == v is rejected;
+   *   - the rationale (description) is mandatory and non-empty: what exactly
+   *     in `to` supports `from` — a link without it is unreadable and thus
+   *     useless;
+   *   - both ends must be alive: an active edge onto a tombstoned node is an
+   *     error, not a silent break (invariant 6);
+   *   - acyclicity: `to` must not reach `from` over live informed_by edges.
+   *     supersedes/contradicts are a separate layer and take no part in this
+   *     check; parent_id does not either. The revive of a tombstoned row goes
+   *     through this same check (invariant 2): a tombstoned u→v is not live,
+   *     so a v→…→u path added in the meantime rejects the revival.
+   */
+  private assertInformedByWritable(
+    fromId: string,
+    toId: string,
+    description: string | null | undefined
+  ): void {
+    if (fromId === toId) {
+      throw new Error(
+        `informed_by self-loop "${fromId}" is rejected: the relation is a strict DAG.`
+      );
+    }
+    if (!description || description.trim().length === 0) {
+      throw new Error(
+        `informed_by: рационал обязателен — что именно в узле-to поддерживает from.`
+      );
+    }
+    if (!this.nodeExists(fromId)) {
+      throw new Error(
+        `informed_by source "${fromId}" does not exist (or is removed) — ` +
+          `an active edge onto a tombstoned node is rejected, not silently broken.`
+      );
+    }
+    if (!this.nodeExists(toId)) {
+      throw new Error(
+        `informed_by target "${toId}" does not exist (or is removed) — ` +
+          `an active edge onto a tombstoned node is rejected, not silently broken.`
+      );
+    }
+    if (this.informedByReaches(toId, fromId)) {
+      throw new Error(
+        `informed_by cycle rejected: "${toId}" already reaches "${fromId}" over live ` +
+          `informed_by edges — adding "${fromId} -> ${toId}" would close a cycle.`
+      );
+    }
+  }
+
+  /**
+   * Plan 4 §2 (invariant 5): cycle-safe reachability over LIVE informed_by
+   * edges only. Iterative walk with a visited set — a pre-existing cycle
+   * (e.g. brought in by a merge) must not hang any new write. Only the
+   * informed_by layer is followed; supersedes/contradicts never leak in.
+   */
+  private informedByReaches(start: string, target: string): boolean {
+    if (start === target) return true;
+    const visited = new Set<string>([start]);
+    const stack = [start];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      const rows = this.db
+        .prepare(
+          "SELECT to_id FROM edges WHERE from_id = ? AND relation = 'informed_by' AND removed_at IS NULL"
+        )
+        .all(current) as Array<{ to_id: string }>;
+      for (const row of rows) {
+        if (row.to_id === target) return true;
+        if (!visited.has(row.to_id)) {
+          visited.add(row.to_id);
+          stack.push(row.to_id);
+        }
+      }
+    }
+    return false;
+  }
+
+  private insertEdgeRow(edge: {
     from_id: string;
     to_id: string;
     relation: string;

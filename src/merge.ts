@@ -126,6 +126,23 @@ export class MergeEngine {
     const leftEdges = leftDb.getAllEdgesRaw();
     const rightEdges = rightDb.getAllEdgesRaw();
 
+    // Plan 4 §5 (import): a live informed_by cycle expressible in a single
+    // row (u -> u) rejects the whole file BEFORE any write — the output must
+    // not contain half-written data. Tombstoned rows are history and are not
+    // a violation.
+    for (const e of [...leftEdges, ...rightEdges]) {
+      if (
+        e.relation === "informed_by" &&
+        e.removed_at === null &&
+        e.from_id === e.to_id
+      ) {
+        throw new Error(
+          `Merge rejected: live informed_by self-loop "${e.from_id}" in a source file — ` +
+            `the relation is a strict DAG. Fix the source and retry.`
+        );
+      }
+    }
+
     const leftNodeMap = new Map<string, NodeRow>();
     const rightNodeMap = new Map<string, NodeRow>();
     const leftVariantsByCanonical = new Map<string, NodeRow[]>();
@@ -394,6 +411,24 @@ export class MergeEngine {
       // which suffixed version to point at (not from_id suffix, which may be absent
       // for edges from non-conflicted nodes)
       const remappedToId = idRemapping.get(`${edge._originSide}:${edge.to_id}`) ?? edge.to_id;
+
+      // Plan 4 §2 (invariant 6) / §5: after a merge there is no u == v and no
+      // LIVE informed_by edge onto a tombstoned node — such rows are caught
+      // here and dropped, not silently alive in the output. Tombstoned
+      // informed_by rows carry over verbatim (history preservation).
+      if (edge.relation === "informed_by" && edge.removed_at === null) {
+        if (edge.from_id === remappedToId) continue;
+        const fromRow = outputDb.getNodeIncludingRemoved(edge.from_id);
+        const toRow = outputDb.getNodeIncludingRemoved(remappedToId);
+        if (
+          !fromRow ||
+          fromRow.removed_at !== null ||
+          !toRow ||
+          toRow.removed_at !== null
+        ) {
+          continue;
+        }
+      }
 
       outputDb.insertEdgeRaw({
         from_id: edge.from_id,
