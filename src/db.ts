@@ -1,11 +1,12 @@
 import Database from "libsql";
 import path from "path";
 import fs from "fs";
+import { createHash } from "node:crypto";
 import type { NodeRow, EdgeRow } from "./types.js";
 import { normalizeName } from "./norm.js";
 
-/** Plan 1 (tombstones + epistemic status). Exported for the doctor check. */
-export const SCHEMA_VERSION = 5;
+/** Plan 2 (workflow: trails, slots, task board). Exported for the doctor check. */
+export const SCHEMA_VERSION = 6;
 
 export class KnowledgeDB {
   private db: Database.Database;
@@ -115,6 +116,9 @@ export class KnowledgeDB {
             name_norm TEXT NOT NULL DEFAULT '',
             epistemic_status TEXT,
             status_scope TEXT,
+            -- Plan 2 (v6): task board columns, NULL for non-task nodes.
+            task_state TEXT,
+            due_at TEXT,
             FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE SET NULL
           );
 
@@ -259,6 +263,48 @@ export class KnowledgeDB {
             );
           }
         }
+      }
+
+      if (currentVersion < 6) {
+        // Plan 2: workflow tables (trails, trail_members, slots) + the task
+        // board columns. Every step is guarded so the migration is idempotent
+        // (fresh dbs already have task_state/due_at from CREATE TABLE).
+        const ncols6 = new Set(
+          this.db.prepare("PRAGMA table_info(nodes)").all().map((c: any) => c.name)
+        );
+        if (!ncols6.has("task_state")) {
+          this.db.exec("ALTER TABLE nodes ADD COLUMN task_state TEXT");
+        }
+        if (!ncols6.has("due_at")) {
+          this.db.exec("ALTER TABLE nodes ADD COLUMN due_at TEXT");
+        }
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_nodes_task ON nodes(task_state) WHERE task_state IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS idx_nodes_due  ON nodes(due_at)     WHERE due_at IS NOT NULL;
+
+          CREATE TABLE IF NOT EXISTS trails (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            stale INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT
+          );
+          CREATE TABLE IF NOT EXISTS trail_members (
+            trail_id TEXT NOT NULL REFERENCES trails(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            node_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            PRIMARY KEY (trail_id, position)
+          );
+          CREATE TABLE IF NOT EXISTS slots (
+            project TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (project, role)
+          );
+        `);
       }
 
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -1066,6 +1112,275 @@ export class KnowledgeDB {
     ).count;
     return { nodes, edges, removed, edges_removed: edgesRemoved };
   }
+
+  // ---- Workflow (plan 2, schema v6): slots, tasks, trails ----
+
+  /**
+   * Take a role slot. Rules (plan 2 §2): the role has exactly one live
+   * holder; taking it with a NEW node supersedes the old holder via a
+   * `supersedes` edge (the old one is never revoked — yesterday's handoff
+   * stays truthful); re-taking by the SAME node is a no-op (an idempotent
+   * retry must not bury the live node). Atomicity comes from the
+   * serialized write, not from check-then-insert.
+   */
+  setSlot(
+    project: string,
+    role: string,
+    nodeId: string
+  ): { taken: boolean; noop: boolean; previous_node: string | null } {
+    if (!this.nodeExists(nodeId)) {
+      throw new Error(`Node "${nodeId}" does not exist (or is removed).`);
+    }
+    let result = { taken: false, noop: false, previous_node: null as string | null };
+    this.runInTransaction(() => {
+      const current = this.db
+        .prepare("SELECT node_id FROM slots WHERE project = ? AND role = ?")
+        .get(project, role) as { node_id: string } | undefined;
+      const previous = current?.node_id ?? null;
+
+      if (previous === nodeId) {
+        result = { taken: false, noop: true, previous_node: previous };
+        return;
+      }
+      // The old holder is demoted with a supersedes edge — only while it is
+      // still alive; a removed holder keeps no active edge to bury.
+      if (previous !== null && this.nodeExists(previous)) {
+        this.insertEdge({
+          from_id: nodeId,
+          to_id: previous,
+          relation: "supersedes",
+          description: `slot ${role}: handoff`,
+        });
+      }
+      this.db
+        .prepare(
+          `INSERT INTO slots (project, role, node_id, updated_at) VALUES (?, ?, ?, datetime('now'))
+           ON CONFLICT(project, role) DO UPDATE SET node_id = excluded.node_id, updated_at = datetime('now')`
+        )
+        .run(project, role, nodeId);
+      result = { taken: true, noop: false, previous_node: previous };
+    });
+    return result;
+  }
+
+  getSlot(project: string, role: string): { node_id: string; node_name: string; updated_at: string } | undefined {
+    return this.db
+      .prepare(
+        `SELECT s.node_id, n.name AS node_name, s.updated_at
+         FROM slots s JOIN nodes n ON n.id = s.node_id AND n.removed_at IS NULL
+         WHERE s.project = ? AND s.role = ?`
+      )
+      .get(project, role) as { node_id: string; node_name: string; updated_at: string } | undefined;
+  }
+
+  /** Release the role without touching the node itself (plan 2 §2 rule 4). */
+  releaseSlot(project: string, role: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM slots WHERE project = ? AND role = ?")
+      .run(project, role);
+    return result.changes > 0;
+  }
+
+  listSlots(project: string): Array<{ role: string; node_id: string; node_name: string; updated_at: string }> {
+    return this.db
+      .prepare(
+        `SELECT s.role, s.node_id, n.name AS node_name, s.updated_at
+         FROM slots s JOIN nodes n ON n.id = s.node_id AND n.removed_at IS NULL
+         WHERE s.project = ? ORDER BY s.role`
+      )
+      .all(project) as Array<{ role: string; node_id: string; node_name: string; updated_at: string }>;
+  }
+
+  // ---- Task board (plan 2 §3) ----
+
+  setTaskState(id: string, taskState: "open" | "done" | null, dueAt: string | null | undefined): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE nodes SET task_state = @taskState,
+           due_at = CASE WHEN @clearDue = 1 THEN NULL ELSE COALESCE(@dueAt, due_at) END,
+           updated_at = datetime('now')
+         WHERE id = @id AND removed_at IS NULL`
+      )
+      .run({
+        taskState,
+        // `done` clears due_at — a closed task must not hang overdue.
+        clearDue: taskState === "done" ? 1 : 0,
+        dueAt: dueAt ?? null,
+        id,
+      });
+    return result.changes > 0;
+  }
+
+  /**
+   * Open tasks with the inputs of the rot score (plan 2 §3): age in days,
+   * overdue flag, isolation (no live edges either way).
+   */
+  getOpenTasks(): Array<{
+    id: string;
+    name: string;
+    summary: string;
+    created_at: string;
+    due_at: string | null;
+    live_edges: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT n.id, n.name, n.summary, n.created_at, n.due_at,
+           (SELECT COUNT(*) FROM edges e
+            WHERE (e.from_id = n.id OR e.to_id = n.id) AND e.removed_at IS NULL) AS live_edges
+         FROM nodes n
+         WHERE n.task_state = 'open' AND n.removed_at IS NULL`
+      )
+      .all() as Array<{
+      id: string;
+      name: string;
+      summary: string;
+      created_at: string;
+      due_at: string | null;
+      live_edges: number;
+    }>;
+  }
+
+  /** Recently closed tasks for the terminal board column (fresh first). */
+  getDoneTasks(limit = 20): Array<{ id: string; name: string; summary: string; updated_at: string }> {
+    return this.db
+      .prepare(
+        `SELECT id, name, summary, updated_at FROM nodes
+         WHERE task_state = 'done' AND removed_at IS NULL
+         ORDER BY updated_at DESC, rowid DESC LIMIT ?`
+      )
+      .all(limit) as Array<{ id: string; name: string; summary: string; updated_at: string }>;
+  }
+
+  // ---- Trails (plan 2 §1) ----
+
+  /**
+   * Fingerprint of a node's MEANING (plan 2 §1): summary + epistemic_status +
+   * the sorted set of live outgoing `informed_by` edges with their rationales.
+   * name, parent_id and timestamps are deliberately excluded — a rename or a
+   * merge-timestamp rewrite must not rot every chain at once. Returns null
+   * for a removed node (the fingerprint of a dead node is not computed).
+   */
+  nodeFingerprint(id: string): string | null {
+    const node = this.db
+      .prepare("SELECT summary, epistemic_status FROM nodes WHERE id = ? AND removed_at IS NULL")
+      .get(id) as { summary: string; epistemic_status: string | null } | undefined;
+    if (!node) return null;
+    const informedBy = (
+      this.db
+        .prepare(
+          `SELECT to_id, description FROM edges
+           WHERE from_id = ? AND relation = 'informed_by' AND removed_at IS NULL
+           ORDER BY to_id`
+        )
+        .all(id) as Array<{ to_id: string; description: string | null }>
+    )
+      .map((e) => `${e.to_id}::${e.description ?? ""}`)
+      .sort();
+    return createHash("sha1")
+      .update(node.summary + "\n" + (node.epistemic_status ?? "") + "\n" + informedBy.join("\n"))
+      .digest("hex");
+  }
+
+  insertTrail(trail: {
+    id: string;
+    name: string;
+    summary: string;
+    node_ids: string[];
+  }): void {
+    this.runInTransaction(() => {
+      this.db
+        .prepare(
+          "INSERT INTO trails (id, name, summary) VALUES (?, ?, ?)"
+        )
+        .run(trail.id, trail.name, trail.summary);
+      const stmt = this.db.prepare(
+        "INSERT INTO trail_members (trail_id, position, node_id, fingerprint) VALUES (?, ?, ?, ?)"
+      );
+      trail.node_ids.forEach((nodeId, i) => {
+        const fp = this.nodeFingerprint(nodeId);
+        if (fp === null) {
+          throw new Error(`Node "${nodeId}" does not exist (or is removed) — trail not saved.`);
+        }
+        stmt.run(trail.id, i, nodeId, fp);
+      });
+    });
+  }
+
+  getTrail(id: string): { id: string; name: string; summary: string; stale: number; created_at: string; updated_at: string | null } | undefined {
+    return this.db
+      .prepare("SELECT * FROM trails WHERE id = ?")
+      .get(id) as never;
+  }
+
+  getTrailMembers(trailId: string): Array<{ position: number; node_id: string; fingerprint: string }> {
+    return this.db
+      .prepare(
+        "SELECT position, node_id, fingerprint FROM trail_members WHERE trail_id = ? ORDER BY position"
+      )
+      .all(trailId) as Array<{ position: number; node_id: string; fingerprint: string }>;
+  }
+
+  /** Trails that reference a node — used by removal notes and node cards. */
+  getTrailsForNode(nodeId: string): Array<{ id: string; name: string }> {
+    return this.db
+      .prepare(
+        `SELECT t.id, t.name FROM trails t
+         JOIN trail_members m ON m.trail_id = t.id
+         WHERE m.node_id = ? ORDER BY t.id`
+      )
+      .all(nodeId) as Array<{ id: string; name: string }>;
+  }
+
+  setTrailStale(trailId: string, stale: boolean): void {
+    this.db
+      .prepare(
+        `UPDATE trails SET stale = ?, updated_at = datetime('now') WHERE id = ?`
+      )
+      .run(stale ? 1 : 0, trailId);
+  }
+
+  /** trail_refresh: overwrite all member fingerprints with the current ones. */
+  refreshTrailFingerprints(trailId: string): void {
+    this.runInTransaction(() => {
+      const members = this.getTrailMembers(trailId);
+      const stmt = this.db.prepare(
+        "UPDATE trail_members SET fingerprint = ? WHERE trail_id = ? AND position = ?"
+      );
+      for (const m of members) {
+        const fp = this.nodeFingerprint(m.node_id);
+        if (fp === null) {
+          throw new Error(`Member "${m.node_id}" no longer exists — chain is broken, refresh impossible.`);
+        }
+        stmt.run(fp, trailId, m.position);
+      }
+      this.setTrailStale(trailId, false);
+    });
+  }
+
+  /** trail_extend: append members with fresh fingerprints. */
+  appendTrailMembers(trailId: string, nodeIds: string[]): void {
+    this.runInTransaction(() => {
+      const maxRow = this.db
+        .prepare("SELECT COALESCE(MAX(position), -1) AS p FROM trail_members WHERE trail_id = ?")
+        .get(trailId) as { p: number };
+      const stmt = this.db.prepare(
+        "INSERT INTO trail_members (trail_id, position, node_id, fingerprint) VALUES (?, ?, ?, ?)"
+      );
+      nodeIds.forEach((nodeId, i) => {
+        const fp = this.nodeFingerprint(nodeId);
+        if (fp === null) {
+          throw new Error(`Node "${nodeId}" does not exist (or is removed) — not added.`);
+        }
+        stmt.run(trailId, maxRow.p + 1 + i, nodeId, fp);
+      });
+      this.db
+        .prepare("UPDATE trails SET updated_at = datetime('now') WHERE id = ?")
+        .run(trailId);
+    });
+  }
+
+
 
   // ---- Merge-related methods ----
 

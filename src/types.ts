@@ -49,7 +49,9 @@ export type RelationType =
   | "calls"
   | "configured_by"
   | "supersedes"
-  | "contradicts";
+  | "contradicts"
+  /** Plan 2 §1: provenance edge — "this conclusion is informed by that fact". */
+  | "informed_by";
 
 /** Node lifecycle (fork T4): active by default, soft-invalidated otherwise. */
 export type NodeStatus = "active" | "superseded" | "deprecated";
@@ -149,6 +151,8 @@ export interface NodeWithContext {
   status_scope?: Record<string, unknown> | null;
   /** Set for refuted nodes: why the verdict was made. */
   refuted_reason?: string | null;
+  /** Plan 2 §1: chains this node participates in, with their state. */
+  trails?: Array<{ id: string; name: string; state: "fresh" | "stale" | "broken" }>;
 }
 
 export interface UnderstandOutput {
@@ -243,6 +247,10 @@ export interface ListRootsOutput {
     kind: NodeKind;
     child_count: number;
   }>;
+  /** Plan 2 §2: role slots — first in the startup digest. */
+  slots?: Array<{ role: string; node_id: string; node_name: string }>;
+  /** Plan 2 §3: top-5 of the open column by rot. */
+  board_top?: Array<{ id: string; name: string; rot?: number; due_at?: string | null }>;
   meta?: UnderstandMeta;
 }
 
@@ -274,6 +282,10 @@ export interface NodeRow {
   // unknown) and the JSON scope of a `validated`.
   epistemic_status?: string | null;
   status_scope?: string | null;
+  // Plan 2 (v6): task board axis — 'open' | 'done', NULL for non-tasks.
+  // Deliberately NOT the lifecycle `status` or the epistemic axis.
+  task_state?: string | null;
+  due_at?: string | null;
 }
 
 export interface EdgeRow {
@@ -289,6 +301,54 @@ export interface EdgeRow {
   merge_timestamp: string | null;
   /** Plan 1 (v5): tombstone timestamp; NULL = active edge. */
   removed_at?: string | null;
+}
+
+// ---- Workflow tools (plan 2, v6) ----
+
+export interface TrailSaveInput {
+  node_ids: string[];
+  summary: string;
+  name?: string;
+}
+
+export interface TrailMemberView {
+  position: number;
+  node_id: string;
+  node_name: string | null;
+  fingerprint_at_save: string;
+  fingerprint_now: string | null;
+  /** fresh = meaning unchanged; stale = meaning changed or node removed; broken = node gone. */
+  state: "fresh" | "stale" | "broken";
+  reason: string | null;
+}
+
+export interface TrailView {
+  id: string;
+  name: string;
+  summary: string;
+  /** fresh / stale / broken for the chain as a whole. */
+  state: "fresh" | "stale" | "broken";
+  members: TrailMemberView[];
+}
+
+export interface SlotView {
+  role: string;
+  node_id: string;
+  node_name: string;
+  updated_at: string;
+}
+
+export interface BoardColumn {
+  name: string;
+  terminal: boolean;
+  count: number;
+  cards: Array<{ id: string; name: string; rot?: number; due_at?: string | null }>;
+}
+
+export interface BoardOutput {
+  columns: BoardColumn[];
+  overdue: number;
+  open: number;
 }
 
 // ---- Merge types ----
