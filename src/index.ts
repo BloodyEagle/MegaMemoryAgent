@@ -219,7 +219,7 @@ async function startMcpServer() {
   const { z } = await import("zod");
   const path = await import("path");
   const { KnowledgeDB } = await import("./db.js");
-  const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError } =
+  const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
 
   type NodeKind = import("./types.js").NodeKind;
@@ -294,7 +294,7 @@ async function startMcpServer() {
     "feature", "module", "pattern", "config", "decision", "component", "digest",
   ]);
   const RelationEnum = z.enum([
-    "connects_to", "depends_on", "implements", "calls", "configured_by", "supersedes", "contradicts",
+    "connects_to", "depends_on", "implements", "calls", "configured_by", "supersedes", "contradicts", "informed_by",
   ]);
 
   // ---- Register tools ----
@@ -659,6 +659,355 @@ async function startMcpServer() {
           params: { merge_group: params.merge_group },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  // ---- Workflow tools (plan 2, schema v6) ----
+
+  server.tool(
+    "trail_save",
+    "Save a reasoning chain: an ordered list of concept ids plus a mandatory author summary of WHY the conclusion follows. Member meaning is fingerprinted at save time; reads compare against the current state and mark the chain stale/broken when the ground shifted. Use after a non-trivial decision.",
+    {
+      node_ids: z.array(z.string()).min(1).describe("Ordered chain members: premises first, conclusion last"),
+      summary: z.string().describe("Author summary of the reasoning — why this conclusion follows from these nodes"),
+      name: z.string().optional().describe("Human-readable chain name (default: auto-generated)"),
+    },
+    async (params) => {
+      try {
+        const result = trailSave(db, params);
+        timeline.log({
+          tool: "trail_save",
+          params: { name: params.name },
+          result_summary: `saved ${result.id}`,
+          is_write: true,
+          is_error: false,
+          affected_ids: params.node_ids,
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "trail_save",
+          params: { name: params.name },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "trail_get",
+    "Read a reasoning chain with its freshness verdict: fresh (member meaning unchanged), stale (a member's summary/epistemic status/informed_by changed or was removed), broken (a member was hard-deleted). Stale members carry a per-member reason.",
+    {
+      id: z.string().describe("Trail id, as returned by trail_save"),
+    },
+    async (params) => {
+      try {
+        const result = trailGet(db, params.id);
+        timeline.log({
+          tool: "trail_get",
+          params: { id: params.id },
+          result_summary: `state ${result.state}`,
+          is_write: false,
+          is_error: false,
+          affected_ids: result.members.map((m) => m.node_id),
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "trail_get",
+          params: { id: params.id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "trail_refresh",
+    "Re-snapshot the fingerprints of every chain member after you verified the chain still holds. Refuses on a broken chain (a member was hard-deleted) — rebuild it instead.",
+    {
+      id: z.string().describe("Trail id"),
+    },
+    async (params) => {
+      try {
+        const result = trailRefresh(db, params.id);
+        timeline.log({
+          tool: "trail_refresh",
+          params: { id: params.id },
+          result_summary: result.message,
+          is_write: true,
+          is_error: false,
+          affected_ids: [],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "trail_refresh",
+          params: { id: params.id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "trail_extend",
+    "Append new members to the end of an existing reasoning chain; their current meaning is fingerprinted at append time.",
+    {
+      id: z.string().describe("Trail id"),
+      node_ids: z.array(z.string()).min(1).describe("Node ids to append, in order"),
+    },
+    async (params) => {
+      try {
+        const result = trailExtend(db, params.id, params.node_ids);
+        timeline.log({
+          tool: "trail_extend",
+          params: { id: params.id },
+          result_summary: result.message,
+          is_write: true,
+          is_error: false,
+          affected_ids: params.node_ids,
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "trail_extend",
+          params: { id: params.id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "slot_set",
+    "Take a named role slot (handoff, entrypoint, queue, ...) with a node — the role's single live pointer. Taking a role held by another node writes a supersedes edge and demotes the previous holder; re-taking by the same node is a no-op. Slots are scoped per project.",
+    {
+      role: z.string().describe("Role name, e.g. 'handoff', 'entrypoint'"),
+      node_id: z.string().describe("Concept id that now holds the role"),
+    },
+    async (params) => {
+      try {
+        const result = slotSet(db, params.role, params.node_id);
+        timeline.log({
+          tool: "slot_set",
+          params: { role: params.role, node_id: params.node_id },
+          result_summary: result.message,
+          is_write: true,
+          is_error: false,
+          affected_ids: [params.node_id],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "slot_set",
+          params: { role: params.role, node_id: params.node_id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "slot_get",
+    "Read who currently holds a role slot.",
+    { role: z.string().describe("Role name") },
+    async (params) => {
+      try {
+        const result = slotGet(db, params.role);
+        timeline.log({
+          tool: "slot_get",
+          params: { role: params.role },
+          result_summary: result.message,
+          is_write: false,
+          is_error: false,
+          affected_ids: [],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "slot_get",
+          params: { role: params.role },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "slot_release",
+    "Release a role slot. The previous holder node is NOT touched — releasing a role never revokes or deletes the handoff history.",
+    { role: z.string().describe("Role name") },
+    async (params) => {
+      try {
+        const result = slotRelease(db, params.role);
+        timeline.log({
+          tool: "slot_release",
+          params: { role: params.role },
+          result_summary: result.message,
+          is_write: true,
+          is_error: false,
+          affected_ids: [],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "slot_release",
+          params: { role: params.role },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "slot_list",
+    "List all role slots of the project with their current holders.",
+    {},
+    async () => {
+      try {
+        const result = slotList(db);
+        timeline.log({
+          tool: "slot_list",
+          params: {},
+          result_summary: `${result.slots.length} slots`,
+          is_write: false,
+          is_error: false,
+          affected_ids: result.slots.map((s) => s.node_id),
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "slot_list",
+          params: {},
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "task_add",
+    "Add a task card to the board. Tasks live in the open column and rot over time: rot = age + isolation penalty + overdue penalty — the board surfaces what is burning, not what is fresh.",
+    {
+      name: z.string().describe("Task name (becomes the concept name)"),
+      due: z.string().optional().describe("Due date, e.g. '2026-11-15'"),
+    },
+    async (params) => {
+      try {
+        const result = taskAdd(db, params.name, params.due);
+        timeline.log({
+          tool: "task_add",
+          params: { name: params.name, due: params.due },
+          result_summary: `created ${result.id}`,
+          is_write: true,
+          is_error: false,
+          affected_ids: [result.id],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "task_add",
+          params: { name: params.name, due: params.due },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "task_done",
+    "Close a task: it moves to the terminal done column and its due date is cleared — a closed task never hangs overdue.",
+    { id: z.string().describe("Task concept id") },
+    async (params) => {
+      try {
+        const result = taskDone(db, params.id);
+        timeline.log({
+          tool: "task_done",
+          params: { id: params.id },
+          result_summary: result.message,
+          is_write: true,
+          is_error: false,
+          affected_ids: [params.id],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "task_done",
+          params: { id: params.id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "board",
+    "Show the task board: the open column sorted by rot (overdue > isolated > oldest) and the terminal done column fresh-first. Call this instead of guessing what to work on next.",
+    {},
+    async () => {
+      try {
+        const result = board(db);
+        timeline.log({
+          tool: "board",
+          params: {},
+          result_summary: result.summary,
+          is_write: false,
+          is_error: false,
+          affected_ids: [],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "board",
+          params: {},
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
           is_error: true,
           affected_ids: [],
         });

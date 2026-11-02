@@ -208,6 +208,11 @@ export function buildNodeWithContext(
       ? { refuted_reason: db.getLatestEpistemicReason(node.id, "refuted") }
       : {}),
     ...(similarity !== undefined ? { similarity } : {}),
+    // Plan 2 §1: the "participates in chains" block on the node card, with
+    // the chain state — a stale/broken chain on the card is a warning sign.
+    trails: db.getTrailsForNode(node.id).map((t) => {
+      return { id: t.id, name: t.name, state: trailState(db, t.id) };
+    }),
   };
 }
 
@@ -724,8 +729,19 @@ export function removeConcept(
   // T4: soft-delete also deprecates the lifecycle status (U5: with reason).
   db.setNodeStatus(input.id, "deprecated", undefined, input.reason);
 
+  // Plan 2 (audit B5): removing a chain member must never be silent — the
+  // affected chains are marked stale and the answer says exactly why.
+  const affectedTrails = db.getTrailsForNode(input.id);
+  for (const t of affectedTrails) {
+    db.setTrailStale(t.id, true);
+  }
+  const trailNote =
+    affectedTrails.length > 0
+      ? ` Chains marked stale because "${input.id}" was removed: ${affectedTrails.map((t) => t.id).join(", ")}.`
+      : "";
+
   return {
-    message: `Removed concept "${input.id}". Reason: ${input.reason}`,
+    message: `Removed concept "${input.id}". Reason: ${input.reason}.${trailNote}`,
   };
 }
 
@@ -749,7 +765,17 @@ export function listRoots(
     kind: root.kind as NodeWithContext["kind"],
     child_count: db.getChildren(root.id).length,
   }));
+  // Plan 2 §2/§3: role slots go FIRST in the startup digest, then the top-5
+  // of the task board by rot — the burning, not the fresh.
+  const slots = db.listSlots("").map((s) => ({
+    role: s.role,
+    node_id: s.node_id,
+    node_name: s.node_name,
+  }));
+  const boardTop = computeBoard(db).columns.find((c) => c.name === "open")!.cards.slice(0, 5);
   const compactProjection = JSON.stringify({
+    slots,
+    board_top: boardTop,
     roots_compact: rootsCompact,
     ...(hint ? { hint } : {}),
   });
@@ -765,6 +791,8 @@ export function listRoots(
       roots: [],
       compact: true,
       roots_compact: rootsCompact,
+      slots,
+      board_top: boardTop,
       ...(hint ? { hint } : {}),
       meta: {
         returned: rootsCompact.length,
@@ -934,5 +962,312 @@ export async function resolveConflict(
 
   return {
     message: `Resolved "${originalId}". Reason: ${input.reason}`,
+  };
+}
+
+// Temporary fragment: appended to src/tools.ts by a node one-liner, then deleted.
+// Kept as a file because heredocs mangle escapes in shell tool calls.
+
+// ---- Workflow tools (plan 2, schema v6) ----
+
+import type {
+  TrailSaveInput,
+  TrailView,
+  TrailMemberView,
+  BoardOutput,
+  BoardColumn,
+} from "./types.js";
+
+/** Empirical rot constants from kaeru — do not change without a reason. */
+const ROT_ISOLATION_PENALTY = 45;
+const ROT_OVERDUE_PENALTY = 400;
+
+/** "YYYY-MM-DD HH:MM:SS" (UTC sqlite) -> epoch ms. */
+function parseSqliteTimestamp(ts: string): number {
+  return Date.parse(ts.includes("T") ? ts : ts.replace(" ", "T") + "Z");
+}
+
+/** Today as YYYY-MM-DD (UTC) for due_at comparisons. */
+function todayUtc(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/** Plan 2 §3: rot = age_days + (isolated ? 45 : 0) + (overdue ? 400 : 0). */
+export function taskRot(task: {
+  created_at: string;
+  due_at: string | null;
+  live_edges: number;
+}): { rot: number; overdue: boolean; age_days: number } {
+  const ageDays = Math.max(
+    0,
+    Math.floor((Date.now() - parseSqliteTimestamp(task.created_at)) / 86_400_000)
+  );
+  const due = task.due_at ? task.due_at.slice(0, 10) : null;
+  const overdue = due !== null && due < todayUtc();
+  const rot =
+    ageDays +
+    (task.live_edges === 0 ? ROT_ISOLATION_PENALTY : 0) +
+    (overdue ? ROT_OVERDUE_PENALTY : 0);
+  return { rot, overdue, age_days: ageDays };
+}
+
+/** Full board: the `open` column sorted by rot, the terminal `done` fresh-first. */
+export function computeBoard(db: KnowledgeDB): BoardOutput {
+  const openTasks = db.getOpenTasks().map((t) => {
+    const { rot, overdue } = taskRot(t);
+    return { id: t.id, name: t.name, rot, due_at: t.due_at, overdue };
+  });
+  openTasks.sort((a, b) => b.rot - a.rot);
+
+  const doneTasks = db.getDoneTasks().map((t) => ({
+    id: t.id,
+    name: t.name,
+  }));
+
+  const columns: BoardColumn[] = [
+    {
+      name: "open",
+      terminal: false,
+      count: openTasks.length,
+      cards: openTasks,
+    },
+    {
+      name: "done",
+      terminal: true,
+      count: doneTasks.length,
+      cards: doneTasks,
+    },
+  ];
+
+  return {
+    columns,
+    overdue: openTasks.filter((t) => t.overdue).length,
+    open: openTasks.length,
+  };
+}
+
+/**
+ * Per-member state of a saved chain, evaluated at read time (plan 2 §1): a
+ * member whose fingerprint no longer matches makes the chain `stale`; a
+ * member that no longer exists at all makes it `broken` — nothing to refresh.
+ */
+export function trailMemberStates(
+  db: KnowledgeDB,
+  trailId: string
+): TrailMemberView[] {
+  return db.getTrailMembers(trailId).map((m) => {
+    const node = db.getNodeIncludingRemoved(m.node_id);
+    const view: TrailMemberView = {
+      position: m.position,
+      node_id: m.node_id,
+      node_name: node?.name ?? null,
+      fingerprint_at_save: m.fingerprint,
+      fingerprint_now: null,
+      state: "fresh",
+      reason: null,
+    };
+    if (!node) {
+      view.state = "broken";
+      view.reason = `member "${m.node_id}" was hard-deleted — the chain is broken, only a rebuild helps`;
+      return view;
+    }
+    if (node.removed_at) {
+      view.state = "stale";
+      view.reason = `member "${m.node_id}" was removed (${node.removed_reason ?? "no reason recorded"})`;
+      return view;
+    }
+    const now = db.nodeFingerprint(m.node_id);
+    view.fingerprint_now = now;
+    if (now !== m.fingerprint) {
+      view.state = "stale";
+      view.reason = `member "${m.node_id}" meaning changed since the chain was saved (summary, epistemic status or informed_by)`;
+    }
+    return view;
+  });
+}
+
+/** Whole-chain state: broken beats stale beats fresh. */
+export function trailState(db: KnowledgeDB, trailId: string): TrailView["state"] {
+  const members = trailMemberStates(db, trailId);
+  if (members.some((m) => m.state === "broken")) return "broken";
+  if (members.some((m) => m.state === "stale")) return "stale";
+  return "fresh";
+}
+
+/** Uniqueness key: same name AND same summary = same chain. */
+function summaryKey(summary: string): string {
+  return summary.trim().slice(0, 200);
+}
+
+export function trailSave(
+  db: KnowledgeDB,
+  input: TrailSaveInput
+): { id: string; message: string } {
+  if (!input.summary || input.summary.trim().length === 0) {
+    throw new Error("A trail requires a non-empty author summary — the chain exists to carry the WHY.");
+  }
+  const nodeIds = [...new Set(input.node_ids)];
+  if (nodeIds.length === 0) {
+    throw new Error("trail_save requires at least one node id.");
+  }
+  for (const id of nodeIds) {
+    if (!db.nodeExists(id)) {
+      throw new Error(`Node "${id}" does not exist (or is removed).`);
+    }
+  }
+  const name = input.name?.trim() || `trail-${Date.now().toString(36)}`;
+  const id = "trail-" + createHash("sha1").update(name + "\n" + summaryKey(input.summary)).digest("hex").slice(0, 8);
+  if (db.getTrail(id)) {
+    throw new Error(`Trail "${id}" already exists. Use trail_extend or a different name.`);
+  }
+  db.insertTrail({ id, name, summary: input.summary, node_ids: nodeIds });
+  return {
+    id,
+    message: `Saved reasoning chain "${id}" (${name}) with ${nodeIds.length} member(s).`,
+  };
+}
+
+export function trailGet(db: KnowledgeDB, id: string): TrailView {
+  const trail = db.getTrail(id);
+  if (!trail) {
+    throw new Error(`Trail "${id}" not found.`);
+  }
+  const members = trailMemberStates(db, id);
+  const state = members.some((m) => m.state === "broken")
+    ? "broken"
+    : members.some((m) => m.state === "stale")
+      ? "stale"
+      : "fresh";
+  // Lazy persist: the stored flag follows what the read actually found.
+  if (Boolean(trail.stale) !== (state !== "fresh")) {
+    db.setTrailStale(id, state !== "fresh");
+  }
+  return {
+    id: trail.id,
+    name: trail.name,
+    summary: trail.summary,
+    state,
+    members,
+  };
+}
+
+export function trailRefresh(db: KnowledgeDB, id: string): { message: string } {
+  const trail = db.getTrail(id);
+  if (!trail) {
+    throw new Error(`Trail "${id}" not found.`);
+  }
+  db.refreshTrailFingerprints(id);
+  return { message: `Trail "${id}" refreshed: fingerprints re-snapshotted, chain is fresh.` };
+}
+
+export function trailExtend(db: KnowledgeDB, id: string, nodeIds: string[]): { message: string } {
+  const trail = db.getTrail(id);
+  if (!trail) {
+    throw new Error(`Trail "${id}" not found.`);
+  }
+  if (nodeIds.length === 0) {
+    throw new Error("trail_extend requires at least one node id.");
+  }
+  for (const nodeId of nodeIds) {
+    if (!db.nodeExists(nodeId)) {
+      throw new Error(`Node "${nodeId}" does not exist (or is removed).`);
+    }
+  }
+  db.appendTrailMembers(id, nodeIds);
+  return { message: `Trail "${id}" extended with ${nodeIds.length} member(s).` };
+}
+
+// ---- Slots ----
+
+export function slotSet(
+  db: KnowledgeDB,
+  role: string,
+  nodeId: string
+): { message: string } {
+  const result = db.setSlot("", role, nodeId);
+  if (result.noop) {
+    return { message: `Node "${nodeId}" already holds role "${role}" — no-op.` };
+  }
+  const note =
+    result.previous_node !== null
+      ? ` Previous holder "${result.previous_node}" superseded (edge written, node not touched).`
+      : "";
+  return { message: `Role "${role}" taken by "${nodeId}".${note}` };
+}
+
+export function slotGet(db: KnowledgeDB, role: string): { message: string } {
+  const slot = db.getSlot("", role);
+  if (!slot) {
+    return { message: `Role "${role}" is not held by anyone.` };
+  }
+  return {
+    message: `Role "${role}" -> "${slot.node_id}" (${slot.node_name}), since ${slot.updated_at}.`,
+  };
+}
+
+export function slotRelease(db: KnowledgeDB, role: string): { message: string } {
+  const released = db.releaseSlot("", role);
+  return {
+    message: released
+      ? `Role "${role}" released. The previous holder node is untouched.`
+      : `Role "${role}" was not held by anyone.`,
+  };
+}
+
+export function slotList(db: KnowledgeDB): {
+  slots: Array<{ role: string; node_id: string; node_name: string; updated_at: string }>;
+} {
+  return { slots: db.listSlots("") };
+}
+
+// ---- Task board ----
+
+export function taskAdd(
+  db: KnowledgeDB,
+  name: string,
+  due?: string
+): { id: string; message: string } {
+  if (!name || name.trim().length === 0) {
+    throw new Error("Task name must be a non-empty string.");
+  }
+  if (due && Number.isNaN(Date.parse(due))) {
+    throw new Error(`due "${due}" is not a parseable date.`);
+  }
+  const id = makeId(name);
+  if (db.nodeExists(id)) {
+    throw new Error(`Concept "${id}" already exists. Use update_concept or a different name.`);
+  }
+  db.insertNode({
+    id,
+    name,
+    kind: "task",
+    summary: `Task: ${name}`,
+    epistemic_status: null,
+  });
+  db.setTaskState(id, "open", due ?? null);
+  return { id, message: `Task "${id}" added to the open column${due ? `, due ${due}` : ""}.` };
+}
+
+export function taskDone(db: KnowledgeDB, id: string): { message: string } {
+  const node = db.getNode(id);
+  if (!node) {
+    throw new Error(`Task "${id}" not found.`);
+  }
+  if (node.task_state === "done") {
+    return { message: `Task "${id}" is already done.` };
+  }
+  const wasDue = node.due_at;
+  db.setTaskState(id, "done", null);
+  return { message: `Task "${id}" done${wasDue ? ` (was due ${wasDue})` : ""}.` };
+}
+
+export function board(db: KnowledgeDB): BoardOutput & { summary: string } {
+  const output = computeBoard(db);
+  const openCol = output.columns.find((c) => c.name === "open")!;
+  return {
+    ...output,
+    summary: `${output.open} open, ${output.overdue} overdue. Top: ${
+      openCol.cards.slice(0, 3).map((c) => c.name).join("; ") || "nothing burning"
+    }.`,
   };
 }
