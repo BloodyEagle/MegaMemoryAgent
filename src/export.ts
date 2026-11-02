@@ -36,6 +36,9 @@ function frontmatterValue(value: string): string {
 export interface MarkdownEdge {
   relation: string;
   to_id: string;
+  /** Plan 3 §5: informed_by edges export their rationale so the markdown
+   * dump does not lose the support. */
+  description?: string | null;
 }
 
 /**
@@ -48,10 +51,26 @@ export function renderNodeMarkdown(
   children: NodeRow[]
 ): string {
   const parentLine = node.parent_id ? `parent: ${frontmatterValue(node.parent_id)}` : null;
+  // Plan 3 §5/§9 (invariant 12): informed_by travels as its own frontmatter
+  // block with the rationale — the export is a snapshot of CURRENT knowledge
+  // (no tombstones), and losing the support would gut it.
+  const informedBy = outgoing.filter((e) => e.relation === "informed_by");
+  const otherEdges = outgoing.filter((e) => e.relation !== "informed_by");
   const edgesLine =
-    outgoing.length > 0
-      ? `edges:${outgoing
+    otherEdges.length > 0
+      ? `edges:${otherEdges
           .map((e) => `\n  - relation: ${e.relation}\n    to: ${frontmatterValue(e.to_id)}`)
+          .join("")}`
+      : null;
+  const informedByLine =
+    informedBy.length > 0
+      ? `informed_by:${informedBy
+          .map(
+            (e) =>
+              `\n  - to: ${frontmatterValue(e.to_id)}${
+                e.description ? `\n    why: ${frontmatterValue(e.description)}` : ""
+              }`
+          )
           .join("")}`
       : null;
 
@@ -63,6 +82,7 @@ export function renderNodeMarkdown(
     `status: ${node.status ?? "active"}`,
     ...(parentLine ? [parentLine] : []),
     ...(edgesLine ? [edgesLine] : []),
+    ...(informedByLine ? [informedByLine] : []),
     `updated_at: ${frontmatterValue(node.updated_at)}`,
     "---",
     "",
@@ -96,7 +116,11 @@ export function renderAllMarkdown(db: KnowledgeDB): Map<string, string> {
       .filter((c) => c.kind !== "digest");
     const outgoing = db
       .getOutgoingEdges(node.id)
-      .map((e) => ({ relation: e.relation, to_id: e.to_id }));
+      .map((e) => ({
+        relation: e.relation,
+        to_id: e.to_id,
+        description: e.description,
+      }));
     files.set(
       nodeFileName(node.id),
       renderNodeMarkdown(node, outgoing, children)

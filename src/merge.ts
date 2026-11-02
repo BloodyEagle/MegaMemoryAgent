@@ -58,6 +58,12 @@ export function nodesAreIdentical(left: NodeRow, right: NodeRow): boolean {
   const rightRemoved = right.removed_at !== null;
   if (leftRemoved !== rightRemoved) return false;
 
+  // Plan 3 §5: lifecycle and epistemic axes must match — otherwise an
+  // open/refuted divergence silently loses the refuted verdict when one
+  // side's copy wins.
+  if ((left.status ?? "active") !== (right.status ?? "active")) return false;
+  if ((left.epistemic_status ?? null) !== (right.epistemic_status ?? null)) return false;
+
   return true;
 }
 
@@ -442,6 +448,29 @@ export class MergeEngine {
         merge_timestamp: edge.merge_timestamp,
         removed_at: edge.removed_at,
       });
+    }
+
+    // ---- PASS 3: re-validate the informed_by DAG over the combined graph ----
+    // Plan 3 §2 (invariants 2, 3): two individually-acyclic inputs can form a
+    // cycle in their union. A cycle brought in by a merge does NOT abort the
+    // merge (a rollback after a long merge with a manual retry would lose the
+    // work) — the edges are flagged needs_merge and reported instead.
+    const cycleComponents = outputDb.informedByCycleComponents();
+    if (cycleComponents.length > 0) {
+      result.informedByCycles = cycleComponents;
+      const all = new Set<string>();
+      for (const component of cycleComponents) {
+        for (const n of component) all.add(n);
+      }
+      const ids = [...all];
+      const placeholders = ids.map(() => "?").join(",");
+      outputDb.execSqlRun(
+        `UPDATE edges SET needs_merge = 1
+         WHERE relation = 'informed_by' AND removed_at IS NULL
+           AND (from_id IN (${placeholders}) OR to_id IN (${placeholders}))`,
+        ...ids,
+        ...ids
+      );
     }
 
     return result;

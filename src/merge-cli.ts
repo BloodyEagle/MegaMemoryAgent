@@ -97,6 +97,20 @@ export async function runMerge(args: string[]): Promise<void> {
       );
       info(`Run ${pc.cyan("megamemory conflicts")} to view, or let your AI agent run ${pc.cyan("/merge")} to resolve.`);
     }
+
+    // Plan 3 §2 (invariant 3): a cycle brought in by the union does not
+    // abort the merge — the edges are flagged needs_merge and reported.
+    if (result.informedByCycles && result.informedByCycles.length > 0) {
+      console.log(
+        pc.yellow(
+          `  ⚠ informed_by cycle(s) after merge: ${result.informedByCycles.length} — edges flagged needs_merge`
+        )
+      );
+      for (const component of result.informedByCycles) {
+        console.log(`    ${pc.dim(component.join(" -> ") + " -> " + component[0])}`);
+      }
+      info(`New informed_by writes into these components are rejected until resolved.`);
+    }
   } catch (err) {
     // Clean up temp file on error
     if (isOverwrite && fs.existsSync(actualOutput)) {

@@ -31,6 +31,11 @@ import type {
   RelationType,
 } from "./types.js";
 import { stripMergeSuffix } from "./merge.js";
+import {
+  readProvenanceConfig,
+  isUngrounded,
+  resolveFileRef,
+} from "./provenance.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
   const errorMsg = err instanceof Error ? err.message : String(err);
@@ -196,6 +201,30 @@ export function buildNodeWithContext(
     .getIncomingEdges(node.id)
     .filter((e) => e.relation === "informed_by");
 
+  // Plan 3 §4.2: weak-link marks on the card. A support is weak when it is
+  // refuted/abandoned or ungrounded; a decision all of whose supports are
+  // weak must not be quoted as proven knowledge.
+  const informedByEntries = informedByOut.map((e) => {
+    const target = db.getNode(e.to_id);
+    let weak = false;
+    if (target) {
+      weak =
+        target.epistemic_status === "refuted" ||
+        target.epistemic_status === "abandoned" ||
+        isUngrounded(db, target);
+    }
+    return {
+      to: e.to_id,
+      to_name: e.to_name,
+      rationale: e.description,
+      ...(weak ? { weak: true } : {}),
+    };
+  });
+  const weakSupport =
+    node.kind === "decision" &&
+    informedByEntries.length > 0 &&
+    informedByEntries.every((e) => e.weak === true);
+
   return {
     id: node.id,
     name: node.name,
@@ -224,13 +253,9 @@ export function buildNodeWithContext(
     trails: db.getTrailsForNode(node.id).map((t) => {
       return { id: t.id, name: t.name, state: trailState(db, t.id) };
     }),
-    ...(informedByOut.length > 0
+    ...(informedByEntries.length > 0
       ? {
-          informed_by: informedByOut.map((e) => ({
-            to: e.to_id,
-            to_name: e.to_name,
-            rationale: e.description,
-          })),
+          informed_by: informedByEntries,
         }
       : {}),
     ...(informedByIn.length > 0
@@ -242,6 +267,7 @@ export function buildNodeWithContext(
           })),
         }
       : {}),
+    ...(weakSupport ? { weak_support: true } : {}),
   };
 }
 
@@ -573,35 +599,158 @@ export async function createConcept(
     throw new Error(`Parent concept "${parentId}" does not exist.`);
   }
 
-  // Generate embedding (null when the vector path is disabled pending reembed)
-  const text = embeddingText(input.name, input.kind, input.summary);
-  const embedding = await embedForStorage(db, text);
+  // Plan 3 §4.1.3/§11: the provenance flags are read fresh on every call —
+  // flipping them in the config file changes behavior without a restart.
+  const provenanceConfig = readProvenanceConfig(db.dbPath);
 
   // Plan 1 §5.3: initial epistemic state, default open. A `validated` at
   // creation time needs the same scope discipline as a transition.
   const epistemic = input.epistemic_status ?? "open";
   validateEpistemicTransition("open", epistemic, input.status_scope);
 
-  db.insertNodeAndEdges(
-    {
-      id,
-      name: input.name,
-      kind: input.kind,
-      summary: input.summary,
-      why: input.why ?? null,
-      file_refs: input.file_refs ? JSON.stringify(input.file_refs) : null,
-      parent_id: parentId ?? null,
-      created_by_task: input.created_by_task ?? null,
-      embedding,
-      epistemic_status: epistemic,
-      status_scope: input.status_scope ? JSON.stringify(input.status_scope) : null,
-    },
-    (input.edges ?? []).map((edge) => ({
-      to_id: edge.to,
-      relation: edge.relation,
-      description: edge.description ?? null,
-    }))
-  );
+  // ---- Plan 3 §4.1.1: resolve the evidence shortcut ----
+  // Each item becomes an informed_by edge with `why` as the rationale,
+  // written in the same transaction as the node. A `ref` reuses the node
+  // that already cites the file; when nothing cites it yet, a file-fact
+  // node (kind=feature, file_refs=[ref]) is created — such nodes are useful
+  // supports in their own right.
+  interface PlannedSupport {
+    toId: string;
+    why: string;
+    fromAutoGround: boolean;
+  }
+  const factNodesToCreate: Array<{
+    id: string;
+    name: string;
+    embedding: Buffer | null;
+  }> = [];
+  const supports: PlannedSupport[] = [];
+  const usedEvidenceIds = new Set<string>();
+
+  const evidence = input.evidence ?? [];
+  for (const item of evidence) {
+    const why = item.why?.trim() ?? "";
+    if (!why) {
+      throw new Error(
+        "evidence.why обязателен: рационал «что именно в опоре поддерживает вывод» без которого связь нечитаема."
+      );
+    }
+    if ((item.ref === undefined) === (item.node === undefined)) {
+      throw new Error("evidence: передай ровно одно — ref (файл) или node (существующий узел).");
+    }
+    if (item.node !== undefined) {
+      if (!db.nodeExists(item.node)) {
+        throw new Error(`evidence.node "${item.node}" does not exist (or is removed).`);
+      }
+      supports.push({ toId: item.node, why, fromAutoGround: false });
+      usedEvidenceIds.add(item.node);
+      continue;
+    }
+    const ref = item.ref!.trim();
+    const found = resolveFileRef(db, ref);
+    if (found) {
+      supports.push({ toId: found.id, why, fromAutoGround: false });
+      usedEvidenceIds.add(found.id);
+      continue;
+    }
+    const factId = makeId(ref);
+    const finalFactId = db.nodeExists(factId) ? disambiguateId(factId, ref) : factId;
+    factNodesToCreate.push({ id: finalFactId, name: ref, embedding: null });
+    supports.push({ toId: finalFactId, why, fromAutoGround: false });
+    usedEvidenceIds.add(finalFactId);
+  }
+
+  // ---- Plan 3 §4.1.2: auto-ground from why + file_refs ----
+  // The agent already states "this knowledge comes from this file"
+  // (file_refs) and "here is why" (why) — deriving the typed support from
+  // what it already wrote is not inventing provenance. Fires only for
+  // decisions when neither evidence nor informed_by edges were passed.
+  let autoGrounded = false;
+  if (
+    input.kind === "decision" &&
+    provenanceConfig.auto_ground &&
+    evidence.length === 0 &&
+    input.why &&
+    input.why.trim().length > 0 &&
+    input.file_refs &&
+    input.file_refs.length > 0 &&
+    !(input.edges ?? []).some((e) => e.relation === "informed_by")
+  ) {
+    for (const ref of input.file_refs) {
+      const found = resolveFileRef(db, ref);
+      if (found) {
+        if (!usedEvidenceIds.has(found.id)) {
+          supports.push({ toId: found.id, why: input.why, fromAutoGround: true });
+          usedEvidenceIds.add(found.id);
+        }
+        continue;
+      }
+      const baseFactId = makeId(ref);
+      const factId = db.nodeExists(baseFactId)
+        ? disambiguateId(baseFactId, ref)
+        : baseFactId;
+      if (!usedEvidenceIds.has(factId)) {
+        factNodesToCreate.push({ id: factId, name: ref, embedding: null });
+        supports.push({ toId: factId, why: input.why, fromAutoGround: true });
+        usedEvidenceIds.add(factId);
+      }
+    }
+    autoGrounded = supports.some((s) => s.fromAutoGround);
+  }
+
+  // Embeddings for the file-fact nodes (computed before the transaction).
+  for (const fact of factNodesToCreate) {
+    fact.embedding = await embedForStorage(
+      db,
+      embeddingText(fact.name, "feature", `File-fact node for "${fact.name}".`)
+    );
+  }
+
+  // Generate embedding (null when the vector path is disabled pending reembed)
+  const text = embeddingText(input.name, input.kind, input.summary);
+  const embedding = await embedForStorage(db, text);
+
+  db.runInTransaction(() => {
+    for (const fact of factNodesToCreate) {
+      db.insertNode({
+        id: fact.id,
+        name: fact.name,
+        kind: "feature",
+        summary: `File-fact node for "${fact.name}" — created as a provenance support.`,
+        file_refs: [fact.name],
+        embedding: fact.embedding,
+      });
+      if (fact.embedding) db.upsertVector(fact.id, fact.embedding);
+    }
+
+    db.insertNodeAndEdges(
+      {
+        id,
+        name: input.name,
+        kind: input.kind,
+        summary: input.summary,
+        why: input.why ?? null,
+        file_refs: input.file_refs ? JSON.stringify(input.file_refs) : null,
+        parent_id: parentId ?? null,
+        created_by_task: input.created_by_task ?? null,
+        embedding,
+        epistemic_status: epistemic,
+        status_scope: input.status_scope ? JSON.stringify(input.status_scope) : null,
+      },
+      [
+        ...(input.edges ?? []).map((edge) => ({
+          to_id: edge.to,
+          relation: edge.relation,
+          description: edge.description ?? null,
+        })),
+        ...supports.map((s) => ({
+          to_id: s.toId,
+          relation: "informed_by",
+          description: s.why,
+        })),
+      ]
+    );
+  });
   if (embedding) {
     // В17: keep the native vector copy in sync.
     db.upsertVector(id, embedding);
@@ -629,9 +778,19 @@ export async function createConcept(
     supersededNote = ` Superseded: ${superseded.join(", ")}.`;
   }
 
+  // Plan 3 §4.1.1/§4.1.2: the agent must see what the shortcut did.
+  const createdFacts = factNodesToCreate.length;
+  const supportNote =
+    supports.length > 0
+      ? ` Создано опор: ${supports.length}${createdFacts > 0 ? ` (из них новых узлов-источников: ${createdFacts})` : ""}.`
+      : "";
+  const autoNote = autoGrounded
+    ? ` Добавил опор по file_refs: ${supports.filter((s) => s.fromAutoGround).length}, поправь если не то.`
+    : "";
+
   return {
     id,
-    message: `Created concept "${id}"${supersededNote}${duplicateNote}`,
+    message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}`,
   };
 }
 
@@ -750,6 +909,33 @@ export function removeConcept(
     throw new Error(`Concept "${input.id}" was already removed.`);
   }
 
+  // Plan 3 §4.3: incoming informed_by edges and chain participation are
+  // counted in ONE pass, and the refusal is ONE message listing both kinds
+  // of dependencies. Refuse-and-redirect: the text tells the agent exactly
+  // what to do next instead of a bare "cannot delete".
+  const supporters = db
+    .getIncomingEdges(input.id)
+    .filter((e) => e.relation === "informed_by")
+    .map((e) => e.from_id);
+  const affectedTrails = db.getTrailsForNode(input.id);
+
+  if (supporters.length > 0 && !input.force) {
+    const ids = supporters.map((s) => `"${s}"`).join(", ");
+    throw new Error(
+      `Удаление отклонено: на узле "${input.id}" держатся ${supporters.length} активных решений: ${ids}.\n` +
+        `Физическое удаление сломает их провенанс. Выбери шаг и повтори:\n` +
+        `  1. Замена: создай узел-преемник (create_concept), переведи решения\n` +
+        `     на него (link informed_by с рационалом «замена ${input.id}»), затем\n` +
+        `     повтори remove "${input.id}" — отказов больше не будет.\n` +
+        `  2. Опровержение: если узел неверен — update ${input.id} → статус refuted\n` +
+        `     с причиной и артефактом. Узел останется в истории, из активного\n` +
+        `     замыкания выпадет, удалять не нужно.\n` +
+        `  3. remove "${input.id}" force=true — удаляет узел и ставит надгробия на все\n` +
+        `     ${supporters.length} рёбер. Решения ${ids} останутся без опоры и будут помечены\n` +
+        `     ungrounded в отчётах. Не используй, если данные ещё нужны.`
+    );
+  }
+
   const removed = db.softDeleteNode(input.id, input.reason);
   if (!removed) {
     throw new Error(`Failed to remove concept "${input.id}".`);
@@ -760,7 +946,6 @@ export function removeConcept(
 
   // Plan 2 (audit B5): removing a chain member must never be silent — the
   // affected chains are marked stale and the answer says exactly why.
-  const affectedTrails = db.getTrailsForNode(input.id);
   for (const t of affectedTrails) {
     db.setTrailStale(t.id, true);
   }
@@ -769,8 +954,16 @@ export function removeConcept(
       ? ` Chains marked stale because "${input.id}" was removed: ${affectedTrails.map((t) => t.id).join(", ")}.`
       : "";
 
+  // Plan 3 §4.3: with force, the report names who lost their support —
+  // every affected edge is tombstoned by softDeleteNode, the decisions
+  // survive without support and surface as ungrounded in reports.
+  const forceNote =
+    input.force && supporters.length > 0
+      ? ` Опора разорвана (force): ${supporters.length} решений потеряли опору (${supporters.join(", ")}), рёбра помечены надгробиями.`
+      : "";
+
   return {
-    message: `Removed concept "${input.id}". Reason: ${input.reason}.${trailNote}`,
+    message: `Removed concept "${input.id}". Reason: ${input.reason}.${forceNote}${trailNote}`,
   };
 }
 
