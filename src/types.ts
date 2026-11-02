@@ -153,6 +153,14 @@ export interface NodeWithContext {
   refuted_reason?: string | null;
   /** Plan 2 §1: chains this node participates in, with their state. */
   trails?: Array<{ id: string; name: string; state: "fresh" | "stale" | "broken" }>;
+  /**
+   * Plan 4 §4: what this node materially relies on — live outgoing
+   * informed_by edges with their (mandatory) rationales. Present only when
+   * non-empty, so cards without provenance stay unchanged.
+   */
+  informed_by?: Array<{ to: string; to_name: string; rationale: string | null }>;
+  /** Plan 4 §4: nodes that rely on this node (live incoming informed_by). */
+  informed_by_incoming?: Array<{ from: string; from_name: string; rationale: string | null }>;
 }
 
 export interface UnderstandOutput {

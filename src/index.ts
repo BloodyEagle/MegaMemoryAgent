@@ -391,7 +391,7 @@ async function startMcpServer() {
       edges: z.array(z.object({
         to: z.string().describe("Target concept ID"),
         relation: RelationEnum.describe("Relationship type"),
-        description: z.string().optional().describe("Why this relationship exists"),
+        description: z.string().optional().describe("Why this relationship exists. Обязателен (непуст) для informed_by: что именно в узле-to поддерживает from — ребро без рационала будет отклонено вместе со всем батчем."),
       })).optional().describe("Relationships to other existing concepts"),
       created_by_task: z.string().optional().describe("Description of the task that created this concept"),
       epistemic_status: z.enum(["open", "validated", "refuted", "abandoned"]).optional().describe("Initial epistemic state (default: open). 'validated' requires status_scope with an artifact"),
@@ -492,12 +492,12 @@ async function startMcpServer() {
 
   server.tool(
     "link",
-    "Create a relationship between two existing concepts.",
+    "Create a relationship between two existing concepts. Для informed_by рационал обязателен: «из from следует to, потому что <конкретно>». Связь без рационала нечитаема и потому бесполезна.",
     {
       from: z.string().describe("Source concept ID"),
       to: z.string().describe("Target concept ID"),
       relation: RelationEnum.describe("Relationship type"),
-      description: z.string().optional().describe("Why this relationship exists"),
+      description: z.string().optional().describe("Why this relationship exists. Обязателен (непуст) для informed_by: что именно в узле-to поддерживает from."),
     },
     async (params) => {
       try {

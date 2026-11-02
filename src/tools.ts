@@ -185,6 +185,17 @@ export function buildNodeWithContext(
     }
   }
 
+  // Plan 4 §4: the node card shows incoming and outgoing informed_by with
+  // their rationales as dedicated blocks. getOutgoingEdges/getIncomingEdges
+  // already filter tombstoned edges and dead endpoints; the blocks are
+  // present only when non-empty.
+  const informedByOut = db
+    .getOutgoingEdges(node.id)
+    .filter((e) => e.relation === "informed_by");
+  const informedByIn = db
+    .getIncomingEdges(node.id)
+    .filter((e) => e.relation === "informed_by");
+
   return {
     id: node.id,
     name: node.name,
@@ -213,6 +224,24 @@ export function buildNodeWithContext(
     trails: db.getTrailsForNode(node.id).map((t) => {
       return { id: t.id, name: t.name, state: trailState(db, t.id) };
     }),
+    ...(informedByOut.length > 0
+      ? {
+          informed_by: informedByOut.map((e) => ({
+            to: e.to_id,
+            to_name: e.to_name,
+            rationale: e.description,
+          })),
+        }
+      : {}),
+    ...(informedByIn.length > 0
+      ? {
+          informed_by_incoming: informedByIn.map((e) => ({
+            from: e.from_id,
+            from_name: e.from_name,
+            rationale: e.description,
+          })),
+        }
+      : {}),
   };
 }
 
