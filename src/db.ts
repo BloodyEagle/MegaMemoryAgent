@@ -4,7 +4,8 @@ import fs from "fs";
 import type { NodeRow, EdgeRow } from "./types.js";
 import { normalizeName } from "./norm.js";
 
-const SCHEMA_VERSION = 4;
+/** Plan 1 (tombstones + epistemic status). Exported for the doctor check. */
+export const SCHEMA_VERSION = 5;
 
 export class KnowledgeDB {
   private db: Database.Database;
@@ -62,7 +63,8 @@ export class KnowledgeDB {
     this.migrate();
   }
 
-  private getUserVersion(): number {
+  /** Public: the doctor checks user_version against SCHEMA_VERSION (plan 1 §6). */
+  getUserVersion(): number {
     const pragmaResult = this.db.pragma("user_version", { simple: true });
     // libsql returns { user_version: N } instead of raw N like better-sqlite3
     return (
@@ -105,6 +107,14 @@ export class KnowledgeDB {
             needs_merge INTEGER DEFAULT 0,
             source_branch TEXT,
             merge_timestamp TEXT,
+            -- Parity with migrate-schema.ts columns (plan 1, B2): fresh and
+            -- migrated dbs must have the same column set/order for SELECT *.
+            status TEXT NOT NULL DEFAULT 'active',
+            valid_from TEXT,
+            valid_until TEXT,
+            name_norm TEXT NOT NULL DEFAULT '',
+            epistemic_status TEXT,
+            status_scope TEXT,
             FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE SET NULL
           );
 
@@ -119,6 +129,7 @@ export class KnowledgeDB {
             needs_merge INTEGER DEFAULT 0,
             source_branch TEXT,
             merge_timestamp TEXT,
+            removed_at TEXT DEFAULT NULL,
             FOREIGN KEY (from_id) REFERENCES nodes(id) ON DELETE CASCADE,
             FOREIGN KEY (to_id) REFERENCES nodes(id) ON DELETE CASCADE
           );
@@ -128,11 +139,14 @@ export class KnowledgeDB {
           CREATE INDEX IF NOT EXISTS idx_nodes_removed ON nodes(removed_at);
           CREATE INDEX IF NOT EXISTS idx_nodes_merge_group ON nodes(merge_group);
           CREATE INDEX IF NOT EXISTS idx_nodes_needs_merge ON nodes(needs_merge);
+          CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
+          CREATE INDEX IF NOT EXISTS idx_nodes_name_norm ON nodes(name_norm);
           CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
           CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
           CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
           CREATE INDEX IF NOT EXISTS idx_edges_merge_group ON edges(merge_group);
           CREATE INDEX IF NOT EXISTS idx_edges_needs_merge ON edges(needs_merge);
+          CREATE INDEX IF NOT EXISTS idx_edges_removed ON edges(removed_at);
         `);
       }
 
@@ -207,6 +221,46 @@ export class KnowledgeDB {
         `);
       }
 
+      if (currentVersion < 5) {
+        // Plan 1: edge tombstones + epistemic status. All steps guarded by
+        // PRAGMA table_info so the migration is idempotent (fresh dbs already
+        // have every column from CREATE TABLE — the ALTERs no-op there).
+        const ecols = new Set(
+          this.db.prepare("PRAGMA table_info(edges)").all().map((c: any) => c.name)
+        );
+        if (!ecols.has("removed_at")) {
+          this.db.exec(
+            "ALTER TABLE edges ADD COLUMN removed_at TEXT;" +
+            "CREATE INDEX IF NOT EXISTS idx_edges_removed ON edges(removed_at);"
+          );
+        }
+        const ncols = new Set(
+          this.db.prepare("PRAGMA table_info(nodes)").all().map((c: any) => c.name)
+        );
+        if (!ncols.has("epistemic_status")) {
+          this.db.exec("ALTER TABLE nodes ADD COLUMN epistemic_status TEXT");
+        }
+        if (!ncols.has("status_scope")) {
+          // JSON: {env?, version?, dataset?, artifact?} — scope of a `validated`.
+          this.db.exec("ALTER TABLE nodes ADD COLUMN status_scope TEXT");
+        }
+        // status_history is created lazily (ensureStatusHistoryTable), so the
+        // field column is only added here when the table already exists.
+        const hasStatusHistory = this.db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='status_history'")
+          .get();
+        if (hasStatusHistory) {
+          const scols = new Set(
+            this.db.prepare("PRAGMA table_info(status_history)").all().map((c: any) => c.name)
+          );
+          if (!scols.has("field")) {
+            this.db.exec(
+              "ALTER TABLE status_history ADD COLUMN field TEXT NOT NULL DEFAULT 'status'"
+            );
+          }
+        }
+      }
+
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       this.db.exec("COMMIT");
     } catch (err) {
@@ -274,10 +328,13 @@ export class KnowledgeDB {
     parent_id?: string | null;
     created_by_task?: string | null;
     embedding?: Buffer | null;
+    // Plan 1 §5.3: initial epistemic state, default open (NULL on legacy dbs).
+    epistemic_status?: string | null;
+    status_scope?: string | null;
   }): void {
     const stmt = this.db.prepare(`
-      INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task, embedding)
-      VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task, @embedding)
+      INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task, embedding, epistemic_status, status_scope)
+      VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task, @embedding, @epistemic_status, @status_scope)
     `);
     stmt.run({
       id: node.id,
@@ -289,6 +346,8 @@ export class KnowledgeDB {
       parent_id: node.parent_id ?? null,
       created_by_task: node.created_by_task ?? null,
       embedding: node.embedding ?? null,
+      epistemic_status: node.epistemic_status ?? "open",
+      status_scope: node.status_scope ?? null,
     });
     this.syncNameNorm(node.id, node.name);
   }
@@ -304,6 +363,8 @@ export class KnowledgeDB {
       parent_id: string | null;
       created_by_task: string | null;
       embedding: Buffer | null;
+      epistemic_status?: string | null;
+      status_scope?: string | null;
     },
     edges: Array<{ to_id: string; relation: string; description: string | null }>
   ): void {
@@ -320,6 +381,8 @@ export class KnowledgeDB {
         parent_id: node.parent_id,
         created_by_task: node.created_by_task,
         embedding: node.embedding,
+        epistemic_status: node.epistemic_status,
+        status_scope: node.status_scope,
       });
 
       for (const edge of edges) {
@@ -413,8 +476,14 @@ export class KnowledgeDB {
 
       if (result.changes > 0) {
         changed = true;
+        // Plan 1: tombstone the edges instead of deleting them. Removing a
+        // node must not silently destroy its neighbours' provenance; restore
+        // brings the links back.
         this.db
-          .prepare("DELETE FROM edges WHERE from_id = ? OR to_id = ?")
+          .prepare(
+            "UPDATE edges SET removed_at = datetime('now') " +
+            "WHERE (from_id = ? OR to_id = ?) AND removed_at IS NULL"
+          )
           .run(id, id);
       }
     });
@@ -429,8 +498,32 @@ export class KnowledgeDB {
     relation: string;
     description?: string | null;
   }): { id: number; inserted: boolean } {
+    // Plan 1 §4.4: idx_edges_unique(from_id,to_id,relation) does not know
+    // about removed_at, so a re-link after a tombstone would be silently
+    // dropped by INSERT OR IGNORE. Revive the tombstoned row instead —
+    // one row per (pair, relation), no duplicates, history preserved.
+    const existing = this.db
+      .prepare(
+        "SELECT id, removed_at FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?"
+      )
+      .get(edge.from_id, edge.to_id, edge.relation) as
+      | { id: number; removed_at: string | null }
+      | undefined;
+
+    if (existing) {
+      if (existing.removed_at !== null) {
+        this.db
+          .prepare(
+            "UPDATE edges SET removed_at = NULL, description = COALESCE(?, description) WHERE id = ?"
+          )
+          .run(edge.description ?? null, existing.id);
+        return { id: existing.id, inserted: true };
+      }
+      return { id: existing.id, inserted: false };
+    }
+
     const stmt = this.db.prepare(`
-      INSERT OR IGNORE INTO edges (from_id, to_id, relation, description)
+      INSERT INTO edges (from_id, to_id, relation, description)
       VALUES (@from_id, @to_id, @relation, @description)
     `);
     const result = stmt.run({
@@ -446,9 +539,12 @@ export class KnowledgeDB {
   }
 
   deleteEdge(fromId: string, to_id: string, relation: string): boolean {
+    // Plan 1 §4.2: unlink tombstones the edge instead of erasing it — the
+    // link history must survive an explicit unlink.
     const result = this.db
       .prepare(
-        "DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?"
+        "UPDATE edges SET removed_at = datetime('now') " +
+        "WHERE from_id = ? AND to_id = ? AND relation = ? AND removed_at IS NULL"
       )
       .run(fromId, to_id, relation);
     return result.changes > 0;
@@ -471,9 +567,18 @@ export class KnowledgeDB {
         from_status TEXT,\
         to_status TEXT NOT NULL,\
         reason TEXT,\
+        field TEXT NOT NULL DEFAULT 'status',\
         at TEXT NOT NULL DEFAULT (datetime('now'))\
       )"
     );
+    // Self-heal for tables created before plan 1: the field column separates
+    // the lifecycle axis (status) from the epistemic axis (epistemic_status).
+    const cols = this.db.pragma("table_info(status_history)") as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "field")) {
+      this.db.exec(
+        "ALTER TABLE status_history ADD COLUMN field TEXT NOT NULL DEFAULT 'status'"
+      );
+    }
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_status_history_node ON status_history(node_id)"
     );
@@ -509,19 +614,84 @@ export class KnowledgeDB {
     return result.changes > 0;
   }
 
+  // ---- Epistemic status (plan 1 §5) ----
+
+  /**
+   * Set the epistemic axis (open/validated/refuted/abandoned) — separate from
+   * the lifecycle `status`. NO transition validation here on purpose: internal
+   * callers (soft-delete, merge) must never be blocked by epistemic rules.
+   * Validation of agent-driven transitions lives in the MCP tool handler.
+   * Every real transition is recorded in status_history with field =
+   * 'epistemic_status' and a non-empty reason.
+   */
+  setEpistemicStatus(
+    id: string,
+    to: string,
+    reason: string,
+    scope?: Record<string, unknown> | null
+  ): boolean {
+    const previous = (
+      this.execSqlFirst(
+        "SELECT epistemic_status FROM nodes WHERE id = ?",
+        id
+      ) as { epistemic_status?: string | null } | undefined
+    )?.epistemic_status;
+
+    const result = this.db
+      .prepare(
+        `UPDATE nodes SET epistemic_status = @to,
+           status_scope = @scope,
+           updated_at = datetime('now')
+         WHERE id = @id`
+      )
+      .run({ to, scope: scope ? JSON.stringify(scope) : null, id });
+
+    if (result.changes > 0 && previous !== to) {
+      this.recordStatusHistory(id, previous ?? null, to, reason, "epistemic_status");
+    }
+    return result.changes > 0;
+  }
+
+  /** Epistemic breakdown for doctor: open/validated/refuted/abandoned/NULL. */
+  getEpistemicStatusCounts(): Record<string, number> {
+    const rows = this.db
+      .prepare(
+        "SELECT COALESCE(epistemic_status, 'null') AS s, count(*) AS n FROM nodes GROUP BY s"
+      )
+      .all() as Array<{ s: string; n: number }>;
+    const counts: Record<string, number> = {};
+    for (const row of rows) counts[row.s] = row.n;
+    return counts;
+  }
+
+  /** Latest epistemic transition reason for a node (shown next to [refuted]). */
+  getLatestEpistemicReason(nodeId: string, toStatus: string): string | null {
+    const has = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='status_history'")
+      .get();
+    if (!has) return null;
+    const row = this.db
+      .prepare(
+        "SELECT reason FROM status_history WHERE node_id = ? AND to_status = ? AND field = 'epistemic_status' ORDER BY id DESC LIMIT 1"
+      )
+      .get(nodeId, toStatus) as { reason: string | null } | undefined;
+    return row?.reason ?? null;
+  }
+
   /** U5: append a status transition row (table self-heals on legacy dbs). */
   recordStatusHistory(
     nodeId: string,
     fromStatus: string | null,
     toStatus: string,
-    reason?: string
+    reason?: string,
+    field: "status" | "epistemic_status" = "status"
   ): void {
     this.ensureStatusHistoryTable();
     this.db
       .prepare(
-        "INSERT INTO status_history (node_id, from_status, to_status, reason) VALUES (?, ?, ?, ?)"
+        "INSERT INTO status_history (node_id, from_status, to_status, reason, field) VALUES (?, ?, ?, ?, ?)"
       )
-      .run(nodeId, fromStatus, toStatus, reason ?? null);
+      .run(nodeId, fromStatus, toStatus, reason ?? null, field);
   }
 
   /** U5: transitions of one node, newest first. */
@@ -609,7 +779,7 @@ export class KnowledgeDB {
       .prepare(
         `SELECT DISTINCT n.* FROM nodes n
          JOIN edges e ON e.to_id = n.id
-         WHERE e.relation = 'contradicts' AND n.removed_at IS NULL`
+         WHERE e.relation = 'contradicts' AND e.removed_at IS NULL AND n.removed_at IS NULL`
       )
       .all() as NodeRow[];
   }
@@ -763,7 +933,7 @@ export class KnowledgeDB {
       SELECT e.*, n.name as to_name, n.summary as to_summary
       FROM edges e
       JOIN nodes n ON e.to_id = n.id
-      WHERE e.from_id = ? AND n.removed_at IS NULL
+      WHERE e.from_id = ? AND e.removed_at IS NULL AND n.removed_at IS NULL
     `
       )
       .all(nodeId) as Array<EdgeRow & { to_name: string; to_summary: string }>;
@@ -778,7 +948,7 @@ export class KnowledgeDB {
       SELECT e.*, n.name as from_name, n.summary as from_summary
       FROM edges e
       JOIN nodes n ON e.from_id = n.id
-      WHERE e.to_id = ? AND n.removed_at IS NULL
+      WHERE e.to_id = ? AND e.removed_at IS NULL AND n.removed_at IS NULL
     `
       )
       .all(nodeId) as Array<
@@ -847,7 +1017,8 @@ export class KnowledgeDB {
          FROM edges e
          JOIN nodes n1 ON e.from_id = n1.id
          JOIN nodes n2 ON e.to_id = n2.id
-         WHERE n1.removed_at IS NULL AND n2.removed_at IS NULL`
+         WHERE e.removed_at IS NULL
+           AND n1.removed_at IS NULL AND n2.removed_at IS NULL`
       )
       .all() as EdgeRow[];
   }
@@ -865,14 +1036,16 @@ export class KnowledgeDB {
     return result;
   }
 
-  getStats(): { nodes: number; edges: number; removed: number } {
+  getStats(): { nodes: number; edges: number; removed: number; edges_removed: number } {
     const nodes = (
       this.db
         .prepare("SELECT COUNT(*) as count FROM nodes WHERE removed_at IS NULL")
         .get() as { count: number }
     ).count;
     const edges = (
-      this.db.prepare("SELECT COUNT(*) as count FROM edges").get() as {
+      this.db
+        .prepare("SELECT COUNT(*) as count FROM edges WHERE removed_at IS NULL")
+        .get() as {
         count: number;
       }
     ).count;
@@ -883,7 +1056,15 @@ export class KnowledgeDB {
         )
         .get() as { count: number }
     ).count;
-    return { nodes, edges, removed };
+    // Plan 1 §4.5: tombstoned edges counted separately (doctor consumes it).
+    const edgesRemoved = (
+      this.db
+        .prepare(
+          "SELECT COUNT(*) as count FROM edges WHERE removed_at IS NOT NULL"
+        )
+        .get() as { count: number }
+    ).count;
+    return { nodes, edges, removed, edges_removed: edgesRemoved };
   }
 
   // ---- Merge-related methods ----
@@ -897,7 +1078,9 @@ export class KnowledgeDB {
 
   getConflictEdges(): EdgeRow[] {
     return this.db
-      .prepare("SELECT * FROM edges WHERE needs_merge = 1")
+      .prepare(
+        "SELECT * FROM edges WHERE needs_merge = 1 AND removed_at IS NULL"
+      )
       .all() as EdgeRow[];
   }
 
@@ -909,7 +1092,9 @@ export class KnowledgeDB {
 
   getEdgesByMergeGroup(mergeGroup: string): EdgeRow[] {
     return this.db
-      .prepare("SELECT * FROM edges WHERE merge_group = ?")
+      .prepare(
+        "SELECT * FROM edges WHERE merge_group = ? AND removed_at IS NULL"
+      )
       .all(mergeGroup) as EdgeRow[];
   }
 
@@ -971,10 +1156,16 @@ export class KnowledgeDB {
   }
 
   getAllEdgesRaw(): EdgeRow[] {
+    // No tombstone filter on purpose: this is the raw export for merge/backup,
+    // callers decide what to do with removed_at (plan 1 §4.5).
     return this.db.prepare("SELECT * FROM edges").all() as EdgeRow[];
   }
 
   deleteEdgesForNode(nodeId: string): void {
+    // Physical delete is correct here, not a bug: the only caller is
+    // hardDeleteNode (merge/consolidate full removal), where an edge without
+    // an endpoint cannot exist. Soft removals go through softDeleteNode,
+    // which tombstones instead.
     this.db
       .prepare("DELETE FROM edges WHERE from_id = ? OR to_id = ?")
       .run(nodeId, nodeId);
@@ -991,6 +1182,17 @@ export class KnowledgeDB {
       changed = result.changes > 0;
     });
     return changed;
+  }
+
+  private _hasEpistemicColumns: boolean | undefined;
+
+  /** Plan 1 columns (v5); false only on dbs opened before the v5 migration. */
+  private get hasEpistemicColumns(): boolean {
+    if (this._hasEpistemicColumns === undefined) {
+      const cols = this.db.pragma("table_info(nodes)") as Array<{ name: string }>;
+      this._hasEpistemicColumns = cols.some((c) => c.name === "epistemic_status");
+    }
+    return this._hasEpistemicColumns;
   }
 
   insertNodeRaw(node: {
@@ -1015,6 +1217,9 @@ export class KnowledgeDB {
     status?: string | null;
     valid_from?: string | null;
     valid_until?: string | null;
+    // Plan 1 (v5): epistemic axis — preserved across branch merges.
+    epistemic_status?: string | null;
+    status_scope?: string | null;
   }): void {
     // Б10: fork columns exist only on migrated dbs — compose the column
     // list conditionally so upstream dbs keep working.
@@ -1024,13 +1229,19 @@ export class KnowledgeDB {
     const forkParams = this.hasStatusColumn
       ? ", @status, @valid_from, @valid_until"
       : "";
+    const epiCols = this.hasEpistemicColumns
+      ? ", epistemic_status, status_scope"
+      : "";
+    const epiParams = this.hasEpistemicColumns
+      ? ", @epistemic_status, @status_scope"
+      : "";
     const stmt = this.db.prepare(`
       INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task,
         created_at, updated_at, removed_at, removed_reason, embedding,
-        merge_group, needs_merge, source_branch, merge_timestamp${forkCols})
+        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols})
       VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task,
         @created_at, @updated_at, @removed_at, @removed_reason, @embedding,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams})
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams})
     `);
     const values: Record<string, unknown> = {
       id: node.id,
@@ -1056,6 +1267,10 @@ export class KnowledgeDB {
       values.valid_from = node.valid_from ?? null;
       values.valid_until = node.valid_until ?? null;
     }
+    if (this.hasEpistemicColumns) {
+      values.epistemic_status = (node as { epistemic_status?: string | null }).epistemic_status ?? null;
+      values.status_scope = (node as { status_scope?: string | null }).status_scope ?? null;
+    }
     stmt.run(values);
     this.syncNameNorm(node.id, node.name);
   }
@@ -1070,12 +1285,17 @@ export class KnowledgeDB {
     needs_merge?: number;
     source_branch?: string | null;
     merge_timestamp?: string | null;
+    removed_at?: string | null;
   }): number {
+    // Plan 1 §4.6: removed_at is carried over verbatim, otherwise a merge
+    // would silently revive tombstoned edges. INSERT (not OR IGNORE-revive):
+    // the raw merge path must preserve history exactly as it was on the
+    // source; callers filter duplicate pairs beforehand.
     const stmt = this.db.prepare(`
       INSERT OR IGNORE INTO edges (from_id, to_id, relation, description, created_at,
-        merge_group, needs_merge, source_branch, merge_timestamp)
+        merge_group, needs_merge, source_branch, merge_timestamp, removed_at)
       VALUES (@from_id, @to_id, @relation, @description, @created_at,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp)
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp, @removed_at)
     `);
     const result = stmt.run({
       from_id: edge.from_id,
@@ -1087,6 +1307,7 @@ export class KnowledgeDB {
       needs_merge: edge.needs_merge ?? 0,
       source_branch: edge.source_branch ?? null,
       merge_timestamp: edge.merge_timestamp ?? null,
+      removed_at: edge.removed_at ?? null,
     });
     return Number(result.lastInsertRowid);
   }
@@ -1252,11 +1473,14 @@ export class KnowledgeDB {
   }
 
   getEdgesAtTime(timestamp: string): EdgeRow[] {
+    // Point-in-time read: an edge existed at @timestamp when it was created
+    // before it and not yet tombstoned (removed_at NULL or later) — plan 1 §4.5.
     const stmt = this.db.prepare(`
       SELECT e.* FROM edges e
       INNER JOIN nodes nf ON e.from_id = nf.id
       INNER JOIN nodes nt ON e.to_id = nt.id
       WHERE e.created_at <= @timestamp
+        AND (e.removed_at IS NULL OR e.removed_at > @timestamp)
         AND nf.created_at <= @timestamp
         AND nt.created_at <= @timestamp
         AND (nf.removed_at IS NULL OR nf.removed_at > @timestamp)

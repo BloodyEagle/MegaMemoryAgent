@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
-import { understand, createConcept, listConflicts, removeConcept } from "../tools.js";
+import { understand, createConcept, listConflicts, removeConcept, updateConcept } from "../tools.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
@@ -155,5 +155,100 @@ describe("status history (U5)", () => {
     const all = db.getAllStatusHistory(10);
     expect(all.length).toBeGreaterThanOrEqual(2);
     expect(all[0].node_id).toBe("b"); // newest first
+  });
+});
+
+describe("epistemic status (plan 1)", () => {
+  it("create defaults to open; explicit values are accepted", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "Hypothesis", kind: "decision", summary: "maybe" });
+    expect(db.getNode("hypothesis")?.epistemic_status).toBe("open");
+
+    await createConcept(db, {
+      name: "Checked Fact",
+      kind: "decision",
+      summary: "confirmed",
+      epistemic_status: "validated",
+      status_scope: { env: "ci", artifact: "run-123" },
+    });
+    expect(db.getNode("checked-fact")?.epistemic_status).toBe("validated");
+  });
+
+  it("invalid transition is rejected; validated without scope/artifact fails", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "Claim", kind: "decision", summary: "x" });
+
+    // open -> validated requires scope with artifact.
+    await expect(
+      updateConcept(db, { id: "claim", changes: { epistemic_status: "validated", epistemic_reason: "looks fine" } })
+    ).rejects.toThrow(/artifact/);
+
+    await expect(
+      updateConcept(db, {
+        id: "claim",
+        changes: {
+          epistemic_status: "validated",
+          epistemic_reason: "tested",
+          status_scope: { env: "ci", artifact: "run-1" },
+        },
+      })
+    ).resolves.toBeTruthy();
+    expect(db.getNode("claim")?.epistemic_status).toBe("validated");
+
+    // validated -> open is not a legal move (must go through refuted/abandoned).
+    await expect(
+      updateConcept(db, { id: "claim", changes: { epistemic_status: "open", epistemic_reason: "reopen" } })
+    ).rejects.toThrow(/Invalid epistemic transition/);
+  });
+
+  it("epistemic_status without reason is rejected; reason without status too", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "R", kind: "decision", summary: "x" });
+    await expect(
+      updateConcept(db, { id: "r", changes: { epistemic_status: "refuted" } })
+    ).rejects.toThrow(/epistemic_reason/);
+    await expect(
+      updateConcept(db, { id: "r", changes: { epistemic_reason: "no status" } })
+    ).rejects.toThrow(/no-op/);
+  });
+
+  it("refuted node stays in the graph and surfaces in the refuted block", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "Wrong Guess", kind: "decision", summary: "cache is disk-backed" });
+    await createConcept(db, { name: "Plain Fact", kind: "decision", summary: "something true" });
+
+    await updateConcept(db, {
+      id: "wrong-guess",
+      changes: { epistemic_status: "refuted", epistemic_reason: "benchmarks show otherwise" },
+    });
+
+    // Still in the graph, with lifecycle status untouched.
+    expect(db.getNode("wrong-guess")).toBeDefined();
+    expect(db.getNode("wrong-guess")?.status).toBe("active");
+
+    // understand: excluded from matches (even with include_inactive), present
+    // in the refuted block with the reason.
+    const res = await understand(db, { query: "cache", mode: "full" });
+    expect(res.matches.some((m) => m.id === "wrong-guess")).toBe(false);
+    const refuted = (res.refuted ?? []) as Array<{ id: string; refuted_reason?: string | null }>;
+    expect(refuted.some((m) => m.id === "wrong-guess" && m.refuted_reason === "benchmarks show otherwise")).toBe(true);
+
+    // refuted survives include_inactive=false as well (compact mode).
+    const compact = await understand(db, { query: "cache" });
+    expect((compact.refuted ?? []).some((m) => m.id === "wrong-guess")).toBe(true);
+  });
+
+  it("every epistemic transition writes status_history with field + reason", async () => {
+    const db = freshDb();
+    await createConcept(db, { name: "E", kind: "decision", summary: "x" });
+    await updateConcept(db, { id: "e", changes: { epistemic_status: "refuted", epistemic_reason: "wrong" } });
+    await updateConcept(db, { id: "e", changes: { epistemic_status: "open", epistemic_reason: "reopened after discussion" } });
+
+    const rows = db.execSqlAll(
+      "SELECT from_status, to_status, reason, field FROM status_history WHERE node_id = 'e' AND field = 'epistemic_status' ORDER BY id"
+    ) as Array<{ from_status: string; to_status: string; reason: string; field: string }>;
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ from_status: "open", to_status: "refuted", reason: "wrong", field: "epistemic_status" });
+    expect(rows[1]).toMatchObject({ from_status: "refuted", to_status: "open", reason: "reopened after discussion" });
   });
 });

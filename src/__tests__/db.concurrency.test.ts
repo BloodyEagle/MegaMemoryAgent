@@ -208,6 +208,7 @@ describe.sequential("KnowledgeDB multi-process concurrency", () => {
         expect(stats).toEqual({
           nodes: FRESH_OPEN_WORKERS.length,
           edges: 0,
+          edges_removed: 0,
           removed: 0,
         });
         expect(nodeIds).toEqual(
@@ -305,6 +306,7 @@ describe.sequential("KnowledgeDB multi-process concurrency", () => {
         expect(stats).toEqual({
           nodes: 1 + CONCURRENT_WRITERS.length,
           edges: CONCURRENT_WRITERS.length,
+          edges_removed: 0,
           removed: 0,
         });
         expect(incomingAnchorEdges).toHaveLength(CONCURRENT_WRITERS.length);

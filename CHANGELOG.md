@@ -1,5 +1,36 @@
 # Changelog
 
+## Fork (1.7.0-fork.1)
+
+### Edge tombstones + epistemic status (plan 1, schema v5)
+
+- **Багфикс:** soft-delete узла больше не удаляет его рёбра физически — они
+  получают `removed_at` (надгробие) и восстанавливаются вместе с узлом.
+  `deleteEdge` (unlink) тоже ставит надгробие вместо стирания истории связи.
+- Повторный `link` той же пары после надгробия **оживляет** ту же строку
+  (оживление вместо частичного индекса — история одна, дублей нет).
+- Все чтения рёбер фильтруют надгробия; `getAllEdgesRaw` остаётся сырым
+  (merge/бэкап). `getStats` отдаёт `edges_removed` отдельно. Merge переносит
+  `removed_at` и не оживляет надгробия.
+- Схема: `PRAGMA user_version` 4 → 5 (`edges.removed_at`,
+  `nodes.epistemic_status`, `nodes.status_scope`, `status_history.field`).
+  Свежие базы получают все колонки сразу в `CREATE TABLE` — паритет с
+  мигрированными. `meta.schema_version` не тронут (это другой штамп).
+- **Эпистемическая ось** узлов: `open / validated / refuted / abandoned`
+  отдельно от жизненного цикла `active / superseded / deprecated`.
+  `validated` требует `status_scope` (JSON с обязательным `artifact` —
+  id прогона теста/замера). Переходы валидируются только на границе
+  MCP-инструмента (`update_concept`: `epistemic_status` + `epistemic_reason`
+  обязательны вместе); внутренние вызовы (soft-delete, merge) идут мимо.
+- `refuted` узлы **всегда** видны в `understand` — отдельным блоком `refuted`
+  с причиной, мимо фильтра `include_inactive` (антизнание не прячется).
+- `create_concept`: опциональные `epistemic_status` (по умолчанию `open`) и
+  `status_scope`.
+- `doctor`: новая проверка `user_version` против `SCHEMA_VERSION`; счётчик
+  надгробий (+ пометка «между живыми узлами»); рассинхрон «живое ребро у
+  удалённого узла»; распределение обеих осей статуса; `validated` без
+  `status_scope.artifact`; эпистемические переходы без `reason`.
+- Версия пакета: 1.7.0-fork.1.
 ## Fork (1.6.3-fork.4)
 
 - Explorer больше не ходит в CDN: d3 7.9.0 вендорится в `web/vendor/` и раздаётся

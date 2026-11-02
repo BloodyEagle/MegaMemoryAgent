@@ -91,6 +91,63 @@ function parseFileRefs(raw: string | null): string[] | null {
   }
 }
 
+/** Plan 1: status_scope is stored as a JSON string; unparseable = no scope. */
+function parseStatusScope(raw: string | null | undefined): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---- Epistemic transitions (plan 1 §5.2) ----
+
+export type EpistemicStatus = "open" | "validated" | "refuted" | "abandoned";
+
+/**
+ * Allowed epistemic transitions. Enforced ONLY at the MCP tool boundary —
+ * internal callers (soft-delete, merge, supersede) bypass this so the system
+ * never blocks its own lifecycle writes.
+ */
+const EPISTEMIC_TRANSITIONS: Record<EpistemicStatus, EpistemicStatus[]> = {
+  open: ["validated", "refuted", "abandoned"],
+  validated: ["refuted", "abandoned"],
+  refuted: ["open"], // reopening, reason mandatory
+  abandoned: ["open"],
+};
+
+/**
+ * Validate an agent-driven epistemic transition. Throws with a human-readable
+ * message on an illegal move; `validated` additionally requires a scope with
+ * an artifact (an agent confirming a fact by itself is circular validation).
+ */
+export function validateEpistemicTransition(
+  from: EpistemicStatus | null,
+  to: EpistemicStatus,
+  scope?: Record<string, unknown>
+): void {
+  if (from === to) return; // rewrite with a new reason/scope is a no-op
+  const allowed = from === null ? ["validated", "refuted", "abandoned"] : EPISTEMIC_TRANSITIONS[from];
+  if (!allowed.includes(to)) {
+    throw new Error(
+      `Invalid epistemic transition: ${from ?? "unknown"} -> ${to}. ` +
+        `Allowed from ${from ?? "unknown"}: ${allowed.join(", ")}.`
+    );
+  }
+  if (to === "validated") {
+    const artifact = scope && typeof scope === "object" ? (scope as { artifact?: unknown }).artifact : undefined;
+    if (!scope || typeof scope !== "object" || !artifact) {
+      throw new Error(
+        `epistemic_status "validated" requires status_scope with an "artifact" ` +
+          `(id of the test/benchmark run that confirms it). Without an external ` +
+          `artifact the agent would be confirming its own claim.`
+      );
+    }
+  }
+}
+
 /**
  * Build a NodeWithContext from a node row and DB lookups.
  */
@@ -142,6 +199,14 @@ export function buildNodeWithContext(
     // T4: lifecycle status surfaces in the node card.
     status: node.status ?? "active",
     valid_until: node.valid_until ?? null,
+    // Plan 1 §5.3: both axes on the card, plus the scope of a `validated`.
+    epistemic_status: node.epistemic_status ?? null,
+    status_scope: parseStatusScope(node.status_scope),
+    // Refuted nodes always carry the reason — that is the whole point of
+    // keeping them in the graph.
+    ...(node.epistemic_status === "refuted"
+      ? { refuted_reason: db.getLatestEpistemicReason(node.id, "refuted") }
+      : {}),
     ...(similarity !== undefined ? { similarity } : {}),
   };
 }
@@ -186,6 +251,7 @@ function compactMatch(
     name: node.name,
     kind: node.kind as CompactMatch["kind"],
     status: node.status ?? "active",
+    epistemic_status: node.epistemic_status ?? null,
     summary: trimSummary(node.summary),
     file_refs: fileRefs,
     ...(opts.score !== undefined
@@ -246,11 +312,19 @@ export async function understand(
 
   // Resolve nodes once, in rank order. T4: superseded/deprecated nodes are
   // hidden by default (include_inactive: true shows them with their status).
+  // Plan 1 §5.3: refuted nodes are the conscious exception — they bypass the
+  // filter and go to a separate output block, because antiknowledge ("where
+  // we went wrong") must never disappear behind include_inactive.
   const includeInactive = input.include_inactive ?? false;
   const nodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
+  const refutedNodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
   for (const match of topMatches) {
     const node = db.getNode(match.id);
     if (!node) continue;
+    if ((node.epistemic_status ?? null) === "refuted") {
+      refutedNodes.push({ node, score: match.similarity, via: viaById.get(match.id) });
+      continue;
+    }
     const status = node.status ?? "active";
     if (!includeInactive && status !== "active") continue;
     nodes.push({ node, score: match.similarity, via: viaById.get(match.id) });
@@ -263,7 +337,12 @@ export async function understand(
       if (via) ctx.via = via;
       matches.push(ctx);
     }
-    const payload = JSON.stringify(matches);
+    const refuted = refutedNodes.map(({ node, score, via }) => {
+      const ctx = buildNodeWithContext(db, node, score);
+      if (via) ctx.via = via;
+      return ctx;
+    });
+    const payload = JSON.stringify({ matches, refuted });
     db.insertUsage({
       tool: "understand",
       query: input.query,
@@ -275,6 +354,7 @@ export async function understand(
     return {
       matches,
       compact: undefined,
+      refuted,
       meta: {
         returned: matches.length,
         dropped: 0,
@@ -288,6 +368,13 @@ export async function understand(
   // В15: the would-be full-mode cost for the same hits, measured once.
   const fullProjection = nodes.map(({ node }) => buildNodeWithContext(db, node));
   const estimatedFullTokens = estimateTokens(JSON.stringify(fullProjection));
+
+  // Plan 1 §5.3: separate "refuted" block, marked and with the reason —
+  // these are not facts and must not blend into the match list. Built before
+  // the budget loop so the early-return below still carries it.
+  const refuted = refutedNodes.map(({ node, score, via }) =>
+    compactMatch(db, node, { score, via, withContext: false })
+  );
 
   const compact: CompactMatch[] = [];
   let tokensEstimated = 0;
@@ -309,6 +396,7 @@ export async function understand(
       return {
         matches: [],
         compact,
+        refuted,
         meta: {
           returned: compact.length,
           dropped,
@@ -321,7 +409,7 @@ export async function understand(
     tokensEstimated = projected;
   }
 
-  const payload = JSON.stringify({ compact, meta: { returned: compact.length, dropped: 0, tokens_estimated: tokensEstimated } });
+  const payload = JSON.stringify({ compact, refuted, meta: { returned: compact.length, dropped: 0, tokens_estimated: tokensEstimated } });
   db.insertUsage({
     tool: "understand",
     query: input.query,
@@ -337,7 +425,8 @@ export async function understand(
     ids.length >= 2
       ? (db.execSqlAll(
           `SELECT DISTINCT from_id, to_id, relation FROM edges
-           WHERE from_id IN (${ids.map(() => "?").join(",")})
+           WHERE removed_at IS NULL
+             AND from_id IN (${ids.map(() => "?").join(",")})
              AND to_id IN (${ids.map(() => "?").join(",")})`,
           ...ids,
           ...ids
@@ -349,6 +438,7 @@ export async function understand(
   return {
     matches: [],
     compact,
+    refuted,
     edges_between: edgesBetween,
     meta: {
       returned: compact.length,
@@ -453,6 +543,11 @@ export async function createConcept(
   const text = embeddingText(input.name, input.kind, input.summary);
   const embedding = await embedForStorage(db, text);
 
+  // Plan 1 §5.3: initial epistemic state, default open. A `validated` at
+  // creation time needs the same scope discipline as a transition.
+  const epistemic = input.epistemic_status ?? "open";
+  validateEpistemicTransition("open", epistemic, input.status_scope);
+
   db.insertNodeAndEdges(
     {
       id,
@@ -464,6 +559,8 @@ export async function createConcept(
       parent_id: parentId ?? null,
       created_by_task: input.created_by_task ?? null,
       embedding,
+      epistemic_status: epistemic,
+      status_scope: input.status_scope ? JSON.stringify(input.status_scope) : null,
     },
     (input.edges ?? []).map((edge) => ({
       to_id: edge.to,
@@ -514,6 +611,28 @@ export async function updateConcept(
     throw new Error(`Concept "${input.id}" not found.`);
   }
 
+  // Plan 1 §5.2: epistemic transitions are validated here, at the MCP tool
+  // boundary (not inside setNodeStatus/setEpistemicStatus — internal callers
+  // like soft-delete and merge must never be blocked). reason is mandatory
+  // together with epistemic_status; validated additionally requires a scope
+  // with an artifact.
+  let scope: Record<string, unknown> | undefined;
+  if (input.changes.epistemic_status !== undefined) {
+    if (!input.changes.epistemic_reason || input.changes.epistemic_reason.trim().length === 0) {
+      throw new Error(
+        `Changing epistemic_status requires a non-empty "epistemic_reason" — every transition is recorded in status_history.`
+      );
+    }
+    scope = input.changes.status_scope;
+    validateEpistemicTransition(
+      (existing.epistemic_status ?? null) as EpistemicStatus | null,
+      input.changes.epistemic_status,
+      scope
+    );
+  } else if (input.changes.epistemic_reason !== undefined) {
+    throw new Error(`"epistemic_reason" without "epistemic_status" is a no-op — pass both or neither.`);
+  }
+
   // If summary or name changed, regenerate embedding (skip when the vector
   // path is disabled pending reembed — reembed will fill it in)
   let embedding: Buffer | undefined;
@@ -535,11 +654,24 @@ export async function updateConcept(
     db.upsertVector(input.id, embedding);
   }
 
-  if (!updated) {
+  if (!updated && input.changes.epistemic_status === undefined) {
     return { message: `No changes applied to "${input.id}"` };
   }
 
-  return { message: `Updated concept "${input.id}"` };
+  // Plan 1: the epistemic write happens after the content update so a failed
+  // transition validation above never leaves a half-applied epistemic change.
+  let epistemicNote = "";
+  if (input.changes.epistemic_status !== undefined) {
+    db.setEpistemicStatus(
+      input.id,
+      input.changes.epistemic_status,
+      input.changes.epistemic_reason!,
+      scope ?? null
+    );
+    epistemicNote = ` Epistemic status: ${input.changes.epistemic_status}.`;
+  }
+
+  return { message: `Updated concept "${input.id}".${epistemicNote}` };
 }
 
 export function link(

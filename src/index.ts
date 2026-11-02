@@ -394,6 +394,8 @@ async function startMcpServer() {
         description: z.string().optional().describe("Why this relationship exists"),
       })).optional().describe("Relationships to other existing concepts"),
       created_by_task: z.string().optional().describe("Description of the task that created this concept"),
+      epistemic_status: z.enum(["open", "validated", "refuted", "abandoned"]).optional().describe("Initial epistemic state (default: open). 'validated' requires status_scope with an artifact"),
+      status_scope: z.record(z.unknown()).optional().describe("Scope of a 'validated' claim, JSON: {env?, version?, dataset?, artifact?} — artifact (test/run id) is mandatory for validated"),
     },
     async (params) => {
       try {
@@ -407,6 +409,8 @@ async function startMcpServer() {
           edges: params.edges?.map((e) => ({ ...e, relation: e.relation as RelationType })),
           supersedes: params.supersedes,
           created_by_task: params.created_by_task,
+          epistemic_status: params.epistemic_status,
+          status_scope: params.status_scope,
         });
         // T6: auto-digest the parent when it gained its 5th+ child.
         let digestNote = "";
@@ -452,6 +456,9 @@ async function startMcpServer() {
         summary: z.string().optional().describe("Updated summary"),
         why: z.string().optional().describe("Updated rationale"),
         file_refs: z.array(z.string()).optional().describe("Updated file references"),
+        epistemic_status: z.enum(["open", "validated", "refuted", "abandoned"]).optional().describe("Epistemic verdict transition; epistemic_reason is mandatory with it. Valid moves: open->validated/refuted/abandoned, validated->refuted/abandoned, refuted->open, abandoned->open"),
+        epistemic_reason: z.string().optional().describe("Why this epistemic transition — recorded in status_history, required with epistemic_status"),
+        status_scope: z.record(z.unknown()).optional().describe("Scope for 'validated': {env?, version?, dataset?, artifact?}; artifact (test/run id) is mandatory"),
       }),
     },
     async (params) => {

@@ -1,4 +1,5 @@
 import type { KnowledgeDB } from "./db.js";
+import { SCHEMA_VERSION } from "./db.js";
 import { MODEL_NAME, isModelLoaded, vectorSearchEnabled } from "./embeddings.js";
 import { MIGRATION_TARGET_SCHEMA_VERSION } from "./migrate-schema.js";
 import { isBrokenId } from "./migrate.js";
@@ -133,6 +134,20 @@ export function runDoctor(db: KnowledgeDB): {
       (c) => c.name === col
     );
   const hasStatus = hasColumn("nodes", "status");
+  const hasEpistemic = hasColumn("nodes", "epistemic_status");
+  const hasEdgesRemovedAt = hasColumn("edges", "removed_at");
+
+  // Plan 1 §6.0: PRAGMA user_version is a SECOND version stamp, independent
+  // of meta.schema_version above. Without this check "the migration ran" and
+  // "the doctor is green" would be unrelated claims.
+  const userVersion = db.getUserVersion();
+  add(
+    "user_version",
+    userVersion === SCHEMA_VERSION,
+    userVersion === SCHEMA_VERSION
+      ? `v${userVersion} (matches SCHEMA_VERSION)`
+      : `v${userVersion}, expected ${SCHEMA_VERSION} — reopen the db (migration runs on open)`
+  );
 
   // schema_version
   const version = db.getMetaValue("schema_version");
@@ -248,6 +263,97 @@ export function runDoctor(db: KnowledgeDB): {
         OR to_id NOT IN (SELECT id FROM nodes)`
   ) as { n: number }).n;
   add("edges", orphans === 0, orphans === 0 ? "no orphans" : `${orphans} orphaned edge(s)`);
+
+  // ---- Plan 1 §6: tombstones and the epistemic axis ----
+
+  if (hasEdgesRemovedAt) {
+    // §6.1: tombstoned edges — count them, and flag tombstones between two
+    // live nodes (a likely pointless unlink).
+    const tombstoned = (db.execSqlFirst(
+      "SELECT count(*) AS n FROM edges WHERE removed_at IS NOT NULL"
+    ) as { n: number }).n;
+    const tombstonedBetweenLive = (db.execSqlFirst(
+      `SELECT count(*) AS n FROM edges e
+       WHERE e.removed_at IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM nodes f WHERE f.id = e.from_id AND f.removed_at IS NOT NULL)
+         AND NOT EXISTS (SELECT 1 FROM nodes t WHERE t.id = e.to_id AND t.removed_at IS NOT NULL)`
+    ) as { n: number }).n;
+    add(
+      "edge tombstones",
+      true, // informational — tombstones are history, not damage
+      `${tombstoned} tombstoned edge(s)` +
+        (tombstonedBetweenLive > 0 ? `, ${tombstonedBetweenLive} between live nodes (check why)` : "")
+    );
+
+    // §6.2: live edges pointing at a soft-removed node — desync, must be 0.
+    const liveAtRemoved = (db.execSqlFirst(
+      `SELECT count(*) AS n FROM edges e
+       WHERE e.removed_at IS NULL
+         AND (EXISTS (SELECT 1 FROM nodes f WHERE f.id = e.from_id AND f.removed_at IS NOT NULL)
+           OR EXISTS (SELECT 1 FROM nodes t WHERE t.id = e.to_id AND t.removed_at IS NOT NULL))`
+    ) as { n: number }).n;
+    add(
+      "edge/node removal sync",
+      liveAtRemoved === 0,
+      liveAtRemoved === 0 ? "no live edges at removed nodes" : `${liveAtRemoved} live edge(s) at removed node(s) — run 'megamemory repair' or re-remove the node`
+    );
+  }
+
+  if (hasEpistemic) {
+    // §6.3: both axes reported separately — lifecycle and epistemic.
+    const epiCounts = db.getEpistemicStatusCounts();
+    const epiSummary = ["open", "validated", "refuted", "abandoned", "null"]
+      .filter((k) => epiCounts[k] !== undefined)
+      .map((k) => `${k}=${epiCounts[k]}`)
+      .join(", ");
+    const statusSummary = hasStatus
+      ? Object.entries(db.getStatusCounts())
+          .map(([k, v]) => `${k}=${v}`)
+          .join(", ")
+      : "n/a";
+    add("status axes", true, `lifecycle: ${statusSummary || "none"} · epistemic: ${epiSummary || "none"}`);
+
+    // §6.3a: validated without a scope, or without an artifact in it —
+    // by plan rules it must not be trusted as confirmed.
+    const unscoped = (db.execSqlFirst(
+      `SELECT count(*) AS n FROM nodes
+       WHERE epistemic_status = 'validated'
+         AND (status_scope IS NULL OR status_scope NOT LIKE '%"artifact"%')`
+    ) as { n: number }).n;
+    add(
+      "validated scope",
+      unscoped === 0,
+      unscoped === 0
+        ? "all validated nodes carry a scope with an artifact"
+        : `${unscoped} validated node(s) without status_scope.artifact — treat as open`
+    );
+
+    // §6.4: epistemic transitions without a reason (legacy rows excluded —
+    // they predate the field column and have no reason by design). The table
+    // is created lazily, so it may not exist yet on a fresh db.
+    const hasHistory =
+      db.execSqlFirst(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='status_history'"
+      ) !== undefined;
+    const hasHistoryField =
+      hasHistory &&
+      (db.pragma("table_info(status_history)") as Array<{ name: string }>).some(
+        (c) => c.name === "field"
+      );
+    const noReason = hasHistoryField
+      ? (db.execSqlFirst(
+          `SELECT count(*) AS n FROM status_history
+           WHERE field = 'epistemic_status' AND (reason IS NULL OR reason = '')`
+        ) as { n: number }).n
+      : 0;
+    add(
+      "epistemic history",
+      noReason === 0,
+      noReason === 0
+        ? "all epistemic transitions carry a reason"
+        : `${noReason} transition(s) without reason (legacy rows are exempt)`
+    );
+  }
 
   // digest sync: parents with >=5 children and no digest
   const digestPending = (db.execSqlFirst(

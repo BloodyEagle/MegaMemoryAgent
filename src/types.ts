@@ -74,6 +74,10 @@ export interface CreateConceptInput {
    */
   supersedes?: string[];
   created_by_task?: string;
+  /** Plan 1 §5.3: initial epistemic state; default `open`. */
+  epistemic_status?: "open" | "validated" | "refuted" | "abandoned";
+  /** Required when epistemic_status = validated (JSON: {env?,version?,dataset?,artifact?}). */
+  status_scope?: Record<string, unknown>;
 }
 
 export interface UpdateConceptInput {
@@ -84,6 +88,13 @@ export interface UpdateConceptInput {
     summary?: string;
     why?: string;
     file_refs?: string[];
+    /**
+     * Plan 1 §5.3: epistemic transition. `reason` is mandatory together with
+     * it; `validated` additionally requires `status_scope` with an `artifact`.
+     */
+    epistemic_status?: "open" | "validated" | "refuted" | "abandoned";
+    epistemic_reason?: string;
+    status_scope?: Record<string, unknown>;
   };
 }
 
@@ -133,6 +144,11 @@ export interface NodeWithContext {
   /** Lifecycle status (T4); absent only in not-yet-migrated dbs. */
   status?: string;
   valid_until?: string | null;
+  /** Plan 1: epistemic axis + the scope of a `validated` (JSON). */
+  epistemic_status?: string | null;
+  status_scope?: Record<string, unknown> | null;
+  /** Set for refuted nodes: why the verdict was made. */
+  refuted_reason?: string | null;
 }
 
 export interface UnderstandOutput {
@@ -159,6 +175,8 @@ export interface CompactMatch {
   name: string;
   kind: NodeKind;
   status: string;
+  /** Plan 1: epistemic axis, shown so refuted nodes are never mistaken for facts. */
+  epistemic_status?: string | null;
   /** Truncated to <=240 chars at a word boundary. */
   summary: string;
   file_refs: string[] | null;
@@ -186,6 +204,12 @@ export interface UnderstandOutput {
    * empty/legacy for backward compatibility with older consumers.
    */
   compact?: CompactMatch[];
+  /**
+   * Plan 1 §5.3: refuted nodes found by the query, always returned regardless
+   * of include_inactive — antiknowledge must not disappear behind a filter.
+   * CompactMatch in compact mode, full NodeWithContext in full mode.
+   */
+  refuted?: Array<CompactMatch | NodeWithContext>;
   /**
    * В14: relations between the returned nodes — graph structure without
    * pulling every node's full context.
@@ -246,6 +270,10 @@ export interface NodeRow {
   status?: string;
   valid_from?: string | null;
   valid_until?: string | null;
+  // Plan 1 (v5): epistemic axis (open/validated/refuted/abandoned, NULL =
+  // unknown) and the JSON scope of a `validated`.
+  epistemic_status?: string | null;
+  status_scope?: string | null;
 }
 
 export interface EdgeRow {
@@ -259,6 +287,8 @@ export interface EdgeRow {
   needs_merge: number; // SQLite stores boolean as 0/1
   source_branch: string | null;
   merge_timestamp: string | null;
+  /** Plan 1 (v5): tombstone timestamp; NULL = active edge. */
+  removed_at?: string | null;
 }
 
 // ---- Merge types ----
