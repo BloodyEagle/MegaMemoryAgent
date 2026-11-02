@@ -178,6 +178,8 @@ export function ensureSchema(
   report.alreadyOk.push(`name_norm backfill (${pendingNorm.length} rows)`);
 
   // U5: status lifecycle history (active -> superseded/deprecated, ...).
+  // Plan 1 (v5): the field column separates the lifecycle axis (status) from
+  // the epistemic axis (epistemic_status).
   db.execSql(
     "CREATE TABLE IF NOT EXISTS status_history (\
       id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -185,9 +187,18 @@ export function ensureSchema(
       from_status TEXT,\
       to_status TEXT NOT NULL,\
       reason TEXT,\
+      field TEXT NOT NULL DEFAULT 'status',\
       at TEXT NOT NULL DEFAULT (datetime('now'))\
     )"
   );
+  {
+    const hcols = tableColumns(db, "status_history");
+    if (!hcols.has("field")) {
+      db.execSql(
+        "ALTER TABLE status_history ADD COLUMN field TEXT NOT NULL DEFAULT 'status'"
+      );
+    }
+  }
   db.execSql(
     "CREATE INDEX IF NOT EXISTS idx_status_history_node ON status_history(node_id)"
   );

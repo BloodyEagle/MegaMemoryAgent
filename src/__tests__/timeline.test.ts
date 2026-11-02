@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import Database from "libsql";
-import { KnowledgeDB } from "../db.js";
+import { KnowledgeDB, SCHEMA_VERSION } from "../db.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -468,7 +468,7 @@ describe("KnowledgeDB timeline", () => {
         typeof pragmaResult === "object"
           ? pragmaResult.user_version
           : pragmaResult;
-      expect(version).toBe(4);
+      expect(version).toBe(SCHEMA_VERSION);
     });
 
     it("verifies timeline table exists with correct columns", () => {

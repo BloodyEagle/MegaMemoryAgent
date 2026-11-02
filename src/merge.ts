@@ -188,6 +188,7 @@ export class MergeEngine {
       needs_merge: number;
       source_branch: string | null;
       merge_timestamp: string | null;
+      removed_at: string | null;
       _originSide: "left" | "right"; // tracks which input DB this edge came from
     };
     const deferredEdges: DeferredEdge[] = [];
@@ -218,6 +219,7 @@ export class MergeEngine {
         needs_merge: e.needs_merge,
         source_branch: e.source_branch,
         merge_timestamp: e.merge_timestamp,
+        removed_at: e.removed_at ?? null,
         _originSide: originSide,
       });
     };
@@ -340,6 +342,7 @@ export class MergeEngine {
               needs_merge: edgesConflict ? 1 : 0,
               source_branch: edgesConflict ? leftLabel : null,
               merge_timestamp: edgesConflict ? now : null,
+              removed_at: e.removed_at ?? null,
               _originSide: "left",
             });
           }
@@ -355,6 +358,7 @@ export class MergeEngine {
               needs_merge: edgesConflict ? 1 : 0,
               source_branch: edgesConflict ? rightLabel : null,
               merge_timestamp: edgesConflict ? now : null,
+              removed_at: e.removed_at ?? null,
               _originSide: "right",
             });
           }
@@ -401,6 +405,7 @@ export class MergeEngine {
         needs_merge: edge.needs_merge,
         source_branch: edge.source_branch,
         merge_timestamp: edge.merge_timestamp,
+        removed_at: edge.removed_at,
       });
     }
 
@@ -430,6 +435,9 @@ export class MergeEngine {
       status: node.status,
       valid_from: node.valid_from,
       valid_until: node.valid_until,
+      // Plan 1 (v5): epistemic axis travels with the row.
+      epistemic_status: node.epistemic_status ?? null,
+      status_scope: node.status_scope ?? null,
     });
   }
 
@@ -463,6 +471,9 @@ export class MergeEngine {
       status: node.status,
       valid_from: node.valid_from,
       valid_until: node.valid_until,
+      // Plan 1 (v5): epistemic axis travels with the row.
+      epistemic_status: node.epistemic_status ?? null,
+      status_scope: node.status_scope ?? null,
     });
   }
 
@@ -475,6 +486,7 @@ export class MergeEngine {
       description: string | null; created_at: string | null;
       merge_group: string | null; needs_merge: number;
       source_branch: string | null; merge_timestamp: string | null;
+      removed_at: string | null;
       _originSide: "left" | "right";
     }>,
     edgeMap: Map<string, EdgeRow[]>,
@@ -494,6 +506,7 @@ export class MergeEngine {
         needs_merge: 0,
         source_branch: null,
         merge_timestamp: null,
+        removed_at: e.removed_at ?? null,
         _originSide: side,
       });
     }
@@ -508,6 +521,7 @@ export class MergeEngine {
       description: string | null; created_at: string | null;
       merge_group: string | null; needs_merge: number;
       source_branch: string | null; merge_timestamp: string | null;
+      removed_at: string | null;
       _originSide: "left" | "right";
     }>,
     leftEdgeMap: Map<string, EdgeRow[]>,
@@ -536,6 +550,7 @@ export class MergeEngine {
         needs_merge: 0,
         source_branch: null,
         merge_timestamp: null,
+        removed_at: e.removed_at ?? null,
         _originSide: "left",
       });
     }
@@ -555,6 +570,7 @@ export class MergeEngine {
         needs_merge: 0,
         source_branch: null,
         merge_timestamp: null,
+        removed_at: e.removed_at ?? null,
         _originSide: "right",
       });
     }
