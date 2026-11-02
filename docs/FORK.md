@@ -30,6 +30,7 @@
 | U4 | Digest cards list source concepts (siblings), `stale` badge, focus toggle | node card |
 | U5 | `status_history` table (schema v3), timeline «status changes» mode, node history via `/api/node/:id/history` | timeline selector, node card |
 | U6 | Search budget line shows «saved ~Z vs full» from `estimated_full_tokens` | search results |
+| U7 | d3 vendored into `web/vendor/` and served from `/vendor/*` (no CDN requests, works offline); `MEGAMEMORY_D3_URL` overrides the source with any absolute URL | explorer head, env table |
 
 Native vector search (no JS cosine loop): embeddings are mirrored into a `nodes_vec`
 shadow table (`F32_BLOB`) and top-k is computed by SQLite via `vector_distance_cos`;
@@ -81,6 +82,7 @@ Upstream touches the same functions (`understand`, `createConcept`, `makeId`). R
 | `MEGAMEMORY_EMBED_IDLE_MS` | `300000` | Unload the model after this idle time; `0` disables unloading |
 | `MEGAMEMORY_EMBED_THREADS` | `1` | Intra-op threads of the ONNX session |
 | `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Database path |
+| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | D3 source for the explorer: local vendored copy by default (no external requests); any absolute URL (e.g. a CDN) to override |
 
 **Model license.** `intfloat/multilingual-e5-small` is MIT; the ONNX export
 `Xenova/multilingual-e5-small` ships under the same license. A prefix-free alternative

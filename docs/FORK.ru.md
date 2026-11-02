@@ -30,6 +30,7 @@ English version of this document: [docs/FORK.md](./FORK.md).
 | U4 | Карточка digest показывает исходные концепции (соседей), бейдж `stale`, фокус | карточка узла |
 | U5 | Таблица `status_history` (схема v3), режим «status changes» в таймлайне, история узла через `/api/node/:id/history` | селектор таймлайна, карточка узла |
 | U6 | Строка бюджета поиска показывает «saved ~Z vs full» из `estimated_full_tokens` | результаты поиска |
+| U7 | d3 вендорится в `web/vendor/` и раздаётся с `/vendor/*` (без запросов в CDN, офлайн-работа); `MEGAMEMORY_D3_URL` переопределяет источник любым абсолютным URL | шапка explorer, таблица env |
 
 Нативный векторный поиск (без JS-перебора): эмбеддинги дублируются в теневую таблицу
 `nodes_vec` (`F32_BLOB`), top-k считает SQLite через `vector_distance_cos`; JS-косинус
@@ -81,6 +82,7 @@ Upstream двигает те же функции (`understand`, `createConcept`,
 | `MEGAMEMORY_EMBED_IDLE_MS` | `300000` | Выгрузка модели после простоя; `0` — не выгружать |
 | `MEGAMEMORY_EMBED_THREADS` | `1` | Внутренние потоки ONNX-сессии |
 | `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Путь к базе |
+| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | Источник D3 для explorer: локальная копия из поставки (без внешних запросов); абсолютный URL (например, CDN) — для переопределения |
 
 **Лицензия модели.** `intfloat/multilingual-e5-small` — MIT; ONNX-экспорт
 `Xenova/multilingual-e5-small` распространяется под той же лицензией. Альтернатива без

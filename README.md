@@ -164,6 +164,7 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid` / `fts` / `vector` |
 | `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` adds a second index for CJK |
 | `MEGAMEMORY_AUTO_DIGEST` | on | `0` disables auto-digest after the 5th child |
+| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | D3 source for the explorer UI; set to a CDN URL to load it remotely instead of the bundled copy |
 
 ---
 

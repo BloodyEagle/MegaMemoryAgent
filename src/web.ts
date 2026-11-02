@@ -34,6 +34,22 @@ function resolveHtmlPath(): string {
   return path.resolve(thisDir, "..", "web", "index.html");
 }
 
+// Directory holding vendored static assets (d3 etc.) shipped with web/.
+function resolveWebDir(): string {
+  const thisDir = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(thisDir, "..", "web");
+}
+
+// Default: d3 is served locally from web/vendor/. Override with
+// MEGAMEMORY_D3_URL (any absolute URL, e.g. a CDN) when the page must not
+// load from the local server.
+const D3_LOCAL_SRC = "/vendor/d3.min.js";
+
+function resolveD3Src(): string {
+  const url = process.env.MEGAMEMORY_D3_URL?.trim();
+  return url ? url : D3_LOCAL_SRC;
+}
+
 function json(res: http.ServerResponse, data: unknown, status = 200): void {
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -552,7 +568,10 @@ export async function runServe(port: number): Promise<void> {
     process.exit(1);
   }
 
-  const htmlContent = fs.readFileSync(htmlPath, "utf-8").replaceAll("{{VERSION}}", VERSION);
+  const htmlContent = fs
+    .readFileSync(htmlPath, "utf-8")
+    .replaceAll("{{VERSION}}", VERSION)
+    .replaceAll("{{D3_SRC}}", resolveD3Src());
 
   let embeddingsReady = false;
   let embeddingInitError: string | null = null;
@@ -587,6 +606,22 @@ export async function runServe(port: number): Promise<void> {
 
     if (pathname === "/" && req.method === "GET") {
       html(res, htmlContent);
+      return;
+    }
+
+    if (pathname.startsWith("/vendor/") && req.method === "GET") {
+      const webDir = resolveWebDir();
+      const vendorRoot = path.join(webDir, "vendor");
+      const rel = path.normalize(decodeURIComponent(pathname.slice("/vendor/".length)));
+      const filePath = path.join(vendorRoot, rel);
+      if (!filePath.startsWith(vendorRoot + path.sep) || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        notFound(res);
+        return;
+      }
+      const types: Record<string, string> = { ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".map": "application/json" };
+      const type = types[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
+      res.writeHead(200, { "Content-Type": type, "Cache-Control": "public, max-age=86400" });
+      fs.createReadStream(filePath).pipe(res);
       return;
     }
 
