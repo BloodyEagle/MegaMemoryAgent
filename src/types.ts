@@ -461,8 +461,14 @@ export interface ProvenanceTraceInput {
   direction?: "ancestry" | "impact";
   /** Traversal depth cap (default 6, plan 3 §10 decision 4). */
   depth?: number;
-  /** Node cap (default 200). */
+  /** Node cap (default 200); the root does not occupy a slot. */
   max_nodes?: number;
+  /**
+   * Scan budget (default 5000, plan-3-fixes-2 contract 5): limits not only
+   * the output but the WORK — the walk stops expanding once this many nodes
+   * have been fetched, and the result is marked total_exact: false.
+   */
+  max_scan_nodes?: number;
   /** Return tombstoned edges too — "how we used to think". */
   retrospective?: boolean;
 }
@@ -476,7 +482,14 @@ export interface ProvenanceTraceInput {
 export type ProvenanceCompleteness = "complete" | "has_hidden" | "truncated";
 
 export interface ProvenanceWeakLink {
-  type: "refuted" | "abandoned" | "no_rationale" | "ungrounded_support" | "cycle";
+  type:
+    | "refuted"
+    | "abandoned"
+    | "no_rationale"
+    | "ungrounded_support"
+    | "missing_support"
+    | "no_support"
+    | "cycle";
   id?: string;
   from?: string;
   to?: string;
@@ -490,8 +503,14 @@ export interface ProvenanceNodeView {
   status: string | null;
   epistemic_status: string | null;
   depth: number;
-  /** Number of enumerated root→node paths containing this node (DAG repeats shown once). */
-  in_paths: number;
+  /**
+   * Root→node paths within the SHOWN subgraph (plan-3-fixes-2 contract 4) —
+   * not a confirmation count. null when every path crosses an unresolved
+   * SCC: an honest unknown beats a lying number.
+   */
+  in_paths: number | null;
+  /** true when in_paths hit PATH_COUNT_CAP — the true count is ≥ the shown value. */
+  in_paths_capped?: boolean;
   /** Stub entry for a tombstoned endpoint in retrospective mode. */
   removed?: boolean;
   /** audit only: epistemic_status != validated — this node is not trusted knowledge. */
@@ -507,17 +526,38 @@ export interface ProvenanceEdgeView {
 }
 
 export interface ProvenanceTraceOutput {
-  root: { id: string; name: string; kind: string; status: string; epistemic_status: string | null };
+  /**
+   * One contract for the root and every other node (plan-3-fixes-2 F15): a
+   * removed node's attributes are hidden (null), status is never invented as
+   * "active"; a removed root is shown as a removed stub, not an error.
+   */
+  root: {
+    id: string;
+    name: string | null;
+    kind: string | null;
+    status: string | null;
+    epistemic_status: string | null;
+    removed?: boolean;
+  };
   direction: "ancestry" | "impact";
   /** Weak links first (plan 3 §4.2): refuted/abandoned, cycles, missing rationales. */
   weak_links: ProvenanceWeakLink[];
   nodes: ProvenanceNodeView[];
   edges: ProvenanceEdgeView[];
-  limits: { depth: number; max_nodes: number };
+  limits: { depth: number; max_nodes: number; max_scan_nodes: number };
   shown: number;
-  total_reachable: number;
+  /**
+   * Nodes within the depth limit (plan-3-fixes-2 contract 3). A lower
+   * estimate when total_exact is false (the scan budget cut the walk).
+   */
+  total_within_depth: number;
+  /** false when the scan budget (max_scan_nodes) cut the closure walk. */
+  total_exact: boolean;
+  /** Always present (F21); true whenever truncated_by is not null. */
+  truncated: boolean;
+  truncated_by: "depth" | "nodes" | "scan" | null;
   completeness: ProvenanceCompleteness;
-  params: { depth: number; max_nodes: number; retrospective: boolean };
+  params: { depth: number; max_nodes: number; max_scan_nodes: number; retrospective: boolean };
 }
 
 export interface ProvenanceAuditOutput extends ProvenanceTraceOutput {

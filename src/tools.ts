@@ -778,11 +778,14 @@ export async function createConcept(
     supersededNote = ` Superseded: ${superseded.join(", ")}.`;
   }
 
-  // Plan 3 §4.1.1/§4.1.2: the agent must see what the shortcut did.
+  // Plan 3 §4.1.1/§4.1.2: the agent must see what the shortcut did. F6: the
+  // count is the number of DISTINCT nodes a support edge was actually written
+  // to — two evidence items about the same node create one edge, not two.
   const createdFacts = factNodesToCreate.length;
+  const writtenSupports = new Set(supports.map((s) => s.toId)).size;
   const supportNote =
-    supports.length > 0
-      ? ` Создано опор: ${supports.length}${createdFacts > 0 ? ` (из них новых узлов-источников: ${createdFacts})` : ""}.`
+    writtenSupports > 0
+      ? ` Создано опор: ${writtenSupports}${createdFacts > 0 ? ` (из них новых узлов-источников: ${createdFacts})` : ""}.`
       : "";
   const autoNote = autoGrounded
     ? ` Добавил опор по file_refs: ${supports.filter((s) => s.fromAutoGround).length}, поправь если не то.`

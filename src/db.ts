@@ -637,19 +637,16 @@ export class KnowledgeDB {
           `informed_by edges — adding "${fromId} -> ${toId}" would close a cycle.`
       );
     }
-    // Plan 3 §2 (invariant 16): a component that kept its cycle after a
-    // needs_merge merge is closed for new informed_by until the conflict is
-    // resolved — the DAG invariant must not be papered over by fresh writes.
+    // Plan 3 §2 (invariant 16), plan-3-fixes-2 F18: a component that kept its
+    // cycle after a needs_merge merge is closed for new INCOMING informed_by
+    // until the conflict is resolved — the DAG invariant must not be papered
+    // over by fresh writes. An OUTGOING edge (from inside the component to a
+    // node outside it) closes no cycle and passes; cycle closure is already
+    // rejected by the reachability check above.
     const cycleNodes = this.informedByCycleNodeSet();
-    const touching =
-      cycleNodes.has(fromId)
-        ? fromId
-        : cycleNodes.has(toId)
-          ? toId
-          : null;
-    if (touching !== null) {
+    if (cycleNodes.has(toId)) {
       throw new Error(
-        `informed_by write rejected: node "${touching}" sits inside an unresolved ` +
+        `informed_by write rejected: "${toId}" sits inside an unresolved ` +
           `informed_by cycle (needs_merge). Resolve the merge conflict first, ` +
           `then retry.`
       );

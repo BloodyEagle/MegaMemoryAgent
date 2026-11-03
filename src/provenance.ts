@@ -17,11 +17,16 @@ import type {
 export interface ProvenanceConfig {
   /** decision without any support is refused (default false). */
   require_support: boolean;
-  /** auto-derive supports from why + file_refs (default true). */
+  /**
+   * auto-derive supports from why + file_refs (default FALSE, F19: edges the
+   * server invents must not masquerade as agent-declared provenance — the
+   * "решения с опорой" metric would otherwise measure the server, not the
+   * agent; enable explicitly per database when wanted).
+   */
   auto_ground: boolean;
 }
 
-const DEFAULTS: ProvenanceConfig = { require_support: false, auto_ground: true };
+const DEFAULTS: ProvenanceConfig = { require_support: false, auto_ground: false };
 
 function envFlag(name: string): boolean | undefined {
   const raw = process.env[name];
@@ -138,13 +143,28 @@ export function resolveFileRef(db: KnowledgeDB, ref: string): NodeRow | undefine
   return undefined;
 }
 
-// ---- Traversal core (plan 3 §4.2) ----
+// ---- Traversal core (plan 3 §4.2, plan-3-fixes-2 contracts) ----
 
 const DEFAULT_DEPTH = 6;
 const DEFAULT_MAX_NODES = 200;
+const DEFAULT_MAX_SCAN_NODES = 5000;
+// Function-level upper bounds (F16). The MCP tool schema keeps tighter caps
+// (depth ≤ 20, max_nodes ≤ 2000) on top of these; direct callers may go
+// deeper — a 3000-node chain must be traceable without a stack overflow.
+const MAX_DEPTH_LIMIT = 100000;
+const MAX_NODES_LIMIT = 100000;
+const MAX_SCAN_NODES_LIMIT = 1000000;
 const RATIONALE_TRIM = 80;
-/** Cap for the DFS path counting — the memo keeps it polynomial anyway. */
+/** Cap for the path counting — capped values are flagged, not silent (F7). */
 const PATH_COUNT_CAP = 100000;
+
+/**
+ * Total order over ids (F12): returns 0 for equal ids — the previous
+ * `a < b ? -1 : 1` comparators sorted equal elements unpredictably.
+ */
+export function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
 
 function trimRationale(text: string | null): string | null {
   if (!text) return null;
@@ -152,158 +172,362 @@ function trimRationale(text: string | null): string | null {
   return text.slice(0, RATIONALE_TRIM - 1).trimEnd() + "…";
 }
 
+/**
+ * F3: a rationale of blanks trims to "" and must surface as null — the old
+ * code trimmed FIRST ("…"), so `trim().length === 0` never fired and
+ * no_rationale was silently swallowed.
+ */
+function rationaleView(raw: string | null): string | null {
+  if (!raw || raw.trim().length === 0) return null;
+  return trimRationale(raw);
+}
+
+interface ValidatedLimits {
+  depth: number;
+  maxNodes: number;
+  maxScanNodes: number;
+}
+
+/**
+ * F16: limits are validated as integers within bounds before they reach any
+ * comparison — 0, NaN and fractional values previously corrupted the walk.
+ */
+function validateLimits(input: ProvenanceTraceInput): ValidatedLimits {
+  const check = (name: string, value: unknown, min: number, max: number): number => {
+    if (
+      typeof value !== "number" ||
+      !Number.isInteger(value) ||
+      (value as number) < min ||
+      (value as number) > max
+    ) {
+      throw new Error(
+        `provenance_trace: ${name} must be an integer in [${min}, ${max}], got ${String(value)}.`
+      );
+    }
+    return value as number;
+  };
+  return {
+    depth: check("depth", input.depth ?? DEFAULT_DEPTH, 0, MAX_DEPTH_LIMIT),
+    maxNodes: check("max_nodes", input.max_nodes ?? DEFAULT_MAX_NODES, 1, MAX_NODES_LIMIT),
+    maxScanNodes: check(
+      "max_scan_nodes",
+      input.max_scan_nodes ?? DEFAULT_MAX_SCAN_NODES,
+      1,
+      MAX_SCAN_NODES_LIMIT
+    ),
+  };
+}
+
 interface TraverseResult {
   nodes: ProvenanceNodeView[];
   edges: ProvenanceEdgeView[];
   shown: number;
-  total: number;
-  truncated: boolean;
+  totalWithinDepth: number;
+  totalExact: boolean;
+  truncatedBy: "depth" | "nodes" | "scan" | null;
+  /** Cyclic SCCs of the SHOWN subgraph (size > 1 or self-loop), deterministically ordered. */
+  cyclicComponents: string[][];
+}
+
+/**
+ * Iterative Tarjan over the shown subgraph (F1/F2: no recursion anywhere —
+ * a 3000-node chain or a cycle behind the root must not touch the call
+ * stack). Returns ALL components in Tarjan emission order, which is reverse
+ * topological over the condensation: downstream components first.
+ */
+function tarjanComponents(
+  nodes: Iterable<string>,
+  childrenOf: (id: string) => string[]
+): string[][] {
+  const index = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const onStack = new Set<string>();
+  const stack: string[] = [];
+  const components: string[][] = [];
+  let counter = 0;
+
+  for (const start of nodes) {
+    if (index.has(start)) continue;
+    index.set(start, counter);
+    lowlink.set(start, counter);
+    counter++;
+    stack.push(start);
+    onStack.add(start);
+    const callStack: Array<{ node: string; pos: number }> = [{ node: start, pos: 0 }];
+    while (callStack.length > 0) {
+      const frame = callStack[callStack.length - 1];
+      const successors = childrenOf(frame.node);
+      if (frame.pos < successors.length) {
+        const next = successors[frame.pos++];
+        if (!index.has(next)) {
+          index.set(next, counter);
+          lowlink.set(next, counter);
+          counter++;
+          stack.push(next);
+          onStack.add(next);
+          callStack.push({ node: next, pos: 0 });
+        } else if (onStack.has(next)) {
+          lowlink.set(frame.node, Math.min(lowlink.get(frame.node)!, index.get(next)!));
+        }
+      } else {
+        callStack.pop();
+        if (callStack.length > 0) {
+          const parent = callStack[callStack.length - 1];
+          lowlink.set(
+            parent.node,
+            Math.min(lowlink.get(parent.node)!, lowlink.get(frame.node)!)
+          );
+        }
+        if (lowlink.get(frame.node) === index.get(frame.node)) {
+          const component: string[] = [];
+          for (;;) {
+            const w = stack.pop()!;
+            onStack.delete(w);
+            component.push(w);
+            if (w === frame.node) break;
+          }
+          components.push(component);
+        }
+      }
+    }
+  }
+  return components;
 }
 
 /**
  * BFS over ONE relation (informed_by) in ONE direction (plan 3 §2, invariant 5:
  * a single projection per walk — supersedes/contradicts/parent_id never leak
- * in). Live mode follows only live edges between live nodes. Retrospective
- * mode follows tombstoned edges too; a filtered endpoint comes back as a
- * stub counted against max_nodes, so no dangling edge can appear (plan 3 §1.3).
+ * in). One level-ordered pass produces BOTH the honest total and the shown
+ * subgraph, so they can never disagree (F4); the same rules apply to both:
+ *
+ * - a removed node is TERMINAL (contract 2): counted and shown as a stub,
+ *   never expanded through;
+ * - the root occupies no node-budget slot (F5);
+ * - admission within a level is by id over the WHOLE next frontier (F13),
+ *   not per parent;
+ * - an edge view is materialized only once its second end is included (F17);
+ * - the scan budget (contract 5) bounds the WORK: expansion stops at
+ *   max_scan_nodes fetched nodes and the closure is marked inexact.
+ *
+ * Everything is iterative: BFS by levels, Tarjan for SCCs, dynamic
+ * programming over the condensation for path counts (F1, F2). Path counts
+ * over the condensation: nodes inside a cyclic SCC get in_paths = null and a
+ * weak-link record — a lying number is worse than an honest unknown.
  */
 function traverse(
   db: KnowledgeDB,
   rootId: string,
   direction: "ancestry" | "impact",
-  depthLimit: number,
-  maxNodes: number,
+  limits: ValidatedLimits,
   retrospective: boolean
 ): TraverseResult {
-  type Row = { other_id: string; description: string | null; removed_at: string | null };
-  const fetch = (id: string): Row[] =>
-    db
-      .getInformedByEdges(id, direction, retrospective)
-      .map((e) => ({
-        other_id: e.other_id,
-        description: e.description,
-        removed_at: e.removed_at ?? null,
-      }));
+  const { depth: depthLimit, maxNodes, maxScanNodes } = limits;
+  const fetch = (id: string) =>
+    db.getInformedByEdges(id, direction, retrospective).map((e) => ({
+      other_id: e.other_id,
+      description: e.description,
+      removed_at: e.removed_at ?? null,
+    }));
+
+  let truncatedBy: "depth" | "nodes" | "scan" | null = null;
+  let totalExact = true;
 
   const nodeById = new Map<string, ProvenanceNodeView>();
-  const edgeViews: ProvenanceEdgeView[] = [];
-  const emittedEdgeKeys = new Set<string>();
-  let truncated = false;
-
-  // Full-closure size first (ignores the node cap) — completeness and the
-  // K из N report must not lie.
-  const seenTotal = new Set<string>([rootId]);
-  const totalQueue: Array<{ id: string; depth: number }> = [{ id: rootId, depth: 0 }];
-  while (totalQueue.length > 0) {
-    const { id, depth } = totalQueue.shift()!;
-    if (depth >= depthLimit) continue;
-    for (const r of fetch(id)) {
-      if (!seenTotal.has(r.other_id)) {
-        seenTotal.add(r.other_id);
-        if (depth + 1 > depthLimit) truncated = true;
-        else totalQueue.push({ id: r.other_id, depth: depth + 1 });
-      }
-    }
-  }
-  const total = seenTotal.size;
-
-  // Emission BFS: level order, deterministic by id, honoring both limits.
   const rootNode = db.getNodeIncludingRemoved(rootId)!;
+  const rootRemoved = !rootNode || rootNode.removed_at !== null;
   nodeById.set(rootId, {
     id: rootId,
-    name: rootNode?.name ?? null,
-    kind: rootNode?.kind ?? null,
-    status: rootNode?.status ?? null,
-    epistemic_status: rootNode?.epistemic_status ?? null,
+    // F15: the removed root obeys the same contract as any removed node.
+    name: rootRemoved ? null : rootNode!.name,
+    kind: rootRemoved ? null : rootNode!.kind,
+    status: rootRemoved ? null : rootNode!.status ?? null,
+    epistemic_status: rootRemoved ? null : rootNode!.epistemic_status ?? null,
     depth: 0,
     in_paths: 1,
-    ...(rootNode?.removed_at ? { removed: true } : {}),
+    ...(rootRemoved ? { removed: true } : {}),
   });
-  const queue: Array<{ id: string; depth: number }> = [{ id: rootId, depth: 0 }];
-  const visited = new Set<string>([rootId]);
 
-  while (queue.length > 0) {
-    const { id, depth } = queue.shift()!;
-    const rows = fetch(id).sort((a, b) => (a.other_id < b.other_id ? -1 : 1));
-    for (const r of rows) {
-      const key = `${id}|${r.other_id}`;
-      if (!emittedEdgeKeys.has(key)) {
-        emittedEdgeKeys.add(key);
-        edgeViews.push({
-          from: direction === "ancestry" ? id : r.other_id,
-          to: direction === "ancestry" ? r.other_id : id,
-          rationale: trimRationale(r.description),
-          ...(r.removed_at !== null ? { removed: true } : {}),
-        });
+  const seen = new Set<string>([rootId]);
+  const edgeViews: ProvenanceEdgeView[] = [];
+  const emittedEdgeKeys = new Set<string>(); // JSON keys — pipe-safe (F11)
+  let total = 1;
+  let frontier: string[] = [rootId];
+  let depth = 0;
+
+  while (frontier.length > 0) {
+    const candidates: string[] = [];
+    const levelRows: Array<{
+      parent: string;
+      other: string;
+      description: string | null;
+      removedEdge: boolean;
+    }> = [];
+    let scanCut = false;
+
+    // Discovery: expand the frontier while the scan budget lasts (contract 5
+    // bounds the WORK — the budget counts DISCOVERED nodes, so a wide root
+    // cannot pull in an unbounded closure in one fetch; F17 — edges are
+    // fetched only for nodes actually being expanded).
+    for (const id of frontier) {
+      if (seen.size >= maxScanNodes) {
+        scanCut = true;
+        break;
       }
-      if (visited.has(r.other_id)) continue;
-      if (nodeById.size >= maxNodes || depth + 1 > depthLimit) {
-        truncated = true;
+      for (const r of fetch(id)) {
+        levelRows.push({
+          parent: id,
+          other: r.other_id,
+          description: r.description,
+          removedEdge: r.removed_at !== null,
+        });
+        if (seen.has(r.other_id)) continue;
+        if (seen.size >= maxScanNodes) {
+          scanCut = true;
+          break;
+        }
+        seen.add(r.other_id);
+        if (depth + 1 > depthLimit) {
+          truncatedBy = truncatedBy ?? "depth";
+          continue; // beyond the depth contract — not counted in total
+        }
+        total++;
+        candidates.push(r.other_id);
+      }
+      if (scanCut) break;
+    }
+    if (scanCut) {
+      truncatedBy = truncatedBy ?? "scan";
+      totalExact = false;
+    }
+
+    // Admission: the whole next level competes for the remaining slots,
+    // ordered by (depth, id) — not each parent's private slice (F13).
+    candidates.sort(compareIds);
+    let budget = maxNodes - (nodeById.size - 1); // root occupies no slot (F5)
+    const nextFrontier: string[] = [];
+    for (const cand of candidates) {
+      if (budget <= 0) {
+        truncatedBy = truncatedBy ?? "nodes";
         continue;
       }
-      const other = db.getNodeIncludingRemoved(r.other_id);
+      const other = db.getNodeIncludingRemoved(cand);
       const isRemoved = !other || other.removed_at !== null;
-      nodeById.set(r.other_id, {
-        id: r.other_id,
+      nodeById.set(cand, {
+        id: cand,
         name: isRemoved ? null : other!.name,
         kind: isRemoved ? null : other!.kind,
         status: isRemoved ? null : other!.status ?? null,
         epistemic_status: isRemoved ? null : other!.epistemic_status ?? null,
         depth: depth + 1,
-        in_paths: 0,
+        in_paths: null,
         ...(isRemoved ? { removed: true } : {}),
       });
-      visited.add(r.other_id);
-      if (!isRemoved) queue.push({ id: r.other_id, depth: depth + 1 });
+      budget--;
+      if (!isRemoved) nextFrontier.push(cand); // removed nodes are terminal (contract 2)
     }
+
+    // Edge materialization: only rows whose second end is included (F17);
+    // a blank rationale surfaces as null (F3).
+    for (const row of levelRows) {
+      if (!nodeById.has(row.other)) continue;
+      const key = JSON.stringify([row.parent, row.other]);
+      if (emittedEdgeKeys.has(key)) continue;
+      emittedEdgeKeys.add(key);
+      edgeViews.push({
+        from: direction === "ancestry" ? row.parent : row.other,
+        to: direction === "ancestry" ? row.other : row.parent,
+        rationale: rationaleView(row.description),
+        ...(row.removedEdge ? { removed: true } : {}),
+      });
+    }
+
+    if (scanCut) break;
+    frontier = nextFrontier;
+    depth++;
   }
 
-  // No dangling edges may survive (plan 3 §1.3 / §6 test): drop any edge
-  // whose endpoints are not both in the emitted node list.
-  const liveEdges = edgeViews.filter(
-    (e) => nodeById.has(e.from) && nodeById.has(e.to)
-  );
-
-  // Path counts (plan 3 §4.2: repeated DAG nodes once, "входит в N путей").
-  // Memoized DFS over the emitted subgraph; on-stack hits (a leftover cycle)
-  // contribute 0 and surface as weak links instead of inflating the count.
-  const children = new Map<string, string[]>();
-  for (const e of liveEdges) {
+  // Path counts over the SHOWN subgraph (contract 4). Orient parent→child
+  // (the side closer to the root is the parent), decompose into SCCs
+  // iteratively, then run the DP in topological order of the condensation.
+  const childrenOf = new Map<string, string[]>();
+  const parentsOf = new Map<string, string[]>();
+  for (const e of edgeViews) {
     const parent = direction === "ancestry" ? e.from : e.to;
     const child = direction === "ancestry" ? e.to : e.from;
-    if (!children.has(child)) children.set(child, []);
-    children.get(child)!.push(parent);
-  }
-  const memo = new Map<string, number>();
-  const countPaths = (id: string, onStack: Set<string>): number => {
-    if (id === rootId) return 1;
-    if (onStack.has(id)) return 0; // cycle — do not inflate
-    const cached = memo.get(id);
-    if (cached !== undefined) return cached;
-    let sum = 0;
-    for (const p of children.get(id) ?? []) sum += countPaths(p, onStack);
-    if (sum > PATH_COUNT_CAP) sum = PATH_COUNT_CAP;
-    memo.set(id, sum);
-    return sum;
-  };
-  for (const id of nodeById.keys()) {
-    if (id === rootId) continue;
-    nodeById.get(id)!.in_paths = countPaths(id, new Set());
-    memo.clear();
+    if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+    childrenOf.get(parent)!.push(child);
+    if (!parentsOf.has(child)) parentsOf.set(child, []);
+    parentsOf.get(child)!.push(parent);
   }
 
-  const nodes = [...nodeById.values()].sort(
-    (a, b) => a.depth - b.depth || (a.id < b.id ? -1 : 1)
+  const components = tarjanComponents(nodeById.keys(), (id) => childrenOf.get(id) ?? []);
+  const cyclicOfComp = components.map(
+    (c) => c.length > 1 || (childrenOf.get(c[0]) ?? []).includes(c[0])
   );
 
-  return { nodes, edges: liveEdges, shown: nodes.length, total, truncated };
+  const count = new Map<string, number | null>();
+  const capped = new Set<string>();
+  count.set(rootId, 1); // the trivial path — even when the root sits in a cycle
+  // Tarjan emits downstream components first, so the reverse order is
+  // topological: every parent is finalized before its child.
+  for (let i = components.length - 1; i >= 0; i--) {
+    for (const n of components[i]) {
+      if (count.has(n)) continue;
+      if (cyclicOfComp[i]) {
+        count.set(n, null); // path crosses an unresolved SCC — honest unknown (F1)
+        continue;
+      }
+      let sum = 0;
+      let unknown = false;
+      let capHit = false;
+      for (const p of parentsOf.get(n) ?? []) {
+        const c = count.get(p);
+        if (c === undefined || c === null) {
+          unknown = true;
+          break;
+        }
+        sum += c;
+        if (sum > PATH_COUNT_CAP) {
+          sum = PATH_COUNT_CAP;
+          capHit = true;
+          break;
+        }
+      }
+      count.set(n, unknown ? null : sum);
+      if (capHit) capped.add(n); // F7: the cap is flagged, not silent
+    }
+  }
+  for (const [id, view] of nodeById) {
+    if (id === rootId) continue;
+    view.in_paths = count.get(id) ?? null;
+    if (capped.has(id)) view.in_paths_capped = true;
+  }
+
+  const cyclicComponents = components
+    .filter((_, i) => cyclicOfComp[i])
+    .map((c) => [...c].sort(compareIds))
+    .sort((a, b) => compareIds(a[0], b[0]));
+
+  const nodes = [...nodeById.values()].sort(
+    (a, b) => a.depth - b.depth || compareIds(a.id, b.id)
+  );
+
+  return {
+    nodes,
+    edges: edgeViews,
+    shown: nodes.length,
+    totalWithinDepth: total,
+    totalExact,
+    truncatedBy,
+    cyclicComponents,
+  };
 }
 
 function weakLinks(
   db: KnowledgeDB,
   result: TraverseResult,
   direction: "ancestry" | "impact",
-  cycleNodes: Set<string>
+  retrospective: boolean
 ): ProvenanceWeakLink[] {
   const weak: ProvenanceWeakLink[] = [];
 
@@ -324,20 +548,43 @@ function weakLinks(
     }
   }
 
-  // 2. unresolved cycles (needs_merge leftovers).
-  for (const n of result.nodes) {
-    if (cycleNodes.has(n.id)) {
-      weak.push({
-        type: "cycle",
-        id: n.id,
-        note: `узел "${n.id}" внутри неразрешённого цикла informed_by (needs_merge)`,
-      });
-    }
+  // 2. unresolved cycles — ONE record per cyclic component (F10), with the
+  // component id, a witness edge and the needs_merge edges; the component is
+  // closed for new informed_by writes until the conflict is resolved. Path
+  // counts through it are null (contract 4), never a lying number.
+  for (let i = 0; i < result.cyclicComponents.length; i++) {
+    const comp = result.cyclicComponents[i];
+    const componentId = `scc:${i + 1}`;
+    const members = new Set(comp);
+    const witness = result.edges.find((e) => members.has(e.from) && members.has(e.to));
+    const needsMerge = db
+      .execSqlAll(
+        `SELECT from_id, to_id FROM edges
+         WHERE relation = 'informed_by' AND removed_at IS NULL AND needs_merge = 1
+           AND (from_id IN (${comp.map(() => "?").join(",")})
+             OR to_id IN (${comp.map(() => "?").join(",")}))
+         ORDER BY from_id, to_id`,
+        ...comp,
+        ...comp
+      )
+      .map((r) => `${(r as { from_id: string }).from_id} -> ${(r as { to_id: string }).to_id}`);
+    const parts = [
+      `цикл informed_by: ${comp.join(", ")}`,
+      witness ? `свидетель ${witness.from} -> ${witness.to}` : null,
+      needsMerge.length > 0 ? `needs_merge: ${needsMerge.join(", ")}` : null,
+      "компонента закрыта для записи (needs_merge)",
+    ].filter(Boolean);
+    weak.push({
+      type: "cycle",
+      id: componentId,
+      note: `${parts.join("; ")}`,
+    });
   }
 
-  // 3. edges without a rationale (legacy rows can predate the check).
+  // 3. edges without a rationale (legacy rows can predate the check). F3: a
+  // blank original already surfaces as null — trimming no longer hides it.
   for (const e of result.edges) {
-    if (!e.rationale || e.rationale.trim().length === 0) {
+    if (!e.rationale) {
       weak.push({
         type: "no_rationale",
         from: e.from,
@@ -347,26 +594,49 @@ function weakLinks(
     }
   }
 
-  // 4. decisions whose every support is ungrounded (ancestry only: the
-  // impact direction does not carry the supports of the affected nodes).
-  if (direction === "ancestry") {
-    for (const n of result.nodes) {
-      if (n.removed) continue;
-      const row = db.getNode(n.id);
-      if (!row || row.kind !== "decision") continue;
-      const supports = db
-        .getInformedByEdges(n.id, "ancestry", false)
-        .map((e) => e.other_id);
-      if (supports.length === 0) continue;
-      const allUngrounded = supports.every((sid) => {
-        const s = db.getNode(sid);
-        return !s || isUngrounded(db, s);
+  // 4. decisions without honest support — in BOTH directions: an impact walk
+  // must not skip the fact that an affected decision stands on sand (its
+  // supports are always read over ancestry edges of that node). F8: the
+  // checked edge set follows the OUTPUT mode — retrospective checks the same
+  // tombstone-carrying set that is shown, live mode checks only live edges,
+  // never a mixture. F9: no supports at all is the most important case and
+  // gets its own type; a missing support node is distinct from an ungrounded
+  // one.
+  for (const n of result.nodes) {
+    if (n.removed) continue;
+    const row = db.getNode(n.id);
+    if (!row || row.kind !== "decision") continue;
+    const supports = db
+      .getInformedByEdges(n.id, "ancestry", retrospective)
+      .map((e) => e.other_id);
+    if (supports.length === 0) {
+      weak.push({
+        type: "no_support",
+        id: n.id,
+        note: `решение "${n.id}" не имеет ни одной опоры`,
       });
-      if (allUngrounded) {
+      continue;
+    }
+    const missing: string[] = [];
+    const ungrounded: string[] = [];
+    for (const sid of supports) {
+      const s = db.getNode(sid);
+      if (!s) missing.push(sid);
+      else if (isUngrounded(db, s)) ungrounded.push(sid);
+    }
+    if (missing.length + ungrounded.length === supports.length) {
+      if (missing.length > 0) {
+        weak.push({
+          type: "missing_support",
+          id: n.id,
+          note: `решение "${n.id}" ссылается на отсутствующие узлы (${missing.join(", ")})`,
+        });
+      }
+      if (ungrounded.length > 0) {
         weak.push({
           type: "ungrounded_support",
           id: n.id,
-          note: `решение "${n.id}" опирается только на ungrounded-узлы (${supports.join(", ")})`,
+          note: `решение "${n.id}" опирается только на ungrounded-узлы (${ungrounded.join(", ")})`,
         });
       }
     }
@@ -375,21 +645,21 @@ function weakLinks(
   return weak;
 }
 
-function rootHeader(
-  db: KnowledgeDB,
-  rootId: string,
-  direction: "ancestry" | "impact"
-): ProvenanceTraceOutput["root"] {
-  const node = db.getNode(rootId);
+function rootHeader(db: KnowledgeDB, rootId: string): ProvenanceTraceOutput["root"] {
+  const node = db.getNodeIncludingRemoved(rootId);
   if (!node) {
     throw new Error(`Concept "${rootId}" not found.`);
   }
+  const removed = node.removed_at !== null;
   return {
     id: node.id,
-    name: node.name,
-    kind: node.kind,
-    status: node.status ?? "active",
-    epistemic_status: node.epistemic_status ?? null,
+    // F15: one contract for the root and every other node — a removed node's
+    // attributes are hidden, and status is never invented as "active".
+    name: removed ? null : node.name,
+    kind: removed ? null : node.kind,
+    status: removed ? null : node.status ?? null,
+    epistemic_status: removed ? null : node.epistemic_status ?? null,
+    ...(removed ? { removed: true } : {}),
   };
 }
 
@@ -398,7 +668,7 @@ function completenessVerdict(
   rootId: string,
   result: TraverseResult
 ): ProvenanceCompleteness {
-  if (result.truncated) return "truncated";
+  if (result.truncatedBy !== null) return "truncated";
   const rootLiveEdges = result.edges.filter(
     (e) => !e.removed && (e.from === rootId || e.to === rootId)
   );
@@ -415,34 +685,70 @@ function completenessVerdict(
  * "кто на него опирается" (impact). Weak links first; node bodies, dates,
  * authors and histories deliberately do not travel — the answer must stay
  * within a few hundred tokens.
+ *
+ * Contracts (plan-3-fixes-2 §1, binding for code and tool description):
+ *
+ * 1. Which graph: informed_by only, live edges only (retrospective also
+ *    follows tombstones); the whole answer is read in ONE transaction, so
+ *    подсчёт, выдача, атрибуты и слабые звенья снимают один и тот же снимок.
+ * 2. A removed node is terminal: the walk never goes through it — not when
+ *    counting, not when emitting. In retrospective it is shown as a stub,
+ *    but is not expanded.
+ * 3. The total counts nodes within the depth limit and is called
+ *    total_within_depth; the reason anything is missing travels in
+ *    truncated_by: "depth" | "nodes" | "scan" | null.
+ * 4. in_paths is the number of root→node paths in the SHOWN subgraph — not a
+ *    confirmation count. At PATH_COUNT_CAP it is flagged in_paths_capped and
+ *    any textual rendering must show "≥ 100000". A path that crosses an
+ *    unresolved SCC yields in_paths = null plus a cycle weak-link with the
+ *    component id — never a made-up number.
+ * 5. Limits bound both the OUTPUT and the WORK: besides depth and max_nodes
+ *    there is a scan budget max_scan_nodes (default 5000); when it trips,
+ *    truncated_by = "scan" and total_within_depth is a lower estimate with
+ *    total_exact: false.
  */
 export function provenanceTrace(
   db: KnowledgeDB,
   input: ProvenanceTraceInput
 ): ProvenanceTraceOutput {
   const direction = input.direction ?? "ancestry";
-  const depth = Math.max(1, input.depth ?? DEFAULT_DEPTH);
-  const maxNodes = Math.max(1, input.max_nodes ?? DEFAULT_MAX_NODES);
   const retrospective = input.retrospective ?? false;
+  const limits = validateLimits(input); // F16: integer, in bounds — before any comparison
 
-  const root = rootHeader(db, input.node_id, direction); // not-found throws here
-  const result = traverse(db, input.node_id, direction, depth, maxNodes, retrospective);
-  const cycleNodes = db.informedByCycleNodeSet();
-  const weak = weakLinks(db, result, direction, cycleNodes);
-  const completeness = completenessVerdict(db, input.node_id, result);
+  // F14: one reading transaction for подсчёт, выдачу, атрибуты и weak_links —
+  // a concurrent write can no longer split the answer into different graphs
+  // (shown > total was possible).
+  return db.runInTransaction(() => {
+    const root = rootHeader(db, input.node_id); // not-found throws here
+    const result = traverse(db, input.node_id, direction, limits, retrospective);
+    const weak = weakLinks(db, result, direction, retrospective);
+    const completeness = completenessVerdict(db, input.node_id, result);
 
-  return {
-    root,
-    direction,
-    weak_links: weak,
-    nodes: result.nodes,
-    edges: result.edges,
-    limits: { depth, max_nodes: maxNodes },
-    shown: result.shown,
-    total_reachable: result.total,
-    completeness,
-    params: { depth, max_nodes: maxNodes, retrospective },
-  };
+    return {
+      root,
+      direction,
+      weak_links: weak,
+      nodes: result.nodes,
+      edges: result.edges,
+      limits: {
+        depth: limits.depth,
+        max_nodes: limits.maxNodes,
+        max_scan_nodes: limits.maxScanNodes,
+      },
+      shown: result.shown,
+      total_within_depth: result.totalWithinDepth,
+      total_exact: result.totalExact,
+      truncated: result.truncatedBy !== null, // F21: always present
+      truncated_by: result.truncatedBy,
+      completeness,
+      params: {
+        depth: limits.depth,
+        max_nodes: limits.maxNodes,
+        max_scan_nodes: limits.maxScanNodes,
+        retrospective,
+      },
+    };
+  });
 }
 
 /**
@@ -466,7 +772,7 @@ export function provenanceAudit(
     params: output.params,
     result: {
       shown: output.shown,
-      total_reachable: output.total_reachable,
+      total_within_depth: output.total_within_depth,
       completeness: output.completeness,
       weak_links: output.weak_links,
       nodes: output.nodes.map((n) => ({

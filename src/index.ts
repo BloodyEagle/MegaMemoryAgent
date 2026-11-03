@@ -679,12 +679,13 @@ async function startMcpServer() {
 
   server.tool(
     "provenance_trace",
-    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Слабые звенья идут первыми: refuted/abandoned, циклы (needs_merge), рёбра без рационала, решения на ungrounded-опорах. Лимиты 200 узлов / 6 уровней; completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated.",
+    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: depth (0–20), max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false). Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами. completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated.",
     {
       node_id: z.string().describe("Узел, с которого начинается обход"),
       direction: z.enum(["ancestry", "impact"]).optional().describe("ancestry (по умолчанию) — что поддерживает узел; impact — что на него опирается"),
       depth: z.number().int().min(1).max(20).optional().describe("Глубина обхода (по умолчанию 6)"),
-      max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов (по умолчанию 200)"),
+      max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов сверх корня (по умолчанию 200)"),
+      max_scan_nodes: z.number().int().min(1).max(100000).optional().describe("Бюджет сканирования — сколько узлов разворачивать (по умолчанию 5000); при срабатывании total_exact: false"),
       retrospective: z.boolean().optional().describe("Вернуть и надгробия — «как думали раньше»; удалённые эндпоинты приходят заглушками и считаются в лимит max_nodes"),
     },
     async (params) => {
@@ -694,12 +695,13 @@ async function startMcpServer() {
           direction: params.direction,
           depth: params.depth,
           max_nodes: params.max_nodes,
+          max_scan_nodes: params.max_scan_nodes,
           retrospective: params.retrospective,
         });
         timeline.log({
           tool: "provenance_trace",
           params: { node_id: params.node_id, direction: result.direction },
-          result_summary: `${result.shown}/${result.total_reachable} nodes, ${result.completeness}, weak: ${result.weak_links.length}`,
+          result_summary: `${result.shown}/${result.total_within_depth} nodes, ${result.completeness}, weak: ${result.weak_links.length}`,
           is_write: false,
           is_error: false,
           affected_ids: result.nodes.map((n) => n.id),
@@ -727,6 +729,7 @@ async function startMcpServer() {
       direction: z.enum(["ancestry", "impact"]).optional().describe("impact (по умолчанию) — что рассыплется; ancestry — на чём стоит"),
       depth: z.number().int().min(1).max(20).optional().describe("Глубина обхода (по умолчанию 6)"),
       max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов (по умолчанию 200)"),
+      max_scan_nodes: z.number().int().min(1).max(100000).optional().describe("Бюджет сканирования (по умолчанию 5000); при срабатывании total_exact: false"),
       retrospective: z.boolean().optional().describe("Вернуть и надгробия"),
     },
     async (params) => {
@@ -736,12 +739,13 @@ async function startMcpServer() {
           direction: params.direction,
           depth: params.depth,
           max_nodes: params.max_nodes,
+          max_scan_nodes: params.max_scan_nodes,
           retrospective: params.retrospective,
         });
         timeline.log({
           tool: "provenance_audit",
           params: { node_id: params.node_id, direction: result.direction },
-          result_summary: `run #${result.audit_run_id}: ${result.shown}/${result.total_reachable} nodes, at_risk ${result.nodes.filter((n) => n.at_risk).length}`,
+          result_summary: `run #${result.audit_run_id}: ${result.shown}/${result.total_within_depth} nodes, at_risk ${result.nodes.filter((n) => n.at_risk).length}`,
           is_write: false,
           is_error: false,
           affected_ids: result.nodes.map((n) => n.id),
