@@ -489,11 +489,29 @@ export interface ProvenanceWeakLink {
     | "ungrounded_support"
     | "missing_support"
     | "no_support"
-    | "cycle";
+    | "cycle"
+    /**
+     * plan-3-fixes-3 D2.2: the support check is bounded by max_scan_nodes —
+     * this record reports how many supports of the decision were actually
+     * verified (checked/total) instead of silently skipping the rest.
+     */
+    | "support_check_truncated"
+    /** plan-3-fixes-3 D2.4: weak_links were cut to fit the 8 KB response cap. */
+    | "weak_links_truncated";
   id?: string;
   from?: string;
   to?: string;
-  note: string;
+  /** Absent only on the truncation markers, which carry numbers instead. */
+  note?: string;
+  /** D2.3: numeric size of the flagged set — agents never parse the note. */
+  count?: number;
+  /** D2.3: first ≤5 ids of the flagged set; the full list is never returned. */
+  sample?: string[];
+  /** D2.2: supports actually verified vs. declared (support_check_truncated). */
+  checked?: number;
+  total?: number;
+  /** D2.4: records kept vs. produced (weak_links_truncated). */
+  shown?: number;
 }
 
 export interface ProvenanceNodeView {

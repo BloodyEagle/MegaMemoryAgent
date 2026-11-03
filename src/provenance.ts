@@ -94,7 +94,17 @@ function parseScope(raw: string | null | undefined): Record<string, unknown> | n
  * as proven knowledge is exactly what the weak-links block must prevent.
  */
 export function isUngrounded(db: KnowledgeDB, node: NodeRow): boolean {
-  if (db.getInformedByEdges(node.id, "ancestry", false).length > 0) return false;
+  return isUngroundedRow(node, db.getInformedByEdges(node.id, "ancestry", false).length > 0);
+}
+
+/**
+ * Pure core of isUngrounded: the caller supplies the "has a live outgoing
+ * informed_by edge" fact, so the batched support check (plan-3-fixes-3 D2.1)
+ * can decide thousands of supports from ONE prefetched set instead of issuing
+ * a query per node. The anchoring rules themselves are identical.
+ */
+export function isUngroundedRow(node: NodeRow, hasLiveOutgoingInformedBy: boolean): boolean {
+  if (hasLiveOutgoingInformedBy) return false;
   try {
     const refs = node.file_refs ? (JSON.parse(node.file_refs) as unknown) : null;
     if (Array.isArray(refs) && refs.length > 0) return false;
@@ -157,6 +167,15 @@ const MAX_SCAN_NODES_LIMIT = 1000000;
 const RATIONALE_TRIM = 80;
 /** Cap for the path counting — capped values are flagged, not silent (F7). */
 const PATH_COUNT_CAP = 100000;
+// plan-3-fixes-3 D2: the support check and the weak-link text are bounded.
+/** D2.3: hard cap on any weak-link note; the full id list is never returned. */
+const MAX_NOTE_CHARS = 300;
+/** D2.3: ids shown in a note before the "… и ещё N" tail. */
+const NOTE_SAMPLE = 5;
+/** D2.1: ids per batched lookup — the query count follows this, not the fan-out. */
+const SUPPORT_LOOKUP_CHUNK = 500;
+/** D2.4: JSON.stringify(weak_links) may never exceed this. */
+const WEAK_LINKS_JSON_LIMIT = 8192;
 
 /**
  * Total order over ids (F12): returns 0 for equal ids — the previous
@@ -523,11 +542,129 @@ function traverse(
   };
 }
 
+// ---- Batched support check and bounded weak-link text (plan-3-fixes-3 D2) ----
+
+/**
+ * D2.1: live nodes for a batch of ids, in chunks of SUPPORT_LOOKUP_CHUNK —
+ * the query count follows the chunk size, never the number of supports.
+ */
+function fetchNodesByIds(db: KnowledgeDB, ids: string[]): Map<string, NodeRow> {
+  const out = new Map<string, NodeRow>();
+  for (let i = 0; i < ids.length; i += SUPPORT_LOOKUP_CHUNK) {
+    const chunk = ids.slice(i, i + SUPPORT_LOOKUP_CHUNK);
+    const rows = db.execSqlAll(
+      `SELECT * FROM nodes WHERE removed_at IS NULL AND id IN (${chunk.map(() => "?").join(",")})`,
+      ...chunk
+    ) as NodeRow[];
+    for (const row of rows) out.set(row.id, row);
+  }
+  return out;
+}
+
+/** D2.1: which of `ids` have at least one LIVE outgoing informed_by edge. */
+function fetchLiveInformedBySources(db: KnowledgeDB, ids: string[]): Set<string> {
+  const out = new Set<string>();
+  for (let i = 0; i < ids.length; i += SUPPORT_LOOKUP_CHUNK) {
+    const chunk = ids.slice(i, i + SUPPORT_LOOKUP_CHUNK);
+    const rows = db.execSqlAll(
+      `SELECT DISTINCT from_id FROM edges
+       WHERE relation = 'informed_by' AND removed_at IS NULL
+         AND from_id IN (${chunk.map(() => "?").join(",")})`,
+      ...chunk
+    ) as Array<{ from_id: string }>;
+    for (const r of rows) out.add(r.from_id);
+  }
+  return out;
+}
+
+/**
+ * D2.3: the id list inside a note — `2: a, b` when short, otherwise
+ * `20000, первые: a1, …, a5 … и ещё 19995`. The count and the "… и ещё N"
+ * tail win over the sample: with pathological id lengths the sample shrinks
+ * (5 → 4 → …) so the numbers always survive within MAX_NOTE_CHARS. The full
+ * list is never returned.
+ */
+function idListForNote(ids: string[]): string {
+  if (ids.length === 0) return "0";
+  if (ids.length <= NOTE_SAMPLE) return `${ids.length}: ${ids.join(", ")}`;
+  const head = `${ids.length}, первые: `;
+  const tail = ` … и ещё ${ids.length - NOTE_SAMPLE}`;
+  for (let take = NOTE_SAMPLE; take >= 1; take--) {
+    const body = ids.slice(0, take).join(", ");
+    if (head.length + body.length + tail.length <= MAX_NOTE_CHARS) {
+      return head + body + tail;
+    }
+  }
+  // Even a single id overflows the cap — cut the id text, keep the tail.
+  const room = Math.max(0, MAX_NOTE_CHARS - head.length - tail.length - 1);
+  return head + ids[0].slice(0, room) + "…" + tail;
+}
+
+/** D2.3: hard guarantee — no record's note exceeds MAX_NOTE_CHARS. */
+function clampNote(note: string): string {
+  return note.length <= MAX_NOTE_CHARS ? note : note.slice(0, MAX_NOTE_CHARS - 1).trimEnd() + "…";
+}
+
+/** Serialized size of the array without building intermediate strings twice. */
+function weakLinksJsonSize(list: ProvenanceWeakLink[]): number {
+  let size = 2; // "[]"
+  for (let i = 0; i < list.length; i++) {
+    if (i > 0) size += 1; // comma
+    size += JSON.stringify(list[i]).length;
+  }
+  return size;
+}
+
+/** D2.4 keep order: antiknowledge first, service records last. */
+const WEAK_LINK_PRIORITY: Record<ProvenanceWeakLink["type"], number> = {
+  refuted: 0,
+  abandoned: 1,
+  cycle: 2,
+  missing_support: 3,
+  no_support: 4,
+  ungrounded_support: 5,
+  no_rationale: 6,
+  support_check_truncated: 7,
+  weak_links_truncated: 8,
+};
+
+/**
+ * D2.4: when the serialized weak_links exceed 8 KB, keep records by priority
+ * (ties keep construction order — the sort is stable), then append ONE
+ * weak_links_truncated marker with shown/total. Dropping warnings silently is
+ * not allowed; a record that does not fit is skipped, shorter ones after it
+ * may still make the cut.
+ */
+function capWeakLinks(weak: ProvenanceWeakLink[]): ProvenanceWeakLink[] {
+  if (weakLinksJsonSize(weak) <= WEAK_LINKS_JSON_LIMIT) return weak;
+  const markerFor = (shown: number): ProvenanceWeakLink => ({
+    type: "weak_links_truncated",
+    shown,
+    total: weak.length,
+  });
+  const byPriority = weak
+    .map((w, i) => ({ w, i }))
+    .sort(
+      (a, b) => WEAK_LINK_PRIORITY[a.w.type] - WEAK_LINK_PRIORITY[b.w.type] || a.i - b.i
+    )
+    .map(({ w }) => w);
+  const kept: ProvenanceWeakLink[] = [];
+  for (const w of byPriority) {
+    // +2 slack covers the marker's own growth as `shown` gains a digit.
+    if (weakLinksJsonSize([...kept, w, markerFor(kept.length + 1)]) > WEAK_LINKS_JSON_LIMIT + 2) {
+      continue;
+    }
+    kept.push(w);
+  }
+  return kept.length === weak.length ? kept : [...kept, markerFor(kept.length)];
+}
+
 function weakLinks(
   db: KnowledgeDB,
   result: TraverseResult,
   direction: "ancestry" | "impact",
-  retrospective: boolean
+  retrospective: boolean,
+  maxScanSupports: number
 ): ProvenanceWeakLink[] {
   const weak: ProvenanceWeakLink[] = [];
 
@@ -537,13 +674,13 @@ function weakLinks(
       weak.push({
         type: "refuted",
         id: n.id,
-        note: `узел "${n.id}" опровергнут — не использовать как факт`,
+        note: clampNote(`узел "${n.id}" опровергнут — не использовать как факт`),
       });
     } else if (n.epistemic_status === "abandoned") {
       weak.push({
         type: "abandoned",
         id: n.id,
-        note: `узел "${n.id}" заброшен — вывод может устареть`,
+        note: clampNote(`узел "${n.id}" заброшен — вывод может устареть`),
       });
     }
   }
@@ -569,7 +706,8 @@ function weakLinks(
       )
       .map((r) => `${(r as { from_id: string }).from_id} -> ${(r as { to_id: string }).to_id}`);
     const parts = [
-      `цикл informed_by: ${comp.join(", ")}`,
+      // D2.3: a huge SCC used to inline every member id into the note.
+      `цикл informed_by: ${idListForNote(comp)}`,
       witness ? `свидетель ${witness.from} -> ${witness.to}` : null,
       needsMerge.length > 0 ? `needs_merge: ${needsMerge.join(", ")}` : null,
       "компонента закрыта для записи (needs_merge)",
@@ -577,7 +715,7 @@ function weakLinks(
     weak.push({
       type: "cycle",
       id: componentId,
-      note: `${parts.join("; ")}`,
+      note: clampNote(`${parts.join("; ")}`),
     });
   }
 
@@ -589,7 +727,7 @@ function weakLinks(
         type: "no_rationale",
         from: e.from,
         to: e.to,
-        note: `ребро ${e.from} -> ${e.to} без рационала — связь нечитаема`,
+        note: clampNote(`ребро ${e.from} -> ${e.to} без рационала — связь нечитаема`),
       });
     }
   }
@@ -602,47 +740,81 @@ function weakLinks(
   // never a mixture. F9: no supports at all is the most important case and
   // gets its own type; a missing support node is distinct from an ungrounded
   // one.
+  //
+  // plan-3-fixes-3 D2.1/D2.2: the supports are verified in BATCHES (one
+  // chunked lookup for the support nodes, one for their live outgoing
+  // informed_by edges) instead of two queries per support, and the check is
+  // bounded by the scan budget: at most maxScanSupports supports are verified
+  // per walk — first by id, honestly reported via support_check_truncated.
+  // The warning semantics within the verified prefix are unchanged: still
+  // every direct support of the decision, not just the shown subgraph.
+  let supportBudget = maxScanSupports;
   for (const n of result.nodes) {
-    if (n.removed) continue;
-    const row = db.getNode(n.id);
-    if (!row || row.kind !== "decision") continue;
+    if (n.removed || n.kind !== "decision") continue;
     const supports = db
       .getInformedByEdges(n.id, "ancestry", retrospective)
-      .map((e) => e.other_id);
+      .map((e) => e.other_id)
+      .sort(compareIds); // deterministic pick when the budget cuts the list
     if (supports.length === 0) {
       weak.push({
         type: "no_support",
         id: n.id,
-        note: `решение "${n.id}" не имеет ни одной опоры`,
+        note: clampNote(`решение "${n.id}" не имеет ни одной опоры`),
       });
       continue;
     }
+    const checkedCount = Math.min(supports.length, supportBudget);
+    supportBudget -= checkedCount;
+    const checked = supports.slice(0, checkedCount);
+    if (checkedCount < supports.length) {
+      weak.push({
+        type: "support_check_truncated",
+        id: n.id,
+        checked: checkedCount,
+        total: supports.length,
+        note: clampNote(
+          `проверено ${checkedCount} из ${supports.length} опор решения "${n.id}" — бюджет сканирования`
+        ),
+      });
+    }
+    if (checked.length === 0) continue;
+    const nodeRows = fetchNodesByIds(db, checked);
+    const groundedSources = fetchLiveInformedBySources(db, checked);
     const missing: string[] = [];
     const ungrounded: string[] = [];
-    for (const sid of supports) {
-      const s = db.getNode(sid);
-      if (!s) missing.push(sid);
-      else if (isUngrounded(db, s)) ungrounded.push(sid);
+    for (const sid of checked) {
+      const row = nodeRows.get(sid);
+      if (!row) missing.push(sid);
+      else if (isUngroundedRow(row, groundedSources.has(sid))) ungrounded.push(sid);
     }
-    if (missing.length + ungrounded.length === supports.length) {
+    if (missing.length + ungrounded.length === checked.length) {
       if (missing.length > 0) {
         weak.push({
           type: "missing_support",
           id: n.id,
-          note: `решение "${n.id}" ссылается на отсутствующие узлы (${missing.join(", ")})`,
+          count: missing.length,
+          sample: missing.slice(0, NOTE_SAMPLE),
+          note: clampNote(
+            `решение "${n.id}" ссылается на отсутствующие узлы (${idListForNote(missing)})`
+          ),
         });
       }
       if (ungrounded.length > 0) {
         weak.push({
           type: "ungrounded_support",
           id: n.id,
-          note: `решение "${n.id}" опирается только на ungrounded-узлы (${ungrounded.join(", ")})`,
+          count: ungrounded.length,
+          sample: ungrounded.slice(0, NOTE_SAMPLE),
+          note: clampNote(
+            `решение "${n.id}" опирается только на ungrounded-узлы (${idListForNote(ungrounded)})`
+          ),
         });
       }
     }
   }
 
-  return weak;
+  // D2.4: the serialized weak_links must fit the 8 KB response cap.
+  return capWeakLinks(weak);
 }
 
 function rootHeader(db: KnowledgeDB, rootId: string): ProvenanceTraceOutput["root"] {
@@ -705,7 +877,17 @@ function completenessVerdict(
  * 5. Limits bound both the OUTPUT and the WORK: besides depth and max_nodes
  *    there is a scan budget max_scan_nodes (default 5000); when it trips,
  *    truncated_by = "scan" and total_within_depth is a lower estimate with
- *    total_exact: false.
+ *    total_exact: false. The same budget also bounds the support check of
+ *    block 4 (plan-3-fixes-3 D2.2): at most max_scan_nodes supports are
+ *    verified, first by id — a support_check_truncated record reports
+ *    checked/total instead of silently skipping the rest.
+ * 6. The weak_links payload is bounded (plan-3-fixes-3 D2.3/D2.4): no note
+ *    exceeds 300 chars (long id lists become "count + первые 5 … и ещё N",
+ *    with numeric count/sample fields), and the serialized weak_links array
+ *    never exceeds 8 KB — when it would, records are kept by priority
+ *    (refuted → abandoned → cycle → missing_support → no_support →
+ *    ungrounded_support → no_rationale → support_check_truncated) and one
+ *    weak_links_truncated marker reports shown/total.
  */
 export function provenanceTrace(
   db: KnowledgeDB,
@@ -721,7 +903,7 @@ export function provenanceTrace(
   return db.runInTransaction(() => {
     const root = rootHeader(db, input.node_id); // not-found throws here
     const result = traverse(db, input.node_id, direction, limits, retrospective);
-    const weak = weakLinks(db, result, direction, retrospective);
+    const weak = weakLinks(db, result, direction, retrospective, limits.maxScanNodes);
     const completeness = completenessVerdict(db, input.node_id, result);
 
     return {
