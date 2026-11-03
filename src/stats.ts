@@ -191,6 +191,16 @@ export async function runStats(args: string[]): Promise<void> {
     printRow("Edges accepted", formatNumber(prov.edges_accepted), "explicitly accepted auto edges");
     printRow("Decisions w/ support", formatNumber(prov.decisions_with_live_support));
     printRow(
+      "Decisions w/o live support",
+      formatNumber(prov.no_live_supports),
+      "snapshot or claim anchor kept, edges gone (F8)"
+    );
+    printRow(
+      "Superseded supports",
+      formatNumber(prov.decisions_with_superseded_supports),
+      "decisions whose supports were confirmed, then acknowledged gone (F7)"
+    );
+    printRow(
       "Snapshot check",
       `unchanged ${formatNumber(prov.decisions_by_check_state.unchanged)}, changed ${formatNumber(prov.decisions_by_check_state.changed)}, unknown ${formatNumber(prov.decisions_by_check_state.unknown)}, incomplete ${formatNumber(prov.decisions_by_check_state.incomplete)}`
     );

@@ -737,15 +737,16 @@ export async function createConcept(
     throw new Error(REQUIRE_SUPPORT_MESSAGE);
   }
 
-  // Plan 4 v8 §2.1: the supports this same call may confirm (evidence and
-  // explicit informed_by edges — content the agent passed right here; NOT the
-  // auto-grounded ones). Empty for a plain create.
+  // Plan 4 v8 §2.1 + plan-4-fixes-6 F1: the ONLY supports this call may
+  // confirm are the evidence items — content the agent read and passed right
+  // here. informed_by edges from input.edges are written but never confirm:
+  // their snapshot would also pin the TARGET's summary and status digests,
+  // which the agent may never have read — a snapshot without a read is
+  // self-confirmation. Those pairs stay `unknown` until an explicit
+  // confirm_supports.
   const confirmableSupportIds = new Set<string>();
   for (const s of supports) {
     if (!s.fromAutoGround) confirmableSupportIds.add(s.toId);
-  }
-  for (const e of input.edges ?? []) {
-    if (e.relation === "informed_by") confirmableSupportIds.add(e.to);
   }
 
   // Embeddings for the file-fact nodes (computed before the transaction).
@@ -811,10 +812,10 @@ export async function createConcept(
     // create_concept with evidence may confirm the very versions it passed in
     // the same call — the agent has just written/read them. Auto-grounded
     // supports are NOT confirmed: the server invented them, and a snapshot
-    // written by the server would be self-confirmation. informed_by edges
-    // from input.edges are agent-written rationales in the same call — same
-    // treatment as evidence. Everything else stays `unknown` until an
-    // explicit confirm_supports.
+    // written by the server would be self-confirmation. F1: informed_by edges
+    // from input.edges are NOT confirmed either — the snapshot would pin the
+    // target's summary/status, which the agent may not have read. Everything
+    // else stays `unknown` until an explicit confirm_supports.
     if (confirmableSupportIds.size > 0) {
       const now = new Date().toISOString();
       db.setClaimDigest(id, claimDigestOf(input.summary), now);

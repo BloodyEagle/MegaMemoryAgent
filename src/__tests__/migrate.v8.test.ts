@@ -49,7 +49,8 @@ describe("migration v7 -> v8 (plan 4 v8: support baselines)", () => {
     const reopened = new KnowledgeDB(dbPath);
     openDb = reopened;
     expect(reopened.getUserVersion()).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(8);
+    // plan-4-fixes-6: superseded_at lives in v9, on top of the v8 table.
+    expect(SCHEMA_VERSION).toBe(9);
 
     const nodeCols = (
       reopened.pragma("table_info(nodes)") as Array<{ name: string }>
@@ -62,6 +63,10 @@ describe("migration v7 -> v8 (plan 4 v8: support baselines)", () => {
     expect(edgeCols).toContain("created_via");
     expect(edgeCols).toContain("accepted_at");
     expect(reopened.hasSupportBaselinesTable()).toBe(true);
+    const baselineCols = (
+      reopened.pragma("table_info(support_baselines)") as Array<{ name: string }>
+    ).map((c) => c.name);
+    expect(baselineCols).toContain("superseded_at");
 
     // Pre-v8 rows are honestly unknown (test 16 of plan 4 v8 §9) and the
     // data itself survives.

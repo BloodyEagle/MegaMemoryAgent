@@ -18,6 +18,7 @@ import {
   confirmSupports,
   edgeDigestOf,
   provenanceMetrics,
+  statusDigestOf,
 } from "../support-baselines.js";
 import { MergeEngine } from "../merge.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
@@ -65,9 +66,11 @@ function confirm(decisionId: string, supportIds: string[]) {
     expected_claim_digest: claimDigestOf(decision.summary),
     items: supportIds.map((sid) => {
       const edge = edges.find((e) => e.other_id === sid)!;
+      const support = db.getNode(sid)!;
       return {
         support_id: sid,
-        expected_claim_digest: claimDigestOf(db.getNode(sid)!.summary),
+        expected_claim_digest: claimDigestOf(support.summary),
+        expected_status_digest: statusDigestOf(support.status, support.epistemic_status),
         expected_edge_digest: edgeDigestOf(edge.description),
       };
     }),
@@ -383,6 +386,7 @@ describe("§9.14 merge keeps the divergence", () => {
       left.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
       left.insertNode({ id: "f", name: "F", kind: "feature", summary: "f v1" });
       left.insertEdge({ from_id: "d", to_id: "f", relation: "informed_by", description: "why f" });
+      const fRow = left.getNode("f")!;
       confirmSupports(left, {
         decision_id: "d",
         expected_claim_digest: claimDigestOf("decision d"),
@@ -390,6 +394,7 @@ describe("§9.14 merge keeps the divergence", () => {
           {
             support_id: "f",
             expected_claim_digest: claimDigestOf("f v1"),
+            expected_status_digest: statusDigestOf(fRow.status, fRow.epistemic_status),
             expected_edge_digest: edgeDigestOf("why f"),
           },
         ],
@@ -440,6 +445,7 @@ describe("§9.15 clean merge remap", () => {
         d.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
         d.insertNode({ id: "f", name: "F", kind: "feature", summary: "f v1" });
         d.insertEdge({ from_id: "d", to_id: "f", relation: "informed_by", description: "why f" });
+        const fRow = d.getNode("f")!;
         confirmSupports(d, {
           decision_id: "d",
           expected_claim_digest: claimDigestOf("decision d"),
@@ -447,6 +453,7 @@ describe("§9.15 clean merge remap", () => {
             {
               support_id: "f",
               expected_claim_digest: claimDigestOf("f v1"),
+              expected_status_digest: statusDigestOf(fRow.status, fRow.epistemic_status),
               expected_edge_digest: edgeDigestOf("why f"),
             },
           ],
@@ -515,13 +522,15 @@ describe("§9.17 accepted auto edge", () => {
     expect((edges[0] as { created_via?: string }).created_via).toBe("auto");
 
     const supportId = edges[0].other_id;
+    const supportRow = db.getNode(supportId)!;
     confirmSupports(db, {
       decision_id: res.id,
       expected_claim_digest: claimDigestOf("auto d"),
       items: [
         {
           support_id: supportId,
-          expected_claim_digest: claimDigestOf(db.getNode(supportId)!.summary),
+          expected_claim_digest: claimDigestOf(supportRow.summary),
+          expected_status_digest: statusDigestOf(supportRow.status, supportRow.epistemic_status),
           expected_edge_digest: edgeDigestOf(edges[0].description),
         },
       ],
@@ -663,7 +672,7 @@ describe("removed supports keep their snapshot rows (plan-4-fixes-5)", () => {
     expect(db.getSupportBaselines("d").map((r) => r.support_id)).toEqual(["f"]);
   });
 
-  it("22. only the explicit 'no supports' confirmation clears the dead row", () => {
+  it("22. the explicit 'no supports' confirmation supersedes the dead rows, it does not erase them (F7)", () => {
     confirmedDecision("d", ["f", "g"]);
     db.deleteEdge("d", "f", "informed_by");
 
@@ -677,17 +686,31 @@ describe("removed supports keep their snapshot rows (plan-4-fixes-5)", () => {
     ]);
 
     // The empty confirm (accepted only with zero live edges) is the explicit
-    // "no supports" statement — the rows go with it, and only with it.
+    // "no supports" statement. F7: the dead rows are MARKED superseded, not
+    // deleted — "confirmed and later removed" stays distinguishable from
+    // "supports never existed".
     db.deleteEdge("d", "g", "informed_by");
     confirmSupports(db, {
       decision_id: "d",
       expected_claim_digest: claimDigestOf(db.getNode("d")!.summary),
       items: [],
     });
-    expect(db.getSupportBaselines("d")).toEqual([]);
+    const rows = db.getSupportBaselines("d");
+    expect(rows.map((r) => r.support_id)).toEqual(["f", "g"]);
+    expect(rows.every((r) => r.superseded_at !== null)).toBe(true);
     const empty = computeSupportCheck(db, "d", new CheckBudget(10, 1_000_000))!;
     expect(empty.state).toBe("unchanged");
     expect(empty.changed).toEqual([]);
+    expect(empty.had_supports).toBe(true);
+
+    // A fresh confirmation of the same pair un-supersedes its row.
+    supportEdge("d", "g");
+    confirm("d", ["g"]);
+    const revived = db.getSupportBaselines("d").find((r) => r.support_id === "g")!;
+    expect(revived.superseded_at).toBeNull();
+    expect(
+      db.getSupportBaselines("d").find((r) => r.support_id === "f")!.superseded_at
+    ).not.toBeNull();
   });
 
   it("23. a decision that never had supports reports no_support, not changed", () => {
@@ -717,5 +740,490 @@ describe("removed supports keep their snapshot rows (plan-4-fixes-5)", () => {
     const out = provenanceTrace(db, { node_id: "d" });
     expect(out.support_check!.state).toBe("changed");
     expect(out.weak_links.some((w) => w.type === "no_support" && w.id === "d")).toBe(false);
+  });
+});
+
+// ---- plan-4-fixes-6: дыры подтверждения, бюджет и идентичность рёбер ----
+
+describe("F1: edges from input.edges never confirm", () => {
+  it("25. a decision created with an informed_by edge but no evidence has no snapshot", async () => {
+    node("f", "fact");
+    const res = await createConcept(db, {
+      name: "d",
+      kind: "decision",
+      summary: "decision d",
+      edges: [{ to: "f", relation: "informed_by", description: "why f" }],
+    });
+    // The edge exists — but nothing was confirmed along with it.
+    expect(db.getInformedByEdges(res.id, "ancestry", false)).toHaveLength(1);
+    expect(db.getNode(res.id)!.claim_digest ?? null).toBeNull();
+    expect(db.getSupportBaselines(res.id)).toEqual([]);
+    const view = computeSupportCheck(db, res.id, new CheckBudget(10, 1_000_000))!;
+    expect(view.state).toBe("unknown");
+  });
+
+  it("26. evidence in the same call still confirms (the §2.1 carve-out holds)", async () => {
+    node("f", "fact");
+    const res = await createConcept(db, {
+      name: "d2",
+      kind: "decision",
+      summary: "decision d2",
+      evidence: [{ node: "f", why: "because f" }],
+    });
+    const rows = db.getSupportBaselines(res.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].confirmed_by).toBe("agent");
+    expect(computeSupportCheck(db, res.id, new CheckBudget(10, 1_000_000))!.state).toBe(
+      "unchanged"
+    );
+  });
+});
+
+describe("F2: the budget bounds the work, not only the verdict", () => {
+  function buildStar(width: number): void {
+    // One transaction — the fixture build must not dominate the timing.
+    db.runInTransaction(() => {
+      node("star", "decision", "decision star");
+      for (let i = 1; i <= width; i++) {
+        node(`s${i}`, "config", `s-${i}`);
+        db.insertEdgeRaw({
+          from_id: "star",
+          to_id: `s${i}`,
+          relation: "informed_by",
+          description: "why",
+        });
+      }
+    });
+  }
+
+  it(
+    "27. a 20k star with max_check_edges = 1 stays incomplete and bounded",
+    () => {
+      buildStar(20_000);
+      const t0 = performance.now();
+      const view = computeSupportCheck(db, "star", new CheckBudget(1, 1_000_000_000))!;
+      const ms = performance.now() - t0;
+      expect(view.state).toBe("incomplete");
+      expect(view.incomplete).toBe(true);
+      expect(view.unknown_count ?? view.unknown!.length).toBeLessThanOrEqual(1);
+      // Bounded work: two page reads, not 20 000 — the same star with a full
+      // budget (next test) does the linear pass, so this one must be far
+      // cheaper than it. A generous 500 ms guard against linear regressions.
+      expect(ms).toBeLessThan(500);
+    },
+    60_000
+  );
+
+  it(
+    "28. the same star with a full budget scans everything and stays honest",
+    () => {
+      buildStar(20_000);
+      const view = computeSupportCheck(
+        db,
+        "star",
+        new CheckBudget(20_000, 1_000_000_000)
+      )!;
+      expect(view.state).toBe("unknown");
+      expect(view.incomplete).toBe(false);
+      expect(view.unknown_count).toBe(20_000);
+    },
+    60_000
+  );
+
+  it("29. an unchanged confirmed graph gives no false added/removed at any budget", () => {
+    confirmedDecision("d", ["f1", "f2", "f3"]);
+    for (const [edges, bytes] of [
+      [10, 1_000_000],
+      [3, 1_000_000],
+      [2, 1_000_000],
+    ] as const) {
+      const view = computeSupportCheck(db, "d", new CheckBudget(edges, bytes))!;
+      expect(view.changed ?? []).toEqual([]);
+      expect(view.state === "unchanged" || view.state === "incomplete").toBe(true);
+      if (view.state === "unchanged") expect(view.incomplete).toBe(false);
+    }
+  });
+});
+
+describe("F3: the status axes are confirmed like every other field", () => {
+  it("30. a status-only change refuses a stale confirmation", () => {
+    confirmedDecision("d", ["f"]);
+    const support = db.getNode("f")!;
+    const staleStatus = statusDigestOf(support.status, support.epistemic_status);
+    const edge = db.getInformedByEdges("d", "ancestry", false)[0];
+
+    db.setEpistemicStatus("f", "validated", "test artifact", { artifact: "run-1" });
+
+    let message = "";
+    try {
+      confirmSupports(db, {
+        decision_id: "d",
+        expected_claim_digest: claimDigestOf(db.getNode("d")!.summary),
+        items: [
+          {
+            support_id: "f",
+            expected_claim_digest: claimDigestOf(support.summary),
+            expected_status_digest: staleStatus,
+            expected_edge_digest: edgeDigestOf(edge.description),
+          },
+        ],
+      });
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain("version_conflict");
+    expect(message).toContain("статус");
+    // Nothing was written: the old confirmation keeps its timestamp.
+    const rows = db.getSupportBaselines("d");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status_digest).toBe(staleStatus);
+  });
+
+  it("31. a confirmation without expected_status_digest is refused", () => {
+    confirmedDecision("d", ["f"]);
+    const before = db.getSupportBaselines("d");
+    const edge = db.getInformedByEdges("d", "ancestry", false)[0];
+    const support = db.getNode("f")!;
+
+    let message = "";
+    try {
+      confirmSupports(db, {
+        decision_id: "d",
+        expected_claim_digest: claimDigestOf(db.getNode("d")!.summary),
+        items: [
+          {
+            support_id: "f",
+            expected_claim_digest: claimDigestOf(support.summary),
+            expected_edge_digest: edgeDigestOf(edge.description),
+          },
+        ],
+      });
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain("version_conflict");
+    expect(message).toContain("expected_status_digest");
+    expect(db.getSupportBaselines("d")).toEqual(before);
+  });
+});
+
+describe("F4: verification and write share one BEGIN IMMEDIATE", () => {
+  it("32. a second connection moving a support between read and confirm is caught", () => {
+    node("d", "decision");
+    node("f", "fact");
+    supportEdge("d", "f");
+
+    const staleClaim = claimDigestOf(db.getNode("f")!.summary);
+    const staleStatus = statusDigestOf(
+      db.getNode("f")!.status,
+      db.getNode("f")!.epistemic_status
+    );
+    const staleEdge = edgeDigestOf(db.getInformedByEdges("d", "ancestry", false)[0].description);
+
+    // The second writer moves f AFTER the agent read its digests and BEFORE
+    // the confirm runs. The confirm must re-read inside its write
+    // transaction, see v2 and refuse — not write a snapshot of a version
+    // that no longer exists.
+    const second = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
+    try {
+      second.updateNode("f", { summary: "f v2 by another writer" });
+    } finally {
+      second.close();
+    }
+
+    let message = "";
+    try {
+      confirmSupports(db, {
+        decision_id: "d",
+        expected_claim_digest: claimDigestOf(db.getNode("d")!.summary),
+        items: [
+          {
+            support_id: "f",
+            expected_claim_digest: staleClaim,
+            expected_status_digest: staleStatus,
+            expected_edge_digest: staleEdge,
+          },
+        ],
+      });
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain("version_conflict");
+    // Zero writes: no snapshot, no claim anchor.
+    expect(db.getSupportBaselines("d")).toEqual([]);
+    expect(db.getNode("d")!.claim_digest ?? null).toBeNull();
+  });
+});
+
+describe("F5: the confirmation follows the edge's identity, not its ends", () => {
+  it("33. after a removed edge is re-created, the snapshot stays with the dead row", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-baselines-f5-"));
+    try {
+      const aPath = path.join(dir, "a.db");
+      const a = new KnowledgeDB(aPath);
+      a.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
+      a.insertNode({ id: "f", name: "F", kind: "feature", summary: "f" });
+      a.insertEdge({ from_id: "d", to_id: "f", relation: "informed_by", description: "why f" });
+      const fRow = a.getNode("f")!;
+      confirmSupports(a, {
+        decision_id: "d",
+        expected_claim_digest: claimDigestOf("decision d"),
+        items: [
+          {
+            support_id: "f",
+            expected_claim_digest: claimDigestOf("f"),
+            expected_status_digest: statusDigestOf(fRow.status, fRow.epistemic_status),
+            expected_edge_digest: edgeDigestOf("why f"),
+          },
+        ],
+      });
+      const deadKey = a.getSupportBaselines("d")[0].edge_key;
+
+      // The confirmed edge row goes away and a new one takes the same ends —
+      // unlink+link would revive the same row, so model the replacement by a
+      // hard row delete (the only way two generations of one pair diverge).
+      a.execSqlRun("DELETE FROM edges WHERE from_id = 'd' AND to_id = 'f'");
+      a.insertEdge({ from_id: "d", to_id: "f", relation: "informed_by", description: "why f" });
+      const live = a.getInformedByEdges("d", "ancestry", false)[0];
+      expect(String(live.id)).not.toBe(deadKey);
+
+      // In-base honesty: the new pair is not the confirmed one.
+      const inBase = computeSupportCheck(a, "d", new CheckBudget(10, 1_000_000))!;
+      expect(inBase.state).toBe("unknown");
+      expect(a.getSupportBaselines("d")[0].edge_key).toBe(deadKey);
+      a.close();
+
+      // Through a merge in both insertion orders: the snapshot keeps pointing
+      // at the dead row and the live edge stays unconfirmed.
+      const bPath = path.join(dir, "b.db");
+      const b = new KnowledgeDB(bPath);
+      b.insertNode({ id: "z", name: "Z", kind: "config", summary: "z" });
+      b.close();
+
+      for (const [left, right] of [
+        [aPath, bPath],
+        [bPath, aPath],
+      ]) {
+        const outPath = path.join(dir, `out-${path.basename(left)}.db`);
+        new MergeEngine().merge(left, right, outPath);
+        const out = new KnowledgeDB(outPath);
+        const rows = out.getSupportBaselines("d");
+        expect(rows).toHaveLength(1);
+        // The dead anchor is carried with a non-collidable key: it must never
+        // re-anchor a live edge, however the output numbers its rows.
+        expect(rows[0].edge_key).toBe(`dead:${deadKey}`);
+        const outLive = out.getInformedByEdges("d", "ancestry", false)[0];
+        expect(computeSupportCheck(out, "d", new CheckBudget(10, 1_000_000))!.state).toBe(
+          "unknown"
+        );
+        expect(outLive).toBeDefined();
+        out.close();
+      }
+    } finally {
+      rmTemp(dir);
+    }
+  });
+});
+
+describe("F6: the last unlinked support still speaks in weak_links", () => {
+  it("34. confirm, unlink — the trace reports support_changed/removed, not no_support", () => {
+    confirmedDecision("d", ["f"]);
+    db.deleteEdge("d", "f", "informed_by");
+
+    const out = provenanceTrace(db, { node_id: "d" });
+    const changed = out.weak_links.find(
+      (w) => w.type === "support_changed" && w.id === "d"
+    );
+    expect(changed).toBeDefined();
+    expect(out.weak_links.some((w) => w.type === "no_support" && w.id === "d")).toBe(false);
+    // The root's own block agrees with the weak link.
+    expect(out.support_check!.state).toBe("changed");
+    expect(out.support_check!.changed![0].reasons).toEqual(["removed"]);
+  });
+});
+
+describe("F7: 'confirmed and removed' stays distinguishable from 'never had'", () => {
+  it("35. the two histories differ in support_check and in the metrics", () => {
+    // (a) had a confirmed support, unlinked, acknowledged gone.
+    confirmedDecision("d1", ["f1"]);
+    db.deleteEdge("d1", "f1", "informed_by");
+    confirmSupports(db, {
+      decision_id: "d1",
+      expected_claim_digest: claimDigestOf(db.getNode("d1")!.summary),
+      items: [],
+    });
+
+    // (b) never had any supports, confirmed the emptiness.
+    node("d2", "decision");
+    confirmSupports(db, {
+      decision_id: "d2",
+      expected_claim_digest: claimDigestOf(db.getNode("d2")!.summary),
+      items: [],
+    });
+
+    const a = computeSupportCheck(db, "d1", new CheckBudget(10, 1_000_000))!;
+    const b = computeSupportCheck(db, "d2", new CheckBudget(10, 1_000_000))!;
+    expect(a.state).toBe("unchanged");
+    expect(b.state).toBe("unchanged");
+    expect(a.had_supports).toBe(true);
+    expect(b.had_supports).toBeUndefined();
+
+    const m = provenanceMetrics(db, new CheckBudget(100, 1_000_000));
+    expect(m.decisions_with_superseded_supports).toBe(1);
+    expect(m.no_live_supports).toBe(2);
+  });
+});
+
+describe("F8: metrics cover decisions without live edges", () => {
+  it("36. a decision whose last support was unlinked counts in changed + no_live_supports", () => {
+    confirmedDecision("d", ["f"]);
+    db.deleteEdge("d", "f", "informed_by");
+    // A second decision with live supports keeps the old counters honest.
+    confirmedDecision("d2", ["f2"]);
+
+    const m = provenanceMetrics(db, new CheckBudget(100, 1_000_000));
+    expect(m.decisions_by_check_state.changed).toBe(1);
+    expect(m.no_live_supports).toBe(1);
+    expect(m.decisions_with_live_support).toBe(1);
+    expect(m.metrics_truncated).toBe(false);
+  });
+});
+
+describe("F9: edge provenance survives a merge", () => {
+  it("37. created_via and accepted_at travel with the row", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-baselines-f9-"));
+    try {
+      const build = (p: string, withExtra: boolean): void => {
+        const d = new KnowledgeDB(p);
+        d.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
+        d.insertNode({ id: "f", name: "F", kind: "feature", summary: "f" });
+        if (withExtra) d.insertNode({ id: "z", name: "Z", kind: "config", summary: "z" });
+        // The agent path: link writes created_via = 'agent'.
+        link(d, { from: "d", to: "f", relation: "informed_by", description: "why f" });
+        const e = d.getInformedByEdges("d", "ancestry", false)[0];
+        d.acceptEdges([e.id], "2026-01-01T00:00:00.000Z");
+        d.close();
+      };
+      const aPath = path.join(dir, "a.db");
+      const bPath = path.join(dir, "b.db");
+      build(aPath, false);
+      build(bPath, true);
+
+      const outPath = path.join(dir, "out.db");
+      new MergeEngine().merge(aPath, bPath, outPath);
+      const out = new KnowledgeDB(outPath);
+      const edge = out.getInformedByEdges("d", "ancestry", false)[0];
+      expect(edge.created_via).toBe("agent");
+      expect(edge.accepted_at).not.toBeNull();
+
+      // A raw row without provenance stays honestly unknown.
+      const raw = out.execSqlFirst(
+        `SELECT created_via FROM edges WHERE created_via = 'unknown'`
+      ) as { created_via: string } | undefined;
+      expect(raw).toBeUndefined();
+      out.close();
+    } finally {
+      rmTemp(dir);
+    }
+  });
+});
+
+describe("F10: the merge carries the OLD claim digest, not the current wording", () => {
+  it("38. a rewritten decision keeps its stale anchor through the merge", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-baselines-f10-"));
+    try {
+      const aPath = path.join(dir, "a.db");
+      const a = new KnowledgeDB(aPath);
+      a.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
+      a.insertNode({ id: "f", name: "F", kind: "feature", summary: "f" });
+      a.insertEdge({ from_id: "d", to_id: "f", relation: "informed_by", description: "why f" });
+      const fRow = a.getNode("f")!;
+      confirmSupports(a, {
+        decision_id: "d",
+        expected_claim_digest: claimDigestOf("decision d"),
+        items: [
+          {
+            support_id: "f",
+            expected_claim_digest: claimDigestOf("f"),
+            expected_status_digest: statusDigestOf(fRow.status, fRow.epistemic_status),
+            expected_edge_digest: edgeDigestOf("why f"),
+          },
+        ],
+      });
+      const oldDigest = a.getNode("d")!.claim_digest!;
+      // The wording moves on AFTER the confirmation — the anchor goes stale.
+      a.updateNode("d", { summary: "decision d, rewritten" });
+      a.close();
+
+      const bPath = path.join(dir, "b.db");
+      const b = new KnowledgeDB(bPath);
+      b.insertNode({ id: "q", name: "Q", kind: "config", summary: "q" });
+      b.close();
+
+      const outPath = path.join(dir, "out.db");
+      new MergeEngine().merge(aPath, bPath, outPath);
+      const out = new KnowledgeDB(outPath);
+      const carried = out.getNodeIncludingRemoved("d")!;
+      // The OLD digest travels verbatim — the snapshot keeps pointing at the
+      // wording it confirmed, and the check reports claim_changed.
+      expect(carried.claim_digest).toBe(oldDigest);
+      expect(carried.claim_digest).not.toBe(claimDigestOf(carried.summary!));
+      const view = computeSupportCheck(out, "d", new CheckBudget(10, 1_000_000))!;
+      expect(view.claim_changed).toBe(true);
+      out.close();
+    } finally {
+      rmTemp(dir);
+    }
+  });
+});
+
+describe("F11: an incomplete inner check is visible", () => {
+  it("39. a budget cut on an inner node sets the counter and degrades completeness", () => {
+    node("d", "decision");
+    node("f1", "fact");
+    node("f2", "fact");
+    supportEdge("d", "f1");
+    supportEdge("f1", "f2");
+    confirm("d", ["f1"]);
+    confirm("f1", ["f2"]);
+
+    const out = provenanceTrace(db, { node_id: "d", max_check_edges: 1 });
+    // d's own pair consumed the single edge; f1's check ran out.
+    expect(out.inner_nodes_incomplete).toBe(1);
+    expect(out.completeness).toBe("truncated");
+    // The unreviewed inner fact keeps its own block off the answer (§5).
+    const f1 = out.nodes.find((n) => n.id === "f1")!;
+    expect(f1.support_check).toBeUndefined();
+
+    // A full budget: no counter, verdict complete.
+    const full = provenanceTrace(db, { node_id: "d", max_check_edges: 10 });
+    expect(full.inner_nodes_incomplete).toBeUndefined();
+    expect(full.completeness).toBe("complete");
+  });
+});
+
+describe("F12: reads never write; the audit writes only its journal", () => {
+  it("40. provenance_trace/get_concept leave nothing behind; audit touches only the journal", async () => {
+    const { getConcept } = await import("../tools.js");
+    const { provenanceAudit } = await import("../provenance.js");
+    confirmedDecision("d", ["f"]);
+
+    const snapshotOf = () => ({
+      baselines: db.getSupportBaselines("d").length,
+      nodes: db.getNodeIncludingRemoved("d")?.updated_at ?? null,
+      edges: db.getInformedByEdges("d", "ancestry", false).length,
+      auditRuns: db.getProvenanceAuditRuns("d").length,
+    });
+
+    const before = snapshotOf();
+    provenanceTrace(db, { node_id: "d" });
+    getConcept(db, { id: "d" });
+    expect(snapshotOf()).toEqual(before);
+
+    provenanceAudit(db, { node_id: "d" });
+    const after = snapshotOf();
+    expect(after.auditRuns).toBe(before.auditRuns + 1); // the journal, and only it
+    expect(after.baselines).toBe(before.baselines);
+    expect(after.edges).toBe(before.edges);
   });
 });

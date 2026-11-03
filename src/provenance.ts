@@ -826,7 +826,9 @@ function weakLinks(
     if (supports.length === 0) {
       // Plan 4 v8 §2.1: an explicit "confirmed: no supports" snapshot is a
       // valid state — the warning fires only when the decision was never
-      // confirmed as supportless.
+      // confirmed as supportless. F6: a recorded snapshot with no live
+      // edges ("confirmed, then unlinked") still checks — the dead anchors
+      // must speak as support_changed/removed, not vanish into this branch.
       const decision = db.getNode(n.id);
       if (!decision?.claim_digest) {
         weak.push({
@@ -834,8 +836,8 @@ function weakLinks(
           id: n.id,
           note: clampNote(`решение "${n.id}" не имеет ни одной опоры`),
         });
+        continue;
       }
-      continue;
     }
     // Plan 4 v8 §3/§4: `unknown` and `incomplete` are not cleanliness — the
     // verdict of the support-baseline check travels as a weak link too, so
@@ -1045,7 +1047,6 @@ export function provenanceTrace(
       new CheckBudget(limits.maxCheckEdges, limits.maxCheckBytes)
     );
     const weak = weakLinks(db, result, direction, retrospective, limits.maxScanNodes, checker);
-    const completeness = completenessVerdict(db, input.node_id, result);
 
     // Plan 4 v8 §4: the root's support check travels with the verdict —
     // present whenever there is anything to check (any state).
@@ -1055,11 +1056,18 @@ export function provenanceTrace(
     // justification. A local divergence travels together with the dependency
     // path (state = changed only: clean and unreviewed nodes keep the answer
     // small; the root above carries its verdict whatever it is).
+    let innerIncomplete = 0;
     for (const n of result.nodes) {
       if (n.id === input.node_id || n.removed) continue;
       const view = checker.check(n.id);
+      // F11: a budget-cut inner check is a signal, not silence — it is
+      // counted on the output and degrades completeness below.
+      if (view && view.state === "incomplete") innerIncomplete += 1;
       if (view && view.state === "changed") n.support_check = view;
     }
+
+    const completeness: ProvenanceCompleteness =
+      innerIncomplete > 0 ? "truncated" : completenessVerdict(db, input.node_id, result);
 
     return {
       root,
@@ -1068,6 +1076,7 @@ export function provenanceTrace(
       nodes: result.nodes,
       edges: result.edges,
       ...(rootCheck ? { support_check: rootCheck } : {}),
+      ...(innerIncomplete > 0 ? { inner_nodes_incomplete: innerIncomplete } : {}),
       limits: {
         depth: limits.depth,
         max_nodes: limits.maxNodes,

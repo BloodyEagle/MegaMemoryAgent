@@ -6,7 +6,7 @@ import type { NodeRow, EdgeRow, SupportBaselineRow } from "./types.js";
 import { normalizeName } from "./norm.js";
 
 /** Plan 4 (informed_by provenance slice, schema v7); v8 adds support baselines. */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export class KnowledgeDB {
   private db: Database.Database;
@@ -382,12 +382,29 @@ export class KnowledgeDB {
             format_version  INTEGER NOT NULL,
             confirmed_at    TEXT NOT NULL,
             confirmed_by    TEXT NOT NULL,
+            superseded_at   TEXT,
             PRIMARY KEY (decision_id, support_id, edge_key)
           );
           CREATE INDEX IF NOT EXISTS idx_baselines_decision
             ON support_baselines(decision_id);
           CREATE INDEX IF NOT EXISTS idx_edges_created_via ON edges(created_via);
         `);
+      }
+
+      if (currentVersion < 9) {
+        // plan-4-fixes-6 (F7): the explicit "no supports" confirmation no
+        // longer deletes dead anchor rows — it marks them superseded_at, so
+        // "confirmed and later removed" stays readable as history. Guarded by
+        // PRAGMA table_info: fresh dbs already have the column from CREATE
+        // TABLE, existing v8 dbs get the ALTER.
+        const bcols9 = new Set(
+          this.db.prepare("PRAGMA table_info(support_baselines)").all().map((c: any) => c.name)
+        );
+        if (bcols9.has("confirmed_by") && !bcols9.has("superseded_at")) {
+          this.db.exec(
+            "ALTER TABLE support_baselines ADD COLUMN superseded_at TEXT"
+          );
+        }
       }
 
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -1434,11 +1451,38 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by
+                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
          FROM support_baselines WHERE decision_id = ?
          ORDER BY support_id, confirmed_at, edge_key`
       )
       .all(decisionId) as SupportBaselineRow[];
+  }
+
+  /** Active (not superseded) rows only — the ones a check compares against. */
+  getActiveSupportBaselines(decisionId: string): SupportBaselineRow[] {
+    if (!this.hasSupportBaselinesTable()) return [];
+    return this.db
+      .prepare(
+        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
+         FROM support_baselines WHERE decision_id = ? AND superseded_at IS NULL
+         ORDER BY support_id, confirmed_at, edge_key`
+      )
+      .all(decisionId) as SupportBaselineRow[];
+  }
+
+  /** One support's active rows (indexed by the PK prefix), for budgeted checks. */
+  getSupportBaselineRowsFor(decisionId: string, supportId: string): SupportBaselineRow[] {
+    if (!this.hasSupportBaselinesTable()) return [];
+    return this.db
+      .prepare(
+        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
+         FROM support_baselines
+         WHERE decision_id = ? AND support_id = ? AND superseded_at IS NULL
+         ORDER BY confirmed_at, edge_key`
+      )
+      .all(decisionId, supportId) as SupportBaselineRow[];
   }
 
   getAllSupportBaselines(): SupportBaselineRow[] {
@@ -1446,11 +1490,38 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by
+                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
          FROM support_baselines
          ORDER BY decision_id, support_id, confirmed_at, edge_key`
       )
       .all() as SupportBaselineRow[];
+  }
+
+  /** F2: counts BEFORE any list is materialized (COUNT over the PK index). */
+  countSupportBaselines(decisionId: string): { active: number; superseded: number } {
+    if (!this.hasSupportBaselinesTable()) return { active: 0, superseded: 0 };
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN superseded_at IS NULL THEN 1 ELSE 0 END) AS active
+         FROM support_baselines WHERE decision_id = ?`
+      )
+      .get(decisionId) as { total: number; active: number | null };
+    const total = Number(row.total);
+    const active = Number(row.active ?? 0);
+    return { active, superseded: total - active };
+  }
+
+  /** F7: MAX(confirmed_at) over active rows; null when none are active. */
+  lastActiveBaselineAt(decisionId: string): string | null {
+    if (!this.hasSupportBaselinesTable()) return null;
+    const row = this.db
+      .prepare(
+        `SELECT MAX(confirmed_at) AS at FROM support_baselines
+         WHERE decision_id = ? AND superseded_at IS NULL`
+      )
+      .get(decisionId) as { at: string | null };
+    return row.at ?? null;
   }
 
   upsertSupportBaseline(row: SupportBaselineRow): void {
@@ -1458,35 +1529,44 @@ export class KnowledgeDB {
       .prepare(
         `INSERT INTO support_baselines
            (decision_id, support_id, edge_key, claim_digest, status_digest,
-            edge_digest, format_version, confirmed_at, confirmed_by)
+            edge_digest, format_version, confirmed_at, confirmed_by, superseded_at)
          VALUES (@decision_id, @support_id, @edge_key, @claim_digest, @status_digest,
-                 @edge_digest, @format_version, @confirmed_at, @confirmed_by)
+                 @edge_digest, @format_version, @confirmed_at, @confirmed_by, @superseded_at)
          ON CONFLICT(decision_id, support_id, edge_key) DO UPDATE SET
            claim_digest = excluded.claim_digest,
            status_digest = excluded.status_digest,
            edge_digest = excluded.edge_digest,
            format_version = excluded.format_version,
            confirmed_at = excluded.confirmed_at,
-           confirmed_by = excluded.confirmed_by`
+           confirmed_by = excluded.confirmed_by,
+           -- a fresh confirmation of the same pair un-supersedes it (F7)
+           superseded_at = NULL`
       )
-      .run(row as unknown as Record<string, unknown>);
+      .run({
+        ...(row as unknown as Record<string, unknown>),
+        superseded_at: row.superseded_at ?? null,
+      });
   }
 
   /**
-   * Overwrite the snapshot with an explicit "no supports" confirmation
-   * (plan-4-fixes-5): the empty confirm_supports is accepted only when the
-   * decision has zero live informed_by edges, so every row of the decision is
-   * a dead anchor whose "removed" signal the agent has just acknowledged —
-   * the rows go here and ONLY here. No other path deletes snapshot rows: no
-   * cascade on remove_concept, deletion hygiene or consolidate, and a
-   * confirmation of live supports never touches dead anchors (the
-   * "confirmed, then removed" fact survives until this explicit overwrite).
+   * Acknowledge the dead anchors with an explicit "no supports" confirmation
+   * (plan-4-fixes-5, changed by plan-4-fixes-6 F7): the empty confirm_supports
+   * is accepted only when the decision has zero live informed_by edges, so
+   * every active row of the decision is a dead anchor whose "removed" signal
+   * the agent has just acknowledged. The rows are NOT deleted — they are
+   * marked superseded_at, so "confirmed and later removed" stays
+   * distinguishable from "supports never existed". No other path touches
+   * dead anchors: no cascade on remove_concept, deletion hygiene or
+   * consolidate, and a confirmation of live supports never marks them.
    */
-  clearSupportBaselines(decisionId: string): number {
+  markSupportBaselinesSuperseded(decisionId: string, at: string): number {
     if (!this.hasSupportBaselinesTable()) return 0;
     const result = this.db
-      .prepare("DELETE FROM support_baselines WHERE decision_id = ?")
-      .run(decisionId);
+      .prepare(
+        `UPDATE support_baselines SET superseded_at = ?
+         WHERE decision_id = ? AND superseded_at IS NULL`
+      )
+      .run(at, decisionId);
     return Number(result.changes);
   }
 
@@ -1522,6 +1602,70 @@ export class KnowledgeDB {
     return this.db.prepare("SELECT * FROM edges WHERE id = ?").get(id) as
       | EdgeRow
       | undefined;
+  }
+
+  // ---- Budgeted support reads (plan-4-fixes-6 F2) ----
+  // The check must COUNT its work before doing it: a budget too small for the
+  // star must not pay for the star. Counts go over the indexes; rows come in
+  // deterministic pages whose total size the caller keeps within the budget.
+
+  /** Live informed_by support count of a node (ancestry direction). */
+  countLiveInformedByEdges(decisionId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM edges
+         WHERE from_id = ? AND relation = 'informed_by' AND removed_at IS NULL`
+      )
+      .get(decisionId) as { n: number };
+    return Number(row.n);
+  }
+
+  /**
+   * A deterministic page of live supports (ancestry), ordered by the
+   * support's id — the budget cuts the list, so the cut must be stable.
+   */
+  getLiveSupportEdgesPage(
+    decisionId: string,
+    offset: number,
+    limit: number
+  ): Array<EdgeRow & { other_id: string }> {
+    return this.db
+      .prepare(
+        `SELECT e.*, e.to_id AS other_id FROM edges e
+         WHERE e.from_id = ? AND e.relation = 'informed_by' AND e.removed_at IS NULL
+         ORDER BY e.to_id LIMIT ? OFFSET ?`
+      )
+      .all(decisionId, limit, offset) as Array<EdgeRow & { other_id: string }>;
+  }
+
+  /**
+   * A deterministic page of dead anchors: active snapshot rows whose support
+   * has no live informed_by edge left (node removed or edge tombstoned).
+   * One row per support — the latest confirmation wins.
+   */
+  getDeadBaselineSupportsPage(
+    decisionId: string,
+    offset: number,
+    limit: number
+  ): Array<{ support_id: string; confirmed_at: string }> {
+    if (!this.hasSupportBaselinesTable()) return [];
+    return this.db
+      .prepare(
+        `SELECT b.support_id, MAX(b.confirmed_at) AS confirmed_at
+         FROM support_baselines b
+         WHERE b.decision_id = ? AND b.superseded_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+             WHERE e.from_id = b.decision_id AND e.to_id = b.support_id
+               AND e.relation = 'informed_by' AND e.removed_at IS NULL
+           )
+         GROUP BY b.support_id
+         ORDER BY b.support_id LIMIT ? OFFSET ?`
+      )
+      .all(decisionId, limit, offset) as Array<{
+      support_id: string;
+      confirmed_at: string;
+    }>;
   }
 
   // ---- Query methods ----
@@ -2208,16 +2352,25 @@ export class KnowledgeDB {
     source_branch?: string | null;
     merge_timestamp?: string | null;
     removed_at?: string | null;
-  }): number {
+    // plan-4-fixes-6 (F9): edge provenance travels with the row — an origin
+    // lost in a merge would inflate the "unknown" bucket and drop the
+    // accepted/declined distinction. Sources without these columns (older
+    // dbs read raw) honestly become 'unknown'/null at the caller.
+    created_via?: string | null;
+    accepted_at?: string | null;
+  }): { id: number; inserted: boolean } {
     // Plan 1 §4.6: removed_at is carried over verbatim, otherwise a merge
     // would silently revive tombstoned edges. INSERT (not OR IGNORE-revive):
     // the raw merge path must preserve history exactly as it was on the
-    // source; callers filter duplicate pairs beforehand.
+    // source; callers filter duplicate pairs beforehand. `inserted` tells the
+    // two apart — lastInsertRowid alone is stale for an ignored insert.
     const stmt = this.db.prepare(`
       INSERT OR IGNORE INTO edges (from_id, to_id, relation, description, created_at,
-        merge_group, needs_merge, source_branch, merge_timestamp, removed_at)
+        merge_group, needs_merge, source_branch, merge_timestamp, removed_at,
+        created_via, accepted_at)
       VALUES (@from_id, @to_id, @relation, @description, @created_at,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp, @removed_at)
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp, @removed_at,
+        @created_via, @accepted_at)
     `);
     const result = stmt.run({
       from_id: edge.from_id,
@@ -2230,8 +2383,13 @@ export class KnowledgeDB {
       source_branch: edge.source_branch ?? null,
       merge_timestamp: edge.merge_timestamp ?? null,
       removed_at: edge.removed_at ?? null,
+      created_via: edge.created_via ?? "unknown",
+      accepted_at: edge.accepted_at ?? null,
     });
-    return Number(result.lastInsertRowid);
+    return {
+      id: Number(result.lastInsertRowid),
+      inserted: result.changes > 0,
+    };
   }
 
   // ---- Timeline Methods ----

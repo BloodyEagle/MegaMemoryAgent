@@ -580,6 +580,13 @@ export interface SupportBaselineRow {
   confirmed_at: string;
   /** 'agent' | 'import' | 'cli' — who confirmed; imports never confirm by themselves. */
   confirmed_by: string;
+  /**
+   * plan-4-fixes-6 F7: set ONLY by the explicit "no supports" confirmation —
+   * it acknowledges the dead anchors instead of erasing them, so "confirmed
+   * and later removed" stays distinguishable from "supports never existed".
+   * A fresh confirmation of the same pair clears the flag again.
+   */
+  superseded_at?: string | null;
 }
 
 /** Why a confirmed support no longer matches (plan 4 v8 §4). */
@@ -618,12 +625,25 @@ export interface SupportCheckView {
    * confirmation does not extend to the new wording (plan 4 v8 §1.2).
    */
   claim_changed?: boolean;
+  /**
+   * plan-4-fixes-6 F7: the snapshot holds superseded rows — this decision HAD
+   * confirmed supports that were later acknowledged as gone. Absent for a
+   * decision that never had any.
+   */
+  had_supports?: boolean;
 }
 
 export interface ConfirmSupportsItem {
   support_id: string;
   /** The support's summary digest as the agent read it. */
   expected_claim_digest: string;
+  /**
+   * The support's status-axes digest as the agent read it. plan-4-fixes-6 F3:
+   * mandatory in practice — a confirmation without it (or with a stale one)
+   * is refused with version_conflict; an agent must never confirm a status
+   * it has not seen.
+   */
+  expected_status_digest?: string;
   /** The rationale digest as the agent read it. */
   expected_edge_digest: string;
 }
@@ -725,6 +745,13 @@ export interface ProvenanceTraceOutput {
    * have long since drifted. Present whenever there is anything to check.
    */
   support_check?: SupportCheckView;
+  /**
+   * plan-4-fixes-6 F11: inner (non-root) nodes of any kind whose own support
+   * check ran out of the shared budget. Present only when > 0; the verdict
+   * also degrades completeness to "truncated" — an unverified inner node must
+   * not hide behind a clean-looking answer.
+   */
+  inner_nodes_incomplete?: number;
   limits: {
     depth: number;
     max_nodes: number;
