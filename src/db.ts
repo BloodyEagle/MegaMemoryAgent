@@ -2,11 +2,11 @@ import Database from "libsql";
 import path from "path";
 import fs from "fs";
 import { createHash } from "node:crypto";
-import type { NodeRow, EdgeRow } from "./types.js";
+import type { NodeRow, EdgeRow, SupportBaselineRow } from "./types.js";
 import { normalizeName } from "./norm.js";
 
-/** Plan 4 (informed_by provenance slice, schema v7). Exported for the doctor check. */
-export const SCHEMA_VERSION = 7;
+/** Plan 4 (informed_by provenance slice, schema v7); v8 adds support baselines. */
+export const SCHEMA_VERSION = 8;
 
 export class KnowledgeDB {
   private db: Database.Database;
@@ -126,6 +126,11 @@ export class KnowledgeDB {
             -- Plan 2 (v6): task board columns, NULL for non-task nodes.
             task_state TEXT,
             due_at TEXT,
+            -- Plan 4 (v8): the confirmed wording digest of the decision.
+            -- Written only by confirm_supports; content writes never touch it
+            -- (a mismatch against the current summary IS the signal).
+            claim_digest TEXT,
+            claim_digest_at TEXT,
             FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE SET NULL
           );
 
@@ -141,6 +146,14 @@ export class KnowledgeDB {
             source_branch TEXT,
             merge_timestamp TEXT,
             removed_at TEXT DEFAULT NULL,
+            -- Plan 4 (v8): which server write path created the row. Assigned
+            -- by the server, never accepted from the caller: link/evidence ->
+            -- 'agent', auto-derivation -> 'auto', pre-v8 rows and every
+            -- import/merge -> 'unknown' (the column default).
+            created_via TEXT NOT NULL DEFAULT 'unknown',
+            -- Plan 4 (v8): when the agent explicitly accepted an auto-derived
+            -- edge. A separate event: it never rewrites created_via.
+            accepted_at TEXT,
             FOREIGN KEY (from_id) REFERENCES nodes(id) ON DELETE CASCADE,
             FOREIGN KEY (to_id) REFERENCES nodes(id) ON DELETE CASCADE
           );
@@ -326,6 +339,57 @@ export class KnowledgeDB {
         `);
       }
 
+      if (currentVersion < 8) {
+        // Plan 4 (v8): support baselines — a snapshot of the justification,
+        // one row per confirmed pair "decision — support". Every step guarded
+        // by PRAGMA table_info so the migration is idempotent (fresh dbs
+        // already carry the columns from CREATE TABLE).
+        const ncols8 = new Set(
+          this.db.prepare("PRAGMA table_info(nodes)").all().map((c: any) => c.name)
+        );
+        if (!ncols8.has("claim_digest")) {
+          this.db.exec("ALTER TABLE nodes ADD COLUMN claim_digest TEXT");
+        }
+        if (!ncols8.has("claim_digest_at")) {
+          this.db.exec("ALTER TABLE nodes ADD COLUMN claim_digest_at TEXT");
+        }
+        const ecols8 = new Set(
+          this.db.prepare("PRAGMA table_info(edges)").all().map((c: any) => c.name)
+        );
+        if (!ecols8.has("created_via")) {
+          // NOT NULL DEFAULT 'unknown': pre-v8 rows (and every import) are
+          // honestly unknown — they must not inflate the "created by agent"
+          // metric (plan 4 v8 §1.3, test 16).
+          this.db.exec(
+            "ALTER TABLE edges ADD COLUMN created_via TEXT NOT NULL DEFAULT 'unknown'"
+          );
+        }
+        if (!ecols8.has("accepted_at")) {
+          this.db.exec("ALTER TABLE edges ADD COLUMN accepted_at TEXT");
+        }
+        // NO foreign keys and NO cascade on purpose: a baseline row survives
+        // the removal of the edge and of the support node — deletion hygiene
+        // must not destroy exactly the information this table exists to keep
+        // (plan 4 v8 §1.1, test 5: the row stays, the check reports "removed").
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS support_baselines (
+            decision_id     TEXT NOT NULL,
+            support_id      TEXT NOT NULL,
+            edge_key        TEXT NOT NULL,
+            claim_digest    TEXT NOT NULL,
+            status_digest   TEXT NOT NULL,
+            edge_digest     TEXT NOT NULL,
+            format_version  INTEGER NOT NULL,
+            confirmed_at    TEXT NOT NULL,
+            confirmed_by    TEXT NOT NULL,
+            PRIMARY KEY (decision_id, support_id, edge_key)
+          );
+          CREATE INDEX IF NOT EXISTS idx_baselines_decision
+            ON support_baselines(decision_id);
+          CREATE INDEX IF NOT EXISTS idx_edges_created_via ON edges(created_via);
+        `);
+      }
+
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       this.db.exec("COMMIT");
     } catch (err) {
@@ -431,7 +495,13 @@ export class KnowledgeDB {
       epistemic_status?: string | null;
       status_scope?: string | null;
     },
-    edges: Array<{ to_id: string; relation: string; description: string | null }>
+    edges: Array<{
+      to_id: string;
+      relation: string;
+      description: string | null;
+      /** Plan 4 (v8) §1.3: per-edge origin — evidence is 'agent', auto-ground is 'auto'. */
+      via?: "agent" | "auto" | "unknown";
+    }>
   ): void {
     this.runInTransaction(() => {
       this.insertNode({
@@ -460,6 +530,7 @@ export class KnowledgeDB {
             to_id: edge.to_id,
             relation: edge.relation,
             description: edge.description,
+            via: edge.via,
           });
         } else if (this.nodeExists(edge.to_id)) {
           this.insertEdge({
@@ -467,6 +538,7 @@ export class KnowledgeDB {
             to_id: edge.to_id,
             relation: edge.relation,
             description: edge.description,
+            via: edge.via,
           });
         }
       }
@@ -579,6 +651,14 @@ export class KnowledgeDB {
     to_id: string;
     relation: string;
     description?: string | null;
+    /**
+     * Plan 4 (v8) §1.3: which server write path creates the row. Assigned by
+     * the CALLING CODE PATH, never accepted from the MCP caller: 'agent' for
+     * explicit tool writes (link, evidence), 'auto' for server-derived edges
+     * (auto-ground), 'unknown' for everything else — the safe default, so an
+     * un-mapped path can never inflate the "created by agent" metric.
+     */
+    via?: "agent" | "auto" | "unknown";
   }): { id: number; inserted: boolean } {
     if (edge.relation === "informed_by") {
       return this.runInTransaction(() => {
@@ -781,6 +861,7 @@ export class KnowledgeDB {
     to_id: string;
     relation: string;
     description?: string | null;
+    via?: "agent" | "auto" | "unknown";
   }): { id: number; inserted: boolean } {
     // Plan 1 §4.4: idx_edges_unique(from_id,to_id,relation) does not know
     // about removed_at, so a re-link after a tombstone would be silently
@@ -796,6 +877,9 @@ export class KnowledgeDB {
 
     if (existing) {
       if (existing.removed_at !== null) {
+        // Revive keeps the original created_via: it is the same row coming
+        // back, not a new creation (plan 4 v8 §1.3 — the metric counts
+        // creations, and rewriting the origin would launder the history).
         this.db
           .prepare(
             "UPDATE edges SET removed_at = NULL, description = COALESCE(?, description) WHERE id = ?"
@@ -807,14 +891,15 @@ export class KnowledgeDB {
     }
 
     const stmt = this.db.prepare(`
-      INSERT INTO edges (from_id, to_id, relation, description)
-      VALUES (@from_id, @to_id, @relation, @description)
+      INSERT INTO edges (from_id, to_id, relation, description, created_via)
+      VALUES (@from_id, @to_id, @relation, @description, @created_via)
     `);
     const result = stmt.run({
       from_id: edge.from_id,
       to_id: edge.to_id,
       relation: edge.relation,
       description: edge.description ?? null,
+      created_via: edge.via ?? "unknown",
     });
     return {
       id: Number(result.lastInsertRowid),
@@ -1044,6 +1129,9 @@ export class KnowledgeDB {
           from_id: newId,
           to_id: oldId,
           relation: "supersedes",
+          // Reached only from create_concept(supersedes) — an explicit agent
+          // call (plan 4 v8 §1.3).
+          via: "agent",
         });
         this.setNodeStatus(
           oldId,
@@ -1323,6 +1411,126 @@ export class KnowledgeDB {
     }>;
   }
 
+  // ---- Support baselines (plan 4 v8) ----
+
+  /**
+   * The snapshot lives in its own table with NO foreign keys: rows survive
+   * node/edge removal on purpose (deletion hygiene must not destroy the
+   * divergence signal). Guard for reading a database opened by an older
+   * build — the v8 migration runs on open, but merge double-checks.
+   */
+  hasSupportBaselinesTable(): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_baselines'"
+        )
+        .get() !== undefined
+    );
+  }
+
+  getSupportBaselines(decisionId: string): SupportBaselineRow[] {
+    if (!this.hasSupportBaselinesTable()) return [];
+    return this.db
+      .prepare(
+        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                edge_digest, format_version, confirmed_at, confirmed_by
+         FROM support_baselines WHERE decision_id = ?
+         ORDER BY support_id, confirmed_at, edge_key`
+      )
+      .all(decisionId) as SupportBaselineRow[];
+  }
+
+  getAllSupportBaselines(): SupportBaselineRow[] {
+    if (!this.hasSupportBaselinesTable()) return [];
+    return this.db
+      .prepare(
+        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                edge_digest, format_version, confirmed_at, confirmed_by
+         FROM support_baselines
+         ORDER BY decision_id, support_id, confirmed_at, edge_key`
+      )
+      .all() as SupportBaselineRow[];
+  }
+
+  upsertSupportBaseline(row: SupportBaselineRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO support_baselines
+           (decision_id, support_id, edge_key, claim_digest, status_digest,
+            edge_digest, format_version, confirmed_at, confirmed_by)
+         VALUES (@decision_id, @support_id, @edge_key, @claim_digest, @status_digest,
+                 @edge_digest, @format_version, @confirmed_at, @confirmed_by)
+         ON CONFLICT(decision_id, support_id, edge_key) DO UPDATE SET
+           claim_digest = excluded.claim_digest,
+           status_digest = excluded.status_digest,
+           edge_digest = excluded.edge_digest,
+           format_version = excluded.format_version,
+           confirmed_at = excluded.confirmed_at,
+           confirmed_by = excluded.confirmed_by`
+      )
+      .run(row as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * Drop snapshot rows of a decision whose support no longer has a live
+   * informed_by edge (removed support, tombstoned edge). Called by
+   * confirm_supports: the agent confirming the current support set has seen
+   * the "removed" signal and accepted it, so the dead anchor must not keep
+   * reporting "removed" forever. Live pairs are never touched.
+   */
+  deleteDeadBaselineRows(decisionId: string): number {
+    if (!this.hasSupportBaselinesTable()) return 0;
+    const result = this.db
+      .prepare(
+        `DELETE FROM support_baselines
+         WHERE decision_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+             WHERE e.from_id = support_baselines.decision_id
+               AND e.to_id = support_baselines.support_id
+               AND e.relation = 'informed_by'
+               AND e.removed_at IS NULL
+           )`
+      )
+      .run(decisionId);
+    return Number(result.changes);
+  }
+
+  /**
+   * Plan 4 (v8) §1.2: record the confirmed wording of the decision. Written
+   * ONLY here (confirm_supports) — update_concept and every other content
+   * write leave it alone, so a later rewrite shows up as claim_changed.
+   */
+  setClaimDigest(id: string, digest: string, at: string): void {
+    this.db
+      .prepare("UPDATE nodes SET claim_digest = ?, claim_digest_at = ? WHERE id = ?")
+      .run(digest, at, id);
+  }
+
+  /**
+   * Plan 4 (v8) §1.3: the agent explicitly accepted auto-derived edges by
+   * confirming them. A separate event on a separate column — created_via is
+   * never rewritten (test 17). Idempotent: the first acceptance moment wins.
+   */
+  acceptEdges(edgeIds: number[], at: string): number {
+    if (edgeIds.length === 0) return 0;
+    let n = 0;
+    for (const id of edgeIds) {
+      const result = this.db
+        .prepare("UPDATE edges SET accepted_at = ? WHERE id = ? AND accepted_at IS NULL")
+        .run(at, id);
+      n += Number(result.changes);
+    }
+    return n;
+  }
+
+  getEdgeById(id: number): EdgeRow | undefined {
+    return this.db.prepare("SELECT * FROM edges WHERE id = ?").get(id) as
+      | EdgeRow
+      | undefined;
+  }
+
   // ---- Query methods ----
 
   getChildren(parentId: string): NodeRow[] {
@@ -1513,6 +1721,8 @@ export class KnowledgeDB {
           to_id: previous,
           relation: "supersedes",
           description: `slot ${role}: handoff`,
+          // slot_set is an explicit agent call (plan 4 v8 §1.3).
+          via: "agent",
         });
       }
       this.db
@@ -1797,10 +2007,14 @@ export class KnowledgeDB {
   }
 
   renameNodeId(oldId: string, newId: string): boolean {
-    // Temporarily disable foreign keys for the rename operation,
-    // since self-referencing FKs (parent_id → id) would block the update.
-    // Wrapped in a transaction so all 4 updates succeed or none do.
-    this.db.pragma("foreign_keys = OFF");
+    // FK checks are DEFERRED to COMMIT instead of pragma foreign_keys=OFF:
+    // the pragma is a no-op inside a transaction, and renameNodeId is also
+    // called from inside one (resolveConflict) — where the old approach
+    // left enforcement on and the rename of a node that edges still
+    // reference failed with "FOREIGN KEY constraint failed". All the
+    // updates below run in one transaction, so the graph is consistent
+    // again by the time the deferral is checked.
+    this.db.pragma("defer_foreign_keys = ON");
     try {
       let changed = false;
       this.runInTransaction(() => {
@@ -1821,11 +2035,27 @@ export class KnowledgeDB {
           this.db
             .prepare("UPDATE edges SET to_id = @newId WHERE to_id = @oldId")
             .run({ oldId, newId });
+          // Plan 4 (v8) §7: a technical id remap carries the snapshot keys
+          // along — the snapshot content itself is not touched. OR IGNORE:
+          // a pathological pre-existing row under the new id must not break
+          // the rename.
+          if (this.hasSupportBaselinesTable()) {
+            this.db
+              .prepare(
+                "UPDATE OR IGNORE support_baselines SET decision_id = @newId WHERE decision_id = @oldId"
+              )
+              .run({ oldId, newId });
+            this.db
+              .prepare(
+                "UPDATE OR IGNORE support_baselines SET support_id = @newId WHERE support_id = @oldId"
+              )
+              .run({ oldId, newId });
+          }
         }
       });
       return changed;
     } finally {
-      this.db.pragma("foreign_keys = ON");
+      this.db.pragma("defer_foreign_keys = OFF");
     }
   }
 
@@ -1873,6 +2103,17 @@ export class KnowledgeDB {
     return this._hasEpistemicColumns;
   }
 
+  /** Plan 4 (v8) claim-confirmation columns; false only on pre-v8 dbs. */
+  private _hasClaimColumns: boolean | undefined;
+
+  private get hasClaimColumns(): boolean {
+    if (this._hasClaimColumns === undefined) {
+      const cols = this.db.pragma("table_info(nodes)") as Array<{ name: string }>;
+      this._hasClaimColumns = cols.some((c) => c.name === "claim_digest");
+    }
+    return this._hasClaimColumns;
+  }
+
   insertNodeRaw(node: {
     id: string;
     name: string;
@@ -1898,6 +2139,10 @@ export class KnowledgeDB {
     // Plan 1 (v5): epistemic axis — preserved across branch merges.
     epistemic_status?: string | null;
     status_scope?: string | null;
+    // Plan 4 (v8): the confirmed wording digest — preserved across merges so
+    // a carried-over snapshot keeps pointing at the wording it confirmed.
+    claim_digest?: string | null;
+    claim_digest_at?: string | null;
   }): void {
     // Б10: fork columns exist only on migrated dbs — compose the column
     // list conditionally so upstream dbs keep working.
@@ -1913,13 +2158,15 @@ export class KnowledgeDB {
     const epiParams = this.hasEpistemicColumns
       ? ", @epistemic_status, @status_scope"
       : "";
+    const claimCols = this.hasClaimColumns ? ", claim_digest, claim_digest_at" : "";
+    const claimParams = this.hasClaimColumns ? ", @claim_digest, @claim_digest_at" : "";
     const stmt = this.db.prepare(`
       INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task,
         created_at, updated_at, removed_at, removed_reason, embedding,
-        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols})
+        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols})
       VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task,
         @created_at, @updated_at, @removed_at, @removed_reason, @embedding,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams})
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams})
     `);
     const values: Record<string, unknown> = {
       id: node.id,
@@ -1948,6 +2195,10 @@ export class KnowledgeDB {
     if (this.hasEpistemicColumns) {
       values.epistemic_status = (node as { epistemic_status?: string | null }).epistemic_status ?? null;
       values.status_scope = (node as { status_scope?: string | null }).status_scope ?? null;
+    }
+    if (this.hasClaimColumns) {
+      values.claim_digest = (node as { claim_digest?: string | null }).claim_digest ?? null;
+      values.claim_digest_at = (node as { claim_digest_at?: string | null }).claim_digest_at ?? null;
     }
     stmt.run(values);
     this.syncNameNorm(node.id, node.name);

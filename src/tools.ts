@@ -37,6 +37,16 @@ import {
   isUngrounded,
   resolveFileRef,
 } from "./provenance.js";
+import {
+  BASELINE_FORMAT_VERSION,
+  CheckBudget,
+  DEFAULT_MAX_CHECK_BYTES,
+  DEFAULT_MAX_CHECK_EDGES,
+  claimDigestOf,
+  computeSupportCheck,
+  edgeDigestOf,
+  statusDigestOf,
+} from "./support-baselines.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
   const errorMsg = err instanceof Error ? err.message : String(err);
@@ -160,7 +170,8 @@ export function validateEpistemicTransition(
 export function buildNodeWithContext(
   db: KnowledgeDB,
   node: NodeRow,
-  similarity?: number
+  similarity?: number,
+  opts?: { withSupportCheck?: boolean }
 ): NodeWithContext {
   const children = db.getChildren(node.id).map((c) => ({
     id: c.id,
@@ -226,6 +237,18 @@ export function buildNodeWithContext(
     informedByEntries.length > 0 &&
     informedByEntries.every((e) => e.weak === true);
 
+  // Plan 4 v8 §4: the support check travels on the node card NEXT TO the
+  // epistemic verdict — otherwise "verified" keeps meaning "was validated
+  // once, nobody knows about the supports". Opt-in: search results (compact
+  // and full) must not pay for it; get_concept turns it on.
+  const supportCheck = opts?.withSupportCheck
+    ? computeSupportCheck(
+        db,
+        node.id,
+        new CheckBudget(DEFAULT_MAX_CHECK_EDGES, DEFAULT_MAX_CHECK_BYTES)
+      )
+    : undefined;
+
   return {
     id: node.id,
     name: node.name,
@@ -269,6 +292,7 @@ export function buildNodeWithContext(
         }
       : {}),
     ...(weakSupport ? { weak_support: true } : {}),
+    ...(supportCheck ? { support_check: supportCheck } : {}),
   };
 }
 
@@ -520,7 +544,7 @@ export function getConcept(
   if (!node) {
     throw new Error(`Concept "${input.id}" not found.`);
   }
-  const ctx = buildNodeWithContext(db, node);
+  const ctx = buildNodeWithContext(db, node, undefined, { withSupportCheck: true });
   const payload = JSON.stringify(ctx);
   db.insertUsage({
     tool: "get_concept",
@@ -713,6 +737,17 @@ export async function createConcept(
     throw new Error(REQUIRE_SUPPORT_MESSAGE);
   }
 
+  // Plan 4 v8 §2.1: the supports this same call may confirm (evidence and
+  // explicit informed_by edges — content the agent passed right here; NOT the
+  // auto-grounded ones). Empty for a plain create.
+  const confirmableSupportIds = new Set<string>();
+  for (const s of supports) {
+    if (!s.fromAutoGround) confirmableSupportIds.add(s.toId);
+  }
+  for (const e of input.edges ?? []) {
+    if (e.relation === "informed_by") confirmableSupportIds.add(e.to);
+  }
+
   // Embeddings for the file-fact nodes (computed before the transaction).
   for (const fact of factNodesToCreate) {
     fact.embedding = await embedForStorage(
@@ -757,14 +792,49 @@ export async function createConcept(
           to_id: edge.to,
           relation: edge.relation,
           description: edge.description ?? null,
+          // Plan 4 v8 §1.3: an explicit agent call -> 'agent'.
+          via: "agent" as const,
         })),
         ...supports.map((s) => ({
           to_id: s.toId,
           relation: "informed_by",
           description: s.why,
+          // Evidence was passed by the agent in this call -> 'agent';
+          // auto-ground is the server's own derivation -> 'auto' (F19:
+          // server-invented edges must not masquerade as agent-declared).
+          via: (s.fromAutoGround ? "auto" : "agent") as "agent" | "auto",
         })),
       ]
     );
+
+    // Plan 4 v8 §2.1 (the single carve-out from "a mutation never confirms"):
+    // create_concept with evidence may confirm the very versions it passed in
+    // the same call — the agent has just written/read them. Auto-grounded
+    // supports are NOT confirmed: the server invented them, and a snapshot
+    // written by the server would be self-confirmation. informed_by edges
+    // from input.edges are agent-written rationales in the same call — same
+    // treatment as evidence. Everything else stays `unknown` until an
+    // explicit confirm_supports.
+    if (confirmableSupportIds.size > 0) {
+      const now = new Date().toISOString();
+      db.setClaimDigest(id, claimDigestOf(input.summary), now);
+      for (const e of db.getInformedByEdges(id, "ancestry", false)) {
+        if (!confirmableSupportIds.has(e.other_id)) continue;
+        const support = db.getNode(e.other_id);
+        if (!support) continue;
+        db.upsertSupportBaseline({
+          decision_id: id,
+          support_id: e.other_id,
+          edge_key: String(e.id),
+          claim_digest: claimDigestOf(support.summary),
+          status_digest: statusDigestOf(support.status, support.epistemic_status),
+          edge_digest: edgeDigestOf(e.description),
+          format_version: BASELINE_FORMAT_VERSION,
+          confirmed_at: now,
+          confirmed_by: "agent",
+        });
+      }
+    }
   });
   if (embedding) {
     // В17: keep the native vector copy in sync.
@@ -805,10 +875,14 @@ export async function createConcept(
   const autoNote = autoGrounded
     ? ` Добавил опор по file_refs: ${supports.filter((s) => s.fromAutoGround).length}, поправь если не то.`
     : "";
+  const confirmNote =
+    confirmableSupportIds.size > 0
+      ? ` Снимок обоснования записан: подтверждено опор ${confirmableSupportIds.size} (изменение опор теперь видно через provenance_trace).`
+      : "";
 
   return {
     id,
-    message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}`,
+    message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}${confirmNote}`,
   };
 }
 
@@ -902,6 +976,9 @@ export function link(
     to_id: input.to,
     relation: input.relation,
     description: input.description,
+    // Plan 4 v8 §1.3: explicit tool call -> 'agent'. The link itself never
+    // confirms anything (§2: a mutation does not confirm).
+    via: "agent",
   });
 
   if (!inserted) {

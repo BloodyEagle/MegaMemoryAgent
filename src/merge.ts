@@ -462,6 +462,15 @@ export class MergeEngine {
       });
     }
 
+    // ---- Plan 4 (v8) §7: carry the support snapshots over ----
+    // After every edge row exists in the output, so edge_key can be remapped
+    // to the new rowids. Left side first, then right (deterministic).
+    const carriedLeft = this.carrySupportBaselines(leftDb, outputDb, "left", idRemapping);
+    const carriedRight = this.carrySupportBaselines(rightDb, outputDb, "right", idRemapping);
+    if (carriedLeft + carriedRight > 0) {
+      result.baselinesCarried = carriedLeft + carriedRight;
+    }
+
     // ---- PASS 3: re-validate the informed_by DAG over the combined graph ----
     // Plan 3 §2 (invariants 2, 3): two individually-acyclic inputs can form a
     // cycle in their union. A cycle brought in by a merge does NOT abort the
@@ -514,6 +523,10 @@ export class MergeEngine {
       // Plan 1 (v5): epistemic axis travels with the row.
       epistemic_status: node.epistemic_status ?? null,
       status_scope: node.status_scope ?? null,
+      // Plan 4 (v8): the confirmed wording digest travels with the row so a
+      // carried-over snapshot keeps pointing at the wording it confirmed.
+      claim_digest: node.claim_digest ?? null,
+      claim_digest_at: node.claim_digest_at ?? null,
     });
   }
 
@@ -550,7 +563,80 @@ export class MergeEngine {
       // Plan 1 (v5): epistemic axis travels with the row.
       epistemic_status: node.epistemic_status ?? null,
       status_scope: node.status_scope ?? null,
+      // Plan 4 (v8): confirmed wording digest travels with the row.
+      claim_digest: node.claim_digest ?? null,
+      claim_digest_at: node.claim_digest_at ?? null,
     });
+  }
+
+  /**
+   * Plan 4 (v8) §7: carry the support snapshot over with the decision.
+   * - ids are remapped consistently with the graph (suffixed conflict copies
+   *   get the snapshots of their own side);
+   * - edge_key is recomputed to the output rowid (§1.1: edge identity is
+   *   edges.id, which merge necessarily renumbers);
+   * - the saved CONTENT (digests, format_version, confirmed_at) is carried
+   *   verbatim — a remap must not replace the stored digests with current
+   *   values, otherwise a clean remap would produce mass false "changed"
+   *   (test 15) and a real divergence could hide;
+   * - confirmed_by is rewritten to 'import' (§7): the import never confirms
+   *   by itself, and a row that came through a merge must be distinguishable
+   *   from one the agent confirmed in this database.
+   * When the edge did not survive the merge (dropped live edge onto a removed
+   * node) the row is still carried with the source edge_key: the pair then
+   * reports "removed" instead of silently losing the anchor.
+   */
+  private carrySupportBaselines(
+    sourceDb: KnowledgeDB,
+    outputDb: KnowledgeDB,
+    side: "left" | "right",
+    idRemapping: Map<string, string>
+  ): number {
+    if (!sourceDb.hasSupportBaselinesTable() || !outputDb.hasSupportBaselinesTable()) {
+      return 0;
+    }
+    const resolve = (id: string): string | null => {
+      if (outputDb.getNodeIncludingRemoved(id)) return id;
+      const canonical = stripMergeSuffix(id);
+      const remapped = idRemapping.get(`${side}:${canonical}`);
+      if (remapped && outputDb.getNodeIncludingRemoved(remapped)) return remapped;
+      if (canonical !== id && outputDb.getNodeIncludingRemoved(canonical)) return canonical;
+      return null;
+    };
+    let carried = 0;
+    for (const row of sourceDb.getAllSupportBaselines()) {
+      const decisionId = resolve(row.decision_id);
+      const supportId = resolve(row.support_id);
+      if (!decisionId || !supportId) continue; // an endpoint did not survive
+      const edge = outputDb.execSqlFirst(
+        `SELECT id FROM edges WHERE from_id = ? AND to_id = ? AND relation = 'informed_by'
+         ORDER BY id LIMIT 1`,
+        decisionId,
+        supportId
+      ) as { id: number } | undefined;
+      const edgeKey = edge ? String(edge.id) : row.edge_key;
+      const exists = outputDb.execSqlFirst(
+        `SELECT 1 FROM support_baselines
+         WHERE decision_id = ? AND support_id = ? AND edge_key = ?`,
+        decisionId,
+        supportId,
+        edgeKey
+      );
+      if (exists) continue; // left side already carried this pair — left first
+      outputDb.upsertSupportBaseline({
+        decision_id: decisionId,
+        support_id: supportId,
+        edge_key: edgeKey,
+        claim_digest: row.claim_digest,
+        status_digest: row.status_digest,
+        edge_digest: row.edge_digest,
+        format_version: row.format_version,
+        confirmed_at: row.confirmed_at,
+        confirmed_by: "import",
+      });
+      carried++;
+    }
+    return carried;
   }
 
   /**

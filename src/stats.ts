@@ -177,6 +177,26 @@ export async function runStats(args: string[]): Promise<void> {
         printRow("Top query", `"${tq.query.slice(0, 40)}"`, `${formatNumber(tq.n)}x`);
       }
     }
+
+    // Plan 4 v8 §8: four different numbers — none of them measures reasoning
+    // quality, and none may be substituted for another in reports.
+    const { provenanceMetrics, CheckBudget } = await import("./support-baselines.js");
+    const prov = provenanceMetrics(db, new CheckBudget(50000, 20_000_000));
+    console.log();
+    console.log(`  ${pc.bold("Provenance")}`);
+    printRow(
+      "Edges by origin",
+      `agent ${formatNumber(prov.edges_by_origin.agent)}, auto ${formatNumber(prov.edges_by_origin.auto)}, unknown ${formatNumber(prov.edges_by_origin.unknown)}`
+    );
+    printRow("Edges accepted", formatNumber(prov.edges_accepted), "explicitly accepted auto edges");
+    printRow("Decisions w/ support", formatNumber(prov.decisions_with_live_support));
+    printRow(
+      "Snapshot check",
+      `unchanged ${formatNumber(prov.decisions_by_check_state.unchanged)}, changed ${formatNumber(prov.decisions_by_check_state.changed)}, unknown ${formatNumber(prov.decisions_by_check_state.unknown)}, incomplete ${formatNumber(prov.decisions_by_check_state.incomplete)}`
+    );
+    if (prov.metrics_truncated) {
+      printRow("Note", "metrics truncated by budget — counts are lower estimates");
+    }
   } finally {
     db.close();
   }

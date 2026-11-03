@@ -10,7 +10,14 @@ import type {
   ProvenanceNodeView,
   ProvenanceEdgeView,
   ProvenanceWeakLink,
+  SupportCheckView,
 } from "./types.js";
+import {
+  CheckBudget,
+  DEFAULT_MAX_CHECK_BYTES,
+  DEFAULT_MAX_CHECK_EDGES,
+  computeSupportCheck,
+} from "./support-baselines.js";
 
 // ---- Config flags (plan 3 §4.1.3, §11) ----
 
@@ -174,6 +181,10 @@ const DEFAULT_MAX_SCAN_NODES = 5000;
 const MAX_DEPTH_LIMIT = 100000;
 const MAX_NODES_LIMIT = 100000;
 const MAX_SCAN_NODES_LIMIT = 1000000;
+// Plan 4 v8 §6: the support-baseline check budget — edges and bytes, not
+// only nodes. Defaults live in support-baselines.ts (§6: 5000 / 2 MB).
+const MAX_CHECK_EDGES_LIMIT = 1000000;
+const MAX_CHECK_BYTES_LIMIT = 100_000_000;
 const RATIONALE_TRIM = 80;
 /** Cap for the path counting — capped values are flagged, not silent (F7). */
 const PATH_COUNT_CAP = 100000;
@@ -215,6 +226,8 @@ interface ValidatedLimits {
   depth: number;
   maxNodes: number;
   maxScanNodes: number;
+  maxCheckEdges: number;
+  maxCheckBytes: number;
 }
 
 /**
@@ -244,7 +257,40 @@ function validateLimits(input: ProvenanceTraceInput): ValidatedLimits {
       1,
       MAX_SCAN_NODES_LIMIT
     ),
+    maxCheckEdges: check(
+      "max_check_edges",
+      input.max_check_edges ?? DEFAULT_MAX_CHECK_EDGES,
+      1,
+      MAX_CHECK_EDGES_LIMIT
+    ),
+    maxCheckBytes: check(
+      "max_check_bytes",
+      input.max_check_bytes ?? DEFAULT_MAX_CHECK_BYTES,
+      1,
+      MAX_CHECK_BYTES_LIMIT
+    ),
   };
+}
+
+/**
+ * Plan 4 v8 §6: one shared check budget per read call, with a per-node cache
+ * — the same node's snapshot is compared once even though both the weak-links
+ * block and the per-node support_check block need it.
+ */
+class SupportChecker {
+  private cache = new Map<string, SupportCheckView | null>();
+
+  constructor(
+    private db: KnowledgeDB,
+    readonly budget: CheckBudget
+  ) {}
+
+  check(nodeId: string): SupportCheckView | null {
+    if (!this.cache.has(nodeId)) {
+      this.cache.set(nodeId, computeSupportCheck(this.db, nodeId, this.budget));
+    }
+    return this.cache.get(nodeId)!;
+  }
 }
 
 interface TraverseResult {
@@ -625,17 +671,21 @@ function weakLinksJsonSize(list: ProvenanceWeakLink[]): number {
   return size;
 }
 
-/** D2.4 keep order: antiknowledge first, service records last. */
+/** D2.4 keep order: antiknowledge first, service records last. Plan 4 v8 §4
+ * puts the support-baseline verdicts right after the cycles: a decision whose
+ * confirmed snapshot no longer matches is as dangerous as a cycle. */
 const WEAK_LINK_PRIORITY: Record<ProvenanceWeakLink["type"], number> = {
   refuted: 0,
   abandoned: 1,
   cycle: 2,
-  missing_support: 3,
-  no_support: 4,
-  ungrounded_support: 5,
-  no_rationale: 6,
-  support_check_truncated: 7,
-  weak_links_truncated: 8,
+  support_changed: 3,
+  support_unreviewed: 4,
+  missing_support: 5,
+  no_support: 6,
+  ungrounded_support: 7,
+  no_rationale: 8,
+  support_check_truncated: 9,
+  weak_links_truncated: 10,
 };
 
 /**
@@ -643,14 +693,21 @@ const WEAK_LINK_PRIORITY: Record<ProvenanceWeakLink["type"], number> = {
  * (ties keep construction order — the sort is stable), then append ONE
  * weak_links_truncated marker with shown/total. Dropping warnings silently is
  * not allowed; a record that does not fit is skipped, shorter ones after it
- * may still make the cut.
+ * may still make the cut. Plan 4 v8 §4: the priority orders the cut, it does
+ * not suppress — the marker also carries the per-reason counts over ALL
+ * produced records, so a cut never hides how many of each kind existed.
  */
 function capWeakLinks(weak: ProvenanceWeakLink[]): ProvenanceWeakLink[] {
   if (weakLinksJsonSize(weak) <= WEAK_LINKS_JSON_LIMIT) return weak;
+  const reasonCounts: Record<string, number> = {};
+  for (const w of weak) {
+    reasonCounts[w.type] = (reasonCounts[w.type] ?? 0) + 1;
+  }
   const markerFor = (shown: number): ProvenanceWeakLink => ({
     type: "weak_links_truncated",
     shown,
     total: weak.length,
+    reason_counts: reasonCounts,
   });
   const byPriority = weak
     .map((w, i) => ({ w, i }))
@@ -674,7 +731,8 @@ function weakLinks(
   result: TraverseResult,
   direction: "ancestry" | "impact",
   retrospective: boolean,
-  maxScanSupports: number
+  maxScanSupports: number,
+  checker: SupportChecker
 ): ProvenanceWeakLink[] {
   const weak: ProvenanceWeakLink[] = [];
 
@@ -766,12 +824,73 @@ function weakLinks(
       .map((e) => e.other_id)
       .sort(compareIds); // deterministic pick when the budget cuts the list
     if (supports.length === 0) {
-      weak.push({
-        type: "no_support",
-        id: n.id,
-        note: clampNote(`решение "${n.id}" не имеет ни одной опоры`),
-      });
+      // Plan 4 v8 §2.1: an explicit "confirmed: no supports" snapshot is a
+      // valid state — the warning fires only when the decision was never
+      // confirmed as supportless.
+      const decision = db.getNode(n.id);
+      if (!decision?.claim_digest) {
+        weak.push({
+          type: "no_support",
+          id: n.id,
+          note: clampNote(`решение "${n.id}" не имеет ни одной опоры`),
+        });
+      }
       continue;
+    }
+    // Plan 4 v8 §3/§4: `unknown` and `incomplete` are not cleanliness — the
+    // verdict of the support-baseline check travels as a weak link too, so
+    // an unreviewed decision is never silently treated as verified.
+    const check = checker.check(n.id);
+    if (check && check.state === "changed") {
+      const changed = check.changed ?? [];
+      const changedTotal = check.changed_count ?? changed.length;
+      const reasonCounts: Record<string, number> = {};
+      for (const c of changed) {
+        for (const r of c.reasons) reasonCounts[r] = (reasonCounts[r] ?? 0) + 1;
+      }
+      if (check.claim_changed) reasonCounts["claim"] = (reasonCounts["claim"] ?? 0) + 1;
+      const detail = changed
+        .slice(0, NOTE_SAMPLE)
+        .map((c) => `${c.support}(${c.reasons.join("+")})`)
+        .join(", ");
+      const tail =
+        changedTotal > changed.length
+          ? ""
+          : changedTotal > NOTE_SAMPLE
+            ? ` … и ещё ${changedTotal - NOTE_SAMPLE}`
+            : "";
+      weak.push({
+        type: "support_changed",
+        id: n.id,
+        count: changedTotal,
+        sample: changed.slice(0, NOTE_SAMPLE).map((c) => c.support),
+        note: clampNote(
+          `опоры решения "${n.id}" разошлись с подтверждённым снимком (${changedTotal}` +
+            `${Object.keys(reasonCounts).length > 0 ? `: ${Object.entries(reasonCounts).map(([r, c]) => `${r} ${c}`).join(", ")}` : ""})` +
+            `${detail ? `: ${detail}` : ""}${tail}; baseline ${check.baseline_at ?? "—"}`
+        ),
+      });
+    } else if (check && check.state === "unknown") {
+      weak.push({
+        type: "support_unreviewed",
+        id: n.id,
+        count: check.unknown_count ?? check.unknown?.length ?? 0,
+        note: clampNote(
+          `решение "${n.id}" не подтверждено снимком (support_check: unknown` +
+            `${check.unknown_count ?? check.unknown?.length ? `, не покрыто опор: ${check.unknown_count ?? check.unknown?.length}` : ""}) — ` +
+            `проверка не считается чистотой, вызови confirm_supports после сверки`
+        ),
+      });
+    } else if (check && check.state === "incomplete") {
+      weak.push({
+        type: "support_unreviewed",
+        id: n.id,
+        count: check.unknown_count ?? check.unknown?.length ?? 0,
+        note: clampNote(
+          `проверка опор решения "${n.id}" оборвана бюджетом (support_check: incomplete) — ` +
+            `вердикт «не изменилось» не выдаётся, увеличь max_check_edges/max_check_bytes`
+        ),
+      });
     }
     const checkedCount = Math.min(supports.length, supportBudget);
     supportBudget -= checkedCount;
@@ -895,9 +1014,15 @@ function completenessVerdict(
  *    exceeds 300 chars (long id lists become "count + первые 5 … и ещё N",
  *    with numeric count/sample fields), and the serialized weak_links array
  *    never exceeds 8 KB — when it would, records are kept by priority
- *    (refuted → abandoned → cycle → missing_support → no_support →
- *    ungrounded_support → no_rationale → support_check_truncated) and one
- *    weak_links_truncated marker reports shown/total.
+ *    (plan 4 v8 §4: refuted → abandoned → cycle → support_changed →
+ *    support_unreviewed → missing_support → no_support → ungrounded_support →
+ *    no_rationale → markers) and one weak_links_truncated marker reports
+ *    shown/total plus the per-reason counts over all produced records.
+ * 7. Plan 4 v8: the root carries a support_check block (any state) whenever
+ *    there is anything to check; inner nodes carry theirs when the state is
+ *    `changed` (§5). `unknown`/`incomplete` are not cleanliness; the check is
+ *    bounded by max_check_edges/max_check_bytes (§6) and READS NEVER WRITE a
+ *    snapshot (§2.2) — confirmation is confirm_supports' job only.
  */
 export function provenanceTrace(
   db: KnowledgeDB,
@@ -913,8 +1038,28 @@ export function provenanceTrace(
   return db.runInTransaction(() => {
     const root = rootHeader(db, input.node_id); // not-found throws here
     const result = traverse(db, input.node_id, direction, limits, retrospective);
-    const weak = weakLinks(db, result, direction, retrospective, limits.maxScanNodes);
+    // Plan 4 v8 §6: one shared edge/byte budget for every support check of
+    // this call; §2.2 — reads only compare, they never write a snapshot.
+    const checker = new SupportChecker(
+      db,
+      new CheckBudget(limits.maxCheckEdges, limits.maxCheckBytes)
+    );
+    const weak = weakLinks(db, result, direction, retrospective, limits.maxScanNodes, checker);
     const completeness = completenessVerdict(db, input.node_id, result);
+
+    // Plan 4 v8 §4: the root's support check travels with the verdict —
+    // present whenever there is anything to check (any state).
+    const rootCheck = checker.check(input.node_id);
+
+    // Plan 4 v8 §5: the check runs at every level — a fact can have its own
+    // justification. A local divergence travels together with the dependency
+    // path (state = changed only: clean and unreviewed nodes keep the answer
+    // small; the root above carries its verdict whatever it is).
+    for (const n of result.nodes) {
+      if (n.id === input.node_id || n.removed) continue;
+      const view = checker.check(n.id);
+      if (view && view.state === "changed") n.support_check = view;
+    }
 
     return {
       root,
@@ -922,10 +1067,13 @@ export function provenanceTrace(
       weak_links: weak,
       nodes: result.nodes,
       edges: result.edges,
+      ...(rootCheck ? { support_check: rootCheck } : {}),
       limits: {
         depth: limits.depth,
         max_nodes: limits.maxNodes,
         max_scan_nodes: limits.maxScanNodes,
+        max_check_edges: limits.maxCheckEdges,
+        max_check_bytes: limits.maxCheckBytes,
       },
       shown: result.shown,
       total_within_depth: result.totalWithinDepth,
@@ -938,6 +1086,8 @@ export function provenanceTrace(
         max_nodes: limits.maxNodes,
         max_scan_nodes: limits.maxScanNodes,
         retrospective,
+        max_check_edges: limits.maxCheckEdges,
+        max_check_bytes: limits.maxCheckBytes,
       },
     };
   });

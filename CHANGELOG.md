@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased (схема v8)
+
+### Снимок обоснования: support_baselines (план 4 v8)
+
+- **`confirm_supports`** — отдельный вызов подтверждения опор: агент передаёт
+  digest'ы прочитанных формулировок (`expected_claim_digest` решения +
+  per-опорные `expected_claim_digest`/`expected_edge_digest`); любое
+  расхождение с текущим состоянием — отказ `version_conflict`, ничего не
+  записывается. Пустой `items` = подтверждение «опор нет» — валидное
+  состояние, отличное от «не проверялось».
+- **`support_check`** в `provenance_trace` (корень — всегда, внутренние узлы
+  при `changed`) и на карточке `get_concept`: `unchanged` / `changed`
+  (причины per опоры: `summary` | `status` | `rationale` | `removed`) /
+  `unknown` / `incomplete` + `baseline_at` и `claim_changed`. `unknown` и
+  `incomplete` чистотой не считаются — решение без снимка не показывается как
+  проверенное.
+- **Ни одна мутация не подтверждает**: link/update_concept/remove/merge/
+  consolidate не пишут и не обновляют снимок. Единственное исключение —
+  `create_concept` с `evidence` подтверждает версии, переданные в том же
+  вызове (автовывод — нет). Чтения ничего не пишут.
+- **Схема v8** (`user_version` 7→8, аддитивно): таблица `support_baselines`
+  (строка на подтверждённую пару «решение — опора», БЕЗ каскадов — строка
+  переживает удаление ребра и опоры, сигнал `removed` сохраняется),
+  `nodes.claim_digest`/`claim_digest_at` (пишутся только подтверждением),
+  `edges.created_via` (`agent`/`auto`/`unknown`, назначается серверным путём
+  записи, от вызывающего не принимается; импорт и до-миграционные строки —
+  честный `unknown`) и `edges.accepted_at` (явное принятие авто-ребра,
+  `created_via` не переписывает).
+- **Digest'ы**: `sha256("v1\n" + payload)`; payload саммари — только обрезание
+  краёв и CRLF→LF, без внутренней нормализации («a  b» ≠ «a b»); у
+  жизненного/эпистемического статуса опоры — свой `status_digest`, поэтому
+  причины `summary` и `status` различимы по отдельности.
+- **Бюджеты проверки**: `max_check_edges` (по умолчанию 5000) и
+  `max_check_bytes` (по умолчанию 2 МБ) на вызов; при исчерпании —
+  `incomplete`, вердикт `unchanged` не выдаётся. Списки id в выдаче
+  ограничены (50 + честный итог).
+- **weak_links**: новые записи `support_changed` и `support_unreviewed`;
+  порядок приоритета — refuted → abandoned → cycle → support_changed →
+  support_unreviewed → missing_support → no_support → ungrounded_support →
+  no_rationale; маркер усечения несёт счётчики причин по всем порождённым
+  записям.
+- **Merge/импорт**: снимки переносятся вместе с решением, remap id и edge_key
+  согласован, содержимое снимка не заменяется текущим; `confirmed_by`
+  переписывается в `import`. renameNodeId (repair-ids, resolve_conflict)
+  переносит ключи снимка; FK при переименовании переведены на
+  `defer_foreign_keys` — rename узла с входящими рёбрами внутри внешней
+  транзакции больше не падает.
+- **Метрики** (CLI `megamemory stats`, секция Provenance): рёбра по
+  происхождению (`created_via`), явно принятые (`accepted_at`), решения с
+  живой опорой, решения по состоянию снимка — четыре разных числа, ни одно
+  не подменяет другое.
+
 ## Fork (2.0.0-fork.1)
 
 Мажор: схема v7, обязательные рационалы у опор, изменение поведения merge и

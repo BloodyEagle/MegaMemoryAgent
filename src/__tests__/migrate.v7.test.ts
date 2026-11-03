@@ -44,7 +44,8 @@ describe("migration v6 -> v7 (plan 4)", () => {
     const reopened = new KnowledgeDB(dbPath);
     openDb = reopened;
     expect(reopened.getUserVersion()).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(7);
+    // v7 added the composite edge indexes; later versions build on top.
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(7);
     const idx = (reopened.execSqlAll(
       "SELECT name FROM sqlite_master WHERE type='index' AND (name = 'idx_edges_relation_from' OR name = 'idx_edges_relation_to')"
     ) as Array<{ name: string }>).map((r) => r.name);
@@ -106,7 +107,7 @@ describe("migration v6 -> v7 (plan 4)", () => {
 
     const reopened = new KnowledgeDB(dbPath);
     openDb = reopened;
-    expect(reopened.getUserVersion()).toBe(7);
+    expect(reopened.getUserVersion()).toBe(SCHEMA_VERSION);
     expect(reopened.getMetaValue("schema_version")).toBe("3");
   });
 });
