@@ -387,7 +387,7 @@ async function startMcpServer() {
 
   server.tool(
     "create_concept",
-    "Add a new concept to the knowledge graph. Call this after completing a task to record new features, components, patterns, or decisions you built. Include specific details: parameter names, defaults, file locations, and rationale. У decision/pattern передавай evidence — список {ref | node, why}: файл или уже существующий узел, на котором держится вывод, плюс рационал. Опоры создаются в том же вызове, отдельный link потом не нужен. Если evidence нет, а file_refs и why заполнены — опоры будут выведены автоматически по файлам. Факт без informed_by на источник (файл, тест, лог, диалог) помечается ungrounded и выпадает из замыкания провенанса.",
+    "Add a new concept to the knowledge graph. Call this after completing a task to record new features, components, patterns, or decisions you built. Include specific details: parameter names, defaults, file locations, and rationale. У decision/pattern передавай evidence — список {ref | node, why}: файл или уже существующий узел, на котором держится вывод, плюс рационал. Опоры создаются в том же вызове, отдельный link потом не нужен. Если evidence нет, а file_refs и why заполнены — опоры будут выведены автоматически по файлам. Факт без informed_by на источник (файл, тест, лог, диалог) помечается ungrounded и выпадает из замыкания провенанса. Если включён строгий режим (provenance.require_support), decision без опоры отклоняется — передавай evidence в том же вызове.",
     {
       name: z.string().describe("Human-readable name for the concept"),
       kind: NodeKindEnum.describe("Type of concept: feature, module, pattern, config, decision, component"),

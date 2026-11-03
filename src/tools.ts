@@ -33,6 +33,7 @@ import type {
 import { stripMergeSuffix } from "./merge.js";
 import {
   readProvenanceConfig,
+  REQUIRE_SUPPORT_MESSAGE,
   isUngrounded,
   resolveFileRef,
 } from "./provenance.js";
@@ -696,6 +697,20 @@ export async function createConcept(
       }
     }
     autoGrounded = supports.some((s) => s.fromAutoGround);
+  }
+
+  // ---- Plan 3 step 8.2: strict mode rejects unsupported decisions ----
+  // A decision with zero supports (no evidence, no informed_by edge, and —
+  // when auto_ground is on — nothing derived) is refused before anything is
+  // written. Other kinds are not touched; link on existing decisions is not
+  // affected; reads are not affected (step 8.3).
+  if (
+    input.kind === "decision" &&
+    provenanceConfig.require_support &&
+    supports.length === 0 &&
+    !(input.edges ?? []).some((e) => e.relation === "informed_by")
+  ) {
+    throw new Error(REQUIRE_SUPPORT_MESSAGE);
   }
 
   // Embeddings for the file-fact nodes (computed before the transaction).

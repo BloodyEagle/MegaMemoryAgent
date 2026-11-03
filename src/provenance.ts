@@ -28,6 +28,14 @@ export interface ProvenanceConfig {
 
 const DEFAULTS: ProvenanceConfig = { require_support: false, auto_ground: false };
 
+/**
+ * Strict-mode rejection text (plan 3 step 8.2). Exact wording matters: the
+ * agent reads it and must understand both the fix (evidence in the same
+ * call) and the reason ("I'll add support later" is rejected on purpose).
+ */
+export const REQUIRE_SUPPORT_MESSAGE =
+  "Узел типа decision принимается только вместе с опорой: передай evidence (файл или узел + рационал) в этом же вызове. Опора «добавлю потом» отклоняется: к следующему вызову источник вывода утерян.";
+
 function envFlag(name: string): boolean | undefined {
   const raw = process.env[name];
   if (raw === undefined) return undefined;
@@ -68,7 +76,9 @@ export function readProvenanceConfig(dbPath: string): ProvenanceConfig {
   } catch {
     // unreadable config -> defaults
   }
-  const envRequire = envFlag("MEGAMEMORY_PROVENANCE_REQUIRE_SUPPORT");
+  const envRequire =
+    envFlag("MEGAMEMORY_PROVENANCE_REQUIRE_SUPPORT") ??
+    envFlag("MEGAMEMORY_REQUIRE_SUPPORT"); // plan 3 step 8.1 short alias
   if (envRequire !== undefined) config.require_support = envRequire;
   const envAuto = envFlag("MEGAMEMORY_PROVENANCE_AUTO_GROUND");
   if (envAuto !== undefined) config.auto_ground = envAuto;
