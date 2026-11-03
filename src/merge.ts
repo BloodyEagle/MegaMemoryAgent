@@ -58,14 +58,22 @@ export function nodesAreIdentical(left: NodeRow, right: NodeRow): boolean {
   const rightRemoved = right.removed_at !== null;
   if (leftRemoved !== rightRemoved) return false;
 
+  // Plan 3 §5: lifecycle and epistemic axes must match — otherwise an
+  // open/refuted divergence silently loses the refuted verdict when one
+  // side's copy wins.
+  if ((left.status ?? "active") !== (right.status ?? "active")) return false;
+  if ((left.epistemic_status ?? null) !== (right.epistemic_status ?? null)) return false;
+
   return true;
 }
 
 /**
  * Create a normalized edge key for comparison (ignoring IDs and timestamps).
+ * JSON array, not `${a}|${b}` — pipe-joined keys collide for ("a|b", "c") and
+ * ("a", "b|c") (plan-3-fixes-2 F11).
  */
-function edgeKey(e: EdgeRow): string {
-  return `${e.from_id}|${e.to_id}|${e.relation}|${e.description ?? ""}`;
+export function edgeKey(e: EdgeRow): string {
+  return JSON.stringify([e.from_id, e.to_id, e.relation, e.description ?? ""]);
 }
 
 /**
@@ -222,7 +230,17 @@ export class MergeEngine {
       e: EdgeRow,
       originSide: "left" | "right"
     ): void => {
-      const key = `${e.from_id}|${e.to_id}|${e.relation}|${e.description ?? ""}|${e.merge_group ?? ""}|${e.needs_merge}|${e.source_branch ?? ""}|${e.merge_timestamp ?? ""}`;
+      // JSON array, not pipe-joined — ids containing "|" must not collide (F11).
+      const key = JSON.stringify([
+        e.from_id,
+        e.to_id,
+        e.relation,
+        e.description ?? "",
+        e.merge_group ?? "",
+        e.needs_merge,
+        e.source_branch ?? "",
+        e.merge_timestamp ?? "",
+      ]);
       if (seenPreexistingEdgeKeys.has(key)) return;
       seenPreexistingEdgeKeys.add(key);
 
@@ -444,6 +462,29 @@ export class MergeEngine {
       });
     }
 
+    // ---- PASS 3: re-validate the informed_by DAG over the combined graph ----
+    // Plan 3 §2 (invariants 2, 3): two individually-acyclic inputs can form a
+    // cycle in their union. A cycle brought in by a merge does NOT abort the
+    // merge (a rollback after a long merge with a manual retry would lose the
+    // work) — the edges are flagged needs_merge and reported instead.
+    const cycleComponents = outputDb.informedByCycleComponents();
+    if (cycleComponents.length > 0) {
+      result.informedByCycles = cycleComponents;
+      const all = new Set<string>();
+      for (const component of cycleComponents) {
+        for (const n of component) all.add(n);
+      }
+      const ids = [...all];
+      const placeholders = ids.map(() => "?").join(",");
+      outputDb.execSqlRun(
+        `UPDATE edges SET needs_merge = 1
+         WHERE relation = 'informed_by' AND removed_at IS NULL
+           AND (from_id IN (${placeholders}) OR to_id IN (${placeholders}))`,
+        ...ids,
+        ...ids
+      );
+    }
+
     return result;
   }
 
@@ -548,7 +589,11 @@ export class MergeEngine {
   }
 
   /**
-   * For identical nodes, defer the union of edges from both sides (deduplicated).
+   * For identical nodes, defer the union of edges from both sides
+   * (deduplicated). F20: when the same edge pair is tombstoned in one input
+   * and live in the other, the TOMBSTONE wins — a removed link must not
+   * resurrect just because the other branch still has it; restoring it is an
+   * explicit `link` call.
    */
   private deferEdgesClean(
     deferred: Array<{
@@ -567,46 +612,35 @@ export class MergeEngine {
     const leftEdges = leftEdgeMap.get(nodeId) ?? [];
     const rightEdges = rightEdgeMap.get(nodeId) ?? [];
 
-    const seen = new Set<string>();
-
-    // Process left edges first, then right — deduplicate by content key
-    for (const e of leftEdges) {
+    const byKey = new Map<string, { edge: EdgeRow; side: "left" | "right" }>();
+    const put = (e: EdgeRow, side: "left" | "right"): void => {
       const key = edgeKey(e);
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const prev = byKey.get(key);
+      if (!prev) {
+        byKey.set(key, { edge: e, side });
+        return;
+      }
+      // Left first, then right; a colliding live copy never overrides a tombstone.
+      if (prev.edge.removed_at === null && e.removed_at !== null) {
+        byKey.set(key, { edge: e, side });
+      }
+    };
+    for (const e of leftEdges) put(e, "left");
+    for (const e of rightEdges) put(e, "right");
 
+    for (const { edge, side } of byKey.values()) {
       deferred.push({
-        from_id: e.from_id,
-        to_id: e.to_id,
-        relation: e.relation,
-        description: e.description,
-        created_at: e.created_at,
+        from_id: edge.from_id,
+        to_id: edge.to_id,
+        relation: edge.relation,
+        description: edge.description,
+        created_at: edge.created_at,
         merge_group: null,
         needs_merge: 0,
         source_branch: null,
         merge_timestamp: null,
-        removed_at: e.removed_at ?? null,
-        _originSide: "left",
-      });
-    }
-
-    for (const e of rightEdges) {
-      const key = edgeKey(e);
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      deferred.push({
-        from_id: e.from_id,
-        to_id: e.to_id,
-        relation: e.relation,
-        description: e.description,
-        created_at: e.created_at,
-        merge_group: null,
-        needs_merge: 0,
-        source_branch: null,
-        merge_timestamp: null,
-        removed_at: e.removed_at ?? null,
-        _originSide: "right",
+        removed_at: edge.removed_at ?? null,
+        _originSide: side,
       });
     }
   }

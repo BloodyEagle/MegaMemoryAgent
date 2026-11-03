@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { errorBold, validatePort } from "./cli-utils.js";
 import { createTimelineLogger } from "./timeline.js";
+import { instructionsStatus } from "./instructions.js";
 
 // ---- CLI routing ----
 
@@ -221,6 +222,7 @@ async function startMcpServer() {
   const { KnowledgeDB } = await import("./db.js");
   const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
+  const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
@@ -330,7 +332,13 @@ async function startMcpServer() {
           is_error: false,
           affected_ids: ids,
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        // Plan 3 step 7.3: staleness travels in the response the agent
+        // already reads — it cannot see stderr.
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ ...result, ...instructionsStatus(VERSION) }, null, 2) },
+          ],
+        };
       } catch (err) {
         timeline.log({
           tool: "understand",
@@ -379,7 +387,7 @@ async function startMcpServer() {
 
   server.tool(
     "create_concept",
-    "Add a new concept to the knowledge graph. Call this after completing a task to record new features, components, patterns, or decisions you built. Include specific details: parameter names, defaults, file locations, and rationale.",
+    "Add a new concept to the knowledge graph. Call this after completing a task to record new features, components, patterns, or decisions you built. Include specific details: parameter names, defaults, file locations, and rationale. У decision/pattern передавай evidence — список {ref | node, why}: файл или уже существующий узел, на котором держится вывод, плюс рационал. Опоры создаются в том же вызове, отдельный link потом не нужен. Если evidence нет, а file_refs и why заполнены — опоры будут выведены автоматически по файлам. Факт без informed_by на источник (файл, тест, лог, диалог) помечается ungrounded и выпадает из замыкания провенанса. Если включён строгий режим (provenance.require_support), decision без опоры отклоняется — передавай evidence в том же вызове.",
     {
       name: z.string().describe("Human-readable name for the concept"),
       kind: NodeKindEnum.describe("Type of concept: feature, module, pattern, config, decision, component"),
@@ -388,6 +396,11 @@ async function startMcpServer() {
       parent_id: z.string().optional().describe("Parent concept ID for nesting; empty string is treated as omitted"),
       file_refs: z.array(z.string()).optional().describe("Relevant file paths + optional line ranges"),
       supersedes: z.array(z.string()).optional().describe("Concept IDs this one replaces — creates supersedes edges and marks the old nodes superseded (T4)"),
+      evidence: z.array(z.object({
+        ref: z.string().optional().describe("Файл (+ строка), на котором держится вывод; узел-факт создастся, если файл ещё никто не цитирует"),
+        node: z.string().optional().describe("Существующий узел-опора"),
+        why: z.string().describe("Рационал: что именно в этой опоре поддерживает вывод — обязателен"),
+      })).optional().describe("Опоры для decision/pattern — {ref | node, why}: файл или существующий узел плюс рационал. Создаются в том же вызове; ровно одно из ref/node на элемент"),
       edges: z.array(z.object({
         to: z.string().describe("Target concept ID"),
         relation: RelationEnum.describe("Relationship type"),
@@ -407,6 +420,7 @@ async function startMcpServer() {
           parent_id: params.parent_id,
           file_refs: params.file_refs,
           edges: params.edges?.map((e) => ({ ...e, relation: e.relation as RelationType })),
+          evidence: params.evidence,
           supersedes: params.supersedes,
           created_by_task: params.created_by_task,
           epistemic_status: params.epistemic_status,
@@ -531,14 +545,15 @@ async function startMcpServer() {
 
   server.tool(
     "remove_concept",
-    "Soft-delete a concept from the knowledge graph. The concept and its removal reason are preserved in history.",
+    "Soft-delete a concept from the knowledge graph. The concept and its removal reason are preserved in history. На узле, на котором держатся активные решения (входящие informed_by), удаление отклоняется — в отказе три шага на выбор: замена через преемника, опровержение (update → refuted) или force: true. Цепочки с участием узла помечаются stale с указанием причины.",
     {
       id: z.string().describe("The concept ID to remove"),
       reason: z.string().describe("Why this concept is being removed"),
+      force: z.boolean().optional().describe("Разорвать опору и удалить: рёбра надгробятся, решения останутся без опоры (ungrounded в отчётах). Только когда данные на узле больше не нужны"),
     },
     async (params) => {
       try {
-        const result = removeConcept(db, { id: params.id, reason: params.reason });
+        const result = removeConcept(db, { id: params.id, reason: params.reason, force: params.force });
         timeline.log({
           tool: "remove_concept",
           params: { id: params.id },
@@ -580,7 +595,16 @@ async function startMcpServer() {
           is_error: false,
           affected_ids: [],
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify({ ...result, stats: db.getStats() }, null, 2) }] };
+        // Plan 3 step 7.3: same staleness fields as understand — both are
+        // startup/diagnostic calls the agent reads before working.
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ ...result, ...instructionsStatus(VERSION), stats: db.getStats() }, null, 2),
+            },
+          ],
+        };
       } catch (err) {
         timeline.log({
           tool: "list_roots",
@@ -659,6 +683,96 @@ async function startMcpServer() {
           params: { merge_group: params.merge_group },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  // ---- Provenance tools (plan 3 §4.2) ----
+
+  server.tool(
+    "provenance_trace",
+    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: depth (0–20), max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false); тот же бюджет ограничивает проверку опор решений — проверяются первые по id, запись support_check_truncated сообщает checked/total. Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами — такие записи несут числовые count и sample (первые ≤5 id), note не длиннее 300 символов. weak_links целиком не превышают 8 КБ: при превышении записи режутся по приоритету и добавляется маркер weak_links_truncated (shown/total). completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated.",
+    {
+      node_id: z.string().describe("Узел, с которого начинается обход"),
+      direction: z.enum(["ancestry", "impact"]).optional().describe("ancestry (по умолчанию) — что поддерживает узел; impact — что на него опирается"),
+      depth: z.number().int().min(1).max(20).optional().describe("Глубина обхода (по умолчанию 6)"),
+      max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов сверх корня (по умолчанию 200)"),
+      max_scan_nodes: z.number().int().min(1).max(100000).optional().describe("Бюджет сканирования — сколько узлов разворачивать (по умолчанию 5000); при срабатывании total_exact: false"),
+      retrospective: z.boolean().optional().describe("Вернуть и надгробия — «как думали раньше»; удалённые эндпоинты приходят заглушками и считаются в лимит max_nodes"),
+    },
+    async (params) => {
+      try {
+        const result = provenanceTrace(db, {
+          node_id: params.node_id,
+          direction: params.direction,
+          depth: params.depth,
+          max_nodes: params.max_nodes,
+          max_scan_nodes: params.max_scan_nodes,
+          retrospective: params.retrospective,
+        });
+        timeline.log({
+          tool: "provenance_trace",
+          params: { node_id: params.node_id, direction: result.direction },
+          result_summary: `${result.shown}/${result.total_within_depth} nodes, ${result.completeness}, weak: ${result.weak_links.length}`,
+          is_write: false,
+          is_error: false,
+          affected_ids: result.nodes.map((n) => n.id),
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "provenance_trace",
+          params: { node_id: params.node_id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "provenance_audit",
+    "«Что рассыплется, если это неверно»: обратный обход (impact) по informed_by с подсветкой узлов, у которых epistemic_status != validated (поле at_risk). Каждый прогон пишется в provenance_audit_runs с ретеншном — последние 200 на узел, не старше 90 дней, чтобы ретроспектива «что мы знали тогда» не врала после того, как граф уехал.",
+    {
+      node_id: z.string().describe("Узел, корректность которого проверяется"),
+      direction: z.enum(["ancestry", "impact"]).optional().describe("impact (по умолчанию) — что рассыплется; ancestry — на чём стоит"),
+      depth: z.number().int().min(1).max(20).optional().describe("Глубина обхода (по умолчанию 6)"),
+      max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов (по умолчанию 200)"),
+      max_scan_nodes: z.number().int().min(1).max(100000).optional().describe("Бюджет сканирования (по умолчанию 5000); при срабатывании total_exact: false"),
+      retrospective: z.boolean().optional().describe("Вернуть и надгробия"),
+    },
+    async (params) => {
+      try {
+        const result = provenanceAudit(db, {
+          node_id: params.node_id,
+          direction: params.direction,
+          depth: params.depth,
+          max_nodes: params.max_nodes,
+          max_scan_nodes: params.max_scan_nodes,
+          retrospective: params.retrospective,
+        });
+        timeline.log({
+          tool: "provenance_audit",
+          params: { node_id: params.node_id, direction: result.direction },
+          result_summary: `run #${result.audit_run_id}: ${result.shown}/${result.total_within_depth} nodes, at_risk ${result.nodes.filter((n) => n.at_risk).length}`,
+          is_write: false,
+          is_error: false,
+          affected_ids: result.nodes.map((n) => n.id),
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "provenance_audit",
+          params: { node_id: params.node_id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
           is_error: true,
           affected_ids: [],
         });

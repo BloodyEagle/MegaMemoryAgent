@@ -71,6 +71,14 @@ export interface CreateConceptInput {
     description?: string;
   }>;
   /**
+   * Plan 3 §4.1.1: provenance shortcut — pass the support together with the
+   * node. `{node}` uses an existing node as evidence, `{ref}` resolves a file
+   * against file_refs (creating a file-fact node when nothing matches); `why`
+   * becomes the informed_by rationale. Support edges are written in the same
+   * transaction as the node.
+   */
+  evidence?: EvidenceInput[];
+  /**
    * IDs this concept replaces (T4): creates supersedes edges and marks the
    * old nodes superseded with valid_until = now.
    */
@@ -80,6 +88,16 @@ export interface CreateConceptInput {
   epistemic_status?: "open" | "validated" | "refuted" | "abandoned";
   /** Required when epistemic_status = validated (JSON: {env?,version?,dataset?,artifact?}). */
   status_scope?: Record<string, unknown>;
+}
+
+/** Plan 3 §4.1.1: one evidence item — exactly one of `ref` / `node`, plus `why`. */
+export interface EvidenceInput {
+  /** File path (+ optional line range) to resolve or create as a file-fact node. */
+  ref?: string;
+  /** Existing node id to lean on. */
+  node?: string;
+  /** Mandatory: what exactly in this support backs the new node. */
+  why: string;
 }
 
 export interface UpdateConceptInput {
@@ -110,6 +128,13 @@ export interface LinkInput {
 export interface RemoveConceptInput {
   id: string;
   reason: string;
+  /**
+   * Plan 3 §4.3: only needed when live decisions still lean on the node.
+   * Without it the removal is refused (refuse-and-redirect); with it the
+   * node goes and every affected informed_by edge is tombstoned with a
+   * report of who lost their support.
+   */
+  force?: boolean;
 }
 
 // ---- Tool output types ----
@@ -157,10 +182,22 @@ export interface NodeWithContext {
    * Plan 4 §4: what this node materially relies on — live outgoing
    * informed_by edges with their (mandatory) rationales. Present only when
    * non-empty, so cards without provenance stay unchanged.
+   * Plan 3 §4.2: `weak: true` marks a weak link — the support is refuted,
+   * abandoned, or ungrounded.
    */
-  informed_by?: Array<{ to: string; to_name: string; rationale: string | null }>;
+  informed_by?: Array<{
+    to: string;
+    to_name: string;
+    rationale: string | null;
+    weak?: boolean;
+  }>;
   /** Plan 4 §4: nodes that rely on this node (live incoming informed_by). */
   informed_by_incoming?: Array<{ from: string; from_name: string; rationale: string | null }>;
+  /**
+   * Plan 3 §4.2: this node is a decision whose every support is ungrounded —
+   * it must not be quoted as proven knowledge.
+   */
+  weak_support?: boolean;
 }
 
 export interface UnderstandOutput {
@@ -408,4 +445,140 @@ export interface MergeResult {
   edgeConflicts: number;
   removedClean: number;
   mergeGroups: string[];
+  /**
+   * Plan 3 §2 (invariant 3): informed_by cycles that exist only in the union
+   * of the two inputs. The merge is NOT aborted — the involved edges are
+   * flagged needs_merge and listed here for the report.
+   */
+  informedByCycles?: string[][];
+}
+
+// ---- Provenance tools (plan 3 §4.2) ----
+
+export interface ProvenanceTraceInput {
+  node_id: string;
+  /** ancestry = what supports this; impact = what relies on this. */
+  direction?: "ancestry" | "impact";
+  /** Traversal depth cap (default 6, plan 3 §10 decision 4). */
+  depth?: number;
+  /** Node cap (default 200); the root does not occupy a slot. */
+  max_nodes?: number;
+  /**
+   * Scan budget (default 5000, plan-3-fixes-2 contract 5): limits not only
+   * the output but the WORK — the walk stops expanding once this many nodes
+   * have been fetched, and the result is marked total_exact: false.
+   */
+  max_scan_nodes?: number;
+  /** Return tombstoned edges too — "how we used to think". */
+  retrospective?: boolean;
+}
+
+/**
+ * `complete`: no live links AND the node never had any informed_by record;
+ * `has_hidden`: no live links, but records exist (removed or filtered by the
+ * current mode) — retrospective would return their metadata;
+ * `truncated`: the depth/node limit was hit, the full closure was not checked.
+ */
+export type ProvenanceCompleteness = "complete" | "has_hidden" | "truncated";
+
+export interface ProvenanceWeakLink {
+  type:
+    | "refuted"
+    | "abandoned"
+    | "no_rationale"
+    | "ungrounded_support"
+    | "missing_support"
+    | "no_support"
+    | "cycle"
+    /**
+     * plan-3-fixes-3 D2.2: the support check is bounded by max_scan_nodes —
+     * this record reports how many supports of the decision were actually
+     * verified (checked/total) instead of silently skipping the rest.
+     */
+    | "support_check_truncated"
+    /** plan-3-fixes-3 D2.4: weak_links were cut to fit the 8 KB response cap. */
+    | "weak_links_truncated";
+  id?: string;
+  from?: string;
+  to?: string;
+  /** Absent only on the truncation markers, which carry numbers instead. */
+  note?: string;
+  /** D2.3: numeric size of the flagged set — agents never parse the note. */
+  count?: number;
+  /** D2.3: first ≤5 ids of the flagged set; the full list is never returned. */
+  sample?: string[];
+  /** D2.2: supports actually verified vs. declared (support_check_truncated). */
+  checked?: number;
+  total?: number;
+  /** D2.4: records kept vs. produced (weak_links_truncated). */
+  shown?: number;
+}
+
+export interface ProvenanceNodeView {
+  id: string;
+  name: string | null;
+  kind: string | null;
+  status: string | null;
+  epistemic_status: string | null;
+  depth: number;
+  /**
+   * Root→node paths within the SHOWN subgraph (plan-3-fixes-2 contract 4) —
+   * not a confirmation count. null when every path crosses an unresolved
+   * SCC: an honest unknown beats a lying number.
+   */
+  in_paths: number | null;
+  /** true when in_paths hit PATH_COUNT_CAP — the true count is ≥ the shown value. */
+  in_paths_capped?: boolean;
+  /** Stub entry for a tombstoned endpoint in retrospective mode. */
+  removed?: boolean;
+  /** audit only: epistemic_status != validated — this node is not trusted knowledge. */
+  at_risk?: boolean;
+}
+
+export interface ProvenanceEdgeView {
+  from: string;
+  to: string;
+  rationale: string | null;
+  /** Tombstoned edge surfaced by retrospective mode. */
+  removed?: boolean;
+}
+
+export interface ProvenanceTraceOutput {
+  /**
+   * One contract for the root and every other node (plan-3-fixes-2 F15): a
+   * removed node's attributes are hidden (null), status is never invented as
+   * "active"; a removed root is shown as a removed stub, not an error.
+   */
+  root: {
+    id: string;
+    name: string | null;
+    kind: string | null;
+    status: string | null;
+    epistemic_status: string | null;
+    removed?: boolean;
+  };
+  direction: "ancestry" | "impact";
+  /** Weak links first (plan 3 §4.2): refuted/abandoned, cycles, missing rationales. */
+  weak_links: ProvenanceWeakLink[];
+  nodes: ProvenanceNodeView[];
+  edges: ProvenanceEdgeView[];
+  limits: { depth: number; max_nodes: number; max_scan_nodes: number };
+  shown: number;
+  /**
+   * Nodes within the depth limit (plan-3-fixes-2 contract 3). A lower
+   * estimate when total_exact is false (the scan budget cut the walk).
+   */
+  total_within_depth: number;
+  /** false when the scan budget (max_scan_nodes) cut the closure walk. */
+  total_exact: boolean;
+  /** Always present (F21); true whenever truncated_by is not null. */
+  truncated: boolean;
+  truncated_by: "depth" | "nodes" | "scan" | null;
+  completeness: ProvenanceCompleteness;
+  params: { depth: number; max_nodes: number; max_scan_nodes: number; retrospective: boolean };
+}
+
+export interface ProvenanceAuditOutput extends ProvenanceTraceOutput {
+  /** Run persisted in provenance_audit_runs (plan 3 §10 decision 7). */
+  audit_run_id: number;
 }

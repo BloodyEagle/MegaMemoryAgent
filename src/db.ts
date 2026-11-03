@@ -10,8 +10,14 @@ export const SCHEMA_VERSION = 7;
 
 export class KnowledgeDB {
   private db: Database.Database;
+  private dbFile: string;
   private _txDepth = 0;
   private _hasStatusColumn: boolean | undefined;
+
+  /** Absolute path of the backing file; config flags are read per call (plan 3 §11). */
+  get dbPath(): string {
+    return this.dbFile;
+  }
 
   /**
    * Fork dbs have nodes.status (T0.5 migration); upstream dbs do not.
@@ -57,6 +63,7 @@ export class KnowledgeDB {
     }
 
     this.db = new Database(dbPath);
+    this.dbFile = path.resolve(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
@@ -630,6 +637,20 @@ export class KnowledgeDB {
           `informed_by edges — adding "${fromId} -> ${toId}" would close a cycle.`
       );
     }
+    // Plan 3 §2 (invariant 16), plan-3-fixes-2 F18: a component that kept its
+    // cycle after a needs_merge merge is closed for new INCOMING informed_by
+    // until the conflict is resolved — the DAG invariant must not be papered
+    // over by fresh writes. An OUTGOING edge (from inside the component to a
+    // node outside it) closes no cycle and passes; cycle closure is already
+    // rejected by the reachability check above.
+    const cycleNodes = this.informedByCycleNodeSet();
+    if (cycleNodes.has(toId)) {
+      throw new Error(
+        `informed_by write rejected: "${toId}" sits inside an unresolved ` +
+          `informed_by cycle (needs_merge). Resolve the merge conflict first, ` +
+          `then retry.`
+      );
+    }
   }
 
   /**
@@ -658,6 +679,101 @@ export class KnowledgeDB {
       }
     }
     return false;
+  }
+
+  /**
+   * Plan 3 §2 (invariant 3/16): every live informed_by cycle as a node list —
+   * an SCC with more than one member (self-loops cannot exist live, the
+   * insert check rejects them). Iterative Tarjan over the whole live
+   * informed_by layer. Shared by the post-merge re-validation (marks
+   * needs_merge instead of aborting), the write ban into an unresolved
+   * cyclic component, and the weak-links block of provenance_trace.
+   */
+  informedByCycleComponents(): string[][] {
+    const rows = this.db
+      .prepare(
+        "SELECT from_id, to_id FROM edges WHERE relation = 'informed_by' AND removed_at IS NULL"
+      )
+      .all() as Array<{ from_id: string; to_id: string }>;
+
+    const adj = new Map<string, string[]>();
+    const nodes = new Set<string>();
+    for (const e of rows) {
+      nodes.add(e.from_id);
+      nodes.add(e.to_id);
+      if (!adj.has(e.from_id)) adj.set(e.from_id, []);
+      adj.get(e.from_id)!.push(e.to_id);
+    }
+
+    // Iterative Tarjan: index/lowlink arrays, explicit DFS stack.
+    const index = new Map<string, number>();
+    const lowlink = new Map<string, number>();
+    const onStack = new Set<string>();
+    const stack: string[] = [];
+    const components: string[][] = [];
+    let counter = 0;
+
+    for (const start of nodes) {
+      if (index.has(start)) continue;
+      // Frames: [node, iterator position into adj.get(node)]
+      const callStack: Array<{ node: string; pos: number }> = [
+        { node: start, pos: 0 },
+      ];
+      index.set(start, counter);
+      lowlink.set(start, counter);
+      counter++;
+      stack.push(start);
+      onStack.add(start);
+
+      while (callStack.length > 0) {
+        const frame = callStack[callStack.length - 1];
+        const successors = adj.get(frame.node) ?? [];
+        if (frame.pos < successors.length) {
+          const next = successors[frame.pos];
+          frame.pos++;
+          if (!index.has(next)) {
+            index.set(next, counter);
+            lowlink.set(next, counter);
+            counter++;
+            stack.push(next);
+            onStack.add(next);
+            callStack.push({ node: next, pos: 0 });
+          } else if (onStack.has(next)) {
+            lowlink.set(frame.node, Math.min(lowlink.get(frame.node)!, index.get(next)!));
+          }
+        } else {
+          callStack.pop();
+          if (callStack.length > 0) {
+            const parent = callStack[callStack.length - 1];
+            lowlink.set(
+              parent.node,
+              Math.min(lowlink.get(parent.node)!, lowlink.get(frame.node)!)
+            );
+          }
+          if (lowlink.get(frame.node) === index.get(frame.node)) {
+            // Root of an SCC — pop the component off the Tarjan stack.
+            const component: string[] = [];
+            for (;;) {
+              const w = stack.pop()!;
+              onStack.delete(w);
+              component.push(w);
+              if (w === frame.node) break;
+            }
+            if (component.length > 1) components.push(component);
+          }
+        }
+      }
+    }
+    return components;
+  }
+
+  /** Flat set of nodes sitting on a live informed_by cycle. */
+  informedByCycleNodeSet(): Set<string> {
+    const set = new Set<string>();
+    for (const component of this.informedByCycleComponents()) {
+      for (const n of component) set.add(n);
+    }
+    return set;
   }
 
   private insertEdgeRow(edge: {
@@ -1080,6 +1196,131 @@ export class KnowledgeDB {
       top_queries: top,
       daily,
     };
+  }
+
+  // ---- Provenance (plan 3) ----
+
+  /**
+   * Has this node EVER had an informed_by record — live or tombstoned, either
+   * direction? The `complete` verdict of trace/audit is unreachable when this
+   * returns true: "no links" is not allowed to lie (plan 3 §4.2).
+   */
+  hasAnyInformedByRecord(id: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM edges
+         WHERE relation = 'informed_by' AND (from_id = ? OR to_id = ?)
+         LIMIT 1`
+      )
+      .get(id, id);
+    return row !== undefined;
+  }
+
+  /**
+   * Live informed_by edges touching a node in one direction. `retrospective`
+   * returns tombstones too (plan 3 §1.3) — the caller decides what to do with
+   * filtered endpoints, no dangling edges may survive that filter.
+   */
+  getInformedByEdges(
+    id: string,
+    direction: "ancestry" | "impact",
+    retrospective: boolean
+  ): Array<EdgeRow & { other_id: string }> {
+    const column = direction === "ancestry" ? "from_id" : "to_id";
+    const other = direction === "ancestry" ? "to_id" : "from_id";
+    return this.db
+      .prepare(
+        `SELECT e.*, e.${other} AS other_id FROM edges e
+         WHERE e.${column} = ? AND e.relation = 'informed_by'
+           ${retrospective ? "" : "AND e.removed_at IS NULL"}`
+      )
+      .all(id) as Array<EdgeRow & { other_id: string }>;
+  }
+
+  private provenanceAuditReady = false;
+
+  /** Plan 3 §3 / §10 (decision 7): audit runs persist so a later re-run of a
+   * shifted graph can be compared against what was actually found. The table
+   * is created lazily like status_history/usage — no schema bump needed. */
+  private ensureProvenanceAuditTable(): void {
+    if (this.provenanceAuditReady) return;
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS provenance_audit_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        root_id TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        params TEXT,
+        result TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_audit_root ON provenance_audit_runs(root_id, created_at);
+    `);
+    this.provenanceAuditReady = true;
+  }
+
+  /**
+   * Persist one audit run and apply the retention rule (plan 3 §10): the last
+   * 200 runs per root, none older than 90 days.
+   */
+  insertProvenanceAuditRun(entry: {
+    root_id: string;
+    direction: string;
+    params: unknown;
+    result: unknown;
+  }): number {
+    this.ensureProvenanceAuditTable();
+    const id = this.runInTransaction(() => {
+      const res = this.db
+        .prepare(
+          `INSERT INTO provenance_audit_runs (root_id, direction, params, result)
+           VALUES (?, ?, ?, ?)`
+        )
+        .run(
+          entry.root_id,
+          entry.direction,
+          JSON.stringify(entry.params ?? null),
+          JSON.stringify(entry.result ?? null)
+        );
+      const rowid = Number(res.lastInsertRowid);
+      this.db
+        .prepare(
+          `DELETE FROM provenance_audit_runs
+           WHERE root_id = ?
+             AND (created_at < datetime('now', '-90 days')
+                  OR id NOT IN (
+                    SELECT id FROM provenance_audit_runs
+                    WHERE root_id = ?
+                    ORDER BY id DESC LIMIT 200
+                  ))`
+        )
+        .run(entry.root_id, entry.root_id);
+      return rowid;
+    });
+    return id;
+  }
+
+  getProvenanceAuditRuns(rootId: string, limit = 5): Array<{
+    id: number;
+    root_id: string;
+    direction: string;
+    params: string | null;
+    result: string | null;
+    created_at: string;
+  }> {
+    this.ensureProvenanceAuditTable();
+    return this.db
+      .prepare(
+        `SELECT id, root_id, direction, params, result, created_at
+         FROM provenance_audit_runs WHERE root_id = ? ORDER BY id DESC LIMIT ?`
+      )
+      .all(rootId, limit) as Array<{
+      id: number;
+      root_id: string;
+      direction: string;
+      params: string | null;
+      result: string | null;
+      created_at: string;
+    }>;
   }
 
   // ---- Query methods ----
