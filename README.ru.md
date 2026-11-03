@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-1.9.0--fork.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.0.0--fork.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -52,6 +52,65 @@
 1. **Начало сессии** — агент вызывает `list_roots` (с бюджетом), чтобы сориентироваться.
 2. **Перед задачей** — `understand` с запросом на естественном языке или `get_concept` по точному id.
 3. **После задачи** — `create_concept` / `update_concept`, затем `link` для связей.
+
+---
+
+## Провенанс
+
+Решение стоит столько, сколько стоит его источник. Граф держит эту связь
+явной и проверяемой машиной.
+
+**Опоры (`informed_by`)** — «from материально опирается на to»: решение
+указывает на факт, тест, лог или диалог, из которого оно выведено. Рационал
+обязателен: ребро `informed_by` с пустым `description` отклоняется — и в
+`link`, и в батче `create_concept`. Граф опор — строгий DAG: ребро, замыкающее
+цикл, отвергается. Циклы, принесённые merge, идут в карантин: компонента
+закрыта для записи, видна в `weak_links` с `needs_merge: true`, а `in_paths`
+сквозь неё честно отдаёт `null` вместо выдуманного числа.
+
+**Шорткат `evidence`** — опоры объявляются в том же вызове `create_concept`,
+отдельный `link` не нужен:
+
+```json
+{ "evidence": [
+    { "ref": "src/auth/session.ts#L42", "why": "таймаут прочитан из кода" },
+    { "node": "req-session-ttl", "why": "требование фиксировало TTL" }
+] }
+```
+
+На элемент — ровно одно из `ref` (файл; узел, уже цитирующий его,
+переиспользуется, иначе создаётся узел-факт) или `node` (существующая
+концепция), плюс обязательный `why`. Автовывод опор из `why` + `file_refs`
+существует, но **выключен по умолчанию** (`provenance.auto_ground` в
+`megamemory.config.json` рядом с базой) — опоры, придуманные сервером, не
+должны выдавать себя за объявленные агентом.
+
+**Строгий режим** — `provenance.require_support: true` отклоняет `decision`
+без единой опоры: ни `evidence`, ни ребра `informed_by`, ни (при включённом
+автовыводе) выведенных опор. Текст отказа говорит передать `evidence` в том
+же вызове — опора «добавлю потом» отклоняется намеренно: к следующему вызову
+источник вывода утерян. Флаг читается заново на каждом вызове
+(`megamemory.config.json` рядом с базой; переопределение переменными
+окружения `MEGAMEMORY_PROVENANCE_REQUIRE_SUPPORT` / `MEGAMEMORY_REQUIRE_SUPPORT`,
+`1|0`). Другие типы узлов, `link` и чтение флаг не трогает.
+
+**`provenance_trace` / `provenance_audit`** — обход `informed_by` в одну
+сторону: `ancestry` («на чём стоит этот вывод») или `impact` («кто на него
+опирается»). Контракт полноты честно сообщает, чего он не показал:
+`total_within_depth` считает узлы в пределах `depth`; причина остановки —
+`truncated_by: depth | nodes | scan | null`; `in_paths` — число путей в
+показанном подграфе, с потолком и пометкой (`in_paths_capped`) вместо
+преувеличения; бюджет сканирования `max_scan_nodes` (по умолчанию 5000)
+ограничивает и выдачу, и работу (`total_exact: false` при срабатывании).
+Слабые звенья идут первыми — refuted/abandoned, цикловые компоненты, рёбра
+без рационала, решения с `no_support` / `missing_support` / только
+`ungrounded`-опорами (числовые `count` и `sample` — первые ≤ 5 id) — а весь
+блок `weak_links` ограничен 8 КБ с маркером `weak_links_truncated`.
+
+**Гигиена удаления** — удаление узла, на который опираются другие, отклоняется
+с подсказкой, называющей зависимые узлы; `force` переопределяет. Удаления
+оставляют надгробия, и в merge надгробие ребра побеждает живую копию —
+разорванная связь не воскресает от того, что вторая ветка о ней не знала.
 
 ---
 
@@ -102,6 +161,14 @@ megamemory install            # интерактивно: opencode / [CC] / Code
 Сервер читает `.megamemory/knowledge.db` относительно рабочей директории; путь переопределяется
 через `MEGAMEMORY_DB_PATH`.
 
+**Свежесть инструкций.** `install` ставит в каждый сгенерированный файл штамп
+`<!-- megamemory:instructions vX.Y.Z -->`. Сервер сверяет штамп со своей
+версией на каждом вызове `list_roots` / `understand` и отдаёт
+`instructions_stale` / `instructions_version` / `server_version` прямо в
+ответе — после `npm update -g` перезапустите `megamemory install`, когда флаг
+вернулся `true` (агент stderr не видит, поэтому сигнал едет в полезной
+нагрузке, которую он и так читает).
+
 ### Обновление существующей базы upstream
 
 ```bash
@@ -130,10 +197,12 @@ megamemory doctor               # проверка здоровья, код вы
 | `list_roots` | Корневые концепции с детьми (с бюджетом). |
 | `list_conflicts` | Неразрешённые конфликты merge и пары `contradicts`. |
 | `resolve_conflict` | Разрешение конфликта проверенным содержимым. |
+| `provenance_trace` | Обход `informed_by` (`ancestry` / `impact`) с честной полнотой и слабыми звеньями в начале. |
+| `provenance_audit` | Аудит провенанса по всему графу: слабые звенья, необоснованные решения, ретеншн прошлых аудитов. |
 
 **Типы узлов:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest`
 
-**Типы связей:** `connects_to` · `depends_on` · `implements` · `calls` · `configured_by` · `supersedes` · `contradicts`
+**Типы связей:** `connects_to` · `depends_on` · `implements` · `calls` · `configured_by` · `supersedes` · `contradicts` · `informed_by`
 
 ---
 

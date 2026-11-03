@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-1.9.0--fork.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.0.0--fork.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -52,6 +52,66 @@ database at `.megamemory/knowledge.db`.
 1. **Session start** — the agent calls `list_roots` (budgeted) to orient itself.
 2. **Before a task** — `understand` with a natural-language query, or `get_concept` for an exact ID.
 3. **After a task** — `create_concept` / `update_concept`, then `link` for relationships.
+
+---
+
+## Provenance
+
+Decisions are only as good as their sources. The graph keeps that linkage
+explicit and machine-checkable.
+
+**Supports (`informed_by`)** — "from materially rests on to": a decision points
+at the fact, test, log or conversation it was drawn from. The rationale is
+mandatory: an `informed_by` edge without a non-empty `description` is rejected,
+in `link` and in batched `create_concept` alike. The support graph stays a
+strict DAG — an edge that would close a cycle is refused. Cycles imported by a
+merge are quarantined: the component is closed for writes, shows up in
+`weak_links` with `needs_merge: true`, and `in_paths` through it honestly
+reports `null` instead of a made-up number.
+
+**`evidence` shortcut** — supports are declared in the same `create_concept`
+call, no follow-up `link` needed:
+
+```json
+{ "evidence": [
+    { "ref": "src/auth/session.ts#L42", "why": "timeout read from the code" },
+    { "node": "req-session-ttl", "why": "the requirement fixed the TTL" }
+] }
+```
+
+Each item takes exactly one of `ref` (a file; the node already citing it is
+reused, otherwise a file-fact node is created) or `node` (an existing concept),
+plus a mandatory `why`. Auto-deriving supports from `why` + `file_refs` exists
+but is **off by default** (`provenance.auto_ground` in `megamemory.config.json`
+next to the database) — server-invented supports must not masquerade as
+agent-declared provenance.
+
+**Strict mode** — `provenance.require_support: true` refuses a `decision` with
+zero supports: no `evidence`, no `informed_by` edge, and (when auto-derivation
+is on) nothing derived. The refusal says to pass `evidence` in the same call —
+"add support later" is rejected on purpose, because the source of the
+conclusion is lost by the next call. The flag is read fresh on every call
+(`megamemory.config.json` next to the db; env overrides
+`MEGAMEMORY_PROVENANCE_REQUIRE_SUPPORT` / `MEGAMEMORY_REQUIRE_SUPPORT`, `1|0`).
+Other kinds, `link` and reads are unaffected.
+
+**`provenance_trace` / `provenance_audit`** — walk `informed_by` in one
+direction: `ancestry` ("what does this rest on") or `impact` ("what rests on
+it"). The completeness contract is honest about what it did not show:
+`total_within_depth` counts nodes within `depth`; the reason for stopping is
+`truncated_by: depth | nodes | scan | null`; `in_paths` is the number of paths
+in the shown subgraph, capped and flagged (`in_paths_capped`) rather than
+exaggerated; the scan budget `max_scan_nodes` (default 5000) bounds both output
+and work (`total_exact: false` when it fires). Weak links come first —
+refuted/abandoned nodes, cycle components, edges without rationale, decisions
+with `no_support` / `missing_support` / only-`ungrounded` supports (numeric
+`count` plus `sample`, the first ≤ 5 ids) — and the whole `weak_links` block is
+capped at 8 KB with a `weak_links_truncated` marker.
+
+**Removal hygiene** — removing a node that other nodes rest on is refused with
+a hint naming the dependents; `force` overrides it. Removals leave tombstones,
+and in a merge an edge tombstone wins over a live copy — a severed link does
+not resurrect because the other branch never knew.
 
 ---
 
@@ -102,6 +162,14 @@ megamemory install            # interactive: opencode / [CC] / Codex / Antigravi
 The server reads `.megamemory/knowledge.db` relative to the working directory; override with
 `MEGAMEMORY_DB_PATH`.
 
+**Keeping prompts fresh.** `install` stamps every file it generates with
+`<!-- megamemory:instructions vX.Y.Z -->`. The server compares that stamp with
+its own version on every `list_roots` / `understand` call and returns
+`instructions_stale` / `instructions_version` / `server_version` right in the
+response — after `npm update -g`, re-run `megamemory install` when the flag
+comes back `true` (an agent cannot see stderr, so the signal travels in the
+payload it already reads).
+
 ### Upgrading an existing upstream database
 
 ```bash
@@ -129,10 +197,12 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 | `list_roots` | Top-level concepts with direct children (budgeted). |
 | `list_conflicts` | Unresolved merge conflicts, plus `contradicts` pairs. |
 | `resolve_conflict` | Resolve a conflict with verified content. |
+| `provenance_trace` | Walk `informed_by` (`ancestry` / `impact`) with honest completeness and weak links first. |
+| `provenance_audit` | Graph-wide provenance audit: weak links, ungrounded decisions, retention of past audits. |
 
 **Kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest`
 
-**Relations:** `connects_to` · `depends_on` · `implements` · `calls` · `configured_by` · `supersedes` · `contradicts`
+**Relations:** `connects_to` · `depends_on` · `implements` · `calls` · `configured_by` · `supersedes` · `contradicts` · `informed_by`
 
 ---
 
