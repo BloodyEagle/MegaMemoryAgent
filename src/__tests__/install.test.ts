@@ -28,6 +28,10 @@ const PLUGIN_SOURCE_PATH = path.join(PROJECT_ROOT, "plugin", "megamemory.ts");
 const BOOTSTRAP_SOURCE_PATH = path.join(PROJECT_ROOT, "commands", "bootstrap-memory.md");
 const SAVE_SOURCE_PATH = path.join(PROJECT_ROOT, "commands", "save-memory.md");
 const EXPECTED_ENTRY = path.join(PROJECT_ROOT, "dist", "index.js");
+const PACKAGE_VERSION = JSON.parse(
+  fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf-8")
+).version as string;
+const EXPECTED_STAMP = `<!-- megamemory:instructions v${PACKAGE_VERSION} -->`;
 
 interface Sandbox {
   root: string;
@@ -183,7 +187,11 @@ describe("runInstall", () => {
 
     expect(fs.readFileSync(pluginPath, "utf-8")).toBe(fs.readFileSync(PLUGIN_SOURCE_PATH, "utf-8"));
     expect(fs.readFileSync(bootstrapPath, "utf-8")).toBe("# My custom command\n");
-    expect(fs.readFileSync(savePath, "utf-8")).toBe(fs.readFileSync(SAVE_SOURCE_PATH, "utf-8"));
+    // Step 7.2: generated command files carry the version stamp on top of
+    // the source content.
+    const saved = fs.readFileSync(savePath, "utf-8");
+    expect(saved).toContain(EXPECTED_STAMP);
+    expect(saved.replace(`${EXPECTED_STAMP}\n`, "")).toBe(fs.readFileSync(SAVE_SOURCE_PATH, "utf-8"));
   });
 
   it("is idempotent on repeated opencode installs", async () => {
@@ -214,21 +222,54 @@ describe("runInstall", () => {
     );
     expect(fs.readFileSync(path.join(sandbox.opencodeDir, "commands", "save-memory.md"), "utf-8")).toBe(firstSave);
     expect(firstPlugin).toBe(fs.readFileSync(PLUGIN_SOURCE_PATH, "utf-8"));
-    expect(firstBootstrap).toBe(fs.readFileSync(BOOTSTRAP_SOURCE_PATH, "utf-8"));
-    expect(firstSave).toBe(fs.readFileSync(SAVE_SOURCE_PATH, "utf-8"));
+    // Stamp lands on line 2, right after the managed-file marker.
+    const stamped = (file: string): string => {
+      const lines = fs.readFileSync(file, "utf-8").split("\n");
+      lines.splice(1, 0, EXPECTED_STAMP);
+      return lines.join("\n");
+    };
+    expect(firstBootstrap).toBe(stamped(BOOTSTRAP_SOURCE_PATH));
+    expect(firstSave).toBe(stamped(SAVE_SOURCE_PATH));
   });
 
-  it("writes a v2-marked block with supersedes rules into a fresh AGENTS.md", async () => {
+  it("keeps the claudecode install inside the $HOME sandbox", async () => {
+    const sandbox = makeSandbox();
+    const { runInstall } = await loadInstallModule(sandbox);
+    await runInstall(["--target", "claudecode"]);
+
+    // os.homedir() ignores $HOME on Windows — without the homeDir() override
+    // this run rewrote the REAL ~/.claude/CLAUDE.md and ~/.claude.json.
+    const claudeMd = fs.readFileSync(path.join(sandbox.homeDir, ".claude", "CLAUDE.md"), "utf-8");
+    expect(claudeMd).toContain(EXPECTED_STAMP);
+    expect(JSON.parse(fs.readFileSync(path.join(sandbox.homeDir, ".claude.json"), "utf-8")).mcpServers.megamemory).toBeTruthy();
+  });
+
+  it("writes a version-stamped block with supersedes rules into a fresh AGENTS.md", async () => {
     const sandbox = makeSandbox();
     const { runInstall } = await loadInstallModule(sandbox);
     await runInstall(["--target", "opencode"]);
 
     const agents = fs.readFileSync(path.join(sandbox.opencodeDir, "AGENTS.md"), "utf-8");
-    expect(agents).toContain("megamemory-snippet:v2");
+    expect(agents).toContain(EXPECTED_STAMP);
     expect(agents).toContain("/megamemory-snippet");
     expect(agents).toContain("supersedes");
     expect(agents).toContain("max_tokens");
     expect(agents).toContain("reembed");
+  });
+
+  it("stamps every generated command file with the package.json version (step 7.4.2)", async () => {
+    const sandbox = makeSandbox();
+    const { runInstall } = await loadInstallModule(sandbox);
+    await runInstall(["--target", "opencode"]);
+
+    for (const filename of ["bootstrap-memory.md", "save-memory.md"]) {
+      const dest = fs.readFileSync(
+        path.join(sandbox.opencodeDir, "commands", filename),
+        "utf-8"
+      );
+      expect(dest).toContain(EXPECTED_STAMP);
+      expect(dest.match(/megamemory:instructions/g)).toHaveLength(1);
+    }
   });
 
   it("replaces a legacy unmarked block instead of skipping or duplicating", async () => {
@@ -245,7 +286,7 @@ describe("runInstall", () => {
 
     const agents = fs.readFileSync(agentsPath, "utf-8");
     expect(agents).not.toContain("OLD TEXT");
-    expect(agents).toContain("megamemory-snippet:v2");
+    expect(agents).toContain(EXPECTED_STAMP);
     expect(agents).toContain("## Something Else"); // untouched sibling section
     expect(agents).toContain("Keep me.");
     expect(agents.match(/## Project Knowledge Graph/g)).toHaveLength(1);
@@ -259,6 +300,35 @@ describe("runInstall", () => {
     await runInstall(["--target", "opencode"]);
     const second = fs.readFileSync(path.join(sandbox.opencodeDir, "AGENTS.md"), "utf-8");
     expect(second).toBe(first);
-    expect(second.match(/megamemory-snippet:v2/g)).toHaveLength(1);
+    expect(second.match(/megamemory:instructions/g)).toHaveLength(1);
+  });
+
+  it("re-install updates the block between the markers and keeps surrounding text (step 7.4.1)", async () => {
+    const sandbox = makeSandbox();
+    const agentsPath = path.join(sandbox.opencodeDir, "AGENTS.md");
+    fs.mkdirSync(sandbox.opencodeDir, { recursive: true });
+    fs.writeFileSync(
+      agentsPath,
+      [
+        "# My agents file\n",
+        `<!-- megamemory:instructions v0.0.1 -->\n`,
+        "## Project Knowledge Graph\n\n",
+        "STALE WORKFLOW TEXT from an older package.\n\n",
+        "<!-- /megamemory-snippet -->\n\n",
+        "## User Section\n\nUser rules stay.\n",
+      ].join("")
+    );
+
+    const { runInstall } = await loadInstallModule(sandbox);
+    await runInstall(["--target", "opencode"]);
+
+    const agents = fs.readFileSync(agentsPath, "utf-8");
+    expect(agents).toContain("# My agents file");
+    expect(agents).toContain(EXPECTED_STAMP);
+    expect(agents).not.toContain("STALE WORKFLOW TEXT");
+    expect(agents).not.toContain("v0.0.1");
+    expect(agents).toContain("## User Section");
+    expect(agents).toContain("User rules stay.");
+    expect(agents.match(/megamemory:instructions/g)).toHaveLength(1);
   });
 });

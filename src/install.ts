@@ -4,6 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { success, skip, error, info, heading, warn, multiSelect } from "./cli-utils.js";
+import { INSTRUCTIONS_STAMP_MARKER, instructionsStamp } from "./instructions.js";
 
 export type InstallTarget = "opencode" | "claudecode" | "antigravity" | "codex";
 
@@ -30,7 +31,7 @@ interface CommandRuntime {
 const OPENCODE_CONFIG_DIR =
   process.env.OPENCODE_CONFIG_DIR ??
   path.join(
-    process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"),
+    process.env.XDG_CONFIG_HOME ?? path.join(homeDir(), ".config"),
     "opencode"
   );
 const OPENCODE_CONFIG_PATH = path.join(OPENCODE_CONFIG_DIR, "opencode.json");
@@ -38,26 +39,33 @@ const OPENCODE_AGENTS_MD_PATH = path.join(OPENCODE_CONFIG_DIR, "AGENTS.md");
 const OPENCODE_TOOL_DIR = path.join(OPENCODE_CONFIG_DIR, "tool");
 const OPENCODE_COMMANDS_DIR = path.join(OPENCODE_CONFIG_DIR, "commands");
 
-const CLAUDE_CONFIG_PATH = path.join(os.homedir(), ".claude.json");
-const CLAUDE_DIR = path.join(os.homedir(), ".claude");
+const CLAUDE_CONFIG_PATH = path.join(homeDir(), ".claude.json");
+const CLAUDE_DIR = path.join(homeDir(), ".claude");
 const CLAUDE_MD_PATH = path.join(CLAUDE_DIR, "CLAUDE.md");
 const CLAUDE_COMMANDS_DIR = path.join(CLAUDE_DIR, "commands");
 
 const ANTIGRAVITY_CONFIG_PATH = path.join(process.cwd(), "mcp_config.json");
 
-const CODEX_DIR = path.join(os.homedir(), ".codex");
+const CODEX_DIR = path.join(homeDir(), ".codex");
 const CODEX_CONFIG_PATH = path.join(CODEX_DIR, "config.toml");
 const CODEX_AGENTS_MD_PATH = path.join(CODEX_DIR, "AGENTS.md");
 
 const AGENTS_MD_MARKER = "## Project Knowledge Graph";
-// F8.2: versioned block markers — repeated installs UPDATE the snippet
-// instead of skipping it, so agents always read the current workflow rules.
-const AGENTS_MD_VERSION = "<!-- megamemory-snippet:v2 -->";
+// F8.2 / plan 3 step 7.2: versioned block markers — repeated installs UPDATE
+// the snippet instead of skipping it, and the stamp carries the package
+// version so the server can report instructions staleness over MCP.
+const PACKAGE_VERSION = JSON.parse(
+  fs.readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"),
+    "utf-8"
+  )
+).version as string;
+const AGENTS_MD_STAMP = instructionsStamp(PACKAGE_VERSION);
 const AGENTS_MD_END = "<!-- /megamemory-snippet -->";
 const MANAGED_FILE_MARKER = "MegaMemory-managed file. Safe for megamemory install to update.";
 
 const AGENTS_MD_SNIPPET = `
-${AGENTS_MD_VERSION}
+${AGENTS_MD_STAMP}
 ## Project Knowledge Graph
 
 You have access to a project knowledge graph via the \`megamemory\` MCP server and skill tool. You have no implicit memory of this project between sessions, so this graph is your only continuity for concepts, architecture, decisions, and relationships.
@@ -84,6 +92,16 @@ ${AGENTS_MD_END}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * os.homedir() ignores $HOME on Windows (it reads USERPROFILE), so the test
+ * sandbox leaked into the real user profile — install tests rewrote the real
+ * ~/.claude.json and ~/.claude/CLAUDE.md. Honor $HOME explicitly: prod runs
+ * are unaffected (Git Bash sets it to the same value), sandboxes are airtight.
+ */
+function homeDir(): string {
+  return process.env.HOME ?? os.homedir();
 }
 
 function stripJsonComments(text: string): string {
@@ -282,11 +300,18 @@ function upsertAgentsMdBlock(filePath: string, block: string): "created" | "repl
     return "appended";
   }
 
-  // A previous v2 run left a version comment right before the heading —
-  // start there, or the old comment survives and the marker duplicates.
-  const versionIdx = content.indexOf("<!-- megamemory-snippet:");
+  // A previous run left a version stamp right before the heading — start
+  // there, or the old stamp survives and the marker duplicates. The stamp
+  // format changed in 2.0 (megamemory:instructions vs megamemory-snippet),
+  // so look for both.
+  const stampIdx = content.indexOf(INSTRUCTIONS_STAMP_MARKER);
+  const legacyIdx = content.indexOf("<!-- megamemory-snippet:");
   const blockStart =
-    versionIdx !== -1 && versionIdx < markerIdx ? versionIdx : markerIdx;
+    stampIdx !== -1 && stampIdx < markerIdx
+      ? stampIdx
+      : legacyIdx !== -1 && legacyIdx < markerIdx
+        ? legacyIdx
+        : markerIdx;
 
   // Versioned block: replace blockStart..END inclusive.
   const endIdx = content.indexOf(AGENTS_MD_END, blockStart);
@@ -315,7 +340,7 @@ function setupInstructionFile(filePath: string): void {
   if (outcome === "created") {
     success(`Created ${pc.dim(filePath)}`);
   } else if (outcome === "replaced") {
-    success(`Updated knowledge graph instructions (v2) in ${pc.dim(filePath)}`);
+    success(`Updated knowledge graph instructions (${PACKAGE_VERSION}) in ${pc.dim(filePath)}`);
   } else {
     success(`Appended knowledge graph instructions to ${pc.dim(filePath)}`);
   }
@@ -357,6 +382,25 @@ function setupToolPlugin(): void {
   success(`Installed tool plugin at ${pc.dim(dest)}`);
 }
 
+/**
+ * Plan 3 step 7.2: every generated file carries the version stamp so the
+ * server's staleness signal can tell which package generation wrote it.
+ * A stamp from a previous install is stripped first — never duplicated.
+ */
+function stampCommandSource(content: string): string {
+  const stampLine = instructionsStamp(PACKAGE_VERSION);
+  const stripped = content.replace(
+    /^<!--\s*megamemory:instructions\s+v?\S+\s*-->\r?\n/m,
+    ""
+  );
+  const lines = stripped.split("\n");
+  if (lines[0]?.includes(MANAGED_FILE_MARKER)) {
+    lines.splice(1, 0, stampLine);
+    return lines.join("\n");
+  }
+  return `${stampLine}\n${stripped}`;
+}
+
 function setupCommand(destinationDir: string, filename: string, label: string): void {
   const source = resolveCommandFile(filename);
   const dest = path.join(destinationDir, filename);
@@ -368,11 +412,11 @@ function setupCommand(destinationDir: string, filename: string, label: string): 
 
   fs.mkdirSync(destinationDir, { recursive: true });
 
-  const sourceContent = fs.readFileSync(source, "utf-8");
+  const stampedSource = stampCommandSource(fs.readFileSync(source, "utf-8"));
 
   if (fs.existsSync(dest)) {
     const existing = fs.readFileSync(dest, "utf-8");
-    if (existing === sourceContent) {
+    if (existing === stampedSource) {
       skip(`${label} already up to date`);
       return;
     }
@@ -382,12 +426,12 @@ function setupCommand(destinationDir: string, filename: string, label: string): 
       return;
     }
 
-    fs.writeFileSync(dest, sourceContent);
+    fs.writeFileSync(dest, stampedSource);
     success(`Updated ${label} at ${pc.dim(dest)}`);
     return;
   }
 
-  fs.writeFileSync(dest, sourceContent);
+  fs.writeFileSync(dest, stampedSource);
   success(`Installed ${label} at ${pc.dim(dest)}`);
 }
 

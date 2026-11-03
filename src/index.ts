@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { errorBold, validatePort } from "./cli-utils.js";
 import { createTimelineLogger } from "./timeline.js";
+import { instructionsStatus } from "./instructions.js";
 
 // ---- CLI routing ----
 
@@ -331,7 +332,13 @@ async function startMcpServer() {
           is_error: false,
           affected_ids: ids,
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        // Plan 3 step 7.3: staleness travels in the response the agent
+        // already reads — it cannot see stderr.
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ ...result, ...instructionsStatus(VERSION) }, null, 2) },
+          ],
+        };
       } catch (err) {
         timeline.log({
           tool: "understand",
@@ -588,7 +595,16 @@ async function startMcpServer() {
           is_error: false,
           affected_ids: [],
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify({ ...result, stats: db.getStats() }, null, 2) }] };
+        // Plan 3 step 7.3: same staleness fields as understand — both are
+        // startup/diagnostic calls the agent reads before working.
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ ...result, ...instructionsStatus(VERSION), stats: db.getStats() }, null, 2),
+            },
+          ],
+        };
       } catch (err) {
         timeline.log({
           tool: "list_roots",
