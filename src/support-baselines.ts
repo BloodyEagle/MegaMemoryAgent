@@ -368,10 +368,12 @@ export function confirmSupports(
   }
 
   db.runInTransaction(() => {
-    // Dead anchors (support removed since the last confirmation) are dropped:
-    // the agent confirming the current set has seen and accepted the
-    // "removed" signal. Live pairs are never touched.
-    db.deleteDeadBaselineRows(input.decision_id);
+    // Plan-4-fixes-5: the snapshot is NOT wiped on every confirmation. Dead
+    // anchors (support removed since the last confirmation) keep reporting
+    // "removed" until the agent explicitly confirms the empty set — the only
+    // overwrite they ever get. An unrelated confirmation of live supports
+    // must not amnesty them.
+    if (input.items.length === 0) db.clearSupportBaselines(input.decision_id);
     for (const p of planned) {
       db.upsertSupportBaseline(p.row);
     }

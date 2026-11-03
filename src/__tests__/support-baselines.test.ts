@@ -646,3 +646,76 @@ describe("confirm_supports empty items", () => {
     expect(message).toContain("version_conflict");
   });
 });
+
+// ---- plan-4-fixes-5: снятая опора живёт в снимке до явного подтверждения ----
+
+describe("removed supports keep their snapshot rows (plan-4-fixes-5)", () => {
+  it("21. a tombstoned support edge reports changed/removed and the row survives", () => {
+    confirmedDecision("d", ["f"]);
+    db.deleteEdge("d", "f", "informed_by"); // the agent unlinks the support
+
+    const view = computeSupportCheck(db, "d", new CheckBudget(10, 1_000_000))!;
+    expect(view.state).toBe("changed");
+    expect(view.changed).toEqual([
+      expect.objectContaining({ support: "f", reasons: ["removed"] }),
+    ]);
+    // The row IS the fact "confirmed, then removed" — nothing deleted it.
+    expect(db.getSupportBaselines("d").map((r) => r.support_id)).toEqual(["f"]);
+  });
+
+  it("22. only the explicit 'no supports' confirmation clears the dead row", () => {
+    confirmedDecision("d", ["f", "g"]);
+    db.deleteEdge("d", "f", "informed_by");
+
+    // Confirming the live support g must not amnesty the dead anchor f.
+    confirm("d", ["g"]);
+    expect(db.getSupportBaselines("d").map((r) => r.support_id)).toEqual(["f", "g"]);
+    const afterG = computeSupportCheck(db, "d", new CheckBudget(10, 1_000_000))!;
+    expect(afterG.state).toBe("changed");
+    expect(afterG.changed).toEqual([
+      expect.objectContaining({ support: "f", reasons: ["removed"] }),
+    ]);
+
+    // The empty confirm (accepted only with zero live edges) is the explicit
+    // "no supports" statement — the rows go with it, and only with it.
+    db.deleteEdge("d", "g", "informed_by");
+    confirmSupports(db, {
+      decision_id: "d",
+      expected_claim_digest: claimDigestOf(db.getNode("d")!.summary),
+      items: [],
+    });
+    expect(db.getSupportBaselines("d")).toEqual([]);
+    const empty = computeSupportCheck(db, "d", new CheckBudget(10, 1_000_000))!;
+    expect(empty.state).toBe("unchanged");
+    expect(empty.changed).toEqual([]);
+  });
+
+  it("23. a decision that never had supports reports no_support, not changed", () => {
+    node("d", "decision"); // no supports ever, never confirmed
+
+    expect(computeSupportCheck(db, "d", new CheckBudget(10, 1_000_000))).toBeNull();
+    const out = provenanceTrace(db, { node_id: "d" });
+    expect(out.support_check).toBeUndefined();
+    expect(out.weak_links.some((w) => w.type === "no_support" && w.id === "d")).toBe(true);
+    expect(out.weak_links.some((w) => w.type === "support_changed")).toBe(false);
+  });
+
+  it("24. force-removing the support node keeps the snapshot alive and the trace honest", () => {
+    confirmedDecision("d", ["f"]);
+    removeConcept(db, { id: "f", reason: "gone", force: true });
+
+    // Full hygiene removal, no cascade deletion: the snapshot row survives.
+    expect(db.getSupportBaselines("d").map((r) => r.support_id)).toEqual(["f"]);
+    const view = computeSupportCheck(db, "d", new CheckBudget(10, 1_000_000))!;
+    expect(view.state).toBe("changed");
+    expect(view.changed).toEqual([
+      expect.objectContaining({ support: "f", reasons: ["removed"] }),
+    ]);
+
+    // The trace completes and reports the divergence — the decision was
+    // confirmed, so this is support_check, not a fresh no_support warning.
+    const out = provenanceTrace(db, { node_id: "d" });
+    expect(out.support_check!.state).toBe("changed");
+    expect(out.weak_links.some((w) => w.type === "no_support" && w.id === "d")).toBe(false);
+  });
+});

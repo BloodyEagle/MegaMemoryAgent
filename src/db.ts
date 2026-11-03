@@ -1473,26 +1473,19 @@ export class KnowledgeDB {
   }
 
   /**
-   * Drop snapshot rows of a decision whose support no longer has a live
-   * informed_by edge (removed support, tombstoned edge). Called by
-   * confirm_supports: the agent confirming the current support set has seen
-   * the "removed" signal and accepted it, so the dead anchor must not keep
-   * reporting "removed" forever. Live pairs are never touched.
+   * Overwrite the snapshot with an explicit "no supports" confirmation
+   * (plan-4-fixes-5): the empty confirm_supports is accepted only when the
+   * decision has zero live informed_by edges, so every row of the decision is
+   * a dead anchor whose "removed" signal the agent has just acknowledged —
+   * the rows go here and ONLY here. No other path deletes snapshot rows: no
+   * cascade on remove_concept, deletion hygiene or consolidate, and a
+   * confirmation of live supports never touches dead anchors (the
+   * "confirmed, then removed" fact survives until this explicit overwrite).
    */
-  deleteDeadBaselineRows(decisionId: string): number {
+  clearSupportBaselines(decisionId: string): number {
     if (!this.hasSupportBaselinesTable()) return 0;
     const result = this.db
-      .prepare(
-        `DELETE FROM support_baselines
-         WHERE decision_id = ?
-           AND NOT EXISTS (
-             SELECT 1 FROM edges e
-             WHERE e.from_id = support_baselines.decision_id
-               AND e.to_id = support_baselines.support_id
-               AND e.relation = 'informed_by'
-               AND e.removed_at IS NULL
-           )`
-      )
+      .prepare("DELETE FROM support_baselines WHERE decision_id = ?")
       .run(decisionId);
     return Number(result.changes);
   }
