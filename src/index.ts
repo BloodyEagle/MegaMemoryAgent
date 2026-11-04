@@ -24,7 +24,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("(no command)")}    Start the MCP stdio server ${pc.dim("(invoked by your editor)")}
   ${pc.cyan("install")}         Configure editor/agent integration (interactive)
   ${pc.cyan("serve")}           Start the web graph explorer
-  ${pc.cyan("stats")}           Show knowledge graph statistics
+  ${pc.cyan("stats")}           Show knowledge graph statistics ${pc.dim("(--prune trims the call journal)")}
   ${pc.cyan("merge")}           Merge two knowledge.db files
   ${pc.cyan("conflicts")}       List unresolved merge conflicts
   ${pc.cyan("resolve")}         Resolve a merge conflict

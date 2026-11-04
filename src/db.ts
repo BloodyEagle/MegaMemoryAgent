@@ -8,11 +8,35 @@ import { normalizeName } from "./norm.js";
 /** Plan 4 (informed_by provenance slice, schema v7); v8 adds support baselines. */
 export const SCHEMA_VERSION = 10;
 
+/**
+ * F5 (2.1.1): timeline retention defaults. The call journal is service
+ * telemetry — useful, but not worth an unbounded file. Configured via
+ * MEGAMEMORY_TIMELINE_RETENTION_DAYS / MEGAMEMORY_TIMELINE_MAX_ENTRIES;
+ * 0 disables a rule. Unlike the provenance audit journal, which keeps its
+ * own 200-runs/90-days rule, this one is trimmed right here.
+ */
+export const TIMELINE_RETENTION_DAYS_DEFAULT = 90;
+export const TIMELINE_MAX_ENTRIES_DEFAULT = 50_000;
+/** Automatic prune rides on writes, at most once per this many inserts. */
+export const TIMELINE_PRUNE_INTERVAL = 500;
+/** Rows deleted per statement — no long write lock over a big backlog. */
+export const TIMELINE_PRUNE_BATCH = 1000;
+
+/** Integer from the environment (per call, plan 3 §11), or the default. */
+function envInt(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return defaultValue;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.trunc(n) : defaultValue;
+}
+
 export class KnowledgeDB {
   private db: Database.Database;
   private dbFile: string;
   private _txDepth = 0;
   private _hasStatusColumn: boolean | undefined;
+  /** F5: inserts since the last automatic timeline prune. */
+  private timelineWritesSincePrune = 0;
 
   /** Absolute path of the backing file; config flags are read per call (plan 3 §11). */
   get dbPath(): string {
@@ -2436,7 +2460,103 @@ export class KnowledgeDB {
       is_error: entry.is_error ? 1 : 0,
       affected_ids: JSON.stringify(entry.affected_ids),
     });
+    // F5 (2.1.1): the journal is written on every tool call and nothing used
+    // to trim it — on an active base it grew unbounded inside the very file
+    // the agent carries around. Prune piggybacks on writes, at most once per
+    // TIMELINE_PRUNE_INTERVAL inserts so the common call pays nothing.
+    this.timelineWritesSincePrune += 1;
+    if (this.timelineWritesSincePrune >= TIMELINE_PRUNE_INTERVAL) {
+      this.timelineWritesSincePrune = 0;
+      try {
+        this.pruneTimeline();
+      } catch (err) {
+        // Retention must never break tool execution — the entry above is
+        // already safely stored.
+        console.error(
+          "Timeline prune failed:",
+          err instanceof Error ? err.message : String(err)
+        );
+      }
+    }
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * F5 (2.1.1): enforce the timeline retention rules.
+   *
+   * - age: rows older than timeline_retention_days go;
+   * - count: rows beyond timeline_max_entries (oldest first) go;
+   * - 0 (or negative) in a setting disables that rule entirely — the default
+   *   for anyone who needs the whole journal.
+   *
+   * Both rules delete in batches of TIMELINE_PRUNE_BATCH, each its own
+   * statement: no long write lock over a huge backlog, a concurrent reader
+   * (web explorer) never sees the timeline disappear in one lump.
+   *
+   * Automatic runs (piggybacking on writes) are throttled by the write
+   * counter in insertTimelineEntry — at most once per TIMELINE_PRUNE_INTERVAL
+   * inserts; this method itself always prunes, which is what the manual
+   * `stats --prune` CLI path uses. The provenance audit journal
+   * (provenance_audit_runs) is NOT touched here — it has its own retention
+   * rule (200 runs per root / 90 days, plan 3 §10).
+   */
+  pruneTimeline(): { byAge: number; byCount: number } {
+    const retentionDays = envInt(
+      "MEGAMEMORY_TIMELINE_RETENTION_DAYS",
+      TIMELINE_RETENTION_DAYS_DEFAULT
+    );
+    const maxEntries = envInt(
+      "MEGAMEMORY_TIMELINE_MAX_ENTRIES",
+      TIMELINE_MAX_ENTRIES_DEFAULT
+    );
+
+    let byAge = 0;
+    if (retentionDays > 0) {
+      // datetime('now') stamps rows in "YYYY-MM-DD HH:MM:SS" (UTC); SQLite
+      // computes the cutoff in the same format, so plain string comparison
+      // is exact.
+      for (;;) {
+        const res = this.db
+          .prepare(
+            `DELETE FROM timeline WHERE seq IN (
+               SELECT seq FROM timeline
+               WHERE timestamp < datetime('now', ?)
+               LIMIT ${TIMELINE_PRUNE_BATCH}
+             )`
+          )
+          .run(`-${retentionDays} days`);
+        const deleted = Number(res.changes);
+        byAge += deleted;
+        if (deleted < TIMELINE_PRUNE_BATCH) break;
+      }
+    }
+
+    let byCount = 0;
+    if (maxEntries > 0) {
+      for (;;) {
+        const count = Number(
+          (
+            this.db.prepare("SELECT COUNT(*) AS n FROM timeline").get() as {
+              n: number;
+            }
+          ).n
+        );
+        const excess = count - maxEntries;
+        if (excess <= 0) break;
+        const batch = Math.min(excess, TIMELINE_PRUNE_BATCH);
+        const res = this.db
+          .prepare(
+            `DELETE FROM timeline WHERE seq IN (
+               SELECT seq FROM timeline ORDER BY seq ASC LIMIT ?
+             )`
+          )
+          .run(batch);
+        byCount += Number(res.changes);
+        if (Number(res.changes) < batch) break;
+      }
+    }
+
+    return { byAge, byCount };
   }
 
   getTimelineBounds(): { first: string | null; last: string | null; count: number } {
