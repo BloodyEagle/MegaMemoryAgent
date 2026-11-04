@@ -734,7 +734,8 @@ function weakLinks(
   direction: "ancestry" | "impact",
   retrospective: boolean,
   maxScanSupports: number,
-  checker: SupportChecker
+  checker: SupportChecker,
+  rootId: string
 ): ProvenanceWeakLink[] {
   const weak: ProvenanceWeakLink[] = [];
 
@@ -946,6 +947,28 @@ function weakLinks(
     }
   }
 
+  // 4b. 2.1.2 F4: an unreviewed support of an INNER non-decision node used
+  // to vanish from the answer — the checks above are decision-scoped and the
+  // inner support_check travels only for state = changed. A fact standing on
+  // an unconfirmed support must speak: unknown at any node with informed_by
+  // becomes a support_unreviewed record (the checker caches, so this adds no
+  // budget spend beyond the per-node check the caller makes anyway).
+  for (const n of result.nodes) {
+    if (n.id === rootId || n.removed || n.kind === "decision") continue;
+    const check = checker.check(n.id);
+    if (check && check.state === "unknown") {
+      weak.push({
+        type: "support_unreviewed",
+        id: n.id,
+        count: check.unknown_count ?? check.unknown?.length ?? 0,
+        note: clampNote(
+          `опоры узла "${n.id}" не подтверждены снимком (support_check: unknown) — ` +
+            `проверка не считается чистотой, вызови confirm_supports после сверки`
+        ),
+      });
+    }
+  }
+
   // D2.4: the serialized weak_links must fit the 8 KB response cap.
   return capWeakLinks(weak);
 }
@@ -1048,7 +1071,15 @@ export function provenanceTrace(
       db,
       new CheckBudget(limits.maxCheckEdges, limits.maxCheckBytes)
     );
-    const weak = weakLinks(db, result, direction, retrospective, limits.maxScanNodes, checker);
+    const weak = weakLinks(
+      db,
+      result,
+      direction,
+      retrospective,
+      limits.maxScanNodes,
+      checker,
+      input.node_id
+    );
 
     // Plan 4 v8 §4: the root's support check travels with the verdict —
     // present whenever there is anything to check (any state).

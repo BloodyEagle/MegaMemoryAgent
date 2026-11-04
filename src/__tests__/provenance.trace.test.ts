@@ -625,4 +625,36 @@ describe("2.1.2 provenance trace fixes", () => {
     expect(out.edges).toEqual([]);
     expect(out.shown).toBe(1);
   });
+
+  it("F4: an unreviewed support of an inner fact node shows up as support_unreviewed", () => {
+    node("D", "decision"); // summary s-D
+    node("F", "feature"); // summary s-F
+    node("S", "fact"); // summary s-S
+    edge("D", "F", "why F");
+    edge("F", "S", "why S");
+    // Only D -> F is confirmed; F -> S never was.
+    confirmSupports(db, {
+      decision_id: "D",
+      expected_claim_digest: claimDigestOf("s-D"),
+      items: [
+        {
+          support_id: "F",
+          expected_claim_digest: claimDigestOf("s-F"),
+          expected_status_digest: statusDigestOf(
+            db.getNode("F")!.status,
+            db.getNode("F")!.epistemic_status
+          ),
+          expected_edge_digest: edgeDigestOf("why F"),
+        },
+      ],
+    });
+
+    const out = trace("D");
+    const unreviewed = out.weak_links.filter((w) => w.type === "support_unreviewed");
+    // F (the inner fact with its own informed_by) is reported; S (no supports
+    // at all) is not, and the root's own verdict lives in support_check.
+    expect(unreviewed.some((w) => w.id === "F")).toBe(true);
+    expect(unreviewed.some((w) => w.id === "S")).toBe(false);
+    expect(out.support_check?.state).toBe("unchanged");
+  });
 });
