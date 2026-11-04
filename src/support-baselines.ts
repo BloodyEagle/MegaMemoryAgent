@@ -174,16 +174,27 @@ export function computeSupportCheck(
 
   const baselineAt = db.lastActiveBaselineAt(nodeId) ?? confirmedAt;
 
-  // The decision's own wording: the confirmation belongs to the wording the
-  // agent saw (§1.2). A rewrite of the summary does not extend it — the
-  // mismatch is surfaced as claim_changed (test 10).
-  const claimChanged = claimAnchor !== null && claimAnchor !== claimDigestOf(node.summary);
-
   // Sets, not arrays: a 20k-support star must not pay O(n²) membership
   // checks; the returned lists are capped after the loop.
   const unknownSet = new Set<string>();
   const changedList: SupportPairChange[] = [];
   let exhausted = false;
+
+  // The decision's own wording: the confirmation belongs to the wording the
+  // agent saw (§1.2). A rewrite of the summary does not extend it — the
+  // mismatch is surfaced as claim_changed (test 10).
+  // 2.1.2 F7: the summary goes through the budget TOO — hashing a 10 MB
+  // wording under a 1-byte budget must not happen behind the check's back.
+  // The bytes are charged via consume before hashing; when they do not fit,
+  // the verdict is `incomplete`, never a clean verdict over a skipped claim.
+  let claimChanged = false;
+  if (claimAnchor !== null) {
+    if (!budget.consume(Buffer.byteLength(node.summary, "utf8"))) {
+      exhausted = true;
+    } else {
+      claimChanged = claimAnchor !== claimDigestOf(node.summary);
+    }
+  }
 
   // Snapshot rows within the budget's reach: when every active row can be
   // checked anyway, one bulk read beats a query per support; otherwise rows
