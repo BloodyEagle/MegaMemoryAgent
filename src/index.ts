@@ -223,7 +223,7 @@ async function startMcpServer() {
   const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
   const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
-  const { confirmSupports } = await import("./support-baselines.js");
+  const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
@@ -829,6 +829,46 @@ async function startMcpServer() {
           params: { decision_id: params.decision_id },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  // ---- Support revision history (2.1.3 F1) ----
+
+  server.tool(
+    "provenance_history",
+    "Цепочка версий подтверждённых опор решения: какую версию агент подтверждал, какая была до неё, какая после — для разбора инцидента задним числом. По каждой паре «решение—опора»: confirmed_at, source (agent — первое подтверждение / import — перенос при merge / superseded — версия вытеснена повторным подтверждением или удалением), reason (confirmed/reconfirmed/removed/edge_relinked), превью digest'ов (12 символов) и признак «это текущая версия». Тел узлов нет — только версии. Чтение не пишет ничего.",
+    {
+      decision_id: z.string().describe("ID решения, чья история версий запрашивается"),
+      support_id: z.string().optional().describe("Опора — вернуть цепочку только этой пары; без неё — по всем парам решения"),
+      limit: z.number().int().min(1).max(100).optional().describe("Сколько ревизий на пару возвращать (по умолчанию 20)"),
+    },
+    async (params) => {
+      try {
+        const result = provenanceHistory(db, {
+          decision_id: params.decision_id,
+          support_id: params.support_id,
+          limit: params.limit,
+        });
+        timeline.log({
+          tool: "provenance_history",
+          params: { decision_id: params.decision_id, support_id: params.support_id },
+          result_summary: `${result.pairs.length} pair(s)`,
+          is_write: false,
+          is_error: false,
+          affected_ids: [params.decision_id],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "provenance_history",
+          params: { decision_id: params.decision_id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
           is_error: true,
           affected_ids: [],
         });

@@ -2,11 +2,29 @@ import Database from "libsql";
 import path from "path";
 import fs from "fs";
 import { createHash } from "node:crypto";
-import type { NodeRow, EdgeRow, SupportBaselineRow } from "./types.js";
+import type {
+  NodeRow,
+  EdgeRow,
+  SupportBaselineRow,
+  SupportRevisionRow,
+} from "./types.js";
 import { normalizeName } from "./norm.js";
 
-/** Plan 4 (informed_by provenance slice, schema v7); v8 adds support baselines. */
-export const SCHEMA_VERSION = 10;
+/** Plan 4 (informed_by provenance slice, schema v7); v8 baselines, v11 revisions
+ * + artifacts. */
+export const SCHEMA_VERSION = 11;
+
+/**
+ * 2.1.3 F1: support revision journal defaults. The journal keeps the history
+ * of confirmed versions per pair "decision — support": at most
+ * SUPPORT_REVISIONS_MAX_PER_PAIR revisions per pair and no row older than
+ * SUPPORT_REVISIONS_RETENTION_DAYS. The per-pair cap is trimmed on every
+ * write to that pair (one indexed DELETE); the day-based purge rides on
+ * writes at most once per SUPPORT_REVISIONS_PRUNE_INTERVAL inserts.
+ */
+export const SUPPORT_REVISIONS_MAX_PER_PAIR = 50;
+export const SUPPORT_REVISIONS_RETENTION_DAYS = 365;
+export const SUPPORT_REVISIONS_PRUNE_INTERVAL = 200;
 
 /**
  * F5 (2.1.1): timeline retention defaults. The call journal is service
@@ -37,6 +55,8 @@ export class KnowledgeDB {
   private _hasStatusColumn: boolean | undefined;
   /** F5: inserts since the last automatic timeline prune. */
   private timelineWritesSincePrune = 0;
+  /** 2.1.3 F1: revision inserts since the last automatic retention purge. */
+  private supportRevisionWritesSincePrune = 0;
 
   /** Absolute path of the backing file; config flags are read per call (plan 3 §11). */
   get dbPath(): string {
@@ -443,6 +463,32 @@ export class KnowledgeDB {
         this.db.exec(
           "CREATE INDEX IF NOT EXISTS idx_edges_live_from_to ON edges(from_id, relation, removed_at, to_id)"
         );
+      }
+
+      if (currentVersion < 11) {
+        // 2.1.3 F1: the revision journal of confirmed support versions —
+        // written by the SAME paths that write support_baselines
+        // (confirm_supports, the create_concept evidence carve-out, the merge
+        // carry). No foreign keys and no cascades, same reason as the
+        // baselines: deletion hygiene must not destroy the history.
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS support_revisions (
+            id             INTEGER PRIMARY KEY,
+            decision_id    TEXT NOT NULL,
+            support_id     TEXT NOT NULL,
+            edge_key       TEXT NOT NULL,
+            claim_digest   TEXT NOT NULL,
+            status_digest  TEXT NOT NULL,
+            edge_digest    TEXT NOT NULL,
+            format_version INTEGER NOT NULL,
+            confirmed_at   TEXT NOT NULL,
+            recorded_at    TEXT NOT NULL,
+            source         TEXT NOT NULL,
+            reason         TEXT
+          );
+          CREATE INDEX IF NOT EXISTS idx_support_revisions_pair
+            ON support_revisions(decision_id, support_id, recorded_at);
+        `);
       }
 
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -1614,6 +1660,143 @@ export class KnowledgeDB {
       )
       .run(at, decisionId);
     return Number(result.changes);
+  }
+
+  // ---- 2.1.3 F1: the support revision journal ----
+  // Written by the same paths that write support_baselines (confirm_supports,
+  // the create_concept evidence carve-out, the merge carry). Mutations and
+  // reads never journal: "a mutation never confirms" stays intact.
+
+  hasSupportRevisionsTable(): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_revisions'"
+        )
+        .get() !== undefined
+    );
+  }
+
+  /**
+   * Append one revision and apply the per-pair cap right away: a single
+   * indexed DELETE over idx_support_revisions_pair keeps the pair at
+   * SUPPORT_REVISIONS_MAX_PER_PAIR rows — the "batched cleanup on write"
+   * rule (2.1.3 F1), paid per written pair, not by every reader.
+   */
+  insertSupportRevision(row: SupportRevisionRow): void {
+    if (!this.hasSupportRevisionsTable()) return;
+    this.db
+      .prepare(
+        `INSERT INTO support_revisions
+           (decision_id, support_id, edge_key, claim_digest, status_digest,
+            edge_digest, format_version, confirmed_at, recorded_at, source, reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        row.decision_id,
+        row.support_id,
+        row.edge_key,
+        row.claim_digest,
+        row.status_digest,
+        row.edge_digest,
+        row.format_version,
+        row.confirmed_at,
+        row.recorded_at,
+        row.source,
+        row.reason ?? null
+      );
+    this.db
+      .prepare(
+        `DELETE FROM support_revisions
+         WHERE decision_id = ? AND support_id = ? AND id NOT IN (
+           SELECT id FROM support_revisions
+           WHERE decision_id = ? AND support_id = ?
+           ORDER BY recorded_at DESC, id DESC
+           LIMIT ?
+         )`
+      )
+      .run(
+        row.decision_id,
+        row.support_id,
+        row.decision_id,
+        row.support_id,
+        SUPPORT_REVISIONS_MAX_PER_PAIR
+      );
+    this.supportRevisionWritesSincePrune += 1;
+    this.maybePruneSupportRevisions(row.recorded_at);
+  }
+
+  /**
+   * Day-based retention (365 days): one DELETE over recorded_at. Rides on
+   * writes at most once per SUPPORT_REVISIONS_PRUNE_INTERVAL inserts — the
+   * scan is paid by writers in batches, never by the history reader.
+   * Public for tests; called automatically from insertSupportRevision.
+   */
+  pruneSupportRevisions(now: string): number {
+    if (!this.hasSupportRevisionsTable()) return 0;
+    const cutoff = new Date(
+      new Date(now).getTime() - SUPPORT_REVISIONS_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    ).toISOString();
+    const result = this.db
+      .prepare("DELETE FROM support_revisions WHERE recorded_at < ?")
+      .run(cutoff);
+    return Number(result.changes);
+  }
+
+  maybePruneSupportRevisions(now: string): void {
+    if (this.supportRevisionWritesSincePrune >= SUPPORT_REVISIONS_PRUNE_INTERVAL) {
+      this.supportRevisionWritesSincePrune = 0;
+      this.pruneSupportRevisions(now);
+    }
+  }
+
+  /** A page of the pair's (or the whole decision's) revisions, newest first.
+   * The caller asks for limit+1 to detect has_more. */
+  getSupportRevisions(
+    decisionId: string,
+    supportId: string | null,
+    limit: number
+  ): SupportRevisionRow[] {
+    if (!this.hasSupportRevisionsTable()) return [];
+    if (supportId !== null) {
+      return this.db
+        .prepare(
+          `SELECT id, decision_id, support_id, edge_key, claim_digest, status_digest,
+                  edge_digest, format_version, confirmed_at, recorded_at, source, reason
+           FROM support_revisions
+           WHERE decision_id = ? AND support_id = ?
+           ORDER BY recorded_at DESC, id DESC LIMIT ?`
+        )
+        .all(decisionId, supportId, limit) as SupportRevisionRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT id, decision_id, support_id, edge_key, claim_digest, status_digest,
+                edge_digest, format_version, confirmed_at, recorded_at, source, reason
+         FROM support_revisions
+         WHERE decision_id = ?
+         ORDER BY recorded_at DESC, id DESC LIMIT ?`
+      )
+      .all(decisionId, limit) as SupportRevisionRow[];
+  }
+
+  countSupportRevisions(): number {
+    if (!this.hasSupportRevisionsTable()) return 0;
+    return Number(
+      (this.db.prepare("SELECT COUNT(*) AS n FROM support_revisions").get() as { n: number }).n
+    );
+  }
+
+  /** Distinct supports of a decision that carry journal history (2.1.3 F1). */
+  getSupportRevisionSupportIds(decisionId: string): string[] {
+    if (!this.hasSupportRevisionsTable()) return [];
+    return (
+      this.db
+        .prepare(
+          "SELECT DISTINCT support_id FROM support_revisions WHERE decision_id = ? ORDER BY support_id"
+        )
+        .all(decisionId) as Array<{ support_id: string }>
+    ).map((r) => r.support_id);
   }
 
   /**

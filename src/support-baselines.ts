@@ -4,10 +4,16 @@ import type {
   ConfirmSupportsInput,
   ConfirmSupportsOutput,
   EdgeRow,
+  ProvenanceHistoryOutput,
   SupportBaselineRow,
   SupportChangeReason,
   SupportCheckView,
+  SupportHistoryPair,
   SupportPairChange,
+  SupportRevisionEntry,
+  SupportRevisionReason,
+  SupportRevisionRow,
+  SupportRevisionSource,
 } from "./types.js";
 
 /**
@@ -379,6 +385,61 @@ function baselineRowBytes(row: SupportBaselineRow): number {
 }
 
 /**
+ * 2.1.3 F1: build a journal row out of a snapshot row. The journal row keeps
+ * the VERSION's own confirmation time (confirmed_at), never the moment the
+ * entry lands — that is recorded_at.
+ */
+function revisionOf(
+  row: SupportBaselineRow,
+  source: SupportRevisionSource,
+  reason: SupportRevisionReason,
+  recordedAt: string
+): SupportRevisionRow {
+  return {
+    decision_id: row.decision_id,
+    support_id: row.support_id,
+    edge_key: row.edge_key,
+    claim_digest: row.claim_digest,
+    status_digest: row.status_digest,
+    edge_digest: row.edge_digest,
+    format_version: row.format_version,
+    confirmed_at: row.confirmed_at,
+    recorded_at: recordedAt,
+    source,
+    reason,
+  };
+}
+
+/**
+ * 2.1.3 F1: journal the write of one snapshot row, in the same transaction
+ * that writes the snapshot ("the journal is written where the snapshot is
+ * written"). Three cases:
+ * - no active row for this pair-edge — the first confirmation: the chain
+ *   opens with the origin entry (agent/confirmed);
+ * - an active row with different digests — the old version leaves the
+ *   snapshot and lands in the journal (superseded/reconfirmed);
+ * - an active row with the same digests — a re-confirmation of the same
+ *   version: no entry, nothing historical happened.
+ * Exported for the create_concept evidence carve-out — the second snapshot
+ * write path; the merge carry journals its own import entries.
+ */
+export function journalSnapshotWrite(db: KnowledgeDB, row: SupportBaselineRow, now: string): void {
+  const existing = db.getSupportBaselineRow(row.decision_id, row.support_id, row.edge_key);
+  if (!existing) {
+    db.insertSupportRevision(revisionOf(row, "agent", "confirmed", now));
+    return;
+  }
+  if (
+    existing.claim_digest !== row.claim_digest ||
+    existing.status_digest !== row.status_digest ||
+    existing.edge_digest !== row.edge_digest ||
+    existing.format_version !== row.format_version
+  ) {
+    db.insertSupportRevision(revisionOf(existing, "superseded", "reconfirmed", now));
+  }
+}
+
+/**
  * §2.1: confirm_supports — verify every expectation and write the snapshot
  * ATOMICALLY. F4: the whole verification runs INSIDE the same BEGIN
  * IMMEDIATE transaction that writes — an expectation checked outside would
@@ -543,9 +604,15 @@ export function confirmSupports(
     // must not amnesty them. F7: the empty confirmation MARKS the rows
     // superseded instead of deleting them — the history stays readable.
     if (input.items.length === 0) {
+      // 2.1.3 F1: the transition into superseded is a version event — every
+      // acknowledged row journals a removed entry before the mark.
+      for (const row of db.getActiveSupportBaselines(input.decision_id)) {
+        db.insertSupportRevision(revisionOf(row, "superseded", "removed", now));
+      }
       db.markSupportBaselinesSuperseded(input.decision_id, now);
     }
     for (const p of planned) {
+      journalSnapshotWrite(db, p.row, now);
       db.upsertSupportBaseline(p.row);
     }
     db.setClaimDigest(input.decision_id, currentClaim, now);
@@ -685,4 +752,122 @@ export function provenanceMetrics(
       metrics_truncated: truncated,
     };
   });
+}
+
+// ---- 2.1.3 F1: provenance_history ----
+
+/** Pairs listed per call — the response must stay small, same philosophy as
+ * the weak-links caps. */
+const HISTORY_PAIRS_CAP = 50;
+const HISTORY_LIMIT_MAX = 100;
+const DIGEST_PREVIEW_CHARS = 12;
+
+/** 12-char digest preview — the plan forbids node bodies in the answer. */
+function preview(digest: string): string {
+  return digest.slice(0, DIGEST_PREVIEW_CHARS);
+}
+
+/**
+ * 2.1.3 F1: the version chain of one pair — the journal entries plus the
+ * live snapshot row (marked current). Reverse chronological by recorded_at
+ * (the current row is dated by its own confirmation); ties keep the current
+ * version first, then the newest journal id. No node bodies: digests are
+ * 12-char previews.
+ */
+function pairHistory(
+  db: KnowledgeDB,
+  decisionId: string,
+  supportId: string,
+  limit: number
+): SupportHistoryPair {
+  const journal = db.getSupportRevisions(decisionId, supportId, limit + 1);
+  const entries: Array<SupportRevisionEntry & { seq: number }> = journal.map((r, seq) => ({
+    edge_key: r.edge_key,
+    confirmed_at: r.confirmed_at,
+    source: r.source,
+    reason: r.reason,
+    claim_digest: preview(r.claim_digest),
+    status_digest: preview(r.status_digest),
+    edge_digest: preview(r.edge_digest),
+    format_version: r.format_version,
+    recorded_at: r.recorded_at,
+    is_current: false,
+    seq,
+  }));
+  // The live anchors of the pair — each is a version the agent can read right
+  // now (a pair may carry two: a dead anchor and a fresh relinked one).
+  let seq = entries.length;
+  for (const b of db.getSupportBaselines(decisionId)) {
+    if (b.support_id !== supportId || b.superseded_at) continue;
+    entries.push({
+      edge_key: b.edge_key,
+      confirmed_at: b.confirmed_at,
+      source: b.confirmed_by,
+      reason: null,
+      claim_digest: preview(b.claim_digest),
+      status_digest: preview(b.status_digest),
+      edge_digest: preview(b.edge_digest),
+      format_version: b.format_version,
+      recorded_at: b.confirmed_at,
+      is_current: true,
+      seq: seq++,
+    });
+  }
+  entries.sort(
+    (a, b) =>
+      b.recorded_at.localeCompare(a.recorded_at) ||
+      Number(b.is_current) - Number(a.is_current) ||
+      b.seq - a.seq
+  );
+  // The limit caps the WHOLE chain, the current version included.
+  const hasMore = entries.length > limit;
+  const revisions: SupportRevisionEntry[] = entries
+    .slice(0, limit)
+    .map(({ seq: _seq, ...e }) => e);
+  return {
+    support_id: supportId,
+    revisions,
+    ...(hasMore ? { revisions_truncated: true } : {}),
+  };
+}
+
+/**
+ * 2.1.3 F1: the provenance_history tool — "which version did the agent
+ * confirm, which came before it, which after". Read-only; answers per pair
+ * with digests as 12-char previews and no node bodies.
+ */
+export function provenanceHistory(
+  db: KnowledgeDB,
+  input: { decision_id: string; support_id?: string; limit?: number }
+): ProvenanceHistoryOutput {
+  const rawLimit = input.limit ?? 20;
+  if (!Number.isFinite(rawLimit) || !Number.isInteger(rawLimit) || rawLimit < 1) {
+    throw new Error(
+      `provenance_history: limit должен быть целым ≥ 1, получено: ${String(input.limit)}.`
+    );
+  }
+  const limit = Math.min(rawLimit, HISTORY_LIMIT_MAX);
+
+  if (input.support_id !== undefined) {
+    return {
+      decision_id: input.decision_id,
+      pairs: [pairHistory(db, input.decision_id, input.support_id, limit)],
+    };
+  }
+
+  // Every support of the decision that carries history: journal rows and/or
+  // a live anchor. Deterministic id order; capped with an honest flag.
+  const supports = new Set<string>();
+  for (const sid of db.getSupportRevisionSupportIds(input.decision_id)) {
+    supports.add(sid);
+  }
+  for (const b of db.getSupportBaselines(input.decision_id)) {
+    supports.add(b.support_id);
+  }
+  const ordered = [...supports].sort(compareIds).slice(0, HISTORY_PAIRS_CAP);
+  return {
+    decision_id: input.decision_id,
+    pairs: ordered.map((sid) => pairHistory(db, input.decision_id, sid, limit)),
+    ...(supports.size > HISTORY_PAIRS_CAP ? { pairs_truncated: true } : {}),
+  };
 }

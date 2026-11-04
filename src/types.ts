@@ -592,6 +592,68 @@ export interface SupportBaselineRow {
 /** Why a confirmed support no longer matches (plan 4 v8 §4). */
 export type SupportChangeReason = "summary" | "status" | "rationale" | "removed";
 
+// ---- 2.1.3 F1: the support revision journal (support_revisions rows) ----
+
+/** Who wrote the journal entry: the confirming agent, the merge carry, or a
+ * version transition (superseded by a re-confirmation / removed). */
+export type SupportRevisionSource = "agent" | "import" | "superseded";
+
+/**
+ * Why the entry landed: the pair was confirmed for the first time, an older
+ * version was replaced by a re-confirmation, the support was acknowledged as
+ * gone, or the merge re-anchored the snapshot to a new edge row.
+ */
+export type SupportRevisionReason = "confirmed" | "reconfirmed" | "removed" | "edge_relinked";
+
+/** One journal row: a confirmed version of a pair, past or superseded. */
+export interface SupportRevisionRow {
+  id?: number;
+  decision_id: string;
+  support_id: string;
+  edge_key: string;
+  claim_digest: string;
+  status_digest: string;
+  edge_digest: string;
+  format_version: number;
+  /** When THIS version was confirmed (not when the entry landed). */
+  confirmed_at: string;
+  /** When the entry landed in the journal. */
+  recorded_at: string;
+  source: SupportRevisionSource;
+  reason: SupportRevisionReason | null;
+}
+
+/** One chain entry as provenance_history returns it: digests are 12-char
+ * previews, no node bodies (the answer must stay small). */
+export interface SupportRevisionEntry {
+  edge_key: string;
+  confirmed_at: string;
+  source: string;
+  reason: string | null;
+  claim_digest: string;
+  status_digest: string;
+  edge_digest: string;
+  format_version: number;
+  recorded_at: string;
+  /** true for the row taken from the live snapshot (support_baselines). */
+  is_current: boolean;
+}
+
+/** The chain of one pair "decision — support". */
+export interface SupportHistoryPair {
+  support_id: string;
+  revisions: SupportRevisionEntry[];
+  /** true when the pair had more revisions than the limit allowed. */
+  revisions_truncated?: boolean;
+}
+
+export interface ProvenanceHistoryOutput {
+  decision_id: string;
+  pairs: SupportHistoryPair[];
+  /** true when more pairs carry history than fit the response. */
+  pairs_truncated?: boolean;
+}
+
 /** One diverged pair "decision — support" in the support_check block. */
 export interface SupportPairChange {
   support: string;
