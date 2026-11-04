@@ -261,7 +261,12 @@ describe("truncation determinism at equal depth (F13)", () => {
     expect(out.nodes.find((n) => n.id === "c")!.in_paths).toBe(1);
     expect(out.truncated_by).toBe("nodes");
     expect(out.total_within_depth).toBe(5); // honest: all 5 are within depth
-    expect(out.total_exact).toBe(true);
+    // 2.1.2 F5: z was dropped by the node budget and never expanded — any
+    // descendants it grew past this point are unknown to the walk, so the
+    // closure cannot be claimed exact. (Assert updated per plan-4-fixes-8
+    // F5: the old `true` codified exactly the order-dependent lie the fix
+    // removes; the fixture is unchanged.)
+    expect(out.total_exact).toBe(false);
 
     // Same input -> same selection.
     const again = trace("r", { maxNodes: 3 });

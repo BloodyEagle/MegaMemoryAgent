@@ -626,6 +626,24 @@ describe("2.1.2 provenance trace fixes", () => {
     expect(out.shown).toBe(1);
   });
 
+  it("F5: a node-budget cut makes total_within_depth inexact", () => {
+    node("D", "decision");
+    node("a");
+    node("b");
+    node("c");
+    edge("D", "a");
+    edge("D", "b");
+    edge("b", "c");
+
+    const out = trace("D", { depth: 2, maxNodes: 1 });
+    // The forbidden combination is total 3 / exact true: b was dropped by the
+    // node budget, so its descendant c never entered the count.
+    const inexact = out.total_within_depth !== 4 || out.total_exact === false;
+    expect(inexact).toBe(true);
+    expect(out.truncated_by).toBe("nodes");
+    expect(out.nodes.find((n) => n.id === "c")).toBeUndefined();
+  });
+
   it("F4: an unreviewed support of an inner fact node shows up as support_unreviewed", () => {
     node("D", "decision"); // summary s-D
     node("F", "feature"); // summary s-F

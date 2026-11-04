@@ -485,6 +485,10 @@ function traverse(
     for (const cand of candidates) {
       if (budget <= 0) {
         truncatedBy = truncatedBy ?? "nodes";
+        // 2.1.2 F5: a node dropped by the node budget is never expanded, so
+        // its descendants never enter the count — total_within_depth is a
+        // lower estimate, and claiming exactness would be a lie.
+        totalExact = false;
         continue;
       }
       const other = db.getNodeIncludingRemoved(cand);
