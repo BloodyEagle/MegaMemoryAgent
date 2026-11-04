@@ -19,6 +19,8 @@ Commands:
   export --md <dir> Export the graph to markdown files (--check for CI; --db PATH)
   doctor          Health check of the current database (exit 1 on problems; --db PATH)
   eval            Measure search recall@k on the eval set (fixtures/eval.jsonl; --db PATH)
+  guide           Print the agent onboarding text (the same constant install writes to AGENTS.md)
+  bench           Measure orientation savings: graph vs baseline in tokens (--baseline files|te|both; --db PATH)
 
 Options:
   --target NAME    Install target (opencode, claudecode, antigravity, codex)
@@ -28,6 +30,10 @@ Options:
   --right-label   Label for right side in merge (default: right)
   --keep          Resolution strategy: left, right, or both
   --json          Machine-readable output for conflicts
+  --questions FILE  bench: jsonl with questions ({"id","query","expect_nodes"?})
+  --baseline      bench: what the graph is measured against (files | te | both; default files)
+  --te-cmd CMD    bench: external structural tool for te/both, {query} is substituted
+  --file-limit KB bench: files over the limit are counted by size (default 200)
   --db PATH       Path to knowledge.db for every command that opens the
                 database (sources: --db, MEGAMEMORY_DB_PATH, ./.megamemory/knowledge.db)
   --help, -h      Show this help

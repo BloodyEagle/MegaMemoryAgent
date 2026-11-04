@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.4-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.5-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -116,6 +116,42 @@ not resurrect because the other branch never knew.
 
 ---
 
+## Measuring the benefit
+
+Is the memory actually useful? Don't argue — measure: `megamemory bench` tells you in
+numbers whether **orientation via the graph is cheaper than the alternative**, and how
+often it points at the right nodes. Three baselines, one flag:
+
+```bash
+# vs reading the file_refs files of the found nodes (default)
+megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline files
+
+# vs an external structural tool (symbol graph, outline): {query} is substituted escaped
+megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline te \
+  --te-cmd "node ~/agent-skills/graph.js path {query}"
+
+# both ratios side by side: where memory wins, where the structural tool is the right call
+megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline both
+```
+
+Mixed-language repositories: the right structural tool depends on the language of the
+module, so `te_cmd` and `lang` are set **per question**, and the report breaks the median
+ratio down per language:
+
+```json
+{"id": "q7", "query": "where is apply_catalog called", "lang": "python",
+ "te_cmd": "python ~/agent-skills/graph.py rdeps {query}"}
+```
+
+`ratio = baseline_tokens / graph_tokens` — but never read it without `hit_rate` (did the
+expected nodes surface in the top-10): a cheap but wrong answer is not savings.
+Questions where the graph lost (`ratio < 1`) are printed, not hidden. And the honest
+caveat the command itself prints: **bench measures the cost of orientation, not the
+quality of the answer — fewer tokens with worse quality is not a saving.** For a live
+agent A/B comparison, see [docs/bench-protocol.md](docs/bench-protocol.md).
+
+---
+
 ## Install
 
 Requires Node.js >= 18. For Russian-only projects a much smaller model (`cointegrated/rubert-tiny2`, 312-dim) works after an ONNX conversion; the model unloads after 5 minutes idle (`MEGAMEMORY_EMBED_IDLE_MS=0` disables that), and `MEGAMEMORY_SEARCH=fts` avoids loading it at all. The embedding model (~120 MB, multilingual) downloads on first use and is
@@ -219,6 +255,8 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 | `megamemory doctor` | Health check: schema, model, FTS, IDs, vectors, orphans, digests |
 | `megamemory stats` | Graph and token statistics |
 | `megamemory eval` | recall@10 over `fixtures/eval.jsonl` |
+| `megamemory guide` | Print the agent onboarding text (what install writes to AGENTS.md, plus a session example) |
+| `megamemory bench --questions q.jsonl` | Orientation savings in tokens: graph vs `--baseline files\|te\|both` |
 | `megamemory consolidate [--dry-run\|--apply]` | Find and merge near-duplicate nodes |
 | `megamemory digest [--apply]` | Build or rebuild digest nodes |
 | `megamemory export --md <dir> [--check]` | Markdown export, CI-friendly drift check |

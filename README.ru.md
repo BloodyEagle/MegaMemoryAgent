@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.4-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.5-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -115,6 +115,43 @@
 
 ---
 
+## Измерение пользы
+
+Помогает ли память на самом деле? Не спорьте — измерьте: `megamemory bench` показывает
+числами, дешевле ли **ориентация по графу, чем альтернатива**, и как часто он указывает
+на нужные узлы. Три режима сравнения, один флаг:
+
+```bash
+# против чтения файлов из file_refs найденных узлов (по умолчанию)
+megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline files
+
+# против внешнего структурного инструмента (граф символов, outline): {query}
+# подставляется экранированным
+megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline te \
+  --te-cmd "node ~/agent-skills/graph.js path {query}"
+
+# оба отношения рядом: где память выигрывает, а где структурный инструмент — верный вызов
+megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline both
+```
+
+Многоязычный репозиторий: правильный структурный инструмент зависит от языка модуля,
+поэтому `te_cmd` и `lang` задаются **на вопрос**, а отчёт выводит медиану отношения
+отдельно по каждому языку:
+
+```json
+{"id": "q7", "query": "где вызывается apply_catalog", "lang": "python",
+ "te_cmd": "python ~/agent-skills/graph.py rdeps {query}"}
+```
+
+`ratio = baseline_tokens / graph_tokens` — но никогда не читайте его без `hit_rate`
+(попали ли ожидаемые узлы в топ-10): дешёвый, но неверный ответ — не экономия.
+Вопросы, где граф проиграл (`ratio < 1`), печатаются, а не прячутся. И честная оговорка,
+которую печатает сама команда: **bench измеряет стоимость ориентации, а не качество
+ответа — меньше токенов при худшем качестве не экономия.** Для живого сравнения A/B с
+агентом см. [docs/bench-protocol.md](docs/bench-protocol.md).
+
+---
+
 ## Установка
 
 Нужен Node.js >= 18. Для чисто русских проектов подойдёт значительно меньшая модель (`cointegrated/rubert-tiny2`, 312-мерная) после конвертации в ONNX; модель выгружается после 5 минут простоя (`MEGAMEMORY_EMBED_IDLE_MS=0` отключает выгрузку), а `MEGAMEMORY_SEARCH=fts` не загружает её вовсе. Модель эмбеддингов (~120 МБ, мультиязычная) скачивается при первом
@@ -219,6 +256,8 @@ megamemory doctor               # проверка здоровья, код вы
 | `megamemory doctor` | Проверка: схема, модель, FTS, id, векторы, осиротевшие рёбра, digest |
 | `megamemory stats` | Статистика графа и токенов |
 | `megamemory eval` | recall@10 по `fixtures/eval.jsonl` |
+| `megamemory guide` | Печатает онбординг-текст агента (что install пишет в AGENTS.md, плюс пример сессии) |
+| `megamemory bench --questions q.jsonl` | Экономия ориентации в токенах: граф против `--baseline files\|te\|both` |
 | `megamemory consolidate [--dry-run\|--apply]` | Поиск и слияние почти одинаковых узлов |
 | `megamemory digest [--apply]` | Сборка и пересборка digest-узлов |
 | `megamemory export --md <dir> [--check]` | Markdown-экспорт и проверка расхождений для CI |

@@ -25,6 +25,8 @@ ${pc.bold("Commands:")}
   ${pc.cyan("export --md <dir>")} Export the graph to markdown files ${pc.dim("(--check for CI; --db PATH)")}
   ${pc.cyan("doctor")}          Health check of the current database ${pc.dim("(exit 1 on problems; --db PATH)")}
   ${pc.cyan("eval")}            Measure search recall@k on the eval set ${pc.dim("(fixtures/eval.jsonl; --db PATH)")}
+  ${pc.cyan("guide")}           Print the agent onboarding text ${pc.dim("(the same constant install writes to AGENTS.md)")}
+  ${pc.cyan("bench")}           Measure orientation savings: graph vs baseline in tokens ${pc.dim("(--baseline files|te|both; --db PATH)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -34,6 +36,10 @@ ${pc.bold("Options:")}
   ${pc.cyan("--right-label")}   Label for right side in merge ${pc.dim("(default: right)")}
   ${pc.cyan("--keep")}          Resolution strategy: left, right, or both
   ${pc.cyan("--json")}          Machine-readable output for conflicts
+  ${pc.cyan("--questions")} ${pc.dim("FILE")}  bench: jsonl with questions ${pc.dim('({"id","query","expect_nodes"?})')}
+  ${pc.cyan("--baseline")}      bench: what the graph is measured against ${pc.dim("(files | te | both; default files)")}
+  ${pc.cyan("--te-cmd")} ${pc.dim("CMD")}    bench: external structural tool for te/both, {query} is substituted
+  ${pc.cyan("--file-limit")} ${pc.dim("KB")} bench: files over the limit are counted by size ${pc.dim("(default 200)")}
   ${pc.cyan("--db")} ${pc.dim("PATH")}       Path to knowledge.db for every command that opens the
                 database ${pc.dim("(sources: --db, MEGAMEMORY_DB_PATH, ./.megamemory/knowledge.db)")}
   ${pc.cyan("--help, -h")}      Show this help
