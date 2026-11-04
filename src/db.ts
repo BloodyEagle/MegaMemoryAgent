@@ -6,7 +6,7 @@ import type { NodeRow, EdgeRow, SupportBaselineRow } from "./types.js";
 import { normalizeName } from "./norm.js";
 
 /** Plan 4 (informed_by provenance slice, schema v7); v8 adds support baselines. */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export class KnowledgeDB {
   private db: Database.Database;
@@ -405,6 +405,20 @@ export class KnowledgeDB {
             "ALTER TABLE support_baselines ADD COLUMN superseded_at TEXT"
           );
         }
+      }
+
+      if (currentVersion < 10) {
+        // plan-4-fixes-7 (F2): the live-support pagination used to page with
+        // ORDER BY to_id LIMIT/OFFSET, so every page re-sorted ALL live edges
+        // of the node — a 20 000-support star with a budget of 1 paid for the
+        // whole star. This index gives the keyset walk (to_id > last ORDER BY
+        // to_id LIMIT n) a prefix to read in order: equality on from_id,
+        // relation, removed_at, then to_id in index order — no temp b-tree,
+        // work proportional to the page, not the star. Old dbs get the same
+        // index as fresh ones (CREATE INDEX IF NOT EXISTS — idempotent).
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_edges_live_from_to ON edges(from_id, relation, removed_at, to_id)"
+        );
       }
 
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -1623,19 +1637,27 @@ export class KnowledgeDB {
   /**
    * A deterministic page of live supports (ancestry), ordered by the
    * support's id — the budget cuts the list, so the cut must be stable.
+   *
+   * F2 (2.1.1): keyset pagination, not OFFSET. `ORDER BY to_id LIMIT/OFFSET`
+   * re-sorted every remaining live edge on each page — with a budget of 1 a
+   * 20 000-support star still paid for the whole star per page. `to_id > ?
+   * ORDER BY to_id LIMIT ?` walks the idx_edges_live_from_to prefix instead:
+   * per-page work is the page itself. to_id is unique per (from_id,
+   * relation) — idx_edges_unique — so the cursor cannot skip a row.
    */
   getLiveSupportEdgesPage(
     decisionId: string,
-    offset: number,
+    afterToId: string,
     limit: number
   ): Array<EdgeRow & { other_id: string }> {
     return this.db
       .prepare(
         `SELECT e.*, e.to_id AS other_id FROM edges e
          WHERE e.from_id = ? AND e.relation = 'informed_by' AND e.removed_at IS NULL
-         ORDER BY e.to_id LIMIT ? OFFSET ?`
+           AND e.to_id > ?
+         ORDER BY e.to_id LIMIT ?`
       )
-      .all(decisionId, limit, offset) as Array<EdgeRow & { other_id: string }>;
+      .all(decisionId, afterToId, limit) as Array<EdgeRow & { other_id: string }>;
   }
 
   /**

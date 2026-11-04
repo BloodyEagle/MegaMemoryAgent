@@ -843,6 +843,62 @@ describe("F2: the budget bounds the work, not only the verdict", () => {
       if (view.state === "unchanged") expect(view.incomplete).toBe(false);
     }
   });
+
+  it(
+    "39. a 20k star with budget 1 stays under the smoke threshold on the keyset walk (F2, 2.1.1)",
+    () => {
+      buildStar(20_000);
+      const t0 = performance.now();
+      const view = computeSupportCheck(db, "star", new CheckBudget(1, 1_000_000_000))!;
+      const ms = performance.now() - t0;
+      // Same result the offset walk used to produce…
+      expect(view.state).toBe("incomplete");
+      expect(view.unknown_count ?? view.unknown!.length).toBeLessThanOrEqual(1);
+      // …at the plan-4-fixes-7 threshold: per-page work is the page (index
+      // prefix read), not a re-sort of the whole star. The full-scan cost of
+      // this graph is an order of magnitude higher (test 28 does the linear
+      // pass), so 1200 ms leaves linear regressions nowhere to hide.
+      expect(ms).toBeLessThan(1200);
+    },
+    60_000
+  );
+
+  it("40. keyset pages return exactly the full ordered support list (F2, 2.1.1)", () => {
+    const WIDTH = 1000;
+    db.runInTransaction(() => {
+      node("kd", "decision", "decision kd");
+      for (let i = 1; i <= WIDTH; i++) {
+        node(`k${i}`, "config", `s-k${i}`);
+        db.insertEdgeRaw({
+          from_id: "kd",
+          to_id: `k${i}`,
+          relation: "informed_by",
+          description: "why",
+        });
+      }
+    });
+
+    // Walk the pages the way computeSupportCheck does — cursor = last to_id.
+    const walked: string[] = [];
+    let cursor = "";
+    for (;;) {
+      const page = db.getLiveSupportEdgesPage("kd", cursor, 37); // non-divisor on purpose
+      if (page.length === 0) break;
+      for (const e of page) walked.push(e.to_id);
+      cursor = page[page.length - 1].to_id;
+    }
+
+    const canonical = (
+      db.execSqlAll(
+        `SELECT to_id FROM edges
+         WHERE from_id = ? AND relation = 'informed_by' AND removed_at IS NULL
+         ORDER BY to_id`,
+        "kd"
+      ) as Array<{ to_id: string }>
+    ).map((r) => r.to_id);
+    expect(walked).toEqual(canonical);
+    expect(walked).toHaveLength(WIDTH);
+  });
 });
 
 describe("F3: the status axes are confirmed like every other field", () => {

@@ -209,10 +209,13 @@ export function computeSupportCheck(
   // EVERY support passes through budget.consume — confirmed, unconfirmed,
   // format-incompatible alike: an unseen support must cost the budget, or a
   // tiny budget would scan an unbounded unknown tail (F2).
+  // F2 (2.1.1): the page cursor is the last seen to_id (keyset), not an
+  // OFFSET — a page must cost its own rows, not a re-sort of the whole star.
   let processed = 0;
+  let lastToId = "";
   while (!exhausted && processed < liveCount) {
     const take = Math.max(1, Math.min(SUPPORT_PAGE, budget.remainingEdges));
-    const page = db.getLiveSupportEdgesPage(nodeId, processed, take);
+    const page = db.getLiveSupportEdgesPage(nodeId, lastToId, take);
     if (page.length === 0) break;
     for (const edge of page) {
       const rows = rowsFor(edge.other_id);
@@ -258,6 +261,7 @@ export function computeSupportCheck(
         });
       }
       processed++;
+      lastToId = edge.to_id;
     }
   }
   if (processed < liveCount) exhausted = true;
