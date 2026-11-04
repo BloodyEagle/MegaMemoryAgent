@@ -1509,18 +1509,26 @@ export class KnowledgeDB {
       .all(decisionId) as SupportBaselineRow[];
   }
 
-  /** One support's active rows (indexed by the PK prefix), for budgeted checks. */
-  getSupportBaselineRowsFor(decisionId: string, supportId: string): SupportBaselineRow[] {
-    if (!this.hasSupportBaselinesTable()) return [];
+  /**
+   * 2.1.2 F8: a PK point lookup — the one active row written for THIS edge
+   * (decision, support, edge_key). The old fallback read the pair's whole
+   * active history and filtered in JS: under a tiny budget that materialized
+   * thousands of rows to find one anchor.
+   */
+  getSupportBaselineRow(
+    decisionId: string,
+    supportId: string,
+    edgeKey: string
+  ): SupportBaselineRow | undefined {
+    if (!this.hasSupportBaselinesTable()) return undefined;
     return this.db
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
                 edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
          FROM support_baselines
-         WHERE decision_id = ? AND support_id = ? AND superseded_at IS NULL
-         ORDER BY confirmed_at, edge_key`
+         WHERE decision_id = ? AND support_id = ? AND edge_key = ? AND superseded_at IS NULL`
       )
-      .all(decisionId, supportId) as SupportBaselineRow[];
+      .get(decisionId, supportId, edgeKey) as SupportBaselineRow | undefined;
   }
 
   getAllSupportBaselines(): SupportBaselineRow[] {

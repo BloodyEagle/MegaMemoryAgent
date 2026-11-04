@@ -230,10 +230,15 @@ export function computeSupportCheck(
       bySupport.get(row.support_id)!.push(row);
     }
   }
-  const rowsFor = (supportId: string): SupportBaselineRow[] => {
-    if (activeBaselineCount === 0) return [];
-    if (bulkRows) return bySupport.get(supportId) ?? [];
-    return db.getSupportBaselineRowsFor(nodeId, supportId);
+  // 2.1.2 F8: the snapshot row of one pair is fetched by its PK — outside
+  // the bulk read there is no per-support list anymore, only a point lookup
+  // by edge_key.
+  const rowsForAnchor = (supportId: string, edgeKey: string): SupportBaselineRow | null => {
+    if (activeBaselineCount === 0) return null;
+    if (bulkRows) {
+      return (bySupport.get(supportId) ?? []).find((r) => r.edge_key === edgeKey) ?? null;
+    }
+    return db.getSupportBaselineRow(nodeId, supportId, edgeKey) ?? null;
   };
 
   // Live supports, in deterministic id order, in pages the budget sizes.
@@ -249,22 +254,25 @@ export function computeSupportCheck(
     const page = db.getLiveSupportEdgesPage(nodeId, lastToId, take);
     if (page.length === 0) break;
     for (const edge of page) {
-      const rows = rowsFor(edge.other_id);
       // F5: the anchor is the row written for THIS edge row (edge_key =
       // edges.id) — no fallback to "the latest row of this support". A
       // snapshot of a dead edge never validates a live one: after
       // confirm → unlink → (re)link the new pair stays unconfirmed until an
       // explicit confirm_supports.
-      const anchor = rows.find((r) => r.edge_key === String(edge.id)) ?? null;
+      const edgeKey = String(edge.id);
+      const anchor = rowsForAnchor(edge.other_id, edgeKey);
       const compatible =
         anchor !== null && anchor.format_version === BASELINE_FORMAT_VERSION;
       const support = compatible ? db.getNode(edge.other_id) : undefined;
       // Bytes are charged for what is actually read: payload texts for a
-      // compatible pair, nothing for an unknown one (F2).
-      const bytes = compatible
-        ? Buffer.byteLength(support?.summary ?? "", "utf8") +
-          Buffer.byteLength(edge.description ?? "", "utf8")
-        : 0;
+      // compatible pair, nothing for an unknown one (F2). 2.1.2 F8: a
+      // snapshot row fetched by the point lookup is charged too.
+      const bytes =
+        (compatible
+          ? Buffer.byteLength(support?.summary ?? "", "utf8") +
+            Buffer.byteLength(edge.description ?? "", "utf8")
+          : 0) +
+        (anchor !== null && !bulkRows ? baselineRowBytes(anchor) : 0);
       if (!budget.consume(bytes)) {
         exhausted = true;
         break;
@@ -356,6 +364,16 @@ export function computeSupportCheck(
 /** Total order over ids for stable capped lists. */
 function compareIds(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** 2.1.2 F8: the materialized cost of one snapshot row (its digest payload). */
+function baselineRowBytes(row: SupportBaselineRow): number {
+  return (
+    Buffer.byteLength(
+      row.claim_digest + row.status_digest + row.edge_digest + row.confirmed_at,
+      "utf8"
+    ) + 64
+  );
 }
 
 /**

@@ -159,3 +159,84 @@ describe("2.1.2 F12: consume flags an attempt beyond the limit", () => {
     expect(b.exceeded).toBe(true);
   });
 });
+
+// ---- F8: запасной путь снимков не материализует всю историю пары ----
+
+/** Count the rows the SQL engine hands back for support_baselines reads. */
+function countBaselineRows(db: KnowledgeDB): () => number {
+  const raw = (db as unknown as { db: Database }).db;
+  const realPrepare = raw.prepare.bind(raw);
+  let rows = 0;
+  (raw as unknown as { prepare: (sql: string) => Database.Statement }).prepare = (
+    sql: string
+  ) => {
+    const stmt = realPrepare(sql);
+    if (/FROM support_baselines/i.test(sql) && !/COUNT\(/i.test(sql)) {
+      const realAll = stmt.all.bind(stmt) as (...a: unknown[]) => unknown[];
+      (stmt as unknown as { all: (...a: unknown[]) => unknown[] }).all = (
+        ...a: unknown[]
+      ) => {
+        const out = realAll(...a);
+        rows += out.length;
+        return out;
+      };
+      const realGet = stmt.get.bind(stmt) as (...a: unknown[]) => unknown;
+      (stmt as unknown as { get: (...a: unknown[]) => unknown }).get = (...a: unknown[]) => {
+        const out = realGet(...a);
+        if (out !== undefined) rows += 1;
+        return out;
+      };
+    }
+    return stmt;
+  };
+  return () => rows;
+}
+
+describe("2.1.2 F8: the fallback snapshot read fetches one row, not the pair history", () => {
+  it("1000 active snapshots of one support + budget 1 -> one row materialized", () => {
+    node("d", "decision", "decision d");
+    node("f", "fact", "fact f");
+    supportEdge("d", "f");
+    confirm("d", ["f"]);
+    // The same support with 999 more ACTIVE snapshot rows under different
+    // edge_keys — the shape merge carry-over produces (relabeled/dead keys
+    // are plain strings; the table has no FK on purpose). link/unlink cannot
+    // build this: a revived edge keeps its rowid.
+    const decision = db.getNode("d")!;
+    const support = db.getNode("f")!;
+    const edge = db.getInformedByEdges("d", "ancestry", false)[0];
+    const base = {
+      decision_id: "d",
+      support_id: "f",
+      claim_digest: claimDigestOf(support.summary),
+      status_digest: statusDigestOf(support.status, support.epistemic_status),
+      edge_digest: edgeDigestOf(edge.description),
+      format_version: 1,
+      confirmed_at: new Date().toISOString(),
+      confirmed_by: "agent",
+    };
+    for (let i = 0; i < 999; i++) {
+      db.upsertSupportBaseline({ ...base, edge_key: `legacy:${i}` });
+    }
+    const counted = db
+      .execSqlAll(
+        "SELECT COUNT(*) AS n FROM support_baselines WHERE decision_id = 'd' AND superseded_at IS NULL"
+      )
+      .map((r) => (r as { n: number }).n)[0];
+    expect(counted).toBe(1000);
+
+    // Budget 2 = the minimum that reaches the live pass under the F7
+    // accounting (1 claim + 1 support): the bulk read stays out of reach
+    // (1000 snapshots), so the check goes through the fallback path.
+    const stop = countBaselineRows(db);
+    const view = computeSupportCheck(db, "d", new CheckBudget(2, 1_000_000))!;
+    const materialized = stop();
+    console.log(`[F8] materialized baseline rows: ${materialized} (budget 2, 1000 snapshots)`);
+    // The verdict stays honest over the single fetched row: the live edge's
+    // anchor matches, so the pair is unchanged.
+    expect(view.state).toBe("unchanged");
+    expect(view.incomplete).toBe(false);
+    // One anchor row for the live edge — not the pair's 1000-row history.
+    expect(materialized).toBeLessThanOrEqual(3);
+  }, 120_000);
+});
