@@ -71,3 +71,103 @@ describe("merge preserves edge tombstones (plan 1 §4.6)", () => {
     output.close();
   });
 });
+
+// ---- 2.1.2 F2: дедуп по концам, расхождение копий — конфликт, не порядок ----
+
+describe("merge dedups by ends and registers divergent copies (2.1.2 F2)", () => {
+  /** Same node on both sides; the pair a->b is live with rationale `liveWhy`
+   * on `liveSide` and tombstoned with rationale `deadWhy` on the other. */
+  function buildDivergentPair(liveOnLeft: boolean, liveWhy: string, deadWhy: string): void {
+    const left = createTmpDb("left.db");
+    const right = createTmpDb("right.db");
+    const outputPath = path.join(tmpDir, `out-${liveOnLeft ? "lr" : "rl"}.db`);
+
+    for (const target of [left, right]) {
+      insertTestNode(target.db, "a");
+      insertTestNode(target.db, "b");
+    }
+    const live = liveOnLeft ? left.db : right.db;
+    const dead = liveOnLeft ? right.db : left.db;
+    live.insertEdge({ from_id: "a", to_id: "b", relation: "informed_by", description: liveWhy });
+    dead.insertEdge({ from_id: "a", to_id: "b", relation: "informed_by", description: deadWhy });
+    dead.deleteEdge("a", "b", "informed_by");
+    left.db.close();
+    right.db.close();
+
+    const result = engine.merge(left.path, right.path, outputPath);
+    // The divergence is a conflict in the report, whichever way the inputs
+    // were ordered.
+    expect(result.edgeConflicts).toBe(1);
+
+    const output = new KnowledgeDB(outputPath);
+    const rows = output.execSqlAll(
+      "SELECT removed_at, needs_merge, description FROM edges WHERE relation = 'informed_by'"
+    ) as Array<{ removed_at: string | null; needs_merge: number; description: string | null }>;
+    output.close();
+    // Exactly one row for the pair, it stays removed (tombstone wins), and
+    // the row carries the conflict flags.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].removed_at).not.toBeNull();
+    expect(rows[0].needs_merge).toBe(1);
+    expect(rows[0].description).toBe(deadWhy);
+  }
+
+  it("live left + tombstoned right (different rationales) -> removed + conflict", () => {
+    buildDivergentPair(true, "new rationale", "old rationale");
+  });
+
+  it("tombstoned left + live right (different rationales) -> same result", () => {
+    buildDivergentPair(false, "new rationale", "old rationale");
+  });
+
+  it("identical live copies on both sides stay clean (no false conflict)", () => {
+    const left = createTmpDb("left.db");
+    const right = createTmpDb("right.db");
+    const outputPath = path.join(tmpDir, "out-clean.db");
+    for (const target of [left, right]) {
+      insertTestNode(target.db, "a");
+      insertTestNode(target.db, "b");
+      target.db.insertEdge({
+        from_id: "a", to_id: "b", relation: "informed_by", description: "same why",
+      });
+    }
+    left.db.close();
+    right.db.close();
+
+    const result = engine.merge(left.path, right.path, outputPath);
+    expect(result.edgeConflicts).toBe(0);
+    const output = new KnowledgeDB(outputPath);
+    const rows = output.execSqlAll(
+      "SELECT removed_at, needs_merge FROM edges WHERE relation = 'informed_by'"
+    ) as Array<{ removed_at: string | null; needs_merge: number }>;
+    output.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].removed_at).toBeNull();
+    expect(rows[0].needs_merge).toBe(0);
+  });
+
+  it("matching removal state but different rationale -> conflict, one live row", () => {
+    const left = createTmpDb("left.db");
+    const right = createTmpDb("right.db");
+    const outputPath = path.join(tmpDir, "out-desc.db");
+    for (const target of [left, right]) {
+      insertTestNode(target.db, "a");
+      insertTestNode(target.db, "b");
+    }
+    left.db.insertEdge({ from_id: "a", to_id: "b", relation: "informed_by", description: "why v1" });
+    right.db.insertEdge({ from_id: "a", to_id: "b", relation: "informed_by", description: "why v2" });
+    left.db.close();
+    right.db.close();
+
+    const result = engine.merge(left.path, right.path, outputPath);
+    expect(result.edgeConflicts).toBe(1);
+    const output = new KnowledgeDB(outputPath);
+    const rows = output.execSqlAll(
+      "SELECT removed_at, needs_merge FROM edges WHERE relation = 'informed_by'"
+    ) as Array<{ removed_at: string | null; needs_merge: number }>;
+    output.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].removed_at).toBeNull();
+    expect(rows[0].needs_merge).toBe(1);
+  });
+});
