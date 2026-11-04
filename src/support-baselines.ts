@@ -366,7 +366,15 @@ export function confirmSupports(
     const liveEdges = liveSupportEdges(db, input.decision_id);
 
     const mismatches: string[] = [];
-    if (input.expected_claim_digest !== currentClaim) {
+    // 2.1.2 F6: every expectation is type-checked BEFORE any comparison — a
+    // missing/null/number digest must refuse via version_conflict, not crash
+    // on .slice() while building the divergence message.
+    if (typeof input.expected_claim_digest !== "string") {
+      mismatches.push(
+        `решение "${input.decision_id}": не передан expected_claim_digest (строка) — ` +
+          `подтверждать можно только прочитанную формулировку (перечитай через get_concept/provenance_trace и повтори)`
+      );
+    } else if (input.expected_claim_digest !== currentClaim) {
       mismatches.push(
         `решение "${input.decision_id}": формулировка изменилась с момента чтения ` +
           `(ожидался digest ${input.expected_claim_digest.slice(0, 12)}…, текущий ${currentClaim.slice(0, 12)}…)`
@@ -412,7 +420,14 @@ export function confirmSupports(
         continue;
       }
       const currentSupportClaim = claimDigestOf(support.summary);
-      if (item.expected_claim_digest !== currentSupportClaim) {
+      // 2.1.2 F6: the claim digest is type-checked like the other two axes —
+      // a non-string expectation refuses the call instead of throwing.
+      if (typeof item.expected_claim_digest !== "string") {
+        mismatches.push(
+          `опора "${supportId}": не передан expected_claim_digest (строка) — подтверждать можно ` +
+            `только прочитанное саммари (перечитай опору через get_concept/provenance_trace и повтори)`
+        );
+      } else if (item.expected_claim_digest !== currentSupportClaim) {
         mismatches.push(
           `опора "${supportId}": саммари изменилось с момента чтения ` +
             `(ожидался ${item.expected_claim_digest.slice(0, 12)}…, текущий ${currentSupportClaim.slice(0, 12)}…)`
@@ -433,7 +448,12 @@ export function confirmSupports(
         );
       }
       const currentEdgeDigest = edgeDigestOf(edge.description);
-      if (item.expected_edge_digest !== currentEdgeDigest) {
+      if (typeof item.expected_edge_digest !== "string") {
+        mismatches.push(
+          `опора "${supportId}": не передан expected_edge_digest (строка) — подтверждать можно ` +
+            `только прочитанный рационал (перечитай связь через get_concept/provenance_trace и повтори)`
+        );
+      } else if (item.expected_edge_digest !== currentEdgeDigest) {
         mismatches.push(
           `опора "${supportId}": рационал изменился с момента чтения ` +
             `(ожидался ${item.expected_edge_digest.slice(0, 12)}…, текущий ${currentEdgeDigest.slice(0, 12)}…)`
