@@ -1150,12 +1150,15 @@ describe("F4 (2.1.1): metrics_truncated means decisions left unchecked", () => {
   it(
     "42. a budget exhausted exactly on the last decision is not truncation",
     () => {
-      // Two decisions, one confirmed support each — each check consumes
-      // exactly one edge, so a budget of 2 runs out on the second, last one.
+      // Two decisions, one confirmed support each — since 2.1.2 F7 a check
+      // of a confirmed decision consumes TWO edges (the claim digest + the
+      // support), so a budget of 4 runs out exactly on the second, last one.
+      // (Budget bumped from 2 for the new accounting; the property under
+      // test — exact exhaustion is not truncation — is unchanged.)
       confirmedDecision("d1", ["f1"]);
       confirmedDecision("d2", ["f2"]);
 
-      const m = provenanceMetrics(db, new CheckBudget(2, 1_000_000));
+      const m = provenanceMetrics(db, new CheckBudget(4, 1_000_000));
       expect(m.decisions_by_check_state.unchanged).toBe(2);
       expect(m.metrics_truncated).toBe(false);
     }
@@ -1166,8 +1169,9 @@ describe("F4 (2.1.1): metrics_truncated means decisions left unchecked", () => {
     confirmedDecision("d2", ["f2"]);
     confirmedDecision("d3", ["f3"]);
 
-    // Budget 2: d3 never gets a verdict — the flag must say so.
-    const m = provenanceMetrics(db, new CheckBudget(2, 1_000_000));
+    // Budget 4 (= 2 checks under the 2.1.2 F7 accounting): d3 never gets a
+    // verdict — the flag must say so.
+    const m = provenanceMetrics(db, new CheckBudget(4, 1_000_000));
     expect(m.metrics_truncated).toBe(true);
     const counted =
       m.decisions_by_check_state.unchanged +
