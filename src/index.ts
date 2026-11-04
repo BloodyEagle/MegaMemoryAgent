@@ -223,7 +223,8 @@ async function startMcpServer() {
   const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
   const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
-  const { confirmSupports } = await import("./support-baselines.js");
+  const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
+  const { checkArtifacts } = await import("./artifacts.js");
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
@@ -696,7 +697,7 @@ async function startMcpServer() {
 
   server.tool(
     "provenance_trace",
-    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: depth (0–20), max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false); тот же бюджет ограничивает проверку опор решений — проверяются первые по id, запись support_check_truncated сообщает checked/total. Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами — такие записи несут числовые count и sample (первые ≤5 id), note не длиннее 300 символов. weak_links целиком не превышают 8 КБ: при превышении записи режутся по приоритету и добавляется маркер weak_links_truncated (shown/total). completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated. Снимок обоснования: решение несёт блок support_check — сверку живых опор с подтверждённым снимком; состояния unchanged/changed (причины per опоры: summary|status|rationale|removed)/unknown/incomplete, unknown и incomplete чистотой не считаются; изменение опоры не стирается добавлением новых рёбер. Подтверждение — отдельный вызов confirm_supports с digest'ами прочитанных формулировок; ни одна мутация (link/update/merge) снимок не пишет и не обновляет. Контракт «чтение не пишет» (plan-4-fixes-6 F12): provenance_trace и get_concept не пишут ничего в граф и снимки; служебная телеметрия вызовов (timeline) ведётся отдельно и на провенанс не влияет; проверка опор ограничена бюджетом max_check_edges/max_check_bytes, inner-узлы с оборванной проверкой видны в inner_nodes_incomplete, а completeness деградирует до truncated.",
+    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: depth (0–20), max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false); тот же бюджет ограничивает проверку опор решений — проверяются первые по id, запись support_check_truncated сообщает checked/total. Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами — такие записи несут числовые count и sample (первые ≤5 id), note не длиннее 300 символов. weak_links целиком не превышают 8 КБ: при превышении записи режутся по приоритету и добавляется маркер weak_links_truncated (shown/total). completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated. Снимок обоснования: решение несёт блок support_check — сверку живых опор с подтверждённым снимком; состояния unchanged/changed (причины per опоры: summary|status|rationale|removed; отдельный сигнал artifact_changed — наблюдённое состояние внешних артефактов опоры, записанное check_artifacts, разошлось с подтверждённым снимком: саммари могло остаться прежним, изменился источник; снимается повторным подтверждением после проверки)/unknown/incomplete, unknown и incomplete чистотой не считаются; изменение опоры не стирается добавлением новых рёбер; цепочка версий подтверждённых опор — provenance_history. Подтверждение — отдельный вызов confirm_supports с digest'ами прочитанных формулировок; ни одна мутация (link/update/merge) снимок не пишет и не обновляет. Контракт «чтение не пишет» (plan-4-fixes-6 F12): provenance_trace и get_concept не пишут ничего в граф и снимки; служебная телеметрия вызовов (timeline) ведётся отдельно и на провенанс не влияет; проверка опор ограничена бюджетом max_check_edges/max_check_bytes, inner-узлы с оборванной проверкой видны в inner_nodes_incomplete, а completeness деградирует до truncated.",
     {
       node_id: z.string().describe("Узел, с которого начинается обход"),
       direction: z.enum(["ancestry", "impact"]).optional().describe("ancestry (по умолчанию) — что поддерживает узел; impact — что на него опирается"),
@@ -827,6 +828,84 @@ async function startMcpServer() {
         timeline.log({
           tool: "confirm_supports",
           params: { decision_id: params.decision_id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  // ---- Support revision history (2.1.3 F1) ----
+
+  server.tool(
+    "provenance_history",
+    "Цепочка версий подтверждённых опор решения: какую версию агент подтверждал, какая была до неё, какая после — для разбора инцидента задним числом. По каждой паре «решение—опора»: confirmed_at, source (agent — первое подтверждение / import — перенос при merge / superseded — версия вытеснена повторным подтверждением или удалением), reason (confirmed/reconfirmed/removed/edge_relinked), превью digest'ов (12 символов) и признак «это текущая версия». Тел узлов нет — только версии. Чтение не пишет ничего.",
+    {
+      decision_id: z.string().describe("ID решения, чья история версий запрашивается"),
+      support_id: z.string().optional().describe("Опора — вернуть цепочку только этой пары; без неё — по всем парам решения"),
+      limit: z.number().int().min(1).max(100).optional().describe("Сколько ревизий на пару возвращать (по умолчанию 20)"),
+    },
+    async (params) => {
+      try {
+        const result = provenanceHistory(db, {
+          decision_id: params.decision_id,
+          support_id: params.support_id,
+          limit: params.limit,
+        });
+        timeline.log({
+          tool: "provenance_history",
+          params: { decision_id: params.decision_id, support_id: params.support_id },
+          result_summary: `${result.pairs.length} pair(s)`,
+          is_write: false,
+          is_error: false,
+          affected_ids: [params.decision_id],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "provenance_history",
+          params: { decision_id: params.decision_id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  // ---- Artifact digests (2.1.3 F2) ----
+
+  server.tool(
+    "check_artifacts",
+    "Проверить внешние артефакты узлов (файлы и git-blob'ы из file_refs): посчитать sha256 содержимого и записать наблюдение. ЯВНЫЙ вызов — ничего не читается и не хешируется само: ни чтение узла, ни трассировка файлы не трогают. Расхождение «наблюдение vs подтверждённый снимок» всплывает в support_check как artifact_changed и в weak_links отдельным типом — это НЕ support_changed: саммари опоры могло остаться прежним, изменился источник. Порядок работы для снимка: check_artifacts по опорам → прочитать digest'ы → confirm_supports (он сохранит текущее состояние артефактов в снимок). Отсутствующий файл — запись missing, не падение. kind=url не поддерживается: сетевые запросы из MCP-сервера — отдельное решение.",
+    {
+      node_ids: z.array(z.string()).min(1).describe("Узлы, чьи артефакты проверить (refs берутся из file_refs)"),
+      max_files: z.number().int().min(1).max(10000).optional().describe("Лимит пар «узел—ref» за вызов (по умолчанию 50); лишние — truncated: true"),
+    },
+    async (params) => {
+      try {
+        const result = await checkArtifacts(db, {
+          node_ids: params.node_ids,
+          max_files: params.max_files,
+        });
+        timeline.log({
+          tool: "check_artifacts",
+          params: { node_ids: params.node_ids, max_files: params.max_files },
+          result_summary: `checked ${result.checked}, changed ${result.changed.length}, missing ${result.missing.length}${result.truncated ? ", truncated" : ""}`,
+          is_write: true,
+          is_error: false,
+          affected_ids: params.node_ids,
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "check_artifacts",
+          params: { node_ids: params.node_ids },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: true,
           is_error: true,

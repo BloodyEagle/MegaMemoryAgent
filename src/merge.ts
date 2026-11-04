@@ -717,6 +717,30 @@ export class MergeEngine {
         confirmed_at: row.confirmed_at,
         confirmed_by: "import",
         superseded_at: row.superseded_at ?? null,
+        // 2.1.3 F2: the confirmed artifacts state travels verbatim — a remap
+        // must not re-observe the artifacts (the import never checks files).
+        artifacts_digest: row.artifacts_digest ?? null,
+      });
+      // 2.1.3 F1: the journal is written where the snapshot is written — the
+      // merge carry journals the carried version as an import entry. When the
+      // edge was re-anchored (its rowid changed through the remap) the entry
+      // says edge_relinked, otherwise the edge identity traveled verbatim.
+      // ISO recorded_at: the journal orders and purges by it.
+      outputDb.insertSupportRevision({
+        decision_id: decisionId,
+        support_id: supportId,
+        edge_key: edgeKey,
+        claim_digest: row.claim_digest,
+        status_digest: row.status_digest,
+        edge_digest: row.edge_digest,
+        format_version: row.format_version,
+        confirmed_at: row.confirmed_at,
+        recorded_at: new Date().toISOString(),
+        source: "import",
+        reason:
+          mappedEdge !== undefined && String(mappedEdge) !== row.edge_key
+            ? "edge_relinked"
+            : null,
       });
       carried++;
     }

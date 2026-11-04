@@ -689,13 +689,16 @@ const WEAK_LINK_PRIORITY: Record<ProvenanceWeakLink["type"], number> = {
   abandoned: 1,
   cycle: 2,
   support_changed: 3,
-  support_unreviewed: 4,
-  missing_support: 5,
-  no_support: 6,
-  ungrounded_support: 7,
-  no_rationale: 8,
-  support_check_truncated: 9,
-  weak_links_truncated: 10,
+  // 2.1.3 F2: the source moved while the summary may be untouched — the same
+  // danger class as a snapshot divergence, right after it.
+  artifact_changed: 4,
+  support_unreviewed: 5,
+  missing_support: 6,
+  no_support: 7,
+  ungrounded_support: 8,
+  no_rationale: 9,
+  support_check_truncated: 10,
+  weak_links_truncated: 11,
 };
 
 /**
@@ -857,32 +860,62 @@ function weakLinks(
     if (check && check.state === "changed") {
       const changed = check.changed ?? [];
       const changedTotal = check.changed_count ?? changed.length;
+      // 2.1.3 F2: artifact-only pairs must not inflate the support_changed
+      // record — the divergence of an external artifact is its own type.
+      // artifact_changed_count is the honest full-set total of artifact
+      // pairs (the changed list is capped), so the reason-pair total is the
+      // difference; both counters travel on the view.
+      const artifactTotal = check.artifact_changed_count ?? 0;
+      const reasonPairs = changed.filter((c) => c.reasons.length > 0);
+      const reasonTotal = Math.max(0, changedTotal - artifactTotal);
       const reasonCounts: Record<string, number> = {};
-      for (const c of changed) {
+      for (const c of reasonPairs) {
         for (const r of c.reasons) reasonCounts[r] = (reasonCounts[r] ?? 0) + 1;
       }
       if (check.claim_changed) reasonCounts["claim"] = (reasonCounts["claim"] ?? 0) + 1;
-      const detail = changed
+      const detail = reasonPairs
         .slice(0, NOTE_SAMPLE)
         .map((c) => `${c.support}(${c.reasons.join("+")})`)
         .join(", ");
       const tail =
-        changedTotal > changed.length
+        reasonTotal > reasonPairs.length
           ? ""
-          : changedTotal > NOTE_SAMPLE
-            ? ` … и ещё ${changedTotal - NOTE_SAMPLE}`
+          : reasonTotal > NOTE_SAMPLE
+            ? ` … и ещё ${reasonTotal - NOTE_SAMPLE}`
             : "";
-      weak.push({
-        type: "support_changed",
-        id: n.id,
-        count: changedTotal,
-        sample: changed.slice(0, NOTE_SAMPLE).map((c) => c.support),
-        note: clampNote(
-          `опоры решения "${n.id}" разошлись с подтверждённым снимком (${changedTotal}` +
-            `${Object.keys(reasonCounts).length > 0 ? `: ${Object.entries(reasonCounts).map(([r, c]) => `${r} ${c}`).join(", ")}` : ""})` +
-            `${detail ? `: ${detail}` : ""}${tail}; baseline ${check.baseline_at ?? "—"}`
-        ),
-      });
+      if (reasonTotal > 0 || check.claim_changed) {
+        weak.push({
+          type: "support_changed",
+          id: n.id,
+          count: reasonTotal,
+          sample: reasonPairs.slice(0, NOTE_SAMPLE).map((c) => c.support),
+          note: clampNote(
+            `опоры решения "${n.id}" разошлись с подтверждённым снимком (${reasonTotal}` +
+              `${Object.keys(reasonCounts).length > 0 ? `: ${Object.entries(reasonCounts).map(([r, c]) => `${r} ${c}`).join(", ")}` : ""})` +
+              `${detail ? `: ${detail}` : ""}${tail}; baseline ${check.baseline_at ?? "—"}`
+          ),
+        });
+      }
+      // The artifact divergence speaks for itself: path + both digest
+      // previews («было → стало»), one record per decision.
+      const artifactPairs = changed.filter((c) => c.artifact_changed);
+      if (artifactPairs.length > 0) {
+        const first = artifactPairs[0];
+        const artifact = first.artifacts?.[0];
+        const previewText = artifact
+          ? `: ${artifact.ref} (${artifact.prev_digest ?? "—"} → ${artifact.digest ?? "—"}, замечено ${artifact.changed_at})`
+          : "";
+        weak.push({
+          type: "artifact_changed",
+          id: n.id,
+          count: artifactTotal,
+          sample: artifactPairs.slice(0, NOTE_SAMPLE).map((c) => c.support),
+          note: clampNote(
+            `артефакты опор решения "${n.id}" разошлись с подтверждённым снимком (${artifactTotal}` +
+              `${previewText ? `, пример — опора ${first.support}${previewText}` : ""})`
+          ),
+        });
+      }
     } else if (check && check.state === "unknown") {
       weak.push({
         type: "support_unreviewed",

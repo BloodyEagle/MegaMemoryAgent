@@ -374,6 +374,29 @@ export function runDoctor(db: KnowledgeDB): {
       : `${digestPending} module(s) without digest — run 'megamemory digest --apply'`
   );
 
+  // ---- 2.1.3 F1/F2: revision journal and artifact observations ----
+  // Both tables are created by the v11 migration on open, so a missing one
+  // means real damage, not an old db. Counts are informational.
+  const hasRevisions = db.hasSupportRevisionsTable();
+  const hasArtifacts = db.hasNodeArtifactsTable();
+  if (hasRevisions && hasArtifacts) {
+    add(
+      "provenance journal",
+      true,
+      `${db.countSupportRevisions()} revision(s), ${db.countNodeArtifacts()} artifact observation(s)`
+    );
+  } else {
+    const missing = [
+      ...(hasRevisions ? [] : ["support_revisions"]),
+      ...(hasArtifacts ? [] : ["node_artifacts"]),
+    ].join(", ");
+    add(
+      "provenance journal",
+      false,
+      `missing table(s): ${missing} — reopen the db (migration runs on open)`
+    );
+  }
+
   // ---- В18: graph health (informational) ----
 
   // Nodes without any edge — isolated facts, hard to navigate.
