@@ -514,7 +514,7 @@ describe("§9.17 accepted auto edge", () => {
     const res = await createConcept(db, {
       name: "auto decision",
       kind: "decision",
-      summary: "auto d",
+      summary: "auto d хранит вывод из файла, подтверждение идёт тем же вызовом",
       why: "from the file",
       file_refs: ["src/a.ts"],
     });
@@ -526,7 +526,7 @@ describe("§9.17 accepted auto edge", () => {
     const supportRow = db.getNode(supportId)!;
     confirmSupports(db, {
       decision_id: res.id,
-      expected_claim_digest: claimDigestOf("auto d"),
+      expected_claim_digest: claimDigestOf("auto d хранит вывод из файла, подтверждение идёт тем же вызовом"),
       items: [
         {
           support_id: supportId,
@@ -617,7 +617,7 @@ describe("create_concept evidence snapshot", () => {
     const res = await createConcept(db, {
       name: "d",
       kind: "decision",
-      summary: "decision d",
+      summary: "decision d plus the fixture context of this check and the call keeps its contract with the evidence passed in the call",
       evidence: [{ node: "f", why: "because f" }],
     });
     const rows = db.getSupportBaselines(res.id);
@@ -632,7 +632,7 @@ describe("create_concept evidence snapshot", () => {
     const res = await createConcept(db, {
       name: "plain",
       kind: "feature",
-      summary: "plain feature",
+      summary: "plain feature plus the fixture context of this check and the call keeps its contract",
     });
     expect(computeSupportCheck(db, res.id, new CheckBudget(10, 1_000_000))).toBeNull();
   });
@@ -752,7 +752,7 @@ describe("F1: edges from input.edges never confirm", () => {
     const res = await createConcept(db, {
       name: "d",
       kind: "decision",
-      summary: "decision d",
+      summary: "decision d plus the fixture context of this check and the call keeps its contract with the evidence passed in the call",
       edges: [{ to: "f", relation: "informed_by", description: "why f" }],
     });
     // The edge exists — but nothing was confirmed along with it.
@@ -768,7 +768,7 @@ describe("F1: edges from input.edges never confirm", () => {
     const res = await createConcept(db, {
       name: "d2",
       kind: "decision",
-      summary: "decision d2",
+      summary: "decision d2 plus the fixture context of this check and the call keeps its contract",
       evidence: [{ node: "f", why: "because f" }],
     });
     const rows = db.getSupportBaselines(res.id);

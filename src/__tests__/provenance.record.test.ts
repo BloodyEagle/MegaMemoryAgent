@@ -49,7 +49,7 @@ describe("evidence shortcut and auto_ground (plan-3-fixes-2 F6, F19)", () => {
     const result = await createConcept(db, {
       name: "Conclusion",
       kind: "decision",
-      summary: "drawn from two sources",
+      summary: "drawn from two sources: one existing node and one file ref that becomes a fact node",
       evidence: [
         { node: "support-a", why: "measured in support-a" },
         { ref: "src/module/impl.ts", why: "read from impl.ts" },
@@ -81,7 +81,7 @@ describe("evidence shortcut and auto_ground (plan-3-fixes-2 F6, F19)", () => {
     const result = await createConcept(db, {
       name: "Conclusion",
       kind: "decision",
-      summary: "two reasons, one support",
+      summary: "two reasons, one support: both evidence items name the same node so the counter stays one",
       evidence: [
         { node: "support-a", why: "first reason" },
         { node: "support-a", why: "second reason" },
@@ -109,7 +109,7 @@ describe("evidence shortcut and auto_ground (plan-3-fixes-2 F6, F19)", () => {
     const result = await createConcept(db, {
       name: "Decision",
       kind: "decision",
-      summary: "a decision with why and refs",
+      summary: "a decision with why and refs but no evidence: auto_ground must not invent supports",
       why: "because the implementation says so",
       file_refs: ["src/module/impl.ts"],
     });
@@ -137,7 +137,7 @@ describe("evidence shortcut and auto_ground (plan-3-fixes-2 F6, F19)", () => {
     const result = await createConcept(db, {
       name: "Decision",
       kind: "decision",
-      summary: "a decision with why and refs",
+      summary: "a decision with why and refs but no evidence: auto_ground must not invent supports",
       why: "because the implementation says so",
       file_refs: ["src/module/impl.ts"],
     });

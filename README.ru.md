@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.7-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.9-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -311,7 +311,7 @@ megamemory doctor               # проверка здоровья, код вы
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid` / `fts` / `vector` |
 | `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` добавляет второй индекс для CJK |
 | `MEGAMEMORY_AUTO_DIGEST` | включено | `0` отключает автосборку digest после 5-го ребёнка |
-| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | Источник D3 для explorer; укажите URL CDN, чтобы грузить его извне вместо локальной копии |
+| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | Источник D3 для explorer. Вендорный `web/vendor/d3.min.js` идёт с пакетом и работает офлайн; укажите URL, чтобы использовать своё зеркало. Если вендорного файла нет, serve откатится на CDN jsDelivr и напечатает предупреждение |
 
 ---
 
@@ -330,6 +330,7 @@ megamemory serve --port 8080
 - чип **Health**: векторы, синхронность FTS, digest, пустые id, сироты, память — с подсказками
 - карточка digest показывает исходные концепции, бейдж `stale` и переключатель **focus**
 - режим **status changes** в таймлайне; в карточке узла — последние смены статусов с причинами
+- d3 идёт с пакетом (`web/vendor/d3.min.js`) — обозреватель рисует офлайн; без файла сработает фолбэк на CDN jsDelivr с предупреждением, `MEGAMEMORY_D3_URL` перебивает оба источника, `/api/health` показывает `d3_source`
 
 ---
 

@@ -138,8 +138,8 @@ describe("createConcept collision handling (T10 hardening)", () => {
     db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
     ensureSchema(db);
 
-    const a = await createConcept(db, { name: "Ёж", kind: "feature", summary: "с колючками" });
-    const b = await createConcept(db, { name: "Еж", kind: "feature", summary: "без ё" });
+    const a = await createConcept(db, { name: "Ёж", kind: "feature", summary: "ёж хранит колючки и сворачивается при угрозе — проверка коллизий слага" });
+    const b = await createConcept(db, { name: "Еж", kind: "feature", summary: "еж без ё пишет те же два символа слага и получает хеш-суффикс" });
 
     expect(a.id).toBe("еж");
     expect(b.id).toMatch(/^еж-[0-9a-f]{8}$/);
@@ -149,7 +149,7 @@ describe("createConcept collision handling (T10 hardening)", () => {
 
     // Same name again → "already exists" (update_concept path).
     await expect(
-      createConcept(db, { name: "Еж", kind: "feature", summary: "dup" })
+      createConcept(db, { name: "Еж", kind: "feature", summary: "еж хранит колючки и сворачивается при угрозе — дубль имени" })
     ).rejects.toThrow(/already exists/);
   });
 });

@@ -153,7 +153,7 @@ describe("F1: journal writes", () => {
     const res = await createConcept(db, {
       name: "d",
       kind: "decision",
-      summary: "decision d",
+      summary: "decision d plus the fixture context of this check and the call keeps its contract with the evidence passed in the call",
       evidence: [{ node: "f", why: "because f" }],
     });
     const rows = revisions(res.id, "f");
@@ -173,7 +173,7 @@ describe("F1: journal writes", () => {
       await createConcept(db, {
         name: "d2",
         kind: "decision",
-        summary: "decision d2",
+        summary: "decision d2 plus the fixture context of this check and the call keeps its contract",
         evidence: [{ node: "f", why: "because f too" }],
       });
     } catch {

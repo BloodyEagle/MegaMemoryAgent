@@ -16,7 +16,8 @@ import {
   isTextOnlySearchMode,
   vectorSearchEnabled,
 } from "./embeddings.js";
-import { healthReport } from "./doctor.js";
+import { healthReport, type HealthReport } from "./doctor.js";
+import { d3Source, resolveD3Src, type D3Source } from "./d3-asset.js";
 import type { NodeRow } from "./types.js";
 
 const VERSION = JSON.parse(
@@ -35,20 +36,18 @@ function resolveHtmlPath(): string {
   return path.resolve(thisDir, "..", "web", "index.html");
 }
 
+/**
+ * U3 metrics plus 2.1.9 F1 `d3_source` (local / cdn / env) — the explorer
+ * header chip shows where the page's d3 came from, same data as doctor.
+ */
+export function healthPayload(db: KnowledgeDB): HealthReport & { d3_source: D3Source } {
+  return { ...healthReport(db), d3_source: d3Source() };
+}
+
 // Directory holding vendored static assets (d3 etc.) shipped with web/.
 function resolveWebDir(): string {
   const thisDir = path.dirname(fileURLToPath(import.meta.url));
   return path.resolve(thisDir, "..", "web");
-}
-
-// Default: d3 is served locally from web/vendor/. Override with
-// MEGAMEMORY_D3_URL (any absolute URL, e.g. a CDN) when the page must not
-// load from the local server.
-const D3_LOCAL_SRC = "/vendor/d3.min.js";
-
-function resolveD3Src(): string {
-  const url = process.env.MEGAMEMORY_D3_URL?.trim();
-  return url ? url : D3_LOCAL_SRC;
 }
 
 function json(res: http.ServerResponse, data: unknown, status = 200): void {
@@ -559,10 +558,14 @@ export async function runServe(port: number): Promise<void> {
     process.exit(1);
   }
 
+  // 2.1.9 F1: a missing vendor file degrades to the CDN with a printed note —
+  // never a silent 404 in the script tag.
+  const d3 = resolveD3Src();
+  if (d3.note) console.log(pc.yellow(`  ${d3.note}`));
   const htmlContent = fs
     .readFileSync(htmlPath, "utf-8")
     .replaceAll("{{VERSION}}", VERSION)
-    .replaceAll("{{D3_SRC}}", resolveD3Src());
+    .replaceAll("{{D3_SRC}}", d3.src);
 
   let embeddingsReady = false;
   let embeddingInitError: string | null = null;
@@ -768,7 +771,7 @@ export async function runServe(port: number): Promise<void> {
 
     if (pathname === "/api/health" && req.method === "GET") {
       // U3: same metrics the CLI doctor prints, for the explorer header chip.
-      json(res, healthReport(db));
+      json(res, healthPayload(db));
       return;
     }
 

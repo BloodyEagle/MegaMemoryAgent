@@ -3,6 +3,8 @@ import { SCHEMA_VERSION } from "./db.js";
 import { MODEL_NAME, isModelLoaded, vectorSearchEnabled } from "./embeddings.js";
 import { MIGRATION_TARGET_SCHEMA_VERSION } from "./migrate-schema.js";
 import { isBrokenId } from "./migrate.js";
+import { D3_CDN_FALLBACK_NOTE, d3Source } from "./d3-asset.js";
+import { countStubSupports } from "./stub.js";
 
 /**
  * F13 helper: turn probe counts into a drift message. Exported for tests —
@@ -302,7 +304,7 @@ export function runDoctor(db: KnowledgeDB): {
   if (hasEpistemic) {
     // §6.3: both axes reported separately — lifecycle and epistemic.
     const epiCounts = db.getEpistemicStatusCounts();
-    const epiSummary = ["open", "validated", "refuted", "abandoned", "null"]
+    const epiSummary = ["open", "validated", "refuted", "abandoned", "stub", "null"]
       .filter((k) => epiCounts[k] !== undefined)
       .map((k) => `${k}=${epiCounts[k]}`)
       .join(", ");
@@ -396,6 +398,33 @@ export function runDoctor(db: KnowledgeDB): {
       `missing table(s): ${missing} — reopen the db (migration runs on open)`
     );
   }
+
+  // ---- 2.1.9 F1/F2: d3 source and support stubs ----
+
+  // The same line serve prints at startup: local file, env override, or the
+  // CDN fallback note. Informational — the fallback works, it just must not
+  // pass silently.
+  const d3 = d3Source();
+  add(
+    "d3 asset",
+    true,
+    d3 === "local"
+      ? "local web/vendor/d3.min.js"
+      : d3 === "env"
+        ? "MEGAMEMORY_D3_URL"
+        : D3_CDN_FALLBACK_NOTE
+  );
+
+  // Support nodes whose summary is a template / too short to be a claim —
+  // they look like confirmation in stats and weak_links while proving nothing.
+  const stubSupports = countStubSupports(db);
+  add(
+    "stub supports",
+    true, // informational — already recorded stubs are marked, not deleted
+    stubSupports === 0
+      ? "no stub supports"
+      : `${stubSupports} support node(s) without a claim — replace with a ref or a real summary`
+  );
 
   // ---- В18: graph health (informational) ----
 

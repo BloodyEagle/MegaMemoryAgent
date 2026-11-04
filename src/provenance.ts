@@ -24,6 +24,7 @@ import {
   edgeDigestOf,
   statusDigestOf,
 } from "./support-baselines.js";
+import { isStubSummary } from "./stub.js";
 
 // ---- Config flags (plan 3 §4.1.3, §11) ----
 
@@ -702,9 +703,11 @@ const WEAK_LINK_PRIORITY: Record<ProvenanceWeakLink["type"], number> = {
   missing_support: 6,
   no_support: 7,
   ungrounded_support: 8,
-  no_rationale: 9,
-  support_check_truncated: 10,
-  weak_links_truncated: 11,
+  // 2.1.9 F2: stub supports — same danger class as ungrounded ones.
+  stub_support: 9,
+  no_rationale: 10,
+  support_check_truncated: 11,
+  weak_links_truncated: 12,
 };
 
 /**
@@ -992,6 +995,26 @@ function weakLinks(
         });
       }
     }
+    // 2.1.9 F2: stub supports — узлы с шаблонным или слишком коротким
+    // саммари. Уже записанные заглушки не удаляются, но не должны читаться
+    // как подтверждение: одна запись на решение, count/sample как у
+    // missing_support, срабатывает при хотя бы одной заглушке среди
+    // проверенных опор.
+    const stubs = checked.filter((sid) => {
+      const row = nodeRows.get(sid);
+      return row !== undefined && isStubSummary(row.summary, row.kind);
+    });
+    if (stubs.length > 0) {
+      weak.push({
+        type: "stub_support",
+        id: n.id,
+        count: stubs.length,
+        sample: stubs.slice(0, NOTE_SAMPLE),
+        note: clampNote(
+          `решение "${n.id}" опирается на заглушки без утверждения (${idListForNote(stubs)}) — замени ref'ом или настоящим саммари, либо подтверди осознанно`
+        ),
+      });
+    }
   }
 
   // 4b. 2.1.2 F4: an unreviewed support of an INNER non-decision node used
@@ -1179,9 +1202,15 @@ export function provenanceTrace(
     const liveEdges = removedRoot
       ? []
       : db.getInformedByEdges(input.node_id, "ancestry", false);
-    const allSupportDigests: ProvenanceSupportDigest[] = liveEdges
+    // 2.1.9: the digest work is bounded by the RETURNED window (50), not by
+    // the fan-out — a 20k-support star used to pay one getNode + three hashes
+    // per support for a list that only ever shows the first 50. The honest
+    // total travels in supports_count, computed from the id list alone.
+    const supportPairs = liveEdges
       .map((e) => ({ sid: e.to_id, description: e.description }))
-      .sort((a, b) => compareSupportIds(a.sid, b.sid))
+      .sort((a, b) => compareSupportIds(a.sid, b.sid));
+    const allSupportDigests: ProvenanceSupportDigest[] = supportPairs
+      .slice(0, SUPPORT_DIGESTS_CAP)
       .map(({ sid, description }) => {
         const sup = db.getNode(sid);
         return {
@@ -1189,8 +1218,13 @@ export function provenanceTrace(
           claim_digest: sup ? claimDigestOf(sup.summary) : null,
           status_digest: sup ? statusDigestOf(sup.status, sup.epistemic_status) : null,
           edge_digest: edgeDigestOf(description),
-        };
+          // 2.1.9 F2: a stub support can never honestly confirm anything —
+          // the quality travels next to the digests so the agent sees it
+          // before confirming. A missing node is "stub" (nothing to claim).
+          quality: sup && !isStubSummary(sup.summary, sup.kind) ? "claim" : "stub",
+        } as ProvenanceSupportDigest;
       });
+    const supportTotal = supportPairs.length;
 
     const completeness: ProvenanceCompleteness =
       innerIncomplete > 0 ? "truncated" : completenessVerdict(db, input.node_id, result);
@@ -1203,11 +1237,11 @@ export function provenanceTrace(
       edges: result.edges,
       ...(rootCheck ? { support_check: rootCheck } : {}),
       current_digests: currentDigests,
-      ...(allSupportDigests.length > 0
+      ...(supportTotal > 0
         ? {
-            supports: allSupportDigests.slice(0, SUPPORT_DIGESTS_CAP),
-            ...(allSupportDigests.length > SUPPORT_DIGESTS_CAP
-              ? { supports_count: allSupportDigests.length }
+            supports: allSupportDigests,
+            ...(supportTotal > SUPPORT_DIGESTS_CAP
+              ? { supports_count: supportTotal }
               : {}),
           }
         : {}),

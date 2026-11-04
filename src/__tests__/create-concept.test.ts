@@ -51,7 +51,7 @@ describe("createConcept tool", () => {
     const result = await createConcept(db, {
       name: "Empty Parent Root",
       kind: "feature",
-      summary: "A root concept created with an empty parent_id",
+      summary: "A root concept created with an empty parent_id, which is treated as omitted and stores null",
       parent_id: "",
     });
 
@@ -71,7 +71,7 @@ describe("createConcept tool", () => {
     const child = await createConcept(db, {
       name: "Child Concept",
       kind: "feature",
-      summary: "A child concept",
+      summary: "A child concept nested under a valid non-empty parent_id to check the hierarchy links",
       parent_id: parent.id,
     });
 
@@ -88,7 +88,7 @@ describe("createConcept tool", () => {
       createConcept(db, {
         name: "Orphan Concept",
         kind: "feature",
-        summary: "Should not be created",
+        summary: "Should not be created because the parent id does not exist anywhere in the graph yet",
         parent_id: "null",
       })
     ).rejects.toThrow('Parent concept "null" does not exist.');
@@ -105,7 +105,7 @@ describe("createConcept: duplicate evidence refs (2.1.2 F1)", () => {
     const result = await createConcept(db, {
       name: "Decision",
       kind: "decision",
-      summary: "A decision resting on one file fact",
+      summary: "A decision resting on one file fact: both evidence items point at the very same ref",
       evidence: [
         { ref: "docs/spec.md", why: "первое чтение спеки" },
         { ref: "docs/spec.md", why: "повторное указание той же опоры" },
@@ -131,7 +131,7 @@ describe("createConcept: duplicate evidence refs (2.1.2 F1)", () => {
     const first = await createConcept(db, {
       name: "First",
       kind: "decision",
-      summary: "creates the file fact",
+      summary: "creates the file fact node on the first evidence ref that points at docs/other.md",
       evidence: [{ ref: "docs/other.md", why: "почему опора" }],
     });
     const factId = db.getInformedByEdges(first.id, "ancestry", false)[0].other_id;
@@ -141,7 +141,7 @@ describe("createConcept: duplicate evidence refs (2.1.2 F1)", () => {
     const second = await createConcept(db, {
       name: "Second",
       kind: "decision",
-      summary: "reuses the existing file fact",
+      summary: "reuses the existing file fact node instead of creating a second one for the same ref",
       evidence: [
         { node: factId, why: "опора существует" },
         { node: factId, why: "дубль той же опоры" },
