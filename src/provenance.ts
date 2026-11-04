@@ -426,7 +426,9 @@ function traverse(
   const edgeViews: ProvenanceEdgeView[] = [];
   const emittedEdgeKeys = new Set<string>(); // JSON keys — pipe-safe (F11)
   let total = 1;
-  let frontier: string[] = [rootId];
+  // 2.1.2 F3: a removed root is terminal (contract 2) — the stub is shown,
+  // its historical edges are not expanded, so the frontier starts empty.
+  let frontier: string[] = rootRemoved ? [] : [rootId];
   let depth = 0;
 
   while (frontier.length > 0) {

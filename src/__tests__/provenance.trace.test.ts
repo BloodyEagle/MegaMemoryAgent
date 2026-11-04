@@ -5,6 +5,12 @@ import path from "node:path";
 import { KnowledgeDB } from "../db.js";
 import { link } from "../tools.js";
 import { provenanceTrace, compareIds } from "../provenance.js";
+import {
+  claimDigestOf,
+  confirmSupports,
+  edgeDigestOf,
+  statusDigestOf,
+} from "../support-baselines.js";
 import type { ProvenanceTraceOutput } from "../types.js";
 
 let tmpDir: string;
@@ -598,5 +604,25 @@ describe("writes touching an unresolved cyclic component (F18)", () => {
       "SELECT 1 FROM edges WHERE from_id = 'b' AND to_id = 'fresh' AND removed_at IS NULL"
     );
     expect(live).toHaveLength(1);
+  });
+});
+
+// ---- 2.1.2: F3 (удалённый корень терминален), F4 (unknown внутреннего узла),
+//      F5 (total_exact при обрезке max_nodes), F13 (наследование in_paths_capped) ----
+
+describe("2.1.2 provenance trace fixes", () => {
+  it("F3: a removed root is terminal — stub only, no historical expansion", () => {
+    node("D", "decision", { removed: true });
+    node("F");
+    node("G");
+    edge("D", "F");
+    edge("F", "G");
+
+    const out = trace("D", { retrospective: true });
+    expect(out.nodes.map((n) => n.id)).toEqual(["D"]);
+    const stub = out.nodes[0];
+    expect(stub.removed).toBe(true);
+    expect(out.edges).toEqual([]);
+    expect(out.shown).toBe(1);
   });
 });
