@@ -140,3 +140,22 @@ describe("2.1.2 F10: CheckBudget refuses NaN/Infinity/negative", () => {
     expect(b.exhausted).toBe(true);
   });
 });
+
+// ---- F12: consume отличает точное исчерпание от отказа ----
+
+describe("2.1.2 F12: consume flags an attempt beyond the limit", () => {
+  it("exact exhaustion leaves exceeded false; one more attempt sets it true", () => {
+    const b = new CheckBudget(2, 10);
+    expect(b.consume(5)).toBe(true);
+    expect(b.consume(5)).toBe(true);
+    expect(b.exceeded).toBe(false); // exactly on the limit, nothing refused yet
+    expect(b.consume(0)).toBe(false); // an extra edge over the limit
+    expect(b.exceeded).toBe(true);
+  });
+
+  it("an over-limit byte charge trips exceeded on the same call", () => {
+    const b = new CheckBudget(10, 5);
+    expect(b.consume(6)).toBe(false);
+    expect(b.exceeded).toBe(true);
+  });
+});

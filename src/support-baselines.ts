@@ -123,9 +123,15 @@ export class CheckBudget {
     return Math.max(0, this.bytesLeft);
   }
 
-  /** Consume one pair; returns false (and trips the flag) when over budget. */
+  /** Consume one pair; returns false (and trips the flag) when over budget.
+   * 2.1.2 F12: an attempt against an already-exhausted budget is an overrun
+   * too — without the flag there is no way to tell exact exhaustion from a
+   * refusal. */
   consume(bytes: number): boolean {
-    if (this.exhausted) return false;
+    if (this.exhausted) {
+      this.exceeded = true;
+      return false;
+    }
     this.edgesLeft -= 1;
     this.bytesLeft -= bytes;
     if (this.edgesLeft < 0 || this.bytesLeft < 0) {
