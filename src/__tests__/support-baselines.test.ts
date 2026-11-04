@@ -1146,6 +1146,63 @@ describe("F8: metrics cover decisions without live edges", () => {
   });
 });
 
+describe("F4 (2.1.1): metrics_truncated means decisions left unchecked", () => {
+  it(
+    "42. a budget exhausted exactly on the last decision is not truncation",
+    () => {
+      // Two decisions, one confirmed support each — each check consumes
+      // exactly one edge, so a budget of 2 runs out on the second, last one.
+      confirmedDecision("d1", ["f1"]);
+      confirmedDecision("d2", ["f2"]);
+
+      const m = provenanceMetrics(db, new CheckBudget(2, 1_000_000));
+      expect(m.decisions_by_check_state.unchanged).toBe(2);
+      expect(m.metrics_truncated).toBe(false);
+    }
+  );
+
+  it("43. decisions past the exhausted budget leave metrics_truncated true", () => {
+    confirmedDecision("d1", ["f1"]);
+    confirmedDecision("d2", ["f2"]);
+    confirmedDecision("d3", ["f3"]);
+
+    // Budget 2: d3 never gets a verdict — the flag must say so.
+    const m = provenanceMetrics(db, new CheckBudget(2, 1_000_000));
+    expect(m.metrics_truncated).toBe(true);
+    const counted =
+      m.decisions_by_check_state.unchanged +
+      m.decisions_by_check_state.changed +
+      m.decisions_by_check_state.unknown +
+      m.decisions_by_check_state.incomplete;
+    expect(counted).toBe(2);
+  });
+
+  it("44. a decision with only a claim anchor is counted, not dropped", () => {
+    // Confirmed "no supports": a claim anchor exists, no live edges, no
+    // snapshot rows — the case the deleted dead branch pretended to cover.
+    // The WHERE keeps such decisions in the metric, and computeSupportCheck
+    // gives them an honest verdict (unchanged: confirmed-empty, nothing
+    // moved); the bucket total proves the decision is not lost.
+    node("solo", "decision", "decision solo");
+    confirmSupports(db, {
+      decision_id: "solo",
+      expected_claim_digest: claimDigestOf("decision solo"),
+      items: [],
+    });
+
+    const m = provenanceMetrics(db, new CheckBudget(10, 1_000_000));
+    expect(m.no_live_supports).toBe(1);
+    const counted =
+      m.decisions_by_check_state.unchanged +
+      m.decisions_by_check_state.changed +
+      m.decisions_by_check_state.unknown +
+      m.decisions_by_check_state.incomplete;
+    expect(counted).toBe(1);
+    expect(m.decisions_by_check_state.unchanged).toBe(1);
+    expect(m.metrics_truncated).toBe(false);
+  });
+});
+
 describe("F9: edge provenance survives a merge", () => {
   it("37. created_via and accepted_at travel with the row", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-baselines-f9-"));

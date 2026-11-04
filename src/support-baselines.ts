@@ -567,15 +567,18 @@ export function provenanceMetrics(
   const byState = { unchanged: 0, changed: 0, unknown: 0, incomplete: 0 };
   let withLive = 0;
   let noLive = 0;
+  let checked = 0;
   for (const { id, has_live } of decisions) {
     if (has_live) withLive += 1;
     else noLive += 1;
     const view = computeSupportCheck(db, id, budget);
-    if (view === null) {
-      byState.unknown += 1; // nothing recorded — not checked
-      continue;
-    }
-    byState[view.state] += 1;
+    // Invariant: the SELECT above guarantees every decision carries a claim
+    // anchor, a live edge or a snapshot row — exactly the inputs
+    // computeSupportCheck needs to return a verdict, so it never returns null
+    // here. The assertion keeps a future WHERE change from silently dropping
+    // decisions from every bucket: it fails loudly instead.
+    byState[view!.state] += 1;
+    checked += 1;
     if (budget.exhausted) break;
   }
 
@@ -594,6 +597,9 @@ export function provenanceMetrics(
     no_live_supports: noLive,
     decisions_with_superseded_supports: Number(supersededDecisions),
     decisions_by_check_state: byState,
-    metrics_truncated: budget.exhausted,
+    // F4 (2.1.1): true only when decisions were left UNCHECKED — a budget
+    // that runs out exactly on the last decision still produced a verdict
+    // for every row, and calling that "truncated" was a false alarm.
+    metrics_truncated: checked < decisions.length,
   };
 }
