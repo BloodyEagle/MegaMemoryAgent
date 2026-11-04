@@ -1,17 +1,9 @@
-import fs from "node:fs";
-import path from "node:path";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { reembed } from "./reembed.js";
 import { MODEL_NAME, vectorSearchEnabled } from "./embeddings.js";
 import { errorBold, success, info, warn } from "./cli-utils.js";
-
-function dbPath(): string {
-  return (
-    process.env.MEGAMEMORY_DB_PATH ??
-    path.join(process.cwd(), ".megamemory", "knowledge.db")
-  );
-}
+import { resolveDbPathOrExit } from "./db-path.js";
 
 /**
  * `megamemory reembed [--batch N]`
@@ -30,11 +22,7 @@ export async function runReembed(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const p = dbPath();
-  if (!fs.existsSync(p)) {
-    errorBold(`No database at ${p}. Run inside a project with .megamemory/knowledge.db.`);
-    process.exit(1);
-  }
+  const p = resolveDbPathOrExit(args);
 
   const db = new KnowledgeDB(p);
   try {

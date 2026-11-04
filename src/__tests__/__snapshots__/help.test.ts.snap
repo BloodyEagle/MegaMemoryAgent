@@ -1,0 +1,46 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildHelp — --db как глобальная опция (2.1.4) > снапшот текста хелпа 1`] = `
+"megamemory v2.1.4 — persistent project knowledge graph for coding agents
+
+Commands:
+  (no command)    Start the MCP stdio server (invoked by your editor)
+  install         Configure editor/agent integration (interactive)
+  serve           Start the web graph explorer (--db PATH)
+  stats           Show knowledge graph statistics (--prune trims the call journal; --db PATH)
+  merge           Merge two knowledge.db files
+  conflicts       List unresolved merge conflicts (--db PATH)
+  resolve         Resolve a merge conflict (--db PATH)
+  repair-ids      Fix legacy empty/trailing-slash node ids (default: dry-run; --db PATH)
+  migrate         Upgrade an upstream v1.6.2 database to the fork schema (default: dry-run; --db PATH)
+  reembed         Reindex node embeddings with the current model (--batch N; --db PATH)
+  consolidate     Find and merge near-duplicate nodes (default: dry-run; --db PATH)
+  digest          Rebuild module digest nodes (default: dry-run; --db PATH)
+  export --md <dir> Export the graph to markdown files (--check for CI; --db PATH)
+  doctor          Health check of the current database (exit 1 on problems; --db PATH)
+  eval            Measure search recall@k on the eval set (fixtures/eval.jsonl; --db PATH)
+
+Options:
+  --target NAME    Install target (opencode, claudecode, antigravity, codex)
+  --port PORT     Port for the web explorer (default: 4321)
+  --into FILE     Output path for merge (default: overwrites file1)
+  --left-label    Label for left side in merge (default: left)
+  --right-label   Label for right side in merge (default: right)
+  --keep          Resolution strategy: left, right, or both
+  --json          Machine-readable output for conflicts
+  --db PATH       Path to knowledge.db for every command that opens the
+                database (sources: --db, MEGAMEMORY_DB_PATH, ./.megamemory/knowledge.db)
+  --help, -h      Show this help
+  --version, -v   Show version
+
+Examples:
+  $ megamemory install                                   Interactive editor integration setup
+  $ megamemory install --target claudecode              Non-interactive Claude Code setup
+  $ megamemory serve                                     Open graph explorer at http://localhost:4321
+  $ megamemory serve --port 8080                         Custom port
+  $ megamemory merge main.db feature.db --into merged.db Merge two knowledge DBs
+  $ megamemory conflicts                                 View unresolved conflicts
+  $ megamemory resolve <group-id> --keep left            Resolve a conflict
+  $ megamemory doctor --db /path/to/knowledge.db         Check a specific database
+  $ megamemory repair-ids --apply                        Rename broken ids after backup"
+`;

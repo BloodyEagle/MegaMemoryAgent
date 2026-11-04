@@ -1,19 +1,15 @@
 import fs from "fs";
-import path from "path";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { errorBold } from "./cli-utils.js";
 import { listRoots } from "./tools.js";
+import { resolveDbPathOrExit } from "./db-path.js";
 
 const KIND_ORDER = ["feature", "module", "component", "pattern", "config", "decision"];
 
 function getFlag(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
   return idx !== -1 && args[idx + 1] ? args[idx + 1] : undefined;
-}
-
-function getDefaultDbPath(): string {
-  return process.env.MEGAMEMORY_DB_PATH ?? path.join(process.cwd(), ".megamemory", "knowledge.db");
 }
 
 function formatBytes(bytes: number): string {
@@ -53,12 +49,7 @@ function sortedKinds(kinds: Record<string, number>): Array<[string, number]> {
 }
 
 export async function runStats(args: string[]): Promise<void> {
-  const dbPath = path.resolve(getFlag(args, "--db") ?? getDefaultDbPath());
-
-  if (!fs.existsSync(dbPath)) {
-    errorBold(`Database not found: ${dbPath}`);
-    process.exit(1);
-  }
+  const dbPath = resolveDbPathOrExit(args);
 
   let dbStat: fs.Stats;
   try {

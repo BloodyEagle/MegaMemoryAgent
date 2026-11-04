@@ -4,13 +4,7 @@ import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { exportMarkdown, checkMarkdown } from "./export.js";
 import { errorBold, success, info, heading, warn } from "./cli-utils.js";
-
-function dbPath(): string {
-  return (
-    process.env.MEGAMEMORY_DB_PATH ??
-    path.join(process.cwd(), ".megamemory", "knowledge.db")
-  );
-}
+import { resolveDbPathOrExit } from "./db-path.js";
 
 /**
  * `megamemory export --md <dir> [--check]`
@@ -29,11 +23,7 @@ export async function runExport(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const p = dbPath();
-  if (!fs.existsSync(p)) {
-    errorBold(`No database at ${p}. Run inside a project with .megamemory/knowledge.db.`);
-    process.exit(1);
-  }
+  const p = resolveDbPathOrExit(args);
 
   const db = new KnowledgeDB(p);
   try {
