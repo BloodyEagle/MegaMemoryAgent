@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.6-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.7-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -157,6 +157,16 @@ agent A/B comparison, see [docs/bench-protocol.md](docs/bench-protocol.md).
   node ranked **first** (the `rank` column shows that position). `hit_rate@1 ≤ hit_rate`
   always — a rank-6 "hit" is a much weaker answer than a rank-1 one, and reading only
   the top-10 number overstates the graph.
+- **Why `hit_rate@1` can drop after you add knowledge.** Supports (the `informed_by`
+  facts behind a decision) contain the query terms verbatim — "EBUSY", "two-batch race" —
+  and compete with the decision itself in search, pushing it off rank 1: the agent asks
+  "why" and gets a fact fragment instead of the decision the fact belongs to. Since 2.1.7
+  such **nested supports** leave the top level and fold under their decision (the
+  `supports` field on the node, depth 1), so adding knowledge no longer sinks
+  `hit_rate@1`; in bench a nested support counts as found at its decision's rank, and
+  `meta.supports_inlined` reports how many nodes were folded. When the decision did not
+  make the output, its support stays a standalone fact on the top level — knowledge is
+  regrouped, never hidden.
 - **`r(files)` vs `r(files-top)`.** `r(files)` compares the graph answer against **all**
   `file_refs` of every found node — that reaches tens of thousands of tokens and
   produces ×50 ratios no live agent would ever pay, because a live agent reads two or

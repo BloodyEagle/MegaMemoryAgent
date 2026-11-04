@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
+import { ensureSchema } from "../migrate-schema.js";
 import { link, estimateTokens } from "../tools.js";
 import {
   BenchError,
@@ -827,5 +828,62 @@ describe("megamemory bench 2.1.6 — честные цифры", () => {
     // формат списка id: до 10 целиком, дальше +N
     expect(formatIdList(["a", "b"])).toBe(" (ids: a, b)");
     expect(formatIdList(Array.from({ length: 12 }, (_, i) => `n${i}`))).toContain("+2");
+  });
+});
+
+describe("megamemory bench 2.1.7 — вложенные опоры в ранге", () => {
+  function insertInlinedPair(): void {
+    // FTS: остальная часть файла живёт на LIKE-fallback, здесь нужен настоящий FTS-AND
+    ensureSchema(db);
+    db.insertNode({
+      id: "inl-decision",
+      name: "inl-decision",
+      kind: "decision",
+      summary: "the decision about the ebusy retry loop bmark",
+    });
+    db.insertNode({
+      id: "inl-support",
+      name: "inl-support",
+      kind: "fact",
+      summary: "the ebusy retry loop reproduced with two parallel writers bmark",
+    });
+    link(db, {
+      from: "inl-decision",
+      to: "inl-support",
+      relation: "informed_by",
+      description: "the reproduction is what the retry loop fixes",
+    });
+  }
+
+  it("F6-14. ожидаемый узел вложен в решение: hit true, ранг равен рангу решения", async () => {
+    insertInlinedPair();
+    const report = await runBench(
+      db,
+      [{ id: "q1", query: "ebusy retry loop bmark", expect_nodes: ["inl-support"] }],
+      opts()
+    );
+    const q = report.questions[0];
+    expect(q.hit).toBe(true);
+    expect(q.nested_ids).toContain("inl-support");
+    // ранг вложенной опоры = ранг её решения
+    const decisionRank = q.top_ids.indexOf("inl-decision") + 1;
+    expect(decisionRank).toBeGreaterThan(0);
+    expect(q.expected_rank).toBe(decisionRank);
+    expect(report.hit_rate).toBe(1);
+  });
+
+  it("F6-15. top_ids содержит вложенный id, nested_ids помечает его", async () => {
+    insertInlinedPair();
+    const report = await runBench(
+      db,
+      [{ id: "q1", query: "ebusy retry loop bmark" }],
+      opts()
+    );
+    const q = report.questions[0];
+    expect(q.top_ids).toContain("inl-support");
+    expect(q.top_ids.filter((id) => id === "inl-support")).toHaveLength(1);
+    expect(q.nested_ids).toEqual(["inl-support"]);
+    // опора не занимает слот верхнего уровня: top-level — только решение
+    expect(q.top_ids.filter((id) => id === "inl-decision")).toHaveLength(1);
   });
 });

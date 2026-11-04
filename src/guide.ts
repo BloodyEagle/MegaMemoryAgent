@@ -63,8 +63,9 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
    enabled (off by default). Auto-derived supports are not confirmed evidence — a draft, not a check.
 9. **Confirm versions:** after reading a support, confirm it: \`confirm_supports(decision_id,
    expected_claim_digest, items:[{support_id, expected_claim_digest, expected_status_digest,
-   expected_edge_digest}])\` — digests come from \`provenance_trace\`/\`get_concept\` responses,
-   never computed by hand. \`support_check.state\`: \`unchanged\` = same as you confirmed;
+   expected_edge_digest}])\` — the decision's digest is \`get_concept.current_digests.claim\`, the
+   supports' digests travel in \`provenance_trace.supports[]\` — never computed by hand, and
+   compact \`understand\` carries no digests. \`support_check.state\`: \`unchanged\` = same as you confirmed;
    \`changed\` = diverged (see \`reasons\`); \`unknown\` = never checked; \`incomplete\` = the check hit
    its budget. \`unknown\` and \`incomplete\` are NOT "all good". On \`changed\`: re-read the support,
    confirm again, or mark the decision \`refuted\`/\`superseded\` via \`update\` — never leave it

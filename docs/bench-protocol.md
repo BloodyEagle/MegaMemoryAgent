@@ -66,6 +66,14 @@ list.
   surfaced anywhere in the top-10; `hit_rate@1` counts only when the best expected
   node ranked **first** (the `rank` column shows the position). `hit_rate@1 ≤ hit_rate`
   always — a rank-6 "hit" is a much weaker answer than a rank-1 one.
+- **Why `hit_rate@1` can drop after you add knowledge.** Supports (the `informed_by`
+  facts behind a decision) contain the query terms verbatim and compete with the
+  decision itself, pushing it off rank 1. Since 2.1.7 such **nested supports** fold
+  under their decision (`supports` on the node, depth 1) instead of occupying a top
+  slot; bench counts a nested support as found at its decision's rank, and
+  `meta.supports_inlined` shows how many nodes were folded. When the decision did not
+  make the output, its support stays on the top level — knowledge is regrouped, never
+  hidden.
 - **`r(files)` vs `r(files-top)`.** `r(files)` sums **all** `file_refs` of every found
   node — tens of thousands of tokens and ×50 ratios that no live agent would ever pay,
   because a live agent reads two or three files. Run with `--files-top 3` and read

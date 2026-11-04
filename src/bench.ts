@@ -145,10 +145,21 @@ export interface QuestionResult {
   line_refs: number;
   /** null = the question carries no expect_nodes */
   hit: boolean | null;
-  /** 1-based position of the best (first) expected node in the output; null when absent or missed (plan 2.1.6 F1) */
+  /**
+   * 1-based position of the best (first) expected node in the output; null
+   * when absent or missed (plan 2.1.6 F1). 2.1.7 F3: rank over the union —
+   * a support folded under its decision (2.1.7 F2) ranks at the decision's
+   * position, it is still in the answer.
+   */
   expected_rank: number | null;
-  /** ids in the output order, up to the top_k */
+  /**
+   * ids in the output order, up to the top_k — top level first, then the
+   * folded (nested) supports; which of them came nested is marked in
+   * nested_ids.
+   */
   top_ids: string[];
+  /** 2.1.7 F3: subset of top_ids that travelled nested under their decisions. */
+  nested_ids: string[];
   /** found nodes whose support_check.state = changed */
   stale_hits: number;
   /** ids of those found nodes (plan 2.1.6 F5) */
@@ -413,13 +424,27 @@ export async function runBench(
     const graphTokens = r.meta?.tokens_estimated ?? 0;
     const matches = r.compact ?? [];
     const ids = matches.map((m) => m.id);
+    // 2.1.7 F3: nested supports are part of the answer — the rank space is
+    // the union: top level in output order, a folded support at its
+    // decision's rank. top_ids carries both (nested marked in nested_ids).
+    const nestedIds = matches.flatMap((m) => (m.supports ?? []).map((s) => s.id));
+    const rankOf = new Map<string, number>();
+    ids.forEach((id, i) => rankOf.set(id, i + 1));
+    for (const m of matches) {
+      const hostRank = rankOf.get(m.id);
+      if (hostRank === undefined) continue;
+      for (const s of m.supports ?? []) {
+        if (!rankOf.has(s.id)) rankOf.set(s.id, hostRank);
+      }
+    }
+    const allIds = [...ids, ...nestedIds];
     // F1: 1-based position of the best expected node in the output order
     const expectedRank = (() => {
       if (!q.expect_nodes || q.expect_nodes.length === 0) return null;
       let best: number | null = null;
       for (const n of q.expect_nodes) {
-        const at = ids.indexOf(n);
-        if (at !== -1 && (best === null || at + 1 < best)) best = at + 1;
+        const at = rankOf.get(n);
+        if (at !== undefined && (best === null || at < best)) best = at;
       }
       return best;
     })();
@@ -543,12 +568,14 @@ export async function runBench(
       }
     }
 
-    // 3. provenance bookkeeping over the found nodes
+    // 3. provenance bookkeeping over the found nodes — the union, not just
+    // the top level: a nested support is still in the answer (2.1.7 F3), so
+    // its check still feeds stale_hits/unknown_supports.
     let staleHits = 0;
     let unknownSupports = 0;
     const staleIds: string[] = [];
     const unknownIds: string[] = [];
-    for (const id of ids) {
+    for (const id of allIds) {
       const node = db.getNode(id);
       if (!node) continue;
       const check = computeSupportCheck(
@@ -583,10 +610,11 @@ export async function runBench(
       line_refs: lineRefs,
       hit:
         q.expect_nodes && q.expect_nodes.length > 0
-          ? q.expect_nodes.some((n) => ids.includes(n))
+          ? q.expect_nodes.some((n) => rankOf.has(n))
           : null,
       expected_rank: expectedRank,
-      top_ids: ids,
+      top_ids: allIds,
+      nested_ids: nestedIds,
       stale_hits: staleHits,
       stale_ids: staleIds,
       unknown_supports: unknownSupports,

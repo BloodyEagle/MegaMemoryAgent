@@ -204,6 +204,29 @@ export interface NodeWithContext {
    * whenever there is anything to check.
    */
   support_check?: SupportCheckView;
+  /**
+   * 2.1.7 F1: the digests the agent can pass straight into confirm_supports
+   * — no hand-reproduction of the hash algorithm. get_concept only (compact
+   * understand must not grow). null for a removed node: a tombstone exposes
+   * no digests.
+   */
+  current_digests?: CurrentDigestsView | null;
+}
+
+/**
+ * 2.1.7 F1: the current digests of one node's wording. `claim` comes from the
+ * confirmed snapshot when one exists (source: "snapshot" — the confirmation
+ * belongs to the wording the agent saw; a rewritten summary refuses this
+ * value with version_conflict, which is the point), otherwise it is computed
+ * from the live summary (source: "computed" — the value a FIRST confirmation
+ * needs). `status` is always the current status-axes digest: the node-level
+ * snapshot tracks the claim only, there is nothing to take it from.
+ */
+export interface CurrentDigestsView {
+  claim: string;
+  status: string;
+  format_version: number;
+  source: "computed" | "snapshot";
 }
 
 export interface UnderstandOutput {
@@ -242,6 +265,15 @@ export interface CompactMatch {
   /** Present only for the first 3 results (one level, names only). */
   children?: Array<{ id: string; name: string; kind: NodeKind }>;
   edges?: Array<{ to: string; to_name: string; relation: RelationType }>;
+  /**
+   * 2.1.7 F2: live informed_by supports of THIS node that the same query
+   * also returned. They are folded here (depth 1 — a nested support carries
+   * no supports of its own) instead of competing for a top slot: a support
+   * shares the query terms with its decision and used to push the decision
+   * off rank 1. Does not occupy a top_k slot; its tokens ARE counted in
+   * tokens_estimated.
+   */
+  supports?: Array<{ id: string; name: string; summary: string }>;
 }
 
 export interface UnderstandMeta {
@@ -250,6 +282,12 @@ export interface UnderstandMeta {
   tokens_estimated: number;
   /** U6: what the full-mode answer would have cost — drives "saved vs full". */
   estimated_full_tokens?: number;
+  /**
+   * 2.1.7 F2: how many nodes were folded under their decisions instead of
+   * sitting on the top level. `returned` counts the top level only; the id
+   * set of the answer is preserved — folded nodes travel nested.
+   */
+  supports_inlined?: number;
 }
 
 export interface UnderstandOutput {
@@ -856,6 +894,20 @@ export interface ProvenanceEdgeView {
   removed?: boolean;
 }
 
+/**
+ * 2.1.7 F1: one live informed_by support of the trace root with its FULL
+ * current digests — the exact values confirm_supports compares against, not
+ * the 12-char previews provenance_history keeps. Null digests mean the
+ * support node is gone while the edge lives: the pair is reported `removed`
+ * in support_check, there is nothing to hash.
+ */
+export interface ProvenanceSupportDigest {
+  support_id: string;
+  claim_digest: string | null;
+  status_digest: string | null;
+  edge_digest: string;
+}
+
 export interface ProvenanceTraceOutput {
   /**
    * One contract for the root and every other node (plan-3-fixes-2 F15): a
@@ -893,6 +945,20 @@ export interface ProvenanceTraceOutput {
    * have long since drifted. Present whenever there is anything to check.
    */
   support_check?: SupportCheckView;
+  /**
+   * 2.1.7 F1: the root's own digests, the same block get_concept carries —
+   * pass `current_digests.claim` straight into confirm_supports. null for a
+   * removed root: a tombstone exposes no digests.
+   */
+  current_digests?: CurrentDigestsView | null;
+  /**
+   * 2.1.7 F1: the root's live supports with their FULL current digests —
+   * what confirm_supports items[] expects, no previews and no hand hashing.
+   * Sorted by support_id; capped like the other digest lists, the honest
+   * total travels in supports_count when the cap cut anything.
+   */
+  supports?: ProvenanceSupportDigest[];
+  supports_count?: number;
   /**
    * plan-4-fixes-6 F11: inner (non-root) nodes of any kind whose own support
    * check ran out of the shared budget. Present only when > 0; the verdict

@@ -124,3 +124,28 @@ describe("документация про bench (2.1.6 F7)", () => {
     expect(ru).toContain("### Как читать цифры");
   });
 });
+
+describe("документация про дайджесты и вложенные опоры (2.1.7 F4)", () => {
+  it("guide учит: дайджест решения — в get_concept.current_digests, руками считать не нужно", () => {
+    const guide = buildGuideText();
+    expect(guide).toContain("current_digests");
+    expect(guide).toContain("never computed by hand");
+    // сниппет остаётся в объёме: одна строка изменилась, блок не разросся
+    expect(SNIPPET.split("\n").length).toBeLessThanOrEqual(60);
+  });
+
+  it("оба README объясняют падение hit_rate@1 из-за вложенных опор", () => {
+    const en = fs.readFileSync(path.join(PROJECT_ROOT, "README.md"), "utf-8");
+    const ru = fs.readFileSync(path.join(PROJECT_ROOT, "README.ru.md"), "utf-8");
+    expect(en).toContain("nested supports");
+    expect(en).toContain("supports_inlined");
+    expect(ru).toContain("вложенные опоры");
+    expect(ru).toContain("supports_inlined");
+  });
+
+  it("docs/bench-protocol.md объясняет вложенные опоры", () => {
+    const doc = fs.readFileSync(path.join(PROJECT_ROOT, "docs", "bench-protocol.md"), "utf-8");
+    expect(doc).toContain("nested supports");
+    expect(doc).toContain("supports_inlined");
+  });
+});
