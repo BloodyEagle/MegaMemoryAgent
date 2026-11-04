@@ -5,6 +5,9 @@ import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { success, skip, error, info, heading, warn, multiSelect } from "./cli-utils.js";
 import { INSTRUCTIONS_STAMP_MARKER, instructionsStamp } from "./instructions.js";
+// F2 (2.1.5): the snippet lives in guide.ts — `megamemory guide` prints the
+// very same constant, so the printed text cannot drift from the written one.
+import { AGENTS_MD_END, AGENTS_MD_SNIPPET } from "./guide.js";
 
 export type InstallTarget = "opencode" | "claudecode" | "antigravity" | "codex";
 
@@ -60,35 +63,7 @@ const PACKAGE_VERSION = JSON.parse(
     "utf-8"
   )
 ).version as string;
-const AGENTS_MD_STAMP = instructionsStamp(PACKAGE_VERSION);
-const AGENTS_MD_END = "<!-- /megamemory-snippet -->";
 const MANAGED_FILE_MARKER = "MegaMemory-managed file. Safe for megamemory install to update.";
-
-const AGENTS_MD_SNIPPET = `
-${AGENTS_MD_STAMP}
-## Project Knowledge Graph
-
-You have access to a project knowledge graph via the \`megamemory\` MCP server and skill tool. You have no implicit memory of this project between sessions, so this graph is your only continuity for concepts, architecture, decisions, and relationships.
-
-**Workflow: understand → work → update**
-
-1. **Session start:** You must call \`megamemory\` with action \`overview\` (or \`megamemory:list_roots\` directly) before you begin work.
-2. **Before each task:** You must call \`megamemory\` with action \`query\` (or \`megamemory:understand\` directly) before reading source files for project understanding.
-3. **After each task:** You must call \`megamemory\` with action \`record\` to create/update/link concepts for what you built.
-
-Be specific in summaries: include parameter names, defaults, file locations, and rationale. Keep concepts max 3 levels deep.
-
-4. **Budget:** \`understand\` is compact by default and bounded by \`max_tokens\` (1500).
-   Use \`mode:"full"\` only when you need \`why\` and full children/edges.
-5. **Freshness:** when a decision replaces an older one, pass \`supersedes: [old_id]\` to
-   \`create_concept\` instead of deleting. If a search finds nothing, retry with
-   \`include_inactive: true\` — the concept may be marked superseded.
-6. **Digests:** \`digest\` nodes are per-module summaries rebuilt from children. Read the digest
-   first, children second. Never create digests by hand.
-7. **After changing the embedding model:** run \`megamemory reembed\`. Until it finishes, vector
-   search is off and results are FTS-only.
-${AGENTS_MD_END}
-`;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

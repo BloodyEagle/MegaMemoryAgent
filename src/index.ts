@@ -21,7 +21,7 @@ const VERSION = JSON.parse(
 
 const HELP = buildHelp(VERSION);
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string } {
   const portIdx = args.indexOf("--port");
@@ -135,6 +135,22 @@ switch (cmd) {
   case "reembed": {
     const { runReembed } = await import("./reembed-cli.js");
     await runReembed(process.argv.slice(3));
+    process.exit(0);
+    break;
+  }
+
+  case "guide": {
+    // F2 (2.1.5): print the agent-facing text — the same snippet install
+    // writes, plus a worked session example and the bench section.
+    const { buildGuideText } = await import("./guide.js");
+    console.log(buildGuideText());
+    process.exit(0);
+    break;
+  }
+
+  case "bench": {
+    const { runBenchCli } = await import("./bench-cli.js");
+    await runBenchCli(process.argv.slice(3));
     process.exit(0);
     break;
   }
