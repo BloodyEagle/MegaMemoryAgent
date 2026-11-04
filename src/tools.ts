@@ -671,18 +671,26 @@ export async function createConcept(
       usedEvidenceIds.add(item.node);
       continue;
     }
+    // 2.1.2 F1: the same ref twice must not plan the same fact id twice —
+    // two insertNode calls with one id violate the primary key and roll back
+    // the whole creation. A repeat reuses the already-planned id: the support
+    // (and later the snapshot) stays single, the first `why` wins.
     const ref = item.ref!.trim();
     const found = resolveFileRef(db, ref);
     if (found) {
-      supports.push({ toId: found.id, why, fromAutoGround: false });
-      usedEvidenceIds.add(found.id);
+      if (!usedEvidenceIds.has(found.id)) {
+        supports.push({ toId: found.id, why, fromAutoGround: false });
+        usedEvidenceIds.add(found.id);
+      }
       continue;
     }
     const factId = makeId(ref);
     const finalFactId = db.nodeExists(factId) ? disambiguateId(factId, ref) : factId;
-    factNodesToCreate.push({ id: finalFactId, name: ref, embedding: null });
-    supports.push({ toId: finalFactId, why, fromAutoGround: false });
-    usedEvidenceIds.add(finalFactId);
+    if (!usedEvidenceIds.has(finalFactId)) {
+      factNodesToCreate.push({ id: finalFactId, name: ref, embedding: null });
+      supports.push({ toId: finalFactId, why, fromAutoGround: false });
+      usedEvidenceIds.add(finalFactId);
+    }
   }
 
   // ---- Plan 3 §4.1.2: auto-ground from why + file_refs ----

@@ -97,3 +97,62 @@ describe("createConcept tool", () => {
     expect(db.getNode("orphan-concept")).toBeUndefined();
   });
 });
+
+// ---- 2.1.2 F1: два evidence с одним ref не роняют создание ----
+
+describe("createConcept: duplicate evidence refs (2.1.2 F1)", () => {
+  it("two evidence items with the same unseen ref create the node, one support, one snapshot", async () => {
+    const result = await createConcept(db, {
+      name: "Decision",
+      kind: "decision",
+      summary: "A decision resting on one file fact",
+      evidence: [
+        { ref: "docs/spec.md", why: "первое чтение спеки" },
+        { ref: "docs/spec.md", why: "повторное указание той же опоры" },
+      ],
+    });
+
+    // The node itself was created (the transaction did not roll back).
+    expect(db.getNode(result.id)).toBeDefined();
+    // Exactly one fact node, one support edge, one snapshot row.
+    const factIds = db
+      .getInformedByEdges(result.id, "ancestry", false)
+      .map((e) => e.other_id);
+    expect(factIds).toHaveLength(1);
+    const fact = db.getNode(factIds[0])!;
+    expect(fact.kind).toBe("feature");
+    expect(fact.file_refs ? JSON.parse(fact.file_refs) : null).toEqual(["docs/spec.md"]);
+    const check = db.getSupportBaselines(result.id);
+    expect(check).toHaveLength(1);
+    expect(check[0].support_id).toBe(factIds[0]);
+  });
+
+  it("the same duplicate-ref call succeeds when the support already exists", async () => {
+    const first = await createConcept(db, {
+      name: "First",
+      kind: "decision",
+      summary: "creates the file fact",
+      evidence: [{ ref: "docs/other.md", why: "почему опора" }],
+    });
+    const factId = db.getInformedByEdges(first.id, "ancestry", false)[0].other_id;
+
+    // Second call: the ref now resolves to the existing fact node — and the
+    // evidence lists that node twice.
+    const second = await createConcept(db, {
+      name: "Second",
+      kind: "decision",
+      summary: "reuses the existing file fact",
+      evidence: [
+        { node: factId, why: "опора существует" },
+        { node: factId, why: "дубль той же опоры" },
+      ],
+    });
+
+    expect(db.getNode(second.id)).toBeDefined();
+    const factIds = db
+      .getInformedByEdges(second.id, "ancestry", false)
+      .map((e) => e.other_id);
+    expect(factIds).toEqual([factId]);
+    expect(db.getSupportBaselines(second.id)).toHaveLength(1);
+  });
+});
