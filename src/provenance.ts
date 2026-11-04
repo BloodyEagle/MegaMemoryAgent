@@ -11,12 +11,18 @@ import type {
   ProvenanceEdgeView,
   ProvenanceWeakLink,
   SupportCheckView,
+  CurrentDigestsView,
+  ProvenanceSupportDigest,
 } from "./types.js";
 import {
   CheckBudget,
+  BASELINE_FORMAT_VERSION,
   DEFAULT_MAX_CHECK_BYTES,
   DEFAULT_MAX_CHECK_EDGES,
+  claimDigestOf,
   computeSupportCheck,
+  edgeDigestOf,
+  statusDigestOf,
 } from "./support-baselines.js";
 
 // ---- Config flags (plan 3 §4.1.3, §11) ----
@@ -1014,6 +1020,18 @@ function weakLinks(
   return capWeakLinks(weak);
 }
 
+/** Total order over support ids for the deterministic supports[] list (2.1.7 F1). */
+function compareSupportIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * 2.1.7 F1: the supports[] cap — a 20k-support star must not blow up the
+ * trace response; the honest total travels in supports_count, same
+ * philosophy as the capped support_check lists.
+ */
+const SUPPORT_DIGESTS_CAP = 50;
+
 function rootHeader(db: KnowledgeDB, rootId: string): ProvenanceTraceOutput["root"] {
   const node = db.getNodeIncludingRemoved(rootId);
   if (!node) {
@@ -1140,6 +1158,40 @@ export function provenanceTrace(
       if (view && view.state === "changed") n.support_check = view;
     }
 
+    // 2.1.7 F1: the digests the agent can pass straight into confirm_supports.
+    // For the root itself — the same block get_concept carries (null for a
+    // removed root: a tombstone exposes no digests); for every live support —
+    // the FULL claim/status/edge digests, not the 12-char previews
+    // provenance_history keeps. Computed with the shared exports, never
+    // re-hashed; a missing support node yields null digests — the pair is
+    // reported `removed` in support_check, there is nothing to hash.
+    const rootNode = db.getNodeIncludingRemoved(input.node_id);
+    const removedRoot = rootNode === undefined || rootNode.removed_at !== null;
+    const currentDigests: CurrentDigestsView | null =
+      removedRoot || rootNode === undefined
+        ? null
+        : {
+            claim: rootNode.claim_digest ?? claimDigestOf(rootNode.summary),
+            status: statusDigestOf(rootNode.status, rootNode.epistemic_status),
+            format_version: BASELINE_FORMAT_VERSION,
+            source: rootNode.claim_digest !== null ? "snapshot" : "computed",
+          };
+    const liveEdges = removedRoot
+      ? []
+      : db.getInformedByEdges(input.node_id, "ancestry", false);
+    const allSupportDigests: ProvenanceSupportDigest[] = liveEdges
+      .map((e) => ({ sid: e.to_id, description: e.description }))
+      .sort((a, b) => compareSupportIds(a.sid, b.sid))
+      .map(({ sid, description }) => {
+        const sup = db.getNode(sid);
+        return {
+          support_id: sid,
+          claim_digest: sup ? claimDigestOf(sup.summary) : null,
+          status_digest: sup ? statusDigestOf(sup.status, sup.epistemic_status) : null,
+          edge_digest: edgeDigestOf(description),
+        };
+      });
+
     const completeness: ProvenanceCompleteness =
       innerIncomplete > 0 ? "truncated" : completenessVerdict(db, input.node_id, result);
 
@@ -1150,6 +1202,15 @@ export function provenanceTrace(
       nodes: result.nodes,
       edges: result.edges,
       ...(rootCheck ? { support_check: rootCheck } : {}),
+      current_digests: currentDigests,
+      ...(allSupportDigests.length > 0
+        ? {
+            supports: allSupportDigests.slice(0, SUPPORT_DIGESTS_CAP),
+            ...(allSupportDigests.length > SUPPORT_DIGESTS_CAP
+              ? { supports_count: allSupportDigests.length }
+              : {}),
+          }
+        : {}),
       ...(innerIncomplete > 0 ? { inner_nodes_incomplete: innerIncomplete } : {}),
       limits: {
         depth: limits.depth,

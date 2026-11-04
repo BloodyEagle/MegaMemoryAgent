@@ -27,6 +27,7 @@ import type {
   ConflictGroup,
   CompactMatch,
   UnderstandMeta,
+  CurrentDigestsView,
   NodeRow,
   RelationType,
 } from "./types.js";
@@ -463,40 +464,154 @@ export async function understand(
     compactMatch(db, node, { score, via, withContext: false })
   );
 
-  const compact: CompactMatch[] = [];
-  let tokensEstimated = 0;
-  for (let i = 0; i < nodes.length; i++) {
-    const candidate = compactMatch(db, nodes[i].node, {
-      score: nodes[i].score,
-      via: nodes[i].via,
-      withContext: compact.length < 3,
-    });
-    const projection = {
-      matches: [],
-      compact: [...compact, candidate],
-      meta: { returned: compact.length + 1, dropped: 0, tokens_estimated: 0 },
-    };
-    const projected = estimateTokens(JSON.stringify(projection));
-    // Always return at least one node, budget or not.
-    if (compact.length > 0 && projected > maxTokens) {
-      const dropped = nodes.length - compact.length;
-      return {
+  // ---- 2.1.7 F2: supports fold under their decisions ----
+  //
+  // A support shares the query terms with its decision ("EBUSY" names both
+  // the fact and the fix) and used to outrank it — the agent asked "why" and
+  // got the fact without the decision it belongs to. When BOTH are in the
+  // answer, the support travels nested under the decision: depth 1, no top_k
+  // slot of its own, tokens still counted. A support whose decision did not
+  // make the answer stays a standalone fact on the top level — knowledge is
+  // never hidden, only regrouped.
+
+  const candidateIds = new Set(nodes.map((n) => n.node.id));
+  const nodeRowById = new Map(nodes.map((n) => [n.node.id, n.node]));
+  // Live informed_by supports of every candidate that are candidates too.
+  const supportIdsOf = new Map<string, string[]>();
+  for (const { node } of nodes) {
+    supportIdsOf.set(
+      node.id,
+      db
+        .getInformedByEdges(node.id, "ancestry", false)
+        .map((e) => e.to_id)
+        .filter((sid) => sid !== node.id && candidateIds.has(sid))
+    );
+  }
+
+  const top: CompactMatch[] = [];
+  let nestedByHost = new Map<string, Array<{ id: string; name: string; summary: string }>>();
+  let foldedIds = new Set<string>();
+
+  /** The answer's top level: placed candidates minus the folded ones. */
+  const displayList = (): CompactMatch[] => top.filter((m) => !foldedIds.has(m.id));
+
+  /** Display list with the folded supports attached — the serialized shape. */
+  const withNested = (list: CompactMatch[]): CompactMatch[] =>
+    list.map((m) =>
+      nestedByHost.has(m.id) ? { ...m, supports: nestedByHost.get(m.id) } : m
+    );
+
+  /** Same projection convention the budget loop always used. */
+  const projectionTokens = (): number =>
+    estimateTokens(
+      JSON.stringify({
         matches: [],
-        compact,
-        refuted,
-        meta: {
-          returned: compact.length,
-          dropped,
-          tokens_estimated: tokensEstimated,
-          estimated_full_tokens: estimatedFullTokens,
-        },
-      };
+        compact: withNested(displayList()),
+        meta: { returned: displayList().length, dropped: 0, tokens_estimated: 0 },
+      })
+    );
+
+  /**
+   * Fold pass — recomputed from scratch, so repeated calls (after each
+   * backfilled node) stay idempotent. Two steps:
+   *
+   * 1. the fold set: every placed node that some OTHER placed node informs;
+   * 2. each of them nests under its first (rank order) host that is NOT
+   *    itself folding — a folded support is a depth-1 leaf, its own supports
+   *    stay on the top level (chain D ← S1 ← S2: S1 folds under D, S2 stays
+   *    top — nothing is lost, nothing nests deeper than one level).
+   *
+   * A support whose every host is folding stays on the top level: nesting it
+   * under a folded host would break the depth contract. Returns the number
+   * of folded supports after the pass.
+   */
+  const foldSupports = (): number => {
+    const inTop = new Set(top.map((m) => m.id));
+    const foldSet = new Set<string>();
+    for (const h of top) {
+      for (const sid of supportIdsOf.get(h.id) ?? []) {
+        if (sid !== h.id && inTop.has(sid)) foldSet.add(sid);
+      }
     }
-    compact.push(candidate);
+    const nextNested = new Map<string, Array<{ id: string; name: string; summary: string }>>();
+    for (const sup of top) {
+      if (!foldSet.has(sup.id)) continue;
+      const row = nodeRowById.get(sup.id);
+      if (!row) continue;
+      for (const h of top) {
+        if (h.id === sup.id || foldSet.has(h.id)) continue;
+        if (supportIdsOf.get(h.id)?.includes(sup.id)) {
+          const bucket = nextNested.get(h.id) ?? [];
+          bucket.push({ id: sup.id, name: row.name, summary: trimSummary(row.summary) });
+          nextNested.set(h.id, bucket);
+          break;
+        }
+      }
+    }
+    nestedByHost = nextNested;
+    foldedIds = new Set([...nextNested.values()].flatMap((b) => b.map((n) => n.id)));
+    return foldedIds.size;
+  };
+
+  let tokensEstimated = 0;
+  let idx = 0;
+
+  // Phase A — the plain top-level fill, unchanged: the first node always
+  // fits, the rest stop at the budget. The cut index is remembered instead
+  // of returning early: folding can free a slot for the tail (F2).
+  for (; idx < nodes.length; idx++) {
+    const candidate = compactMatch(db, nodes[idx].node, {
+      score: nodes[idx].score,
+      via: nodes[idx].via,
+      withContext: displayList().length < 3,
+    });
+    top.push(candidate);
+    const projected = projectionTokens();
+    // Always return at least one node, budget or not.
+    if (displayList().length > 1 && projected > maxTokens) {
+      top.pop();
+      break; // idx stays on the unplaced candidate
+    }
     tokensEstimated = projected;
   }
 
-  const payload = JSON.stringify({ compact, refuted, meta: { returned: compact.length, dropped: 0, tokens_estimated: tokensEstimated } });
+  // Phase B — fold supports whose decision made the answer.
+  if (foldSupports() > 0) tokensEstimated = projectionTokens();
+
+  // Phase C — a folded support freed its top_k slot: refill from where the
+  // budget stopped (top_k stays filled by the top level, not by the fold).
+  // Every newly placed node can fold its own supports; the loop resumes at
+  // the same index after each fold until the budget is full again.
+  while (idx < nodes.length) {
+    if (foldedIds.has(nodes[idx].node.id)) {
+      idx += 1; // already in the answer, nested
+      continue;
+    }
+    const candidate = compactMatch(db, nodes[idx].node, {
+      score: nodes[idx].score,
+      via: nodes[idx].via,
+      withContext: displayList().length < 3,
+    });
+    top.push(candidate);
+    const projected = projectionTokens();
+    if (projected > maxTokens) {
+      top.pop();
+      break; // budget full again
+    }
+    idx += 1;
+    tokensEstimated = projected;
+    if (foldSupports() > 0) tokensEstimated = projectionTokens();
+  }
+
+  const compact = withNested(displayList());
+  const dropped = nodes.length - top.length;
+  const supportsInlined = foldedIds.size;
+
+  const payload = JSON.stringify({
+    compact,
+    refuted,
+    meta: { returned: compact.length, dropped: 0, tokens_estimated: tokensEstimated },
+  });
   db.insertUsage({
     tool: "understand",
     query: input.query,
@@ -529,9 +644,10 @@ export async function understand(
     edges_between: edgesBetween,
     meta: {
       returned: compact.length,
-      dropped: 0,
+      dropped,
       tokens_estimated: tokensEstimated,
       estimated_full_tokens: estimatedFullTokens,
+      supports_inlined: supportsInlined,
     },
   };
 }
@@ -547,6 +663,12 @@ export function getConcept(
     throw new Error(`Concept "${input.id}" not found.`);
   }
   const ctx = buildNodeWithContext(db, node, undefined, { withSupportCheck: true });
+  // 2.1.7 F1: the digests the agent can pass straight into confirm_supports —
+  // the audit showed the first confirmation was impossible without
+  // reproducing the hash outside the server. getNode filters tombstones, so
+  // there is always a live node here; `current_digests: null` as a contract
+  // belongs to the removed-root case in provenance_trace.
+  ctx.current_digests = currentDigestsOf(node);
   const payload = JSON.stringify(ctx);
   db.insertUsage({
     tool: "get_concept",
@@ -556,6 +678,23 @@ export function getConcept(
     returnedTokens: estimateTokens(payload),
   });
   return ctx;
+}
+
+/**
+ * 2.1.7 F1: the current digests of one node — computed from live exports of
+ * support-baselines, never re-hashed here. A confirmed node reports its
+ * snapshot claim (source: "snapshot"): the confirmation belongs to the
+ * wording it was made on, and a stale value refusing confirm_supports IS the
+ * divergence signal. status has no node-level snapshot — always current.
+ */
+function currentDigestsOf(node: NodeRow): CurrentDigestsView {
+  const snapshotClaim = node.claim_digest ?? null;
+  return {
+    claim: snapshotClaim ?? claimDigestOf(node.summary),
+    status: statusDigestOf(node.status, node.epistemic_status),
+    format_version: BASELINE_FORMAT_VERSION,
+    source: snapshotClaim !== null ? "snapshot" : "computed",
+  };
 }
 
 /**
