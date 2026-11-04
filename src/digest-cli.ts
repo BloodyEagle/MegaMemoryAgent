@@ -1,16 +1,8 @@
-import fs from "node:fs";
-import path from "node:path";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { planDigests, rebuildDigests } from "./digest.js";
-import { errorBold, success, info, heading, skip } from "./cli-utils.js";
-
-function dbPath(): string {
-  return (
-    process.env.MEGAMEMORY_DB_PATH ??
-    path.join(process.cwd(), ".megamemory", "knowledge.db")
-  );
-}
+import { success, info, heading, skip } from "./cli-utils.js";
+import { resolveDbPathOrExit } from "./db-path.js";
 
 /**
  * `megamemory digest [--module <id>] [--apply]`
@@ -23,11 +15,7 @@ export async function runDigest(args: string[]): Promise<void> {
   const moduleIdx = args.indexOf("--module");
   const moduleId = moduleIdx !== -1 ? args[moduleIdx + 1] : undefined;
 
-  const p = dbPath();
-  if (!fs.existsSync(p)) {
-    errorBold(`No database at ${p}. Run inside a project with .megamemory/knowledge.db.`);
-    process.exit(1);
-  }
+  const p = resolveDbPathOrExit(args);
 
   const db = new KnowledgeDB(p);
   try {

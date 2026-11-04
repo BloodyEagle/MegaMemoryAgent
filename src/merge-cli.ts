@@ -4,6 +4,7 @@ import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { MergeEngine, stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
 import { errorBold, success, info, error } from "./cli-utils.js";
+import { resolveDbPathOrExit } from "./db-path.js";
 import type { NodeRow } from "./types.js";
 
 // ---- Flag parsing helpers ----
@@ -124,13 +125,8 @@ export async function runMerge(args: string[]): Promise<void> {
 // ---- conflicts command ----
 
 export async function runConflicts(args: string[]): Promise<void> {
-  const dbPath = getFlag(args, "--db") ?? getDefaultDbPath();
+  const dbPath = resolveDbPathOrExit(args);
   const json = hasFlag(args, "--json");
-
-  if (!fs.existsSync(dbPath)) {
-    errorBold(`Database not found: ${dbPath}`);
-    process.exit(1);
-  }
 
   const db = new KnowledgeDB(dbPath);
   try {
@@ -225,17 +221,13 @@ export async function runResolve(args: string[]): Promise<void> {
 
   const mergeGroup = positional[0];
   const keep = getFlag(args, "--keep") as "left" | "right" | "both" | undefined;
-  const dbPath = getFlag(args, "--db") ?? getDefaultDbPath();
 
   if (!keep || !["left", "right", "both"].includes(keep)) {
     errorBold("--keep is required and must be one of: left, right, both");
     process.exit(1);
   }
 
-  if (!fs.existsSync(dbPath)) {
-    errorBold(`Database not found: ${dbPath}`);
-    process.exit(1);
-  }
+  const dbPath = resolveDbPathOrExit(args);
 
   const db = new KnowledgeDB(dbPath);
   try {
@@ -302,9 +294,3 @@ export async function runResolve(args: string[]): Promise<void> {
 }
 
 // ---- helpers ----
-
-function getDefaultDbPath(): string {
-  const envPath = process.env.MEGAMEMORY_DB_PATH;
-  if (envPath) return envPath;
-  return path.join(process.cwd(), ".megamemory", "knowledge.db");
-}

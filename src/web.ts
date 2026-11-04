@@ -9,6 +9,7 @@ import { findDuplicates, mergeNodes } from "./consolidate.js";
 import { renderAllMarkdown, renderNodeMarkdown } from "./export.js";
 import { digestSourceChildren } from "./digest.js";
 import { errorBold, askPort } from "./cli-utils.js";
+import { resolveDbPathOrExit } from "./db-path.js";
 import {
   initializeEmbeddings,
   isModelLoaded,
@@ -132,19 +133,9 @@ function listenWithRetry(
 }
 
 export async function runServe(port: number): Promise<void> {
-  const dbPath =
-    process.env.MEGAMEMORY_DB_PATH ??
-    path.join(process.cwd(), ".megamemory", "knowledge.db");
-
-  if (!fs.existsSync(dbPath)) {
-    console.log();
-    errorBold(`No database found at ${pc.dim(dbPath)}`);
-    console.log(
-      pc.dim(`  Run megamemory in a project that has been used with the MCP server,\n`) +
-      pc.dim(`  or set ${pc.cyan("MEGAMEMORY_DB_PATH")} environment variable.\n`)
-    );
-    process.exit(1);
-  }
+  // serve и MCP — единственные, кому законно создавать базу: первая установка
+  // ещё не имеет knowledge.db, её нельзя встречать ошибкой.
+  const dbPath = resolveDbPathOrExit(process.argv.slice(3), { allowCreate: true });
 
   const db = new KnowledgeDB(dbPath);
 

@@ -4,13 +4,7 @@ import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { loadEvalPairs, runEval } from "./eval.js";
 import { errorBold, success, info, heading, warn } from "./cli-utils.js";
-
-function dbPath(): string {
-  return (
-    process.env.MEGAMEMORY_DB_PATH ??
-    path.join(process.cwd(), ".megamemory", "knowledge.db")
-  );
-}
+import { resolveDbPathOrExit } from "./db-path.js";
 
 /**
  * `megamemory eval [--file <jsonl>] [--k 10] [--min 0.8]`
@@ -31,11 +25,7 @@ export async function runEvalCli(args: string[]): Promise<void> {
     errorBold(`Eval set not found: ${file}`);
     process.exit(1);
   }
-  const p = dbPath();
-  if (!fs.existsSync(p)) {
-    errorBold(`No database at ${p}.`);
-    process.exit(1);
-  }
+  const p = resolveDbPathOrExit(args);
 
   const pairs = loadEvalPairs(fs.readFileSync(file, "utf8"));
   if (pairs.length === 0) {

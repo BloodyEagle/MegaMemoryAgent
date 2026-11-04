@@ -1,17 +1,10 @@
-import fs from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { findDuplicates, mergeNodes } from "./consolidate.js";
 import { backupDb } from "./migrate.js";
-import { errorBold, success, info, heading, skip } from "./cli-utils.js";
-
-function dbPath(): string {
-  return (
-    process.env.MEGAMEMORY_DB_PATH ??
-    path.join(process.cwd(), ".megamemory", "knowledge.db")
-  );
-}
+import { success, info, heading, skip } from "./cli-utils.js";
+import { resolveDbPathOrExit } from "./db-path.js";
 
 function numFlag(args: string[], flag: string, fallback: number): number {
   const idx = args.indexOf(flag);
@@ -33,11 +26,7 @@ export async function runConsolidate(args: string[]): Promise<void> {
   const threshold = numFlag(args, "--threshold", 0.95);
   const limit = numFlag(args, "--limit", 100);
 
-  const p = dbPath();
-  if (!fs.existsSync(p)) {
-    errorBold(`No database at ${p}. Run inside a project with .megamemory/knowledge.db.`);
-    process.exit(1);
-  }
+  const p = resolveDbPathOrExit(args);
 
   const db = new KnowledgeDB(p);
   try {
