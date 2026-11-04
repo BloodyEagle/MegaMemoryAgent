@@ -1150,12 +1150,15 @@ describe("F4 (2.1.1): metrics_truncated means decisions left unchecked", () => {
   it(
     "42. a budget exhausted exactly on the last decision is not truncation",
     () => {
-      // Two decisions, one confirmed support each — each check consumes
-      // exactly one edge, so a budget of 2 runs out on the second, last one.
+      // Two decisions, one confirmed support each — since 2.1.2 F7 a check
+      // of a confirmed decision consumes TWO edges (the claim digest + the
+      // support), so a budget of 4 runs out exactly on the second, last one.
+      // (Budget bumped from 2 for the new accounting; the property under
+      // test — exact exhaustion is not truncation — is unchanged.)
       confirmedDecision("d1", ["f1"]);
       confirmedDecision("d2", ["f2"]);
 
-      const m = provenanceMetrics(db, new CheckBudget(2, 1_000_000));
+      const m = provenanceMetrics(db, new CheckBudget(4, 1_000_000));
       expect(m.decisions_by_check_state.unchanged).toBe(2);
       expect(m.metrics_truncated).toBe(false);
     }
@@ -1166,8 +1169,9 @@ describe("F4 (2.1.1): metrics_truncated means decisions left unchecked", () => {
     confirmedDecision("d2", ["f2"]);
     confirmedDecision("d3", ["f3"]);
 
-    // Budget 2: d3 never gets a verdict — the flag must say so.
-    const m = provenanceMetrics(db, new CheckBudget(2, 1_000_000));
+    // Budget 4 (= 2 checks under the 2.1.2 F7 accounting): d3 never gets a
+    // verdict — the flag must say so.
+    const m = provenanceMetrics(db, new CheckBudget(4, 1_000_000));
     expect(m.metrics_truncated).toBe(true);
     const counted =
       m.decisions_by_check_state.unchanged +
@@ -1419,5 +1423,91 @@ describe("F12: reads never write; the audit writes only its journal", () => {
     expect(after.auditRuns).toBe(before.auditRuns + 1); // the journal, and only it
     expect(after.baselines).toBe(before.baselines);
     expect(after.edges).toBe(before.edges);
+  });
+});
+
+// ---- 2.1.2 F6: нестроковые ожидания — version_conflict, а не TypeError ----
+
+describe("2.1.2 F6: non-string expectations refuse via version_conflict", () => {
+  type Bad = "absent" | "null" | "number";
+  const badValues: Array<[Bad, unknown]> = [
+    ["absent", undefined],
+    ["null", null],
+    ["number", 12345],
+  ];
+
+  it("each of the three expectations refuses on absent/null/number, writing nothing", () => {
+    const cases: Array<{
+      label: string;
+      patch: (item: Record<string, unknown>, decision: Record<string, unknown>, v: unknown) => void;
+    }> = [
+      {
+        label: "decision expected_claim_digest",
+        patch: (_item, decision, v) => {
+          decision.expected_claim_digest = v;
+        },
+      },
+      {
+        label: "item expected_claim_digest",
+        patch: (item, _decision, v) => {
+          item.expected_claim_digest = v;
+        },
+      },
+      {
+        label: "item expected_status_digest",
+        patch: (item, _decision, v) => {
+          item.expected_status_digest = v;
+        },
+      },
+      {
+        label: "item expected_edge_digest",
+        patch: (item, _decision, v) => {
+          item.expected_edge_digest = v;
+        },
+      },
+    ];
+
+    let run = 0;
+    for (const c of cases) {
+      for (const [kind, value] of badValues) {
+        run += 1;
+        const did = `d${run}`;
+        const sid = `f${run}`;
+        confirmedDecision(did, [sid]);
+        const before = db.getSupportBaselines(did).length;
+        const decision = db.getNode(did)!;
+        const support = db.getNode(sid)!;
+        const edge = db.getInformedByEdges(did, "ancestry", false)[0];
+        const decisionInput: Record<string, unknown> = {
+          decision_id: did,
+          expected_claim_digest: claimDigestOf(decision.summary),
+        };
+        const item: Record<string, unknown> = {
+          support_id: sid,
+          expected_claim_digest: claimDigestOf(support.summary),
+          expected_status_digest: statusDigestOf(support.status, support.epistemic_status),
+          expected_edge_digest: edgeDigestOf(edge.description),
+        };
+        c.patch(item, decisionInput, value);
+        if (kind === "absent" && c.label.startsWith("decision")) {
+          // "absent" for the decision-level digest: delete the key outright
+          delete decisionInput.expected_claim_digest;
+        }
+
+        let message = "";
+        try {
+          confirmSupports(db, {
+            ...(decisionInput as unknown as Parameters<typeof confirmSupports>[1]),
+            items: [item as unknown as Parameters<typeof confirmSupports>[1]["items"][0]],
+          });
+          throw new Error(`expected a refusal for ${c.label} / ${kind}`);
+        } catch (err) {
+          message = String(err);
+        }
+        expect(message).toContain("version_conflict");
+        // Nothing written, no crash: the row count is untouched.
+        expect(db.getSupportBaselines(did).length).toBe(before);
+      }
+    }
   });
 });

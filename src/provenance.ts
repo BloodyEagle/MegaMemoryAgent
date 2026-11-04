@@ -426,7 +426,9 @@ function traverse(
   const edgeViews: ProvenanceEdgeView[] = [];
   const emittedEdgeKeys = new Set<string>(); // JSON keys — pipe-safe (F11)
   let total = 1;
-  let frontier: string[] = [rootId];
+  // 2.1.2 F3: a removed root is terminal (contract 2) — the stub is shown,
+  // its historical edges are not expanded, so the frontier starts empty.
+  let frontier: string[] = rootRemoved ? [] : [rootId];
   let depth = 0;
 
   while (frontier.length > 0) {
@@ -483,6 +485,10 @@ function traverse(
     for (const cand of candidates) {
       if (budget <= 0) {
         truncatedBy = truncatedBy ?? "nodes";
+        // 2.1.2 F5: a node dropped by the node budget is never expanded, so
+        // its descendants never enter the count — total_within_depth is a
+        // lower estimate, and claiming exactness would be a lie.
+        totalExact = false;
         continue;
       }
       const other = db.getNodeIncludingRemoved(cand);
@@ -562,6 +568,10 @@ function traverse(
           break;
         }
         sum += c;
+        // 2.1.2 F13: a parent already sitting on the cap passes its clamped
+        // number downstream — the child inherits the flag, or the clamped
+        // value would read as an exact count.
+        if (capped.has(p)) capHit = true;
         if (sum > PATH_COUNT_CAP) {
           sum = PATH_COUNT_CAP;
           capHit = true;
@@ -732,7 +742,8 @@ function weakLinks(
   direction: "ancestry" | "impact",
   retrospective: boolean,
   maxScanSupports: number,
-  checker: SupportChecker
+  checker: SupportChecker,
+  rootId: string
 ): ProvenanceWeakLink[] {
   const weak: ProvenanceWeakLink[] = [];
 
@@ -944,6 +955,28 @@ function weakLinks(
     }
   }
 
+  // 4b. 2.1.2 F4: an unreviewed support of an INNER non-decision node used
+  // to vanish from the answer — the checks above are decision-scoped and the
+  // inner support_check travels only for state = changed. A fact standing on
+  // an unconfirmed support must speak: unknown at any node with informed_by
+  // becomes a support_unreviewed record (the checker caches, so this adds no
+  // budget spend beyond the per-node check the caller makes anyway).
+  for (const n of result.nodes) {
+    if (n.id === rootId || n.removed || n.kind === "decision") continue;
+    const check = checker.check(n.id);
+    if (check && check.state === "unknown") {
+      weak.push({
+        type: "support_unreviewed",
+        id: n.id,
+        count: check.unknown_count ?? check.unknown?.length ?? 0,
+        note: clampNote(
+          `опоры узла "${n.id}" не подтверждены снимком (support_check: unknown) — ` +
+            `проверка не считается чистотой, вызови confirm_supports после сверки`
+        ),
+      });
+    }
+  }
+
   // D2.4: the serialized weak_links must fit the 8 KB response cap.
   return capWeakLinks(weak);
 }
@@ -1046,7 +1079,15 @@ export function provenanceTrace(
       db,
       new CheckBudget(limits.maxCheckEdges, limits.maxCheckBytes)
     );
-    const weak = weakLinks(db, result, direction, retrospective, limits.maxScanNodes, checker);
+    const weak = weakLinks(
+      db,
+      result,
+      direction,
+      retrospective,
+      limits.maxScanNodes,
+      checker,
+      input.node_id
+    );
 
     // Plan 4 v8 §4: the root's support check travels with the verdict —
     // present whenever there is anything to check (any state).

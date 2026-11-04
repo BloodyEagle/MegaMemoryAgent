@@ -5,6 +5,12 @@ import path from "node:path";
 import { KnowledgeDB } from "../db.js";
 import { link } from "../tools.js";
 import { provenanceTrace, compareIds } from "../provenance.js";
+import {
+  claimDigestOf,
+  confirmSupports,
+  edgeDigestOf,
+  statusDigestOf,
+} from "../support-baselines.js";
 import type { ProvenanceTraceOutput } from "../types.js";
 
 let tmpDir: string;
@@ -599,4 +605,105 @@ describe("writes touching an unresolved cyclic component (F18)", () => {
     );
     expect(live).toHaveLength(1);
   });
+});
+
+// ---- 2.1.2: F3 (удалённый корень терминален), F4 (unknown внутреннего узла),
+//      F5 (total_exact при обрезке max_nodes), F13 (наследование in_paths_capped) ----
+
+describe("2.1.2 provenance trace fixes", () => {
+  it("F3: a removed root is terminal — stub only, no historical expansion", () => {
+    node("D", "decision", { removed: true });
+    node("F");
+    node("G");
+    edge("D", "F");
+    edge("F", "G");
+
+    const out = trace("D", { retrospective: true });
+    expect(out.nodes.map((n) => n.id)).toEqual(["D"]);
+    const stub = out.nodes[0];
+    expect(stub.removed).toBe(true);
+    expect(out.edges).toEqual([]);
+    expect(out.shown).toBe(1);
+  });
+
+  it("F5: a node-budget cut makes total_within_depth inexact", () => {
+    node("D", "decision");
+    node("a");
+    node("b");
+    node("c");
+    edge("D", "a");
+    edge("D", "b");
+    edge("b", "c");
+
+    const out = trace("D", { depth: 2, maxNodes: 1 });
+    // The forbidden combination is total 3 / exact true: b was dropped by the
+    // node budget, so its descendant c never entered the count.
+    const inexact = out.total_within_depth !== 4 || out.total_exact === false;
+    expect(inexact).toBe(true);
+    expect(out.truncated_by).toBe("nodes");
+    expect(out.nodes.find((n) => n.id === "c")).toBeUndefined();
+  });
+
+  it("F4: an unreviewed support of an inner fact node shows up as support_unreviewed", () => {
+    node("D", "decision"); // summary s-D
+    node("F", "feature"); // summary s-F
+    node("S", "fact"); // summary s-S
+    edge("D", "F", "why F");
+    edge("F", "S", "why S");
+    // Only D -> F is confirmed; F -> S never was.
+    confirmSupports(db, {
+      decision_id: "D",
+      expected_claim_digest: claimDigestOf("s-D"),
+      items: [
+        {
+          support_id: "F",
+          expected_claim_digest: claimDigestOf("s-F"),
+          expected_status_digest: statusDigestOf(
+            db.getNode("F")!.status,
+            db.getNode("F")!.epistemic_status
+          ),
+          expected_edge_digest: edgeDigestOf("why F"),
+        },
+      ],
+    });
+
+    const out = trace("D");
+    const unreviewed = out.weak_links.filter((w) => w.type === "support_unreviewed");
+    // F (the inner fact with its own informed_by) is reported; S (no supports
+    // at all) is not, and the root's own verdict lives in support_check.
+    expect(unreviewed.some((w) => w.id === "F")).toBe(true);
+    expect(unreviewed.some((w) => w.id === "S")).toBe(false);
+    expect(out.support_check?.state).toBe("unchanged");
+  });
+
+  it("F13: in_paths_capped is inherited by the descendant of a capped node", () => {
+    // 5 levels x 20 fully-connected nodes: the last level sits above the cap
+    // (20^4 = 160k paths); its child sums to the clamped 100k and inherits
+    // the flag without crossing the cap itself.
+    node("root", "decision");
+    const levels: string[][] = [];
+    for (let l = 0; l < 5; l++) {
+      const level: string[] = [];
+      for (let i = 0; i < 20; i++) {
+        const id = `L${l}n${i}`;
+        node(id);
+        level.push(id);
+      }
+      levels.push(level);
+    }
+    node("child");
+    for (const n of levels[0]) edge("root", n);
+    for (let l = 0; l < 4; l++) {
+      for (const a of levels[l]) for (const b of levels[l + 1]) edge(a, b);
+    }
+    edge(levels[4][0], "child");
+
+    const out = trace("root", { depth: 6, maxNodes: 300 });
+    const last = out.nodes.find((n) => n.id === levels[4][0])!;
+    expect(last.in_paths).toBe(100000);
+    expect(last.in_paths_capped).toBe(true);
+    const child = out.nodes.find((n) => n.id === "child")!;
+    expect(child.in_paths).toBe(100000);
+    expect(child.in_paths_capped).toBe(true);
+  }, 60000);
 });

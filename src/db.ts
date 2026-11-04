@@ -1509,18 +1509,26 @@ export class KnowledgeDB {
       .all(decisionId) as SupportBaselineRow[];
   }
 
-  /** One support's active rows (indexed by the PK prefix), for budgeted checks. */
-  getSupportBaselineRowsFor(decisionId: string, supportId: string): SupportBaselineRow[] {
-    if (!this.hasSupportBaselinesTable()) return [];
+  /**
+   * 2.1.2 F8: a PK point lookup — the one active row written for THIS edge
+   * (decision, support, edge_key). The old fallback read the pair's whole
+   * active history and filtered in JS: under a tiny budget that materialized
+   * thousands of rows to find one anchor.
+   */
+  getSupportBaselineRow(
+    decisionId: string,
+    supportId: string,
+    edgeKey: string
+  ): SupportBaselineRow | undefined {
+    if (!this.hasSupportBaselinesTable()) return undefined;
     return this.db
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
                 edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
          FROM support_baselines
-         WHERE decision_id = ? AND support_id = ? AND superseded_at IS NULL
-         ORDER BY confirmed_at, edge_key`
+         WHERE decision_id = ? AND support_id = ? AND edge_key = ? AND superseded_at IS NULL`
       )
-      .all(decisionId, supportId) as SupportBaselineRow[];
+      .get(decisionId, supportId, edgeKey) as SupportBaselineRow | undefined;
   }
 
   getAllSupportBaselines(): SupportBaselineRow[] {
@@ -1688,10 +1696,16 @@ export class KnowledgeDB {
    * A deterministic page of dead anchors: active snapshot rows whose support
    * has no live informed_by edge left (node removed or edge tombstoned).
    * One row per support — the latest confirmation wins.
+   *
+   * 2.1.2 F11: keyset pagination (cursor = the last seen support_id), not
+   * OFFSET — a LIMIT/OFFSET page re-walked its whole prefix every time, so a
+   * star with many dead anchors paid quadratic work across pages. The PK
+   * prefix (decision_id, support_id) makes the keyset walk a straight index
+   * read: per-page work is the page itself.
    */
   getDeadBaselineSupportsPage(
     decisionId: string,
-    offset: number,
+    afterSupportId: string,
     limit: number
   ): Array<{ support_id: string; confirmed_at: string }> {
     if (!this.hasSupportBaselinesTable()) return [];
@@ -1700,18 +1714,65 @@ export class KnowledgeDB {
         `SELECT b.support_id, MAX(b.confirmed_at) AS confirmed_at
          FROM support_baselines b
          WHERE b.decision_id = ? AND b.superseded_at IS NULL
+           AND b.support_id > ?
            AND NOT EXISTS (
              SELECT 1 FROM edges e
              WHERE e.from_id = b.decision_id AND e.to_id = b.support_id
                AND e.relation = 'informed_by' AND e.removed_at IS NULL
            )
          GROUP BY b.support_id
-         ORDER BY b.support_id LIMIT ? OFFSET ?`
+         ORDER BY b.support_id LIMIT ?`
       )
-      .all(decisionId, limit, offset) as Array<{
+      .all(decisionId, afterSupportId, limit) as Array<{
       support_id: string;
       confirmed_at: string;
     }>;
+  }
+
+  // ---- 2.1.2 F9: the metrics decision scan is paginated ----
+  // The whole list used to materialize in one SELECT before the budget got a
+  // say; now the caller pulls keyset pages whose size the budget sizes, and
+  // probes whether anything is left past the cursor.
+
+  /** Predicate shared by the metrics page query and its probe: decisions that
+   * carry a claim anchor, a live informed_by edge or an active snapshot row —
+   * exactly the inputs computeSupportCheck needs for a verdict. */
+  private metricDecisionsQuery(tail: string): string {
+    const baselineClause = this.hasSupportBaselinesTable()
+      ? `OR EXISTS (SELECT 1 FROM support_baselines b
+                     WHERE b.decision_id = n.id AND b.superseded_at IS NULL)`
+      : "";
+    return `SELECT n.id,
+            EXISTS (SELECT 1 FROM edges e
+                    WHERE e.from_id = n.id AND e.relation = 'informed_by'
+                      AND e.removed_at IS NULL) AS has_live
+     FROM nodes n
+     WHERE n.removed_at IS NULL AND n.kind = 'decision'
+       AND n.id > ?
+       AND (n.claim_digest IS NOT NULL
+         OR EXISTS (SELECT 1 FROM edges e
+                    WHERE e.from_id = n.id AND e.relation = 'informed_by'
+                      AND e.removed_at IS NULL)
+         ${baselineClause})
+     ${tail}`;
+  }
+
+  /** A keyset page of metric decisions (ordered by id, cursor = last id). */
+  getMetricDecisionsPage(
+    afterId: string,
+    limit: number
+  ): Array<{ id: string; has_live: number }> {
+    return this.db
+      .prepare(this.metricDecisionsQuery("ORDER BY n.id LIMIT ?"))
+      .all(afterId, limit) as Array<{ id: string; has_live: number }>;
+  }
+
+  /** Cheap probe: is there another metric decision past the cursor? */
+  hasMetricDecisionsAfter(afterId: string): boolean {
+    const row = this.db
+      .prepare(this.metricDecisionsQuery("ORDER BY n.id LIMIT 1"))
+      .get(afterId) as { id: string } | undefined;
+    return row !== undefined;
   }
 
   // ---- Query methods ----

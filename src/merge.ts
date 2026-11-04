@@ -444,7 +444,17 @@ export class MergeEngine {
         this.deferEdgesForNode(deferredEdges, leftEdgeMap, leftNode.id, idRemapping, "left");
       } else if (leftNode && rightNode) {
         // Identical nodes — union of edges from both sides
-        this.deferEdgesClean(deferredEdges, leftEdgeMap, rightEdgeMap, leftNode.id, idRemapping);
+        this.deferEdgesClean(
+          deferredEdges,
+          leftEdgeMap,
+          rightEdgeMap,
+          leftNode.id,
+          idRemapping,
+          result,
+          now,
+          leftLabel,
+          rightLabel
+        );
       }
     }
 
@@ -760,6 +770,15 @@ export class MergeEngine {
    * and live in the other, the TOMBSTONE wins — a removed link must not
    * resurrect just because the other branch still has it; restoring it is an
    * explicit `link` call.
+   *
+   * 2.1.2 F2: the dedup key is the SAME one the unique index enforces —
+   * (from_id, to_id, relation), no description. With the old content key a
+   * live copy and a tombstone of one pair looked like two different edges:
+   * the second INSERT OR IGNORE was silently dropped and the surviving side
+   * depended on the input order (live on the left -> live wins, live on the
+   * right -> tombstone wins). Now the divergence between copies (removed_at
+   * or description) is registered as a needs_merge conflict instead of being
+   * settled by order; the tombstone rule applies within the single key.
    */
   private deferEdgesClean(
     deferred: Array<{
@@ -776,45 +795,64 @@ export class MergeEngine {
     leftEdgeMap: Map<string, EdgeRow[]>,
     rightEdgeMap: Map<string, EdgeRow[]>,
     nodeId: string,
-    _idRemapping: Map<string, string>
+    _idRemapping: Map<string, string>,
+    result: MergeResult,
+    now: string,
+    leftLabel: string,
+    rightLabel: string
   ): void {
     const leftEdges = leftEdgeMap.get(nodeId) ?? [];
     const rightEdges = rightEdgeMap.get(nodeId) ?? [];
 
-    const byKey = new Map<
+    const byEnds = new Map<
       string,
-      { edge: EdgeRow; side: "left" | "right"; sources: Array<{ side: "left" | "right"; id: number }> }
+      {
+        edge: EdgeRow;
+        side: "left" | "right";
+        sources: Array<{ side: "left" | "right"; id: number }>;
+        diverged: boolean;
+      }
     >();
     const put = (e: EdgeRow, side: "left" | "right"): void => {
-      const key = edgeKey(e);
-      const prev = byKey.get(key);
+      const key = JSON.stringify([e.from_id, e.to_id, e.relation]);
+      const prev = byEnds.get(key);
       if (!prev) {
-        byKey.set(key, { edge: e, side, sources: [{ side, id: e.id }] });
+        byEnds.set(key, { edge: e, side, sources: [{ side, id: e.id }], diverged: false });
         return;
       }
       // F5: the losing copy still maps to the winning output row — its
       // snapshot (if any) must follow the same edge, not dangle on a raw
       // source rowid.
       prev.sources.push({ side, id: e.id });
+      // 2.1.2 F2: copies of one pair that disagree in removal state or
+      // rationale are a conflict — flagged on the surviving row, counted in
+      // the merge report, never settled by the order of the inputs.
+      const removedDiffers = (prev.edge.removed_at === null) !== (e.removed_at === null);
+      const descriptionDiffers = (prev.edge.description ?? "") !== (e.description ?? "");
+      if (removedDiffers || descriptionDiffers) prev.diverged = true;
       // Left first, then right; a colliding live copy never overrides a tombstone.
       if (prev.edge.removed_at === null && e.removed_at !== null) {
-        byKey.set(key, { edge: e, side, sources: prev.sources });
+        prev.edge = e;
+        prev.side = side;
       }
     };
     for (const e of leftEdges) put(e, "left");
     for (const e of rightEdges) put(e, "right");
 
-    for (const { edge, side, sources } of byKey.values()) {
+    for (const { edge, side, sources, diverged } of byEnds.values()) {
+      if (diverged) {
+        result.edgeConflicts++;
+      }
       deferred.push({
         from_id: edge.from_id,
         to_id: edge.to_id,
         relation: edge.relation,
         description: edge.description,
         created_at: edge.created_at,
-        merge_group: null,
-        needs_merge: 0,
-        source_branch: null,
-        merge_timestamp: null,
+        merge_group: diverged ? randomUUID() : null,
+        needs_merge: diverged ? 1 : 0,
+        source_branch: diverged ? (side === "left" ? leftLabel : rightLabel) : null,
+        merge_timestamp: diverged ? now : null,
         removed_at: edge.removed_at ?? null,
         _originSide: side,
         _srcEdgeIds: sources,

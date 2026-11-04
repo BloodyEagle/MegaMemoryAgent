@@ -92,6 +92,20 @@ export class CheckBudget {
   exceeded = false;
 
   constructor(maxEdges: number, maxBytes: number) {
+    // 2.1.2 F10: NaN makes every comparison false — with NaN or Infinity the
+    // budget would silently disable itself (consume always succeeds,
+    // exhausted stays false). Refuse anything that is not a finite
+    // non-negative integer; 0 is legal (a budget closed from the start).
+    for (const [name, value] of [
+      ["max_check_edges", maxEdges],
+      ["max_check_bytes", maxBytes],
+    ] as const) {
+      if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+        throw new Error(
+          `CheckBudget: ${name} должен быть конечным неотрицательным целым, получено: ${String(value)}.`
+        );
+      }
+    }
     this.edgesLeft = maxEdges;
     this.bytesLeft = maxBytes;
   }
@@ -109,9 +123,15 @@ export class CheckBudget {
     return Math.max(0, this.bytesLeft);
   }
 
-  /** Consume one pair; returns false (and trips the flag) when over budget. */
+  /** Consume one pair; returns false (and trips the flag) when over budget.
+   * 2.1.2 F12: an attempt against an already-exhausted budget is an overrun
+   * too — without the flag there is no way to tell exact exhaustion from a
+   * refusal. */
   consume(bytes: number): boolean {
-    if (this.exhausted) return false;
+    if (this.exhausted) {
+      this.exceeded = true;
+      return false;
+    }
     this.edgesLeft -= 1;
     this.bytesLeft -= bytes;
     if (this.edgesLeft < 0 || this.bytesLeft < 0) {
@@ -174,16 +194,27 @@ export function computeSupportCheck(
 
   const baselineAt = db.lastActiveBaselineAt(nodeId) ?? confirmedAt;
 
-  // The decision's own wording: the confirmation belongs to the wording the
-  // agent saw (§1.2). A rewrite of the summary does not extend it — the
-  // mismatch is surfaced as claim_changed (test 10).
-  const claimChanged = claimAnchor !== null && claimAnchor !== claimDigestOf(node.summary);
-
   // Sets, not arrays: a 20k-support star must not pay O(n²) membership
   // checks; the returned lists are capped after the loop.
   const unknownSet = new Set<string>();
   const changedList: SupportPairChange[] = [];
   let exhausted = false;
+
+  // The decision's own wording: the confirmation belongs to the wording the
+  // agent saw (§1.2). A rewrite of the summary does not extend it — the
+  // mismatch is surfaced as claim_changed (test 10).
+  // 2.1.2 F7: the summary goes through the budget TOO — hashing a 10 MB
+  // wording under a 1-byte budget must not happen behind the check's back.
+  // The bytes are charged via consume before hashing; when they do not fit,
+  // the verdict is `incomplete`, never a clean verdict over a skipped claim.
+  let claimChanged = false;
+  if (claimAnchor !== null) {
+    if (!budget.consume(Buffer.byteLength(node.summary, "utf8"))) {
+      exhausted = true;
+    } else {
+      claimChanged = claimAnchor !== claimDigestOf(node.summary);
+    }
+  }
 
   // Snapshot rows within the budget's reach: when every active row can be
   // checked anyway, one bulk read beats a query per support; otherwise rows
@@ -199,10 +230,15 @@ export function computeSupportCheck(
       bySupport.get(row.support_id)!.push(row);
     }
   }
-  const rowsFor = (supportId: string): SupportBaselineRow[] => {
-    if (activeBaselineCount === 0) return [];
-    if (bulkRows) return bySupport.get(supportId) ?? [];
-    return db.getSupportBaselineRowsFor(nodeId, supportId);
+  // 2.1.2 F8: the snapshot row of one pair is fetched by its PK — outside
+  // the bulk read there is no per-support list anymore, only a point lookup
+  // by edge_key.
+  const rowsForAnchor = (supportId: string, edgeKey: string): SupportBaselineRow | null => {
+    if (activeBaselineCount === 0) return null;
+    if (bulkRows) {
+      return (bySupport.get(supportId) ?? []).find((r) => r.edge_key === edgeKey) ?? null;
+    }
+    return db.getSupportBaselineRow(nodeId, supportId, edgeKey) ?? null;
   };
 
   // Live supports, in deterministic id order, in pages the budget sizes.
@@ -218,22 +254,25 @@ export function computeSupportCheck(
     const page = db.getLiveSupportEdgesPage(nodeId, lastToId, take);
     if (page.length === 0) break;
     for (const edge of page) {
-      const rows = rowsFor(edge.other_id);
       // F5: the anchor is the row written for THIS edge row (edge_key =
       // edges.id) — no fallback to "the latest row of this support". A
       // snapshot of a dead edge never validates a live one: after
       // confirm → unlink → (re)link the new pair stays unconfirmed until an
       // explicit confirm_supports.
-      const anchor = rows.find((r) => r.edge_key === String(edge.id)) ?? null;
+      const edgeKey = String(edge.id);
+      const anchor = rowsForAnchor(edge.other_id, edgeKey);
       const compatible =
         anchor !== null && anchor.format_version === BASELINE_FORMAT_VERSION;
       const support = compatible ? db.getNode(edge.other_id) : undefined;
       // Bytes are charged for what is actually read: payload texts for a
-      // compatible pair, nothing for an unknown one (F2).
-      const bytes = compatible
-        ? Buffer.byteLength(support?.summary ?? "", "utf8") +
-          Buffer.byteLength(edge.description ?? "", "utf8")
-        : 0;
+      // compatible pair, nothing for an unknown one (F2). 2.1.2 F8: a
+      // snapshot row fetched by the point lookup is charged too.
+      const bytes =
+        (compatible
+          ? Buffer.byteLength(support?.summary ?? "", "utf8") +
+            Buffer.byteLength(edge.description ?? "", "utf8")
+          : 0) +
+        (anchor !== null && !bulkRows ? baselineRowBytes(anchor) : 0);
       if (!budget.consume(bytes)) {
         exhausted = true;
         break;
@@ -273,10 +312,12 @@ export function computeSupportCheck(
   // out of the comparison. The scan runs only when the live pass finished —
   // over a truncated live prefix a row past it would be misread as removed.
   if (!exhausted) {
-    let deadProcessed = 0;
+    // 2.1.2 F11: the cursor is the last seen support_id (keyset), not an
+    // OFFSET — each page costs its own rows, not a re-walk of the prefix.
+    let lastSupportId = "";
     for (;;) {
       const take = Math.max(1, Math.min(SUPPORT_PAGE, budget.remainingEdges));
-      const dead = db.getDeadBaselineSupportsPage(nodeId, deadProcessed, take);
+      const dead = db.getDeadBaselineSupportsPage(nodeId, lastSupportId, take);
       if (dead.length === 0) break;
       let stop = false;
       for (const r of dead) {
@@ -290,7 +331,7 @@ export function computeSupportCheck(
           reasons: ["removed"],
           since: r.confirmed_at,
         });
-        deadProcessed++;
+        lastSupportId = r.support_id;
       }
       if (stop || dead.length < take) break;
     }
@@ -325,6 +366,16 @@ export function computeSupportCheck(
 /** Total order over ids for stable capped lists. */
 function compareIds(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** 2.1.2 F8: the materialized cost of one snapshot row (its digest payload). */
+function baselineRowBytes(row: SupportBaselineRow): number {
+  return (
+    Buffer.byteLength(
+      row.claim_digest + row.status_digest + row.edge_digest + row.confirmed_at,
+      "utf8"
+    ) + 64
+  );
 }
 
 /**
@@ -366,7 +417,15 @@ export function confirmSupports(
     const liveEdges = liveSupportEdges(db, input.decision_id);
 
     const mismatches: string[] = [];
-    if (input.expected_claim_digest !== currentClaim) {
+    // 2.1.2 F6: every expectation is type-checked BEFORE any comparison — a
+    // missing/null/number digest must refuse via version_conflict, not crash
+    // on .slice() while building the divergence message.
+    if (typeof input.expected_claim_digest !== "string") {
+      mismatches.push(
+        `решение "${input.decision_id}": не передан expected_claim_digest (строка) — ` +
+          `подтверждать можно только прочитанную формулировку (перечитай через get_concept/provenance_trace и повтори)`
+      );
+    } else if (input.expected_claim_digest !== currentClaim) {
       mismatches.push(
         `решение "${input.decision_id}": формулировка изменилась с момента чтения ` +
           `(ожидался digest ${input.expected_claim_digest.slice(0, 12)}…, текущий ${currentClaim.slice(0, 12)}…)`
@@ -412,7 +471,14 @@ export function confirmSupports(
         continue;
       }
       const currentSupportClaim = claimDigestOf(support.summary);
-      if (item.expected_claim_digest !== currentSupportClaim) {
+      // 2.1.2 F6: the claim digest is type-checked like the other two axes —
+      // a non-string expectation refuses the call instead of throwing.
+      if (typeof item.expected_claim_digest !== "string") {
+        mismatches.push(
+          `опора "${supportId}": не передан expected_claim_digest (строка) — подтверждать можно ` +
+            `только прочитанное саммари (перечитай опору через get_concept/provenance_trace и повтори)`
+        );
+      } else if (item.expected_claim_digest !== currentSupportClaim) {
         mismatches.push(
           `опора "${supportId}": саммари изменилось с момента чтения ` +
             `(ожидался ${item.expected_claim_digest.slice(0, 12)}…, текущий ${currentSupportClaim.slice(0, 12)}…)`
@@ -433,7 +499,12 @@ export function confirmSupports(
         );
       }
       const currentEdgeDigest = edgeDigestOf(edge.description);
-      if (item.expected_edge_digest !== currentEdgeDigest) {
+      if (typeof item.expected_edge_digest !== "string") {
+        mismatches.push(
+          `опора "${supportId}": не передан expected_edge_digest (строка) — подтверждать можно ` +
+            `только прочитанный рационал (перечитай связь через get_concept/provenance_trace и повтори)`
+        );
+      } else if (item.expected_edge_digest !== currentEdgeDigest) {
         mismatches.push(
           `опора "${supportId}": рационал изменился с момента чтения ` +
             `(ожидался ${item.expected_edge_digest.slice(0, 12)}…, текущий ${currentEdgeDigest.slice(0, 12)}…)`
@@ -530,76 +601,88 @@ export function provenanceMetrics(
   };
   metrics_truncated: boolean;
 } {
-  const origin = { agent: 0, auto: 0, unknown: 0 };
-  for (const r of db.execSqlAll(
-    `SELECT created_via, COUNT(*) AS n FROM edges
-     WHERE removed_at IS NULL GROUP BY created_via`
-  ) as Array<{ created_via: string; n: number }>) {
-    if (r.created_via === "agent") origin.agent = r.n;
-    else if (r.created_via === "auto") origin.auto = r.n;
-    else origin.unknown += r.n;
-  }
-  const edgesAccepted = (
-    db.execSqlFirst(
-      "SELECT COUNT(*) AS n FROM edges WHERE removed_at IS NULL AND accepted_at IS NOT NULL"
-    ) as { n: number }
-  ).n;
+  // 2.1.2 F14: one read transaction around the whole call — the SQL-side
+  // aggregates, the decision pages and every per-decision check must read
+  // the same snapshot, or a concurrent unlink/remove can split the answer
+  // (a decision present in the page SELECT but gone by its check used to
+  // crash on a null view). runInTransaction nests, so a caller's transaction
+  // is joined, not reopened.
+  return db.runInTransaction(() => {
+    const origin = { agent: 0, auto: 0, unknown: 0 };
+    for (const r of db.execSqlAll(
+      `SELECT created_via, COUNT(*) AS n FROM edges
+       WHERE removed_at IS NULL GROUP BY created_via`
+    ) as Array<{ created_via: string; n: number }>) {
+      if (r.created_via === "agent") origin.agent = r.n;
+      else if (r.created_via === "auto") origin.auto = r.n;
+      else origin.unknown += r.n;
+    }
+    const edgesAccepted = (
+      db.execSqlFirst(
+        "SELECT COUNT(*) AS n FROM edges WHERE removed_at IS NULL AND accepted_at IS NOT NULL"
+      ) as { n: number }
+    ).n;
 
-  const baselineClause = db.hasSupportBaselinesTable()
-    ? `OR EXISTS (SELECT 1 FROM support_baselines b
-                   WHERE b.decision_id = n.id AND b.superseded_at IS NULL)`
-    : "";
-  const decisions = db.execSqlAll(
-    `SELECT n.id,
-            EXISTS (SELECT 1 FROM edges e
-                    WHERE e.from_id = n.id AND e.relation = 'informed_by'
-                      AND e.removed_at IS NULL) AS has_live
-     FROM nodes n
-     WHERE n.removed_at IS NULL AND n.kind = 'decision'
-       AND (n.claim_digest IS NOT NULL
-         OR EXISTS (SELECT 1 FROM edges e
-                    WHERE e.from_id = n.id AND e.relation = 'informed_by'
-                      AND e.removed_at IS NULL)
-         ${baselineClause})
-     ORDER BY n.id`
-  ) as Array<{ id: string; has_live: number }>;
+    // 2.1.2 F9: the decision scan is paginated (keyset by id, page size the
+    // budget sizes) — a million decisions under a minimal budget materialize a
+    // page, not the whole sorted list. The counters cover the rows actually
+    // read; anything past the cursor is reported by metrics_truncated.
+    const byState = { unchanged: 0, changed: 0, unknown: 0, incomplete: 0 };
+    let withLive = 0;
+    let noLive = 0;
+    let checked = 0;
+    let truncated = false;
+    let lastId = "";
+    for (;;) {
+      const take = Math.max(1, Math.min(SUPPORT_PAGE, budget.remainingEdges));
+      const page = db.getMetricDecisionsPage(lastId, take);
+      if (page.length === 0) break;
+      let stop = false;
+      for (const { id, has_live } of page) {
+        lastId = id;
+        if (has_live) withLive += 1;
+        else noLive += 1;
+        const view = computeSupportCheck(db, id, budget);
+        // F14: inside the read transaction the page SELECT and the check see
+        // the same snapshot, so the view cannot vanish between the two — the
+        // invariant holds. If a future WHERE change breaks it, the entry is
+        // reported as unreviewed (`unknown`), never a crash.
+        byState[view ? view.state : "unknown"] += 1;
+        checked += 1;
+        if (budget.exhausted) {
+          stop = true;
+          break;
+        }
+      }
+      if (stop) {
+        // The budget ran out — the probe (a LIMIT 1 over the same predicate)
+        // tells whether anything is actually left unchecked, so exhaustion
+        // exactly on the last decision is still not a false alarm (F4, 2.1.1).
+        truncated = db.hasMetricDecisionsAfter(lastId);
+        break;
+      }
+      if (page.length < take) break;
+    }
 
-  const byState = { unchanged: 0, changed: 0, unknown: 0, incomplete: 0 };
-  let withLive = 0;
-  let noLive = 0;
-  let checked = 0;
-  for (const { id, has_live } of decisions) {
-    if (has_live) withLive += 1;
-    else noLive += 1;
-    const view = computeSupportCheck(db, id, budget);
-    // Invariant: the SELECT above guarantees every decision carries a claim
-    // anchor, a live edge or a snapshot row — exactly the inputs
-    // computeSupportCheck needs to return a verdict, so it never returns null
-    // here. The assertion keeps a future WHERE change from silently dropping
-    // decisions from every bucket: it fails loudly instead.
-    byState[view!.state] += 1;
-    checked += 1;
-    if (budget.exhausted) break;
-  }
+    const supersededDecisions = db.hasSupportBaselinesTable()
+      ? (
+          db.execSqlFirst(
+            `SELECT COUNT(DISTINCT decision_id) AS n FROM support_baselines WHERE superseded_at IS NOT NULL`
+          ) as { n: number }
+        ).n
+      : 0;
 
-  const supersededDecisions = db.hasSupportBaselinesTable()
-    ? (
-        db.execSqlFirst(
-          `SELECT COUNT(DISTINCT decision_id) AS n FROM support_baselines WHERE superseded_at IS NOT NULL`
-        ) as { n: number }
-      ).n
-    : 0;
-
-  return {
-    edges_by_origin: origin,
-    edges_accepted: edgesAccepted,
-    decisions_with_live_support: withLive,
-    no_live_supports: noLive,
-    decisions_with_superseded_supports: Number(supersededDecisions),
-    decisions_by_check_state: byState,
-    // F4 (2.1.1): true only when decisions were left UNCHECKED — a budget
-    // that runs out exactly on the last decision still produced a verdict
-    // for every row, and calling that "truncated" was a false alarm.
-    metrics_truncated: checked < decisions.length,
-  };
+    return {
+      edges_by_origin: origin,
+      edges_accepted: edgesAccepted,
+      decisions_with_live_support: withLive,
+      no_live_supports: noLive,
+      decisions_with_superseded_supports: Number(supersededDecisions),
+      decisions_by_check_state: byState,
+      // F4 (2.1.1) / F9 (2.1.2): true only when decisions were left UNCHECKED —
+      // a budget that runs out exactly on the last decision still produced a
+      // verdict for every row, and calling that "truncated" was a false alarm.
+      metrics_truncated: truncated,
+    };
+  });
 }
