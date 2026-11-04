@@ -92,6 +92,20 @@ export class CheckBudget {
   exceeded = false;
 
   constructor(maxEdges: number, maxBytes: number) {
+    // 2.1.2 F10: NaN makes every comparison false — with NaN or Infinity the
+    // budget would silently disable itself (consume always succeeds,
+    // exhausted stays false). Refuse anything that is not a finite
+    // non-negative integer; 0 is legal (a budget closed from the start).
+    for (const [name, value] of [
+      ["max_check_edges", maxEdges],
+      ["max_check_bytes", maxBytes],
+    ] as const) {
+      if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+        throw new Error(
+          `CheckBudget: ${name} должен быть конечным неотрицательным целым, получено: ${String(value)}.`
+        );
+      }
+    }
     this.edgesLeft = maxEdges;
     this.bytesLeft = maxBytes;
   }

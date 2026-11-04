@@ -121,3 +121,22 @@ describe("2.1.2 F7: the decision's own summary is budgeted", () => {
     expect(view.incomplete).toBe(false);
   });
 });
+
+// ---- F10: аргументы CheckBudget валидируются ----
+
+describe("2.1.2 F10: CheckBudget refuses NaN/Infinity/negative", () => {
+  it("constructor throws on NaN, Infinity, -1, non-integer", () => {
+    expect(() => new CheckBudget(Number.NaN, 100)).toThrow(/CheckBudget/);
+    expect(() => new CheckBudget(100, Number.NaN)).toThrow(/CheckBudget/);
+    expect(() => new CheckBudget(Number.POSITIVE_INFINITY, 100)).toThrow(/CheckBudget/);
+    expect(() => new CheckBudget(100, Number.POSITIVE_INFINITY)).toThrow(/CheckBudget/);
+    expect(() => new CheckBudget(-1, 100)).toThrow(/CheckBudget/);
+    expect(() => new CheckBudget(100, -1)).toThrow(/CheckBudget/);
+    expect(() => new CheckBudget(1.5, 100)).toThrow(/CheckBudget/);
+  });
+
+  it("zero budgets are legal and exhausted from the start", () => {
+    const b = new CheckBudget(0, 0);
+    expect(b.exhausted).toBe(true);
+  });
+});
