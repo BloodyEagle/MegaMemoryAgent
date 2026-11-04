@@ -198,6 +198,12 @@ export interface NodeWithContext {
    * it must not be quoted as proven knowledge.
    */
   weak_support?: boolean;
+  /**
+   * Plan 4 v8 §4: the support check next to the epistemic verdict on the node
+   * card (get_concept only — search results must not pay for it). Present
+   * whenever there is anything to check.
+   */
+  support_check?: SupportCheckView;
 }
 
 export interface UnderstandOutput {
@@ -331,6 +337,12 @@ export interface NodeRow {
   // Deliberately NOT the lifecycle `status` or the epistemic axis.
   task_state?: string | null;
   due_at?: string | null;
+  // Plan 4 v8: the digest of the decision's own wording AS CONFIRMED (written
+  // only by confirm_supports, never by content writes) + when. A rewrite of
+  // the summary does not touch this column — the mismatch IS the signal that
+  // the old confirmation does not extend to the new wording.
+  claim_digest?: string | null;
+  claim_digest_at?: string | null;
 }
 
 export interface EdgeRow {
@@ -346,6 +358,13 @@ export interface EdgeRow {
   merge_timestamp: string | null;
   /** Plan 1 (v5): tombstone timestamp; NULL = active edge. */
   removed_at?: string | null;
+  // Plan 4 v8: which server write path created the row — assigned by the
+  // server, never accepted from the caller. 'agent' = explicit tool call
+  // (link/evidence), 'auto' = server-derived (auto-ground), 'unknown' =
+  // pre-v8 rows and every import/merge. Explicit acceptance does NOT rewrite it.
+  created_via?: string;
+  /** Plan 4 v8: when the agent explicitly accepted an auto-derived edge (confirm_supports). */
+  accepted_at?: string | null;
 }
 
 // ---- Workflow tools (plan 2, v6) ----
@@ -451,6 +470,11 @@ export interface MergeResult {
    * flagged needs_merge and listed here for the report.
    */
   informedByCycles?: string[][];
+  /**
+   * Plan 4 v8 §7: support-baseline rows carried over from the inputs
+   * (confirmed_by rewritten to 'import'). Absent when there was nothing.
+   */
+  baselinesCarried?: number;
 }
 
 // ---- Provenance tools (plan 3 §4.2) ----
@@ -471,6 +495,14 @@ export interface ProvenanceTraceInput {
   max_scan_nodes?: number;
   /** Return tombstoned edges too — "how we used to think". */
   retrospective?: boolean;
+  /**
+   * Plan 4 v8 §6: the support-baseline check is bounded by EDGES, not only
+   * nodes — a decision can have tens of thousands of direct supports. When
+   * the budget runs out the verdict is `incomplete`, never `unchanged`.
+   */
+  max_check_edges?: number;
+  /** Plan 4 v8 §6: byte budget for one check call (default 2 MB). */
+  max_check_bytes?: number;
 }
 
 /**
@@ -490,6 +522,16 @@ export interface ProvenanceWeakLink {
     | "missing_support"
     | "no_support"
     | "cycle"
+    /**
+     * Plan 4 v8 §4: the supports diverge from the confirmed snapshot (or the
+     * decision's own wording was rewritten after the confirmation).
+     */
+    | "support_changed"
+    /**
+     * Plan 4 v8 §3: no snapshot, or live supports the snapshot does not cover
+     * — `unknown`/`incomplete` are not cleanliness and must not be silent.
+     */
+    | "support_unreviewed"
     /**
      * plan-3-fixes-3 D2.2: the support check is bounded by max_scan_nodes —
      * this record reports how many supports of the decision were actually
@@ -512,6 +554,122 @@ export interface ProvenanceWeakLink {
   total?: number;
   /** D2.4: records kept vs. produced (weak_links_truncated). */
   shown?: number;
+  /**
+   * Plan 4 v8 §4: priority orders the cut, it does not suppress — when
+   * weak_links are truncated, this carries the per-reason counts over ALL
+   * produced records, not only the kept ones.
+   */
+  reason_counts?: Record<string, number>;
+}
+
+// ---- Support baselines (plan 4 v8: snapshot of the justification) ----
+
+/** One confirmed pair "decision — support" (support_baselines row). */
+export interface SupportBaselineRow {
+  decision_id: string;
+  support_id: string;
+  /** Stable edge identity: edges.id (the rowid); recomputed on merge. */
+  edge_key: string;
+  /** Digest of the tracked claim fields of the support (summary, v1). */
+  claim_digest: string;
+  /** Digest of the support's status axes (lifecycle + epistemic, v1). */
+  status_digest: string;
+  /** Digest of the rationale (v1). */
+  edge_digest: string;
+  format_version: number;
+  confirmed_at: string;
+  /** 'agent' | 'import' | 'cli' — who confirmed; imports never confirm by themselves. */
+  confirmed_by: string;
+  /**
+   * plan-4-fixes-6 F7: set ONLY by the explicit "no supports" confirmation —
+   * it acknowledges the dead anchors instead of erasing them, so "confirmed
+   * and later removed" stays distinguishable from "supports never existed".
+   * A fresh confirmation of the same pair clears the flag again.
+   */
+  superseded_at?: string | null;
+}
+
+/** Why a confirmed support no longer matches (plan 4 v8 §4). */
+export type SupportChangeReason = "summary" | "status" | "rationale" | "removed";
+
+/** One diverged pair "decision — support" in the support_check block. */
+export interface SupportPairChange {
+  support: string;
+  /** Array, not a single value: summary AND status can both move at once. */
+  reasons: SupportChangeReason[];
+  /** The confirmation time (baseline_at), not the edit time — the db keeps no edit log. */
+  since: string;
+}
+
+/**
+ * Plan 4 v8 §3: four states, per pair and for the node as a whole.
+ * `unknown` and `incomplete` are NOT cleanliness — a node without a snapshot
+ * is never shown as verified.
+ */
+export interface SupportCheckView {
+  state: "unchanged" | "changed" | "unknown" | "incomplete";
+  /** Pairs that diverged from the confirmed snapshot (state = changed). */
+  changed?: SupportPairChange[];
+  /** Honest total when the changed list was capped for the response. */
+  changed_count?: number;
+  /** Live supports the snapshot does not cover (never confirmed). */
+  unknown?: string[];
+  /** Honest total when the unknown list was capped for the response. */
+  unknown_count?: number;
+  /** true when the check ran out of the edge/byte budget. */
+  incomplete?: boolean;
+  /** The confirmation time of the snapshot (max over its rows); null = never confirmed. */
+  baseline_at: string | null;
+  /**
+   * The decision's own wording was rewritten after the confirmation — the old
+   * confirmation does not extend to the new wording (plan 4 v8 §1.2).
+   */
+  claim_changed?: boolean;
+  /**
+   * plan-4-fixes-6 F7: the snapshot holds superseded rows — this decision HAD
+   * confirmed supports that were later acknowledged as gone. Absent for a
+   * decision that never had any.
+   */
+  had_supports?: boolean;
+}
+
+export interface ConfirmSupportsItem {
+  support_id: string;
+  /** The support's summary digest as the agent read it. */
+  expected_claim_digest: string;
+  /**
+   * The support's status-axes digest as the agent read it. plan-4-fixes-6 F3:
+   * mandatory in practice — a confirmation without it (or with a stale one)
+   * is refused with version_conflict; an agent must never confirm a status
+   * it has not seen.
+   */
+  expected_status_digest?: string;
+  /** The rationale digest as the agent read it. */
+  expected_edge_digest: string;
+}
+
+export interface ConfirmSupportsInput {
+  decision_id: string;
+  /** The decision's own wording digest as the agent saw it. */
+  expected_claim_digest: string;
+  /**
+   * Confirms exactly the listed supports; live supports missing from the list
+   * stay `unknown`, never "confirmed by default". An EMPTY list is valid: it
+   * asserts "this node has no supports" — distinct from "never checked".
+   */
+  items: ConfirmSupportsItem[];
+  note?: string;
+}
+
+export interface ConfirmSupportsOutput {
+  decision_id: string;
+  /** Number of baseline rows written (0 for a valid empty confirmation). */
+  confirmed: number;
+  claim_digest: string;
+  baseline_at: string;
+  /** Auto-derived edges explicitly accepted by this confirmation. */
+  accepted_auto_edges: number;
+  message: string;
 }
 
 export interface ProvenanceNodeView {
@@ -533,6 +691,13 @@ export interface ProvenanceNodeView {
   removed?: boolean;
   /** audit only: epistemic_status != validated — this node is not trusted knowledge. */
   at_risk?: boolean;
+  /**
+   * Plan 4 v8 §4/§5: the node's own support check. On the root it is present
+   * whenever there is anything to check; on inner nodes only when the state
+   * is `changed` — the local divergence travels together with the dependency
+   * path (§5), while clean/unknown nodes keep the response small.
+   */
+  support_check?: SupportCheckView;
 }
 
 export interface ProvenanceEdgeView {
@@ -562,7 +727,6 @@ export interface ProvenanceTraceOutput {
   weak_links: ProvenanceWeakLink[];
   nodes: ProvenanceNodeView[];
   edges: ProvenanceEdgeView[];
-  limits: { depth: number; max_nodes: number; max_scan_nodes: number };
   shown: number;
   /**
    * Nodes within the depth limit (plan-3-fixes-2 contract 3). A lower
@@ -575,7 +739,34 @@ export interface ProvenanceTraceOutput {
   truncated: boolean;
   truncated_by: "depth" | "nodes" | "scan" | null;
   completeness: ProvenanceCompleteness;
-  params: { depth: number; max_nodes: number; max_scan_nodes: number; retrospective: boolean };
+  /**
+   * Plan 4 v8 §4: the root's support check, next to the epistemic verdict —
+   * otherwise search keeps returning "verified" decisions whose supports
+   * have long since drifted. Present whenever there is anything to check.
+   */
+  support_check?: SupportCheckView;
+  /**
+   * plan-4-fixes-6 F11: inner (non-root) nodes of any kind whose own support
+   * check ran out of the shared budget. Present only when > 0; the verdict
+   * also degrades completeness to "truncated" — an unverified inner node must
+   * not hide behind a clean-looking answer.
+   */
+  inner_nodes_incomplete?: number;
+  limits: {
+    depth: number;
+    max_nodes: number;
+    max_scan_nodes: number;
+    max_check_edges: number;
+    max_check_bytes: number;
+  };
+  params: {
+    depth: number;
+    max_nodes: number;
+    max_scan_nodes: number;
+    retrospective: boolean;
+    max_check_edges: number;
+    max_check_bytes: number;
+  };
 }
 
 export interface ProvenanceAuditOutput extends ProvenanceTraceOutput {

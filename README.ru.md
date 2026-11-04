@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.0.0--fork.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -14,6 +14,7 @@
 </p>
 
 > **Форк [0xK3vin/MegaMemory](https://github.com/0xK3vin/MegaMemory) v1.6.2 (MIT).**
+> Форк npm-пакета [`megamemory`](https://www.npmjs.com/package/megamemory), публикуется как `@bloodyeagle/megamemory`.
 > Идея и база — upstream. В форке: исправлены идентификаторы для любых языков, добавлены
 > гибридный поиск, бюджет контекста, актуальность фактов, digest-узлы, экспорт и учёт токенов.
 > English version: [README.md](./README.md).

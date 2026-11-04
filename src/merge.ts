@@ -6,6 +6,13 @@ import type { NodeRow, EdgeRow, MergeResult } from "./types.js";
 export const MERGE_SUFFIX_LEFT = "::left";
 export const MERGE_SUFFIX_RIGHT = "::right";
 
+/**
+ * F5: prefix for a carried snapshot row whose edge did not survive the merge.
+ * Never equals a numeric edges.id, so the row can no longer anchor a live
+ * pair by accident.
+ */
+export const DEAD_EDGE_KEY_PREFIX = "dead:";
+
 export interface MergeOptions {
   leftLabel?: string;
   rightLabel?: string;
@@ -215,6 +222,15 @@ export class MergeEngine {
       merge_timestamp: string | null;
       removed_at: string | null;
       _originSide: "left" | "right"; // tracks which input DB this edge came from
+      // F5: every SOURCE row this deferred edge represents — the winner of a
+      // dedup plus the copies it absorbed. The support-baseline carry maps
+      // edge_key through these, so a snapshot never migrates to an unrelated
+      // edge just because the ends match.
+      _srcEdgeIds: Array<{ side: "left" | "right"; id: number }>;
+      // F9: edge provenance travels with the row (sources without the
+      // columns honestly become 'unknown'/null).
+      created_via: string | null;
+      accepted_at: string | null;
     };
     const deferredEdges: DeferredEdge[] = [];
     const insertedNodeIds = new Set<string>();
@@ -256,6 +272,9 @@ export class MergeEngine {
         merge_timestamp: e.merge_timestamp,
         removed_at: e.removed_at ?? null,
         _originSide: originSide,
+        _srcEdgeIds: [{ side: originSide, id: e.id }],
+        created_via: e.created_via ?? "unknown",
+        accepted_at: e.accepted_at ?? null,
       });
     };
 
@@ -379,6 +398,9 @@ export class MergeEngine {
               merge_timestamp: edgesConflict ? now : null,
               removed_at: e.removed_at ?? null,
               _originSide: "left",
+              _srcEdgeIds: [{ side: "left", id: e.id }],
+              created_via: e.created_via ?? "unknown",
+              accepted_at: e.accepted_at ?? null,
             });
           }
 
@@ -395,6 +417,9 @@ export class MergeEngine {
               merge_timestamp: edgesConflict ? now : null,
               removed_at: e.removed_at ?? null,
               _originSide: "right",
+              _srcEdgeIds: [{ side: "right", id: e.id }],
+              created_via: e.created_via ?? "unknown",
+              accepted_at: e.accepted_at ?? null,
             });
           }
         }
@@ -423,7 +448,12 @@ export class MergeEngine {
       }
     }
 
-    // Now insert all deferred edges, remapping target IDs where needed
+    // Now insert all deferred edges, remapping target IDs where needed.
+    // F5: every source rowid maps to the output rowid it became — by
+    // identity, never by ends — so the snapshot carry (§7) re-anchors each
+    // baseline to ITS edge.
+    const outEdgeIdByEnds = new Map<string, number>();
+    const edgeIdRemapping = new Map<string, number>(); // "side:srcEdgeId" → output rowid
     for (const edge of deferredEdges) {
       // Remap to_id if the target was conflicted — use _originSide to determine
       // which suffixed version to point at (not from_id suffix, which may be absent
@@ -448,7 +478,7 @@ export class MergeEngine {
         }
       }
 
-      outputDb.insertEdgeRaw({
+      const res = outputDb.insertEdgeRaw({
         from_id: edge.from_id,
         to_id: remappedToId,
         relation: edge.relation,
@@ -459,7 +489,50 @@ export class MergeEngine {
         source_branch: edge.source_branch,
         merge_timestamp: edge.merge_timestamp,
         removed_at: edge.removed_at,
+        created_via: edge.created_via,
+        accepted_at: edge.accepted_at,
       });
+      const endsKey = JSON.stringify([edge.from_id, remappedToId, edge.relation]);
+      // INSERT OR IGNORE: same ends were inserted earlier in this pass (e.g.
+      // two rationales for one pair) — the surviving row anchors every copy.
+      // A source rowid dropped above (dead live edge) maps to nothing: its
+      // snapshot keeps the source edge_key and honestly reports "removed".
+      let outId = res.id;
+      if (!res.inserted) {
+        const existing = outEdgeIdByEnds.get(endsKey);
+        if (existing === undefined) {
+          throw new Error(
+            `Merge error: ignored insert of ${edge.from_id} -> ${remappedToId} ` +
+              `(${edge.relation}) has no earlier output row.`
+          );
+        }
+        outId = existing;
+      }
+      outEdgeIdByEnds.set(endsKey, outId);
+      for (const src of edge._srcEdgeIds) {
+        edgeIdRemapping.set(`${src.side}:${src.id}`, outId);
+      }
+    }
+
+    // ---- Plan 4 (v8) §7: carry the support snapshots over ----
+    // After every edge row exists in the output, so edge_key can be remapped
+    // to the new rowids. Left side first, then right (deterministic).
+    const carriedLeft = this.carrySupportBaselines(
+      leftDb,
+      outputDb,
+      "left",
+      idRemapping,
+      edgeIdRemapping
+    );
+    const carriedRight = this.carrySupportBaselines(
+      rightDb,
+      outputDb,
+      "right",
+      idRemapping,
+      edgeIdRemapping
+    );
+    if (carriedLeft + carriedRight > 0) {
+      result.baselinesCarried = carriedLeft + carriedRight;
     }
 
     // ---- PASS 3: re-validate the informed_by DAG over the combined graph ----
@@ -514,6 +587,10 @@ export class MergeEngine {
       // Plan 1 (v5): epistemic axis travels with the row.
       epistemic_status: node.epistemic_status ?? null,
       status_scope: node.status_scope ?? null,
+      // Plan 4 (v8): the confirmed wording digest travels with the row so a
+      // carried-over snapshot keeps pointing at the wording it confirmed.
+      claim_digest: node.claim_digest ?? null,
+      claim_digest_at: node.claim_digest_at ?? null,
     });
   }
 
@@ -550,7 +627,90 @@ export class MergeEngine {
       // Plan 1 (v5): epistemic axis travels with the row.
       epistemic_status: node.epistemic_status ?? null,
       status_scope: node.status_scope ?? null,
+      // Plan 4 (v8): confirmed wording digest travels with the row.
+      claim_digest: node.claim_digest ?? null,
+      claim_digest_at: node.claim_digest_at ?? null,
     });
+  }
+
+  /**
+   * Plan 4 (v8) §7: carry the support snapshot over with the decision.
+   * - ids are remapped consistently with the graph (suffixed conflict copies
+   *   get the snapshots of their own side);
+   * - F5: edge_key is recomputed through the identity map built while the
+   *   edges were transferred (source rowid → the output rowid THAT row
+   *   became). The old ends-and-min-id lookup could not tell a tombstone
+   *   from a live edge with the same ends, so a confirmation could migrate
+   *   onto a link nobody confirmed;
+   * - the saved CONTENT (digests, format_version, confirmed_at) is carried
+   *   verbatim — a remap must not replace the stored digests with current
+   *   values, otherwise a clean remap would produce mass false "changed"
+   *   (test 15) and a real divergence could hide;
+   * - confirmed_by is rewritten to 'import' (§7): the import never confirms
+   *   by itself, and a row that came through a merge must be distinguishable
+   *   from one the agent confirmed in this database.
+   * When the edge did not survive the merge (dropped live edge onto a removed
+   * node) the row is still carried with the source edge_key: the pair then
+   * reports "removed" instead of silently losing the anchor.
+   */
+  private carrySupportBaselines(
+    sourceDb: KnowledgeDB,
+    outputDb: KnowledgeDB,
+    side: "left" | "right",
+    idRemapping: Map<string, string>,
+    edgeIdRemapping: Map<string, number>
+  ): number {
+    if (!sourceDb.hasSupportBaselinesTable() || !outputDb.hasSupportBaselinesTable()) {
+      return 0;
+    }
+    const resolve = (id: string): string | null => {
+      if (outputDb.getNodeIncludingRemoved(id)) return id;
+      const canonical = stripMergeSuffix(id);
+      const remapped = idRemapping.get(`${side}:${canonical}`);
+      if (remapped && outputDb.getNodeIncludingRemoved(remapped)) return remapped;
+      if (canonical !== id && outputDb.getNodeIncludingRemoved(canonical)) return canonical;
+      return null;
+    };
+    let carried = 0;
+    for (const row of sourceDb.getAllSupportBaselines()) {
+      const decisionId = resolve(row.decision_id);
+      const supportId = resolve(row.support_id);
+      if (!decisionId || !supportId) continue; // an endpoint did not survive
+      const mappedEdge = edgeIdRemapping.get(`${side}:${row.edge_key}`);
+      // F5: a row whose edge did not survive can never anchor a live edge —
+      // keeping the raw source rowid would risk colliding with a NEW output
+      // rowid (the first inserted edge becomes id 1 again), which would
+      // silently re-confirm a pair nobody confirmed. The "dead:" prefix
+      // cannot equal any numeric rowid: the anchor stays with the dead row.
+      const edgeKey =
+        mappedEdge !== undefined
+          ? String(mappedEdge)
+          : row.edge_key.startsWith(DEAD_EDGE_KEY_PREFIX)
+            ? row.edge_key
+            : `${DEAD_EDGE_KEY_PREFIX}${row.edge_key}`;
+      const exists = outputDb.execSqlFirst(
+        `SELECT 1 FROM support_baselines
+         WHERE decision_id = ? AND support_id = ? AND edge_key = ?`,
+        decisionId,
+        supportId,
+        edgeKey
+      );
+      if (exists) continue; // left side already carried this pair — left first
+      outputDb.upsertSupportBaseline({
+        decision_id: decisionId,
+        support_id: supportId,
+        edge_key: edgeKey,
+        claim_digest: row.claim_digest,
+        status_digest: row.status_digest,
+        edge_digest: row.edge_digest,
+        format_version: row.format_version,
+        confirmed_at: row.confirmed_at,
+        confirmed_by: "import",
+        superseded_at: row.superseded_at ?? null,
+      });
+      carried++;
+    }
+    return carried;
   }
 
   /**
@@ -564,6 +724,9 @@ export class MergeEngine {
       source_branch: string | null; merge_timestamp: string | null;
       removed_at: string | null;
       _originSide: "left" | "right";
+      _srcEdgeIds: Array<{ side: "left" | "right"; id: number }>;
+      created_via: string | null;
+      accepted_at: string | null;
     }>,
     edgeMap: Map<string, EdgeRow[]>,
     nodeId: string,
@@ -584,6 +747,9 @@ export class MergeEngine {
         merge_timestamp: null,
         removed_at: e.removed_at ?? null,
         _originSide: side,
+        _srcEdgeIds: [{ side, id: e.id }],
+        created_via: e.created_via ?? "unknown",
+        accepted_at: e.accepted_at ?? null,
       });
     }
   }
@@ -603,6 +769,9 @@ export class MergeEngine {
       source_branch: string | null; merge_timestamp: string | null;
       removed_at: string | null;
       _originSide: "left" | "right";
+      _srcEdgeIds: Array<{ side: "left" | "right"; id: number }>;
+      created_via: string | null;
+      accepted_at: string | null;
     }>,
     leftEdgeMap: Map<string, EdgeRow[]>,
     rightEdgeMap: Map<string, EdgeRow[]>,
@@ -612,23 +781,30 @@ export class MergeEngine {
     const leftEdges = leftEdgeMap.get(nodeId) ?? [];
     const rightEdges = rightEdgeMap.get(nodeId) ?? [];
 
-    const byKey = new Map<string, { edge: EdgeRow; side: "left" | "right" }>();
+    const byKey = new Map<
+      string,
+      { edge: EdgeRow; side: "left" | "right"; sources: Array<{ side: "left" | "right"; id: number }> }
+    >();
     const put = (e: EdgeRow, side: "left" | "right"): void => {
       const key = edgeKey(e);
       const prev = byKey.get(key);
       if (!prev) {
-        byKey.set(key, { edge: e, side });
+        byKey.set(key, { edge: e, side, sources: [{ side, id: e.id }] });
         return;
       }
+      // F5: the losing copy still maps to the winning output row — its
+      // snapshot (if any) must follow the same edge, not dangle on a raw
+      // source rowid.
+      prev.sources.push({ side, id: e.id });
       // Left first, then right; a colliding live copy never overrides a tombstone.
       if (prev.edge.removed_at === null && e.removed_at !== null) {
-        byKey.set(key, { edge: e, side });
+        byKey.set(key, { edge: e, side, sources: prev.sources });
       }
     };
     for (const e of leftEdges) put(e, "left");
     for (const e of rightEdges) put(e, "right");
 
-    for (const { edge, side } of byKey.values()) {
+    for (const { edge, side, sources } of byKey.values()) {
       deferred.push({
         from_id: edge.from_id,
         to_id: edge.to_id,
@@ -641,6 +817,9 @@ export class MergeEngine {
         merge_timestamp: null,
         removed_at: edge.removed_at ?? null,
         _originSide: side,
+        _srcEdgeIds: sources,
+        created_via: edge.created_via ?? "unknown",
+        accepted_at: edge.accepted_at ?? null,
       });
     }
   }

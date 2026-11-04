@@ -201,6 +201,10 @@ export function mergeNodes(
         to_id: to,
         relation: edge.relation,
         description: edge.description,
+        // Plan 4 v8 §1.3: a server-side re-creation during consolidation —
+        // the original row's origin is gone with it, so the new row is
+        // honestly 'unknown', not laundered into 'agent'.
+        via: "unknown",
       });
     }
 

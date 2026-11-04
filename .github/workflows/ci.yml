@@ -25,7 +25,7 @@ jobs:
         run: |
           PKG=$(node -p 'require("./package.json").version')
           for f in README.md README.ru.md; do
-            BADGE=$(grep -o "version-[0-9.]*--fork.[0-9]*" "$f" | head -1 | sed "s/version-//; s/--/-/")
+            BADGE=$(grep -oE "version-[0-9]+\.[0-9]+\.[0-9]+(--fork\.[0-9]+)?" "$f" | head -1 | sed "s/version-//; s/--/-/")
             test "$PKG" = "$BADGE" || { echo "$f badge $BADGE != package.json $PKG"; exit 1; }
           done
 

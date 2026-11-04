@@ -223,6 +223,7 @@ async function startMcpServer() {
   const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
   const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
+  const { confirmSupports } = await import("./support-baselines.js");
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
@@ -355,7 +356,7 @@ async function startMcpServer() {
 
   server.tool(
     "get_concept",
-    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID.",
+    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. Read-only: get_concept writes nothing (plan-4-fixes-6 F12).",
     {
       id: z.string().describe("Exact concept ID to look up (e.g., 'auth-module' or 'database-config')"),
     },
@@ -387,7 +388,7 @@ async function startMcpServer() {
 
   server.tool(
     "create_concept",
-    "Add a new concept to the knowledge graph. Call this after completing a task to record new features, components, patterns, or decisions you built. Include specific details: parameter names, defaults, file locations, and rationale. У decision/pattern передавай evidence — список {ref | node, why}: файл или уже существующий узел, на котором держится вывод, плюс рационал. Опоры создаются в том же вызове, отдельный link потом не нужен. Если evidence нет, а file_refs и why заполнены — опоры будут выведены автоматически по файлам. Факт без informed_by на источник (файл, тест, лог, диалог) помечается ungrounded и выпадает из замыкания провенанса. Если включён строгий режим (provenance.require_support), decision без опоры отклоняется — передавай evidence в том же вызове.",
+    "Add a new concept to the knowledge graph. Call this after completing a task to record new features, components, patterns, or decisions you built. Include specific details: parameter names, defaults, file locations, and rationale. У decision/pattern передавай evidence — список {ref | node, why}: файл или уже существующий узел, на котором держится вывод, плюс рационал. Опоры создаются в том же вызове, отдельный link потом не нужен; снимок обоснования пишется только по evidence — рёбра из edges создаются, но подтверждением не считаются (plan-4-fixes-6 F1). Если evidence нет, а file_refs и why заполнены — опоры будут выведены автоматически по файлам. Факт без informed_by на источник (файл, тест, лог, диалог) помечается ungrounded и выпадает из замыкания провенанса. Если включён строгий режим (provenance.require_support), decision без опоры отклоняется — передавай evidence в том же вызове.",
     {
       name: z.string().describe("Human-readable name for the concept"),
       kind: NodeKindEnum.describe("Type of concept: feature, module, pattern, config, decision, component"),
@@ -695,13 +696,15 @@ async function startMcpServer() {
 
   server.tool(
     "provenance_trace",
-    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: depth (0–20), max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false); тот же бюджет ограничивает проверку опор решений — проверяются первые по id, запись support_check_truncated сообщает checked/total. Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами — такие записи несут числовые count и sample (первые ≤5 id), note не длиннее 300 символов. weak_links целиком не превышают 8 КБ: при превышении записи режутся по приоритету и добавляется маркер weak_links_truncated (shown/total). completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated.",
+    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: depth (0–20), max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false); тот же бюджет ограничивает проверку опор решений — проверяются первые по id, запись support_check_truncated сообщает checked/total. Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами — такие записи несут числовые count и sample (первые ≤5 id), note не длиннее 300 символов. weak_links целиком не превышают 8 КБ: при превышении записи режутся по приоритету и добавляется маркер weak_links_truncated (shown/total). completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated. Снимок обоснования: решение несёт блок support_check — сверку живых опор с подтверждённым снимком; состояния unchanged/changed (причины per опоры: summary|status|rationale|removed)/unknown/incomplete, unknown и incomplete чистотой не считаются; изменение опоры не стирается добавлением новых рёбер. Подтверждение — отдельный вызов confirm_supports с digest'ами прочитанных формулировок; ни одна мутация (link/update/merge) снимок не пишет и не обновляет. Контракт «чтение не пишет» (plan-4-fixes-6 F12): provenance_trace и get_concept не записывают ничего — ни снимки, ни журналы; проверка опор ограничена бюджетом max_check_edges/max_check_bytes, inner-узлы с оборванной проверкой видны в inner_nodes_incomplete, а completeness деградирует до truncated.",
     {
       node_id: z.string().describe("Узел, с которого начинается обход"),
       direction: z.enum(["ancestry", "impact"]).optional().describe("ancestry (по умолчанию) — что поддерживает узел; impact — что на него опирается"),
       depth: z.number().int().min(1).max(20).optional().describe("Глубина обхода (по умолчанию 6)"),
       max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов сверх корня (по умолчанию 200)"),
       max_scan_nodes: z.number().int().min(1).max(100000).optional().describe("Бюджет сканирования — сколько узлов разворачивать (по умолчанию 5000); при срабатывании total_exact: false"),
+      max_check_edges: z.number().int().min(1).max(1000000).optional().describe("Бюджет проверки снимка опор — сколько пар «решение—опора» сверять за вызов (по умолчанию 5000); при исчерпании support_check.state = incomplete, а не unchanged"),
+      max_check_bytes: z.number().int().min(1).max(20000000).optional().describe("Байтовый бюджет проверки снимка (по умолчанию 2 МБ)"),
       retrospective: z.boolean().optional().describe("Вернуть и надгробия — «как думали раньше»; удалённые эндпоинты приходят заглушками и считаются в лимит max_nodes"),
     },
     async (params) => {
@@ -712,6 +715,8 @@ async function startMcpServer() {
           depth: params.depth,
           max_nodes: params.max_nodes,
           max_scan_nodes: params.max_scan_nodes,
+          max_check_edges: params.max_check_edges,
+          max_check_bytes: params.max_check_bytes,
           retrospective: params.retrospective,
         });
         timeline.log({
@@ -739,13 +744,15 @@ async function startMcpServer() {
 
   server.tool(
     "provenance_audit",
-    "«Что рассыплется, если это неверно»: обратный обход (impact) по informed_by с подсветкой узлов, у которых epistemic_status != validated (поле at_risk). Каждый прогон пишется в provenance_audit_runs с ретеншном — последние 200 на узел, не старше 90 дней, чтобы ретроспектива «что мы знали тогда» не врала после того, как граф уехал.",
+    "«Что рассыплется, если это неверно»: обратный обход (impact) по informed_by с подсветкой узлов, у которых epistemic_status != validated (поле at_risk). Каждый прогон пишется в provenance_audit_runs с ретеншном — последние 200 на узел, не старше 90 дней, чтобы ретроспектива «что мы знали тогда» не врала после того, как граф уехал. Контракт записи: этот журнал — единственное, что audit пишет; граф, узлы и снимки опор он не трогает (plan-4-fixes-6 F12).",
     {
       node_id: z.string().describe("Узел, корректность которого проверяется"),
       direction: z.enum(["ancestry", "impact"]).optional().describe("impact (по умолчанию) — что рассыплется; ancestry — на чём стоит"),
       depth: z.number().int().min(1).max(20).optional().describe("Глубина обхода (по умолчанию 6)"),
       max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов (по умолчанию 200)"),
       max_scan_nodes: z.number().int().min(1).max(100000).optional().describe("Бюджет сканирования (по умолчанию 5000); при срабатывании total_exact: false"),
+      max_check_edges: z.number().int().min(1).max(1000000).optional().describe("Бюджет проверки снимка опор (по умолчанию 5000)"),
+      max_check_bytes: z.number().int().min(1).max(20000000).optional().describe("Байтовый бюджет проверки снимка (по умолчанию 2 МБ)"),
       retrospective: z.boolean().optional().describe("Вернуть и надгробия"),
     },
     async (params) => {
@@ -756,6 +763,8 @@ async function startMcpServer() {
           depth: params.depth,
           max_nodes: params.max_nodes,
           max_scan_nodes: params.max_scan_nodes,
+          max_check_edges: params.max_check_edges,
+          max_check_bytes: params.max_check_bytes,
           retrospective: params.retrospective,
         });
         timeline.log({
@@ -773,6 +782,53 @@ async function startMcpServer() {
           params: { node_id: params.node_id },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: false,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  // ---- Support baseline confirmation (plan 4 v8) ----
+
+  server.tool(
+    "confirm_supports",
+    "Записать снимок обоснования решения: сверить digest'ы формулировок, которые агент прочитал, с текущими и атомарно записать опоры. items подтверждает ровно перечисленные опоры — живые опоры вне списка остаются unknown, «подтверждены по умолчанию» не бывают. Для каждой опоры обязателен expected_status_digest (status_digest опоры, который агент читал): подтверждение без него и с несовпадающим — отказ; агент не подтверждает статус, который не видел. ПУСТОЙ список = «подтверждаю, что опор нет» (валидное состояние, отличное от «не проверялось»): прежние строки снимка не стираются, а помечаются superseded — «была подтверждена, потом снята» остаётся отличимым от «опор никогда не было» (признак had_supports в support_check). Любое расхождение ожидаемого с текущим — отказ version_conflict, ничего не записывается: перечитай опоры через provenance_trace/get_concept и повтори с актуальными digest'ами. Ни link, ни update_concept, ни merge снимок не пишут — подтверждение только этим вызовом (единственное исключение: create_concept с evidence подтверждает переданные в том же вызове версии; рёбра из edges снимок не создают). Автоматические рёбра при подтверждении получают accepted_at, created_via не переписывается.",
+    {
+      decision_id: z.string().describe("ID решения, снимок которого записывается"),
+      expected_claim_digest: z.string().describe("claim_digest формулировки решения, которую агент видел (get_concept/provenance_trace отдают текущий)"),
+      items: z.array(z.object({
+        support_id: z.string().describe("ID узла-опоры"),
+        expected_claim_digest: z.string().describe("claim_digest саммари опоры, который агент читал"),
+        expected_status_digest: z.string().optional().describe("status_digest опоры (оси статуса), который агент читал; без него подтверждение отказывает"),
+        expected_edge_digest: z.string().describe("edge_digest рационала ребра, который агент читал"),
+      })).describe("Подтверждаемые опоры с ожидаемыми digest'ами; пустой массив = «опор нет»"),
+      note: z.string().optional().describe("Произвольная пометка агента (попадает в timeline)"),
+    },
+    async (params) => {
+      try {
+        const result = confirmSupports(db, {
+          decision_id: params.decision_id,
+          expected_claim_digest: params.expected_claim_digest,
+          items: params.items,
+          note: params.note,
+        });
+        timeline.log({
+          tool: "confirm_supports",
+          params: { decision_id: params.decision_id, note: params.note },
+          result_summary: `confirmed ${result.confirmed} support(s)`,
+          is_write: true,
+          is_error: false,
+          affected_ids: [params.decision_id, ...params.items.map((i) => i.support_id)],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "confirm_supports",
+          params: { decision_id: params.decision_id },
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: true,
           is_error: true,
           affected_ids: [],
         });
