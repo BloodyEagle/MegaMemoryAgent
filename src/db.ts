@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import type {
   NodeRow,
   EdgeRow,
+  NodeArtifactRow,
   SupportBaselineRow,
   SupportRevisionRow,
 } from "./types.js";
@@ -427,6 +428,10 @@ export class KnowledgeDB {
             confirmed_at    TEXT NOT NULL,
             confirmed_by    TEXT NOT NULL,
             superseded_at   TEXT,
+            -- 2.1.3 F2: digest of the support's observed artifacts at the
+            -- confirmation moment; NULL = no artifacts were observed yet
+            -- (nothing to compare — honestly no signal).
+            artifacts_digest TEXT,
             PRIMARY KEY (decision_id, support_id, edge_key)
           );
           CREATE INDEX IF NOT EXISTS idx_baselines_decision
@@ -489,6 +494,37 @@ export class KnowledgeDB {
           CREATE INDEX IF NOT EXISTS idx_support_revisions_pair
             ON support_revisions(decision_id, support_id, recorded_at);
         `);
+        // 2.1.3 F2: digests of the external artifacts a node references
+        // (files, git blobs). Written ONLY by the explicit check_artifacts —
+        // reads never hash files. digest is nullable ON PURPOSE: null = the
+        // file was missing at the last check. prev_digest/changed_at exist
+        // for the warning text only, the verdict compares snapshots.
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS node_artifacts (
+            node_id       TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            ref           TEXT NOT NULL,
+            digest        TEXT,
+            prev_digest   TEXT,
+            size_bytes    INTEGER,
+            checked_at    TEXT NOT NULL,
+            changed_at    TEXT,
+            checked_by    TEXT NOT NULL,
+            PRIMARY KEY (node_id, kind, ref)
+          );
+        `);
+        // 2.1.3 F2: the confirmed artifacts state INSIDE the snapshot —
+        // artifact_changed is derived by content (snapshot vs the current
+        // observation), never by comparing clocks. Guarded: fresh dbs get
+        // the column from CREATE TABLE, v10 dbs get the ALTER.
+        const bcols11 = new Set(
+          this.db.prepare("PRAGMA table_info(support_baselines)").all().map((c: any) => c.name)
+        );
+        if (bcols11.has("superseded_at") && !bcols11.has("artifacts_digest")) {
+          this.db.exec(
+            "ALTER TABLE support_baselines ADD COLUMN artifacts_digest TEXT"
+          );
+        }
       }
 
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -1535,7 +1571,8 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
+                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                artifacts_digest
          FROM support_baselines WHERE decision_id = ?
          ORDER BY support_id, confirmed_at, edge_key`
       )
@@ -1548,7 +1585,8 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
+                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                artifacts_digest
          FROM support_baselines WHERE decision_id = ? AND superseded_at IS NULL
          ORDER BY support_id, confirmed_at, edge_key`
       )
@@ -1570,7 +1608,8 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
+                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                artifacts_digest
          FROM support_baselines
          WHERE decision_id = ? AND support_id = ? AND edge_key = ? AND superseded_at IS NULL`
       )
@@ -1582,7 +1621,8 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at
+                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                artifacts_digest
          FROM support_baselines
          ORDER BY decision_id, support_id, confirmed_at, edge_key`
       )
@@ -1621,9 +1661,11 @@ export class KnowledgeDB {
       .prepare(
         `INSERT INTO support_baselines
            (decision_id, support_id, edge_key, claim_digest, status_digest,
-            edge_digest, format_version, confirmed_at, confirmed_by, superseded_at)
+            edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+            artifacts_digest)
          VALUES (@decision_id, @support_id, @edge_key, @claim_digest, @status_digest,
-                 @edge_digest, @format_version, @confirmed_at, @confirmed_by, @superseded_at)
+                 @edge_digest, @format_version, @confirmed_at, @confirmed_by, @superseded_at,
+                 @artifacts_digest)
          ON CONFLICT(decision_id, support_id, edge_key) DO UPDATE SET
            claim_digest = excluded.claim_digest,
            status_digest = excluded.status_digest,
@@ -1631,12 +1673,17 @@ export class KnowledgeDB {
            format_version = excluded.format_version,
            confirmed_at = excluded.confirmed_at,
            confirmed_by = excluded.confirmed_by,
+           -- 2.1.3 F2: the confirmation re-read the artifacts, the stored
+           -- state moves to what the agent has just seen (or stays NULL when
+           -- none were observed).
+           artifacts_digest = excluded.artifacts_digest,
            -- a fresh confirmation of the same pair un-supersedes it (F7)
            superseded_at = NULL`
       )
       .run({
         ...(row as unknown as Record<string, unknown>),
         superseded_at: row.superseded_at ?? null,
+        artifacts_digest: row.artifacts_digest ?? null,
       });
   }
 
@@ -1797,6 +1844,71 @@ export class KnowledgeDB {
         )
         .all(decisionId) as Array<{ support_id: string }>
     ).map((r) => r.support_id);
+  }
+
+  // ---- 2.1.3 F2: node artifacts ----
+  // Rows are written ONLY by the explicit check_artifacts; reads (including
+  // the support check) never hash files.
+
+  hasNodeArtifactsTable(): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_artifacts'"
+        )
+        .get() !== undefined
+    );
+  }
+
+  /** All observed artifacts of one node, deterministic (kind, ref) order. */
+  getNodeArtifacts(nodeId: string): NodeArtifactRow[] {
+    if (!this.hasNodeArtifactsTable()) return [];
+    return this.db
+      .prepare(
+        `SELECT node_id, kind, ref, digest, prev_digest, size_bytes,
+                checked_at, changed_at, checked_by
+         FROM node_artifacts WHERE node_id = ?
+         ORDER BY kind, ref`
+      )
+      .all(nodeId) as NodeArtifactRow[];
+  }
+
+  /** Insert or replace one observation row. The caller computes digest /
+   * prev_digest / changed_at (the compare logic lives in check_artifacts). */
+  upsertNodeArtifact(row: NodeArtifactRow): void {
+    if (!this.hasNodeArtifactsTable()) return;
+    this.db
+      .prepare(
+        `INSERT INTO node_artifacts
+           (node_id, kind, ref, digest, prev_digest, size_bytes, checked_at, changed_at, checked_by)
+         VALUES (@node_id, @kind, @ref, @digest, @prev_digest, @size_bytes,
+                 @checked_at, @changed_at, @checked_by)
+         ON CONFLICT(node_id, kind, ref) DO UPDATE SET
+           digest = excluded.digest,
+           prev_digest = excluded.prev_digest,
+           size_bytes = excluded.size_bytes,
+           checked_at = excluded.checked_at,
+           changed_at = excluded.changed_at,
+           checked_by = excluded.checked_by`
+      )
+      .run({
+        node_id: row.node_id,
+        kind: row.kind,
+        ref: row.ref,
+        digest: row.digest ?? null,
+        prev_digest: row.prev_digest ?? null,
+        size_bytes: row.size_bytes ?? null,
+        checked_at: row.checked_at,
+        changed_at: row.changed_at ?? null,
+        checked_by: row.checked_by,
+      });
+  }
+
+  countNodeArtifacts(): number {
+    if (!this.hasNodeArtifactsTable()) return 0;
+    return Number(
+      (this.db.prepare("SELECT COUNT(*) AS n FROM node_artifacts").get() as { n: number }).n
+    );
   }
 
   /**

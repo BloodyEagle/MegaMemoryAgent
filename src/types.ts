@@ -528,6 +528,12 @@ export interface ProvenanceWeakLink {
      */
     | "support_changed"
     /**
+     * 2.1.3 F2: the observed state of a support's external artifact (file /
+     * git blob) diverges from the one saved in the snapshot. Not a
+     * support_changed — the summary may be untouched, the source moved.
+     */
+    | "artifact_changed"
+    /**
      * Plan 4 v8 §3: no snapshot, or live supports the snapshot does not cover
      * — `unknown`/`incomplete` are not cleanliness and must not be silent.
      */
@@ -587,6 +593,62 @@ export interface SupportBaselineRow {
    * A fresh confirmation of the same pair clears the flag again.
    */
   superseded_at?: string | null;
+  /**
+   * 2.1.3 F2: sha256 over the support's observed artifacts sorted by
+   * (kind, ref, digest), taken at the confirmation moment. NULL = no
+   * artifacts were observed when the pair was confirmed — honestly no
+   * signal, never a false "changed".
+   */
+  artifacts_digest?: string | null;
+}
+
+// ---- 2.1.3 F2: node artifacts ----
+
+/** One observed external artifact of a node (node_artifacts row). */
+export interface NodeArtifactRow {
+  node_id: string;
+  /** 'file' (path) | 'git_blob' (<rev>:<path>). URLs are out of scope. */
+  kind: "file" | "git_blob";
+  ref: string;
+  /** sha256 of the content; null = the file was missing at the last check. */
+  digest: string | null;
+  /** Previous observed digest — warning text only ("was → became"). */
+  prev_digest: string | null;
+  size_bytes: number | null;
+  /** Last check time (moves on every check, even a matching one). */
+  checked_at: string;
+  /** When a divergence was last noticed — warning text only. */
+  changed_at: string | null;
+  /** 'agent' | 'cli'. */
+  checked_by: string;
+}
+
+/** check_artifacts input (2.1.3 F2). */
+export interface CheckArtifactsInput {
+  node_ids: string[];
+  /** Cap on checked (node, ref) pairs; more => truncated: true. Default 50. */
+  max_files?: number;
+  /** Base dir for relative refs and the git working tree (default cwd). */
+  cwd?: string;
+}
+
+/** One missing ref in the check_artifacts answer. */
+export interface MissingArtifact {
+  node_id: string;
+  ref: string;
+  kind: string;
+  digest: null;
+  missing: true;
+}
+
+export interface CheckArtifactsOutput {
+  /** Number of (node, ref) pairs actually hashed. */
+  checked: number;
+  /** Observed divergences: old digest → new digest. */
+  changed: Array<{ node_id: string; ref: string; old: string | null; new: string | null }>;
+  missing: MissingArtifact[];
+  /** true when more (node, ref) pairs were waiting than max_files allowed. */
+  truncated: boolean;
 }
 
 /** Why a confirmed support no longer matches (plan 4 v8 §4). */
@@ -661,6 +723,23 @@ export interface SupportPairChange {
   reasons: SupportChangeReason[];
   /** The confirmation time (baseline_at), not the edit time — the db keeps no edit log. */
   since: string;
+  /**
+   * 2.1.3 F2: the observed artifact state of the support diverges from the
+   * one saved in the snapshot. NOT a support change: the summary may be
+   * untouched, the source moved. True also when content reasons fired.
+   */
+  artifact_changed?: boolean;
+  /** ≤3 observed artifact changes behind the flag — warning text only. */
+  artifacts?: SupportArtifactChange[];
+}
+
+/** 2.1.3 F2: one observed artifact divergence, digests are 12-char previews. */
+export interface SupportArtifactChange {
+  ref: string;
+  kind: string;
+  prev_digest: string | null;
+  digest: string | null;
+  changed_at: string;
 }
 
 /**
@@ -674,6 +753,13 @@ export interface SupportCheckView {
   changed?: SupportPairChange[];
   /** Honest total when the changed list was capped for the response. */
   changed_count?: number;
+  /**
+   * 2.1.3 F2: honest total of pairs whose observed artifacts diverge from
+   * the snapshot — full-set, counted before the response cap. Lets the
+   * weak-links layer size the support_changed record without the artifact
+   * only pairs.
+   */
+  artifact_changed_count?: number;
   /** Live supports the snapshot does not cover (never confirmed). */
   unknown?: string[];
   /** Honest total when the unknown list was capped for the response. */

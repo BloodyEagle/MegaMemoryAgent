@@ -48,6 +48,7 @@ import {
   journalSnapshotWrite,
   statusDigestOf,
 } from "./support-baselines.js";
+import { artifactsDigestOf } from "./artifacts.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
   const errorMsg = err instanceof Error ? err.message : String(err);
@@ -842,6 +843,8 @@ export async function createConcept(
           format_version: BASELINE_FORMAT_VERSION,
           confirmed_at: now,
           confirmed_by: "agent",
+          // 2.1.3 F2: the confirmed artifacts state at the moment of the call.
+          artifacts_digest: artifactsDigestOf(db.getNodeArtifacts(e.other_id)),
         };
         // 2.1.3 F1: the journal is written where the snapshot is written —
         // this carve-out is a first confirmation, so it opens the chain with

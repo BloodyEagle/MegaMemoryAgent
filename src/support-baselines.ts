@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import type { KnowledgeDB } from "./db.js";
+import { artifactsDigestOf } from "./artifacts.js";
 import type {
   ConfirmSupportsInput,
   ConfirmSupportsOutput,
   EdgeRow,
   ProvenanceHistoryOutput,
+  SupportArtifactChange,
   SupportBaselineRow,
   SupportChangeReason,
   SupportCheckView,
@@ -204,6 +206,9 @@ export function computeSupportCheck(
   // checks; the returned lists are capped after the loop.
   const unknownSet = new Set<string>();
   const changedList: SupportPairChange[] = [];
+  // 2.1.3 F2: pairs whose observed artifacts diverge from the snapshot — a
+  // full-set counter (the changed list is capped for the response).
+  let artifactChangedTotal = 0;
   let exhausted = false;
 
   // The decision's own wording: the confirmation belongs to the wording the
@@ -294,8 +299,49 @@ export function computeSupportCheck(
           reasons.push("status");
         }
         if (edgeDigestOf(edge.description) !== anchor.edge_digest) reasons.push("rationale");
-        if (reasons.length > 0) {
-          changedList.push({ support: edge.other_id, reasons, since: anchor.confirmed_at });
+        // 2.1.3 F2: the artifact verdict is derived BY CONTENT — the snapshot
+        // saved the combined digest of the support's observed artifacts; the
+        // current observation must still match it. NULL on either side means
+        // "nothing observed": honestly no signal, never a false change. No
+        // file is read here — the rows are the last explicit check_artifacts
+        // observation. The extra rows are materialized work: they pay the
+        // budget too.
+        let artifactChanged = false;
+        let artifactPreviews: SupportArtifactChange[] = [];
+        if (anchor.artifacts_digest !== null && anchor.artifacts_digest !== undefined) {
+          const artRows = db.getNodeArtifacts(edge.other_id);
+          if (!budget.consume(96 * artRows.length)) {
+            exhausted = true;
+            break;
+          }
+          const currentArtifacts = artifactsDigestOf(artRows);
+          if (currentArtifacts !== null && currentArtifacts !== anchor.artifacts_digest) {
+            artifactChanged = true;
+            artifactChangedTotal += 1;
+            // ≤3 newest divergences — warning text, not a report.
+            artifactPreviews = artRows
+              .filter((r) => r.changed_at !== null)
+              .sort((a, b) => (a.changed_at! < b.changed_at! ? 1 : -1))
+              .slice(0, 3)
+              .map((r) => ({
+                ref: r.ref,
+                kind: r.kind,
+                prev_digest: r.prev_digest?.slice(0, 12) ?? null,
+                digest: r.digest?.slice(0, 12) ?? null,
+                changed_at: r.changed_at!,
+              }));
+          }
+        }
+        // An artifact-only divergence is NOT a support_changed: the summary
+        // may be untouched while the source moved. It still flips the state
+        // to `changed` — the confirmed picture no longer matches reality.
+        if (reasons.length > 0 || artifactChanged) {
+          changedList.push({
+            support: edge.other_id,
+            reasons,
+            since: anchor.confirmed_at,
+            ...(artifactChanged ? { artifact_changed: true, artifacts: artifactPreviews } : {}),
+          });
         }
       } else {
         // The support node is gone while the edge lives — the pair diverged.
@@ -359,6 +405,9 @@ export function computeSupportCheck(
     ...(changedList.length > VIEW_LIST_CAP
       ? { changed_count: changedList.length }
       : {}),
+    // 2.1.3 F2: honest total for the weak-links layer (it subtracts this from
+    // changed_count to size the support_changed record).
+    ...(artifactChangedTotal > 0 ? { artifact_changed_count: artifactChangedTotal } : {}),
     unknown: [...unknownSet].slice(0, VIEW_LIST_CAP).sort(compareIds),
     ...(unknownSet.size > VIEW_LIST_CAP ? { unknown_count: unknownSet.size } : {}),
     incomplete: exhausted,
@@ -584,6 +633,10 @@ export function confirmSupports(
           format_version: BASELINE_FORMAT_VERSION,
           confirmed_at: now,
           confirmed_by: "agent",
+          // 2.1.3 F2: the confirmed artifacts state — what the agent saw
+          // (the rows are the last explicit check_artifacts observation).
+          // NULL when nothing was observed: no signal until a check exists.
+          artifacts_digest: artifactsDigestOf(db.getNodeArtifacts(supportId)),
         },
       });
     }

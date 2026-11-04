@@ -717,6 +717,9 @@ export class MergeEngine {
         confirmed_at: row.confirmed_at,
         confirmed_by: "import",
         superseded_at: row.superseded_at ?? null,
+        // 2.1.3 F2: the confirmed artifacts state travels verbatim — a remap
+        // must not re-observe the artifacts (the import never checks files).
+        artifacts_digest: row.artifacts_digest ?? null,
       });
       // 2.1.3 F1: the journal is written where the snapshot is written — the
       // merge carry journals the carried version as an import entry. When the
