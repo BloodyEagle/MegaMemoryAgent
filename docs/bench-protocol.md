@@ -59,3 +59,24 @@ the human judgement of correctness — but it is manual, slow, and does not fit
 CI. Run `bench` often (it is cheap and mechanical), run the A/B protocol when
 you need proof the memory actually helps a working agent, not just a reading
 list.
+
+## How to read the numbers
+
+- **`hit_rate` vs `hit_rate@1`.** `hit_rate` counts a hit when any expected node
+  surfaced anywhere in the top-10; `hit_rate@1` counts only when the best expected
+  node ranked **first** (the `rank` column shows the position). `hit_rate@1 ≤ hit_rate`
+  always — a rank-6 "hit" is a much weaker answer than a rank-1 one.
+- **`r(files)` vs `r(files-top)`.** `r(files)` sums **all** `file_refs` of every found
+  node — tens of thousands of tokens and ×50 ratios that no live agent would ever pay,
+  because a live agent reads two or three files. Run with `--files-top 3` and read
+  `r(files-top)`: the baseline over the first three unique files in the output order.
+  `r(files-top) ≤ r(files)` always.
+- **`refs: resolved N/M`** — how many unique `file_refs` pointed at existing files.
+  Line suffixes (`src/db.ts:9`) resolve to the same file; a ref is tried against
+  `ref_roots` (per question), `--ref-root PATH` (repeatable), the git root, then the
+  cwd — first hit wins. `missing:N` in the notes means the roots don't match the refs.
+- **`unknown_supports`** — found decisions with no confirmed support snapshot: a
+  to-confirm queue, not an error. `stale_hits` is the same for decisions whose
+  confirmed support has drifted.
+- **`cold-start`** — the first question paid the embedding model load; the summary
+  prints the warmup time next to the median without it, neither number is hidden.

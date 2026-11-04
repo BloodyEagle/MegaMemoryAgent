@@ -106,3 +106,21 @@ describe("документация про bench (2.1.5 F5)", () => {
     expect(doc).toContain("10 questions");
   });
 });
+
+describe("документация про bench (2.1.6 F7)", () => {
+  it("--help содержит --ref-root и --files-top с описанием hit_rate@1", () => {
+    const help = plain(buildHelp("2.1.6"));
+    expect(help).toContain("--ref-root");
+    expect(help).toContain("--files-top");
+    expect(help).toContain("hit_rate@1");
+  });
+
+  it("оба README объясняют честную цифру --files-top 3", () => {
+    const en = fs.readFileSync(path.join(PROJECT_ROOT, "README.md"), "utf-8");
+    const ru = fs.readFileSync(path.join(PROJECT_ROOT, "README.ru.md"), "utf-8");
+    expect(en).toContain("--files-top 3");
+    expect(en).toContain("### How to read the numbers");
+    expect(ru).toContain("--files-top 3");
+    expect(ru).toContain("### Как читать цифры");
+  });
+});

@@ -128,6 +128,10 @@ graph saves orientation time — three baselines, one flag:
 \`ratio = baseline_tokens / graph_tokens\`; read it only together with \`hit_rate\` — a cheap
 but wrong answer is not savings. Questions with fewer tokens than the baseline
 (\`ratio < 1\`) are printed, not hidden.
+
+For an honest number run with \`--files-top 3\` — a live agent reads two or three files, not
+every \`file_refs\` of every found node — and read \`hit_rate@1\` (expected node ranked first)
+next to \`hit_rate\` (anywhere in the top-10): a rank-6 hit is a much weaker answer.
 `;
 
 /**

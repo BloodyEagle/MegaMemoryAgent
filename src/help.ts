@@ -26,7 +26,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("doctor")}          Health check of the current database ${pc.dim("(exit 1 on problems; --db PATH)")}
   ${pc.cyan("eval")}            Measure search recall@k on the eval set ${pc.dim("(fixtures/eval.jsonl; --db PATH)")}
   ${pc.cyan("guide")}           Print the agent onboarding text ${pc.dim("(the same constant install writes to AGENTS.md)")}
-  ${pc.cyan("bench")}           Measure orientation savings: graph vs baseline in tokens ${pc.dim("(--baseline files|te|both; --db PATH)")}
+  ${pc.cyan("bench")}           Measure orientation savings: graph vs baseline in tokens ${pc.dim("(--baseline files|te|both; hit_rate@1 next to hit_rate; --db PATH)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -40,6 +40,8 @@ ${pc.bold("Options:")}
   ${pc.cyan("--baseline")}      bench: what the graph is measured against ${pc.dim("(files | te | both; default files)")}
   ${pc.cyan("--te-cmd")} ${pc.dim("CMD")}    bench: external structural tool for te/both, {query} is substituted
   ${pc.cyan("--file-limit")} ${pc.dim("KB")} bench: files over the limit are counted by size ${pc.dim("(default 200)")}
+  ${pc.cyan("--ref-root")} ${pc.dim("PATH")}  bench: extra root for relative file_refs, repeatable ${pc.dim("(first hit wins; try git root, then cwd)")}
+  ${pc.cyan("--files-top")} ${pc.dim("N")}   bench: files baseline over the first N unique files in output order ${pc.dim("(default 0 = all; 3 is the honest live-agent number)")}
   ${pc.cyan("--db")} ${pc.dim("PATH")}       Path to knowledge.db for every command that opens the
                 database ${pc.dim("(sources: --db, MEGAMEMORY_DB_PATH, ./.megamemory/knowledge.db)")}
   ${pc.cyan("--help, -h")}      Show this help

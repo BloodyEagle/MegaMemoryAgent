@@ -150,6 +150,35 @@ caveat the command itself prints: **bench measures the cost of orientation, not 
 quality of the answer — fewer tokens with worse quality is not a saving.** For a live
 agent A/B comparison, see [docs/bench-protocol.md](docs/bench-protocol.md).
 
+### How to read the numbers
+
+- **`hit_rate` vs `hit_rate@1`.** `hit_rate` counts a question as a hit when any expected
+  node surfaced anywhere in the top-10; `hit_rate@1` counts only when the best expected
+  node ranked **first** (the `rank` column shows that position). `hit_rate@1 ≤ hit_rate`
+  always — a rank-6 "hit" is a much weaker answer than a rank-1 one, and reading only
+  the top-10 number overstates the graph.
+- **`r(files)` vs `r(files-top)`.** `r(files)` compares the graph answer against **all**
+  `file_refs` of every found node — that reaches tens of thousands of tokens and
+  produces ×50 ratios no live agent would ever pay, because a live agent reads two or
+  three files, not seventy. Run with `--files-top 3` and read `r(files-top)`: the
+  baseline over the first three unique files in the output order (the order of found
+  nodes, not the alphabet). `r(files-top) ≤ r(files)` always; when `N` exceeds the
+  number of unique files they coincide.
+- **`refs: resolved N/M (roots: …)`** — how many of the `M` unique `file_refs` pointed at
+  files that actually exist. Refs with line suffixes (`src/db.ts:9`, `src/db.ts:605-643`)
+  resolve to the same file as `src/db.ts`; a ref is tried against the question's
+  `ref_roots`, then `--ref-root PATH` (repeatable), then the git root, then the cwd —
+  the first hit wins. A high `missing:N` in the notes means the roots don't match how
+  the refs were written; add a `--ref-root` instead of ignoring the misses.
+- **`unknown_supports`** — found **decisions** with no confirmed support snapshot: the
+  graph points at a decision, but nobody has verified yet that its justification still
+  holds (per-question `unk:N` note, ids in the summary). It is a to-confirm queue, not
+  an error; `stale_hits` (`st:N`) is the same for decisions whose confirmed support has
+  since drifted.
+- **`cold-start`** — the first question paid the embedding model load (its time is far
+  above the median of the rest). The summary prints `warmup: …s (model load, excluded
+  from median time)` next to the median without it; neither number is hidden.
+
 ---
 
 ## Install

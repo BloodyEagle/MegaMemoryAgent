@@ -41,6 +41,8 @@ export interface BenchQuestion {
   te_cmd?: string;
   /** Pre-recorded te baseline: used as-is, the external command is not run. */
   baseline_te_tokens?: number;
+  /** Extra roots for relative file_refs (plan 2.1.6 F3); overrides the run-level --ref-root. */
+  ref_roots?: string[];
 }
 
 /** Parse the questions.jsonl format. Throws on a malformed line. */
@@ -77,6 +79,9 @@ export function loadQuestions(text: string): BenchQuestion[] {
         typeof obj.baseline_te_tokens === "number" && obj.baseline_te_tokens >= 0
           ? obj.baseline_te_tokens
           : undefined,
+      ref_roots: Array.isArray(obj.ref_roots)
+        ? (obj.ref_roots as unknown[]).filter((r): r is string => typeof r === "string" && r !== "")
+        : undefined,
     });
   }
   return questions;
@@ -96,11 +101,20 @@ export interface BenchOptions {
   fileLimitBytes?: number;
   /** Root for resolving relative file_refs (default: process.cwd()). */
   root?: string;
+  /** Extra roots for relative file_refs (plan 2.1.6 F3), repeatable, in order. Tried before the cwd. */
+  refRoots?: string[];
+  /** Files baseline over the first N unique files in output order (plan 2.1.6 F4); 0 = all, the 2.1.5 behavior. */
+  filesTopN?: number;
   /**
    * Injectable te runner for tests — counts invocations, skips the shell.
    * Default: child_process.exec with a 60 s cap per command.
    */
   runTeCommand?: (cmd: string) => Promise<TeRunResult>;
+  /**
+   * Injectable git root lookup (plan 2.1.6 F3). Default: `git rev-parse --show-toplevel`
+   * run from the cwd; null when git is absent or the cwd is not a repository.
+   */
+  resolveGitRoot?: (cwd: string) => string | null | Promise<string | null>;
 }
 
 export interface FileStat {
@@ -118,18 +132,31 @@ export interface QuestionResult {
   lang?: string;
   graph_tokens: number;
   baseline_files_tokens: number | null;
+  /** baseline over the first filesTopN unique files in output order (null when filesTopN = 0) */
+  baseline_files_top_tokens: number | null;
   baseline_te_tokens: number | null;
   ratio_files: number | null;
+  ratio_files_top: number | null;
   ratio_te: number | null;
   /** any file over the limit in this question (counted by size) */
   estimated: boolean;
   missing_files: number;
+  /** refs of this question carrying a :line or :line-line suffix (plan 2.1.6 F2) */
+  line_refs: number;
   /** null = the question carries no expect_nodes */
   hit: boolean | null;
+  /** 1-based position of the best (first) expected node in the output; null when absent or missed (plan 2.1.6 F1) */
+  expected_rank: number | null;
+  /** ids in the output order, up to the top_k */
+  top_ids: string[];
   /** found nodes whose support_check.state = changed */
   stale_hits: number;
+  /** ids of those found nodes (plan 2.1.6 F5) */
+  stale_ids: string[];
   /** found decisions with no confirmed snapshot (none at all or never checked) */
   unknown_supports: number;
+  /** ids of those decisions (plan 2.1.6 F5) */
+  unknown_support_ids: string[];
   time_to_graph_ms: number;
   time_to_baseline_ms: number | null;
   time_to_te_ms: number | null;
@@ -142,10 +169,24 @@ export interface ModeSummary {
   baseline_tokens: number;
   /** median over questions with a defined ratio */
   median_ratio: number | null;
+  /** files mode only: totals and median for the --files-top baseline (plan 2.1.6 F4) */
+  baseline_top_tokens?: number;
+  median_ratio_top?: number | null;
   /** questions where the graph lost: ratio < 1 */
   lost: number;
   /** questions with a defined ratio (0-graph-token questions excluded) */
   compared: number;
+}
+
+/** How a relative file_ref was rooted this run (plan 2.1.6 F3). */
+export type RefRootLabel = "question" | "--ref-root" | "git-root" | "cwd" | "absolute";
+
+export interface RefsSummary {
+  /** unique refs seen this run */
+  total: number;
+  resolved: number;
+  /** resolved refs per root label, first hit wins */
+  roots: Partial<Record<RefRootLabel, number>>;
 }
 
 export interface LangSummary {
@@ -160,12 +201,27 @@ export interface BenchReport {
   questions: QuestionResult[];
   files: ModeSummary | null;
   te: ModeSummary | null;
+  /** the --files-top N the run was made with (0 = off) */
+  files_top_n: number;
+  /** unique file_refs resolution stats (plan 2.1.6 F3); null in te-only mode */
+  refs: RefsSummary | null;
   /** share of questions where an expect_node surfaced in the top-10 */
   hit_rate: number | null;
+  /** share where the best expected node ranked first (plan 2.1.6 F1); ≤ hit_rate */
+  hit_rate_at_1: number | null;
   hits: number;
+  hits_at_1: number;
   expected_total: number;
   stale_hits: number;
+  /** union of per-question stale ids */
+  stale_ids: string[];
   unknown_supports: number;
+  /** union of per-question unknown-support ids */
+  unknown_support_ids: string[];
+  /** true when the first question paid a model load (plan 2.1.6 F6) */
+  cold_start: boolean;
+  warmup_ms: number | null;
+  median_time_wo_warmup_ms: number | null;
   per_lang: LangSummary[];
   disclaimer: string;
 }
@@ -177,6 +233,45 @@ function median(values: number[]): number | null {
   return sorted.length % 2 === 1
     ? sorted[mid]
     : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Split a `path:line` / `path:line-line` suffix off a file ref (plan 2.1.6 F2).
+ * The suffix is cut only when the tail after the last `:` is digits or
+ * digits-digits. A drive-letter colon (`C:\...`, `C:name`) is never cut —
+ * it sits at index 1 — and a colon inside a file name (`a:b.ts`) is safe
+ * because the tail after it is not pure digits. The empty suffix (`src/db.ts:`)
+ * is not a suffix either: the ref stays whole and resolves as missing.
+ */
+export function splitRefSuffix(ref: string): { path: string; suffix: string } {
+  const i = ref.lastIndexOf(":");
+  if (i <= 0 || i === 1) return { path: ref, suffix: "" };
+  const tail = ref.slice(i + 1);
+  if (!/^\d+(?:-\d+)?$/.test(tail)) return { path: ref, suffix: "" };
+  return { path: ref.slice(0, i), suffix: tail };
+}
+
+/**
+ * Cold start of a run (plan 2.1.6 F6): the first question paid a model load.
+ * The first time is never silently dropped — the report prints the warmup
+ * duration next to the median of the remaining questions.
+ */
+export interface ColdStartInfo {
+  cold: boolean;
+  warmupMs: number | null;
+  medianWithoutWarmupMs: number | null;
+}
+
+export function detectColdStart(times: number[]): ColdStartInfo {
+  if (times.length < 2) return { cold: false, warmupMs: null, medianWithoutWarmupMs: null };
+  const [first, ...rest] = times;
+  const restMedian = median(rest);
+  const cold = restMedian !== null && first > 5 * restMedian;
+  return {
+    cold,
+    warmupMs: cold ? first : null,
+    medianWithoutWarmupMs: cold ? restMedian : null,
+  };
 }
 
 function ratio(baseline: number, graph: number): number | null {
@@ -215,6 +310,20 @@ async function defaultRunTeCommand(cmd: string): Promise<TeRunResult> {
         (e.killed ? " (killed by the 60 s timeout)" : "") +
         (tail ? `\n${tail}` : `\n${e.message}`)
     );
+  }
+}
+
+/** F3: git root of the cwd, or null when git is absent or the cwd is not a repository. */
+async function defaultResolveGitRoot(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execAsync("git rev-parse --show-toplevel", {
+      cwd,
+      timeout: 5_000,
+    });
+    const p = stdout.trim();
+    return p !== "" ? p : null;
+  } catch {
+    return null;
   }
 }
 
@@ -285,6 +394,14 @@ export async function runBench(
   const root = opts.root ?? process.cwd();
   const runTe = opts.runTeCommand ?? defaultRunTeCommand;
   const mode = opts.baseline;
+  const filesTopN = opts.filesTopN ?? 0;
+
+  // F3: the git root is one lookup per run, not per question.
+  const resolveGitRoot = opts.resolveGitRoot ?? defaultResolveGitRoot;
+  const gitRoot = await resolveGitRoot(root);
+  // F3: ref → resolved absolute path, cached for the whole run so the same
+  // ref is not re-statted 14 times. First root to hit wins, deterministically.
+  const refCache = new Map<string, { abs: string | null; label: RefRootLabel }>();
 
   const results: QuestionResult[] = [];
 
@@ -296,27 +413,105 @@ export async function runBench(
     const graphTokens = r.meta?.tokens_estimated ?? 0;
     const matches = r.compact ?? [];
     const ids = matches.map((m) => m.id);
+    // F1: 1-based position of the best expected node in the output order
+    const expectedRank = (() => {
+      if (!q.expect_nodes || q.expect_nodes.length === 0) return null;
+      let best: number | null = null;
+      for (const n of q.expect_nodes) {
+        const at = ids.indexOf(n);
+        if (at !== -1 && (best === null || at + 1 < best)) best = at + 1;
+      }
+      return best;
+    })();
 
     // 2a. files baseline: the files you would have read instead
     let baselineFiles: number | null = null;
+    let baselineFilesTop: number | null = null;
     let timeToBaselineMs: number | null = null;
     let estimated = false;
     let missing = 0;
+    let lineRefs = 0;
     if (mode === "files" || mode === "both") {
+      // missing refs contribute 0, not null — the ratio stays defined (lost), as in 2.1.5
+      baselineFiles = 0;
       const t1 = performance.now();
-      const refs = new Set<string>();
+      const chain: { label: RefRootLabel; dir: string }[] = [];
+      for (const dir of q.ref_roots ?? []) chain.push({ label: "question", dir });
+      for (const dir of opts.refRoots ?? []) chain.push({ label: "--ref-root", dir });
+      if (gitRoot) chain.push({ label: "git-root", dir: gitRoot });
+      chain.push({ label: "cwd", dir: root });
+
+      // unique refs in output order: nodes in top_ids order, refs as stored
+      const refOrder: string[] = [];
+      const refSeen = new Set<string>();
       for (const m of matches) {
-        for (const ref of m.file_refs ?? []) refs.add(ref);
+        for (const ref of m.file_refs ?? []) {
+          if (!refSeen.has(ref)) {
+            refSeen.add(ref);
+            refOrder.push(ref);
+          }
+        }
       }
-      let tokens = 0;
-      for (const ref of refs) {
-        const stat = countFile(ref, path.resolve(root, ref), fileLimitBytes);
-        if (stat.missing) missing += 1;
+
+      // F2: split the :line suffix, then F3: resolve against the root chain
+      const resolved: { ref: string; clean: string; abs: string | null }[] = [];
+      for (const ref of refOrder) {
+        const { path: clean, suffix } = splitRefSuffix(ref);
+        if (suffix) lineRefs += 1;
+        const cached = refCache.get(ref);
+        if (cached) {
+          resolved.push({ ref, clean, abs: cached.abs });
+          continue;
+        }
+        let abs: string | null = null;
+        for (const rootEntry of chain) {
+          const candidate = path.resolve(rootEntry.dir, clean);
+          try {
+            fs.statSync(candidate);
+            abs = candidate;
+            refCache.set(ref, { abs, label: rootEntry.label });
+            break;
+          } catch {
+            // try the next root
+          }
+        }
+        if (abs === null) refCache.set(ref, { abs: null, label: "cwd" });
+        resolved.push({ ref, clean, abs });
+      }
+
+      // unique files in output order (missing refs keep their raw ref as key)
+      const fileKeys = new Set<string>();
+      const orderedFiles: { tokens: number }[] = [];
+      for (const res of resolved) {
+        const key = res.abs ?? `missing:${res.ref}`;
+        if (fileKeys.has(key)) continue;
+        fileKeys.add(key);
+        if (res.abs === null) {
+          missing += 1;
+          continue;
+        }
+        const stat = countFile(res.clean, res.abs, fileLimitBytes);
+        if (stat.missing) {
+          missing += 1;
+          continue;
+        }
         if (stat.estimated) estimated = true;
-        tokens += stat.tokens;
+        baselineFiles = (baselineFiles ?? 0) + stat.tokens;
+        orderedFiles.push({ tokens: stat.tokens });
+      }
+
+      // F4: the top-of-output subset — what a live agent would actually read
+      if (filesTopN > 0) {
+        let taken = 0;
+        let topTokens = 0;
+        for (const f of orderedFiles) {
+          if (taken >= filesTopN) break;
+          topTokens += f.tokens;
+          taken += 1;
+        }
+        baselineFilesTop = topTokens;
       }
       timeToBaselineMs = performance.now() - t1;
-      baselineFiles = tokens;
     }
 
     // 2b. te baseline: an external structural tool, or the preset from the file
@@ -351,6 +546,8 @@ export async function runBench(
     // 3. provenance bookkeeping over the found nodes
     let staleHits = 0;
     let unknownSupports = 0;
+    const staleIds: string[] = [];
+    const unknownIds: string[] = [];
     for (const id of ids) {
       const node = db.getNode(id);
       if (!node) continue;
@@ -359,9 +556,13 @@ export async function runBench(
         id,
         new CheckBudget(DEFAULT_MAX_CHECK_EDGES, DEFAULT_MAX_CHECK_BYTES)
       );
-      if (check?.state === "changed") staleHits += 1;
+      if (check?.state === "changed") {
+        staleHits += 1;
+        staleIds.push(id);
+      }
       if (node.kind === "decision" && (check === null || check.state === "unknown")) {
         unknownSupports += 1;
+        unknownIds.push(id);
       }
     }
 
@@ -371,17 +572,25 @@ export async function runBench(
       lang: q.lang,
       graph_tokens: graphTokens,
       baseline_files_tokens: baselineFiles,
+      baseline_files_top_tokens: baselineFilesTop,
       baseline_te_tokens: baselineTe,
       ratio_files: baselineFiles !== null ? ratio(baselineFiles, graphTokens) : null,
+      ratio_files_top:
+        baselineFilesTop !== null ? ratio(baselineFilesTop, graphTokens) : null,
       ratio_te: baselineTe !== null ? ratio(baselineTe, graphTokens) : null,
       estimated,
       missing_files: missing,
+      line_refs: lineRefs,
       hit:
         q.expect_nodes && q.expect_nodes.length > 0
           ? q.expect_nodes.some((n) => ids.includes(n))
           : null,
+      expected_rank: expectedRank,
+      top_ids: ids,
       stale_hits: staleHits,
+      stale_ids: staleIds,
       unknown_supports: unknownSupports,
+      unknown_support_ids: unknownIds,
       time_to_graph_ms: timeToGraphMs,
       time_to_baseline_ms: timeToBaselineMs,
       time_to_te_ms: timeToTeMs,
@@ -391,6 +600,24 @@ export async function runBench(
 
   const withExpect = results.filter((q) => q.hit !== null);
   const hits = withExpect.filter((q) => q.hit === true).length;
+  const hitsAt1 = withExpect.filter((q) => q.expected_rank === 1).length;
+
+  // F3: refs resolution stats over the whole run
+  let refsSummary: RefsSummary | null = null;
+  if (mode === "files" || mode === "both") {
+    const roots: Partial<Record<RefRootLabel, number>> = {};
+    let resolvedCount = 0;
+    for (const entry of refCache.values()) {
+      if (entry.abs !== null) {
+        resolvedCount += 1;
+        roots[entry.label] = (roots[entry.label] ?? 0) + 1;
+      }
+    }
+    refsSummary = { total: refCache.size, resolved: resolvedCount, roots };
+  }
+
+  // F6: the first question paying a model load is reported, never dropped silently
+  const cold = detectColdStart(results.map((q) => q.time_to_graph_ms));
 
   // Per-language breakdown: medians per mode so one weak structural graph in
   // one language does not bury the picture for the rest of the repo.
@@ -412,22 +639,46 @@ export async function runBench(
     ),
   }));
 
+  const filesSummary =
+    mode === "files" || mode === "both"
+      ? summarize(results, (q) => ({ baseline: q.baseline_files_tokens, ratio: q.ratio_files }))
+      : null;
+  if (filesSummary && filesTopN > 0) {
+    const tops = results
+      .map((q) => q.ratio_files_top)
+      .filter((v): v is number => v !== null);
+    filesSummary.baseline_top_tokens = results.reduce(
+      (s, q) => s + (q.baseline_files_top_tokens ?? 0),
+      0
+    );
+    filesSummary.median_ratio_top = median(tops);
+  }
+
+  const staleIdsUnion = [...new Set(results.flatMap((q) => q.stale_ids))];
+  const unknownIdsUnion = [...new Set(results.flatMap((q) => q.unknown_support_ids))];
+
   return {
     mode,
     questions: results,
-    files:
-      mode === "files" || mode === "both"
-        ? summarize(results, (q) => ({ baseline: q.baseline_files_tokens, ratio: q.ratio_files }))
-        : null,
+    files: filesSummary,
     te:
       mode === "te" || mode === "both"
         ? summarize(results, (q) => ({ baseline: q.baseline_te_tokens, ratio: q.ratio_te }))
         : null,
+    files_top_n: filesTopN,
+    refs: refsSummary,
     hit_rate: withExpect.length > 0 ? hits / withExpect.length : null,
+    hit_rate_at_1: withExpect.length > 0 ? hitsAt1 / withExpect.length : null,
     hits,
+    hits_at_1: hitsAt1,
     expected_total: withExpect.length,
     stale_hits: results.reduce((s, q) => s + q.stale_hits, 0),
+    stale_ids: staleIdsUnion,
     unknown_supports: results.reduce((s, q) => s + q.unknown_supports, 0),
+    unknown_support_ids: unknownIdsUnion,
+    cold_start: cold.cold,
+    warmup_ms: cold.warmupMs,
+    median_time_wo_warmup_ms: cold.medianWithoutWarmupMs,
     per_lang: perLang,
     disclaimer: BENCH_DISCLAIMER,
   };
