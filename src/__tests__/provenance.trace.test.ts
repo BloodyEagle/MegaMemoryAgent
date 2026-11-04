@@ -675,4 +675,35 @@ describe("2.1.2 provenance trace fixes", () => {
     expect(unreviewed.some((w) => w.id === "S")).toBe(false);
     expect(out.support_check?.state).toBe("unchanged");
   });
+
+  it("F13: in_paths_capped is inherited by the descendant of a capped node", () => {
+    // 5 levels x 20 fully-connected nodes: the last level sits above the cap
+    // (20^4 = 160k paths); its child sums to the clamped 100k and inherits
+    // the flag without crossing the cap itself.
+    node("root", "decision");
+    const levels: string[][] = [];
+    for (let l = 0; l < 5; l++) {
+      const level: string[] = [];
+      for (let i = 0; i < 20; i++) {
+        const id = `L${l}n${i}`;
+        node(id);
+        level.push(id);
+      }
+      levels.push(level);
+    }
+    node("child");
+    for (const n of levels[0]) edge("root", n);
+    for (let l = 0; l < 4; l++) {
+      for (const a of levels[l]) for (const b of levels[l + 1]) edge(a, b);
+    }
+    edge(levels[4][0], "child");
+
+    const out = trace("root", { depth: 6, maxNodes: 300 });
+    const last = out.nodes.find((n) => n.id === levels[4][0])!;
+    expect(last.in_paths).toBe(100000);
+    expect(last.in_paths_capped).toBe(true);
+    const child = out.nodes.find((n) => n.id === "child")!;
+    expect(child.in_paths).toBe(100000);
+    expect(child.in_paths_capped).toBe(true);
+  }, 60000);
 });

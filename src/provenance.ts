@@ -568,6 +568,10 @@ function traverse(
           break;
         }
         sum += c;
+        // 2.1.2 F13: a parent already sitting on the cap passes its clamped
+        // number downstream — the child inherits the flag, or the clamped
+        // value would read as an exact count.
+        if (capped.has(p)) capHit = true;
         if (sum > PATH_COUNT_CAP) {
           sum = PATH_COUNT_CAP;
           capHit = true;
