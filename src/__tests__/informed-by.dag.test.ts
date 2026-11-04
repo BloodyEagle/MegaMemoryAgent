@@ -70,7 +70,7 @@ describe("informed_by is a strict DAG (plan 4 §5)", () => {
     const created = await createConcept(db, {
       name: "Conclusion",
       kind: "decision",
-      summary: "use it",
+      summary: "the conclusion leans on the evidence node through an explicit informed_by edge batch",
       edges: [
         { to: "evidence", relation: "informed_by", description: "measured" },
       ],
@@ -130,7 +130,7 @@ describe("informed_by is a strict DAG (plan 4 §5)", () => {
       createConcept(db, {
         name: "Half Written",
         kind: "decision",
-        summary: "must not exist",
+        summary: "this decision must not exist because the whole batch is rejected before any write",
         edges: [
           { to: "b", relation: "informed_by", description: "fine" },
           { to: "c", relation: "informed_by", description: "  " },
@@ -150,7 +150,7 @@ describe("informed_by is a strict DAG (plan 4 §5)", () => {
       createConcept(db, {
         name: "Hanging",
         kind: "decision",
-        summary: "must not exist",
+        summary: "this decision must not exist because the whole batch is rejected before any write",
         edges: [{ to: "gone", relation: "informed_by", description: "dangling" }],
       })
     ).rejects.toThrow(/does not exist \(or is removed\)/);

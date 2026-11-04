@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.7-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.9-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -312,7 +312,7 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid` / `fts` / `vector` |
 | `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` adds a second index for CJK |
 | `MEGAMEMORY_AUTO_DIGEST` | on | `0` disables auto-digest after the 5th child |
-| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | D3 source for the explorer UI; set to a CDN URL to load it remotely instead of the bundled copy |
+| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | D3 source for the explorer UI. The vendored `web/vendor/d3.min.js` ships with the package and works offline; set this to a URL to use your own mirror. When the vendored file is missing, serve falls back to the jsDelivr CDN and prints a note |
 
 ---
 
@@ -331,6 +331,7 @@ megamemory serve --port 8080
 - **Health** chip: vectors, FTS sync, digests, empty ids, orphans, memory — with remedy hints
 - digest cards list source concepts with a `stale` badge and a **focus** toggle
 - timeline **status changes** mode; node cards show recent status transitions with reasons
+- d3 ships with the package (`web/vendor/d3.min.js`) — the explorer renders offline; a missing file falls back to the jsDelivr CDN with a printed note, `MEGAMEMORY_D3_URL` overrides both, `/api/health` reports `d3_source`
 
 ---
 

@@ -149,3 +149,19 @@ describe("документация про дайджесты и вложенны
     expect(doc).toContain("supports_inlined");
   });
 });
+
+describe("сниппет: файл — это ref, а не узел (2.1.9 F3)", () => {
+  it("15. сниппет учит: опора на файл — ref, узел-опора только для невыразимого ссылкой", () => {
+    expect(SNIPPET).toContain('evidence: [{ref: "src/x.ts:120-180", why}]');
+    expect(SNIPPET).toMatch(/not\s*\n\s*a new node/);
+    expect(SNIPPET).toContain("a thought a link cannot express");
+    // лимит объёма сохранён
+    expect(SNIPPET.split("\n").length).toBeLessThanOrEqual(60);
+  });
+
+  it("16. guide печатает ту же строку — один источник текста", () => {
+    const line = SNIPPET.split("\n").find((l) => l.includes("src/x.ts:120-180"));
+    expect(line).toBeDefined();
+    expect(buildGuideText()).toContain(line!);
+  });
+});

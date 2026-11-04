@@ -59,7 +59,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
     const result = await createConcept(db, {
       name: "Free Decision",
       kind: "decision",
-      summary: "no support passed at all",
+      summary: "no support passed at all plus the fixture context of this check and the call keeps its contract",
     });
 
     expect(db.getNode(result.id).kind).toBe("decision");
@@ -72,7 +72,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
       createConcept(db, {
         name: "Unsupported Decision",
         kind: "decision",
-        summary: "no support passed at all",
+        summary: "no support passed at all plus the fixture context of this check and the call keeps its contract",
       })
     ).rejects.toThrow(REQUIRE_SUPPORT_MESSAGE);
 
@@ -86,7 +86,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
     const result = await createConcept(db, {
       name: "Grounded Decision",
       kind: "decision",
-      summary: "supported by evidence",
+      summary: "supported by evidence plus the fixture context of this check and the call keeps its contract",
       evidence: [{ node: "support-node", why: "measured in support-node" }],
     });
 
@@ -104,7 +104,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
     const result = await createConcept(db, {
       name: "Plain Feature",
       kind: "feature",
-      summary: "no support and that is fine",
+      summary: "no support and that is fine plus the fixture context of this check and the call keeps its contract",
     });
 
     expect(db.getNode(result.id).kind).toBe("feature");
@@ -113,22 +113,22 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
   it("8.4.5: flag flip without a restart — two consecutive calls behave differently", async () => {
     setRequireSupport(true);
     await expect(
-      createConcept(db, { name: "First Try", kind: "decision", summary: "s" })
+      createConcept(db, { name: "First Try", kind: "decision", summary: "s plus the fixture context of this check and the call keeps its contract with the evidence passed in the call" })
     ).rejects.toThrow(REQUIRE_SUPPORT_MESSAGE);
 
     setRequireSupport(false);
-    const ok = await createConcept(db, { name: "Second Try", kind: "decision", summary: "s" });
+    const ok = await createConcept(db, { name: "Second Try", kind: "decision", summary: "s plus the fixture context of this check and the call keeps its contract with the evidence passed in the call" });
     expect(db.getNode(ok.id).kind).toBe("decision");
   });
 
   it("8.4.5b: env alias MEGAMEMORY_REQUIRE_SUPPORT overrides without a restart", async () => {
     process.env.MEGAMEMORY_REQUIRE_SUPPORT = "1";
     await expect(
-      createConcept(db, { name: "Env Gated", kind: "decision", summary: "s" })
+      createConcept(db, { name: "Env Gated", kind: "decision", summary: "s plus the fixture context of this check and the call keeps its contract with the evidence passed in the call" })
     ).rejects.toThrow(REQUIRE_SUPPORT_MESSAGE);
 
     process.env.MEGAMEMORY_REQUIRE_SUPPORT = "0";
-    const ok = await createConcept(db, { name: "Env Allowed", kind: "decision", summary: "s" });
+    const ok = await createConcept(db, { name: "Env Allowed", kind: "decision", summary: "s plus the fixture context of this check and the call keeps its contract with the evidence passed in the call" });
     expect(db.getNode(ok.id).kind).toBe("decision");
   });
 
@@ -139,7 +139,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
     const result = await createConcept(db, {
       name: "Edge Decision",
       kind: "decision",
-      summary: "supported by a plain informed_by edge",
+      summary: "supported by a plain informed_by edge plus the fixture context of this check and the call keeps its contract",
       edges: [{ to: "source-node", relation: "informed_by", description: "read from source-node" }],
     });
 
@@ -160,7 +160,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
     const result = await createConcept(db, {
       name: "Auto Decision",
       kind: "decision",
-      summary: "auto-grounded",
+      summary: "auto-grounded plus the fixture context of this check and the call keeps its contract",
       why: "the file says so",
       file_refs: ["src/impl.ts"],
     });

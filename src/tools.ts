@@ -50,6 +50,7 @@ import {
   statusDigestOf,
 } from "./support-baselines.js";
 import { artifactsDigestOf } from "./artifacts.js";
+import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary } from "./stub.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
   const errorMsg = err instanceof Error ? err.message : String(err);
@@ -123,7 +124,13 @@ function parseStatusScope(raw: string | null | undefined): Record<string, unknow
 
 // ---- Epistemic transitions (plan 1 §5.2) ----
 
-export type EpistemicStatus = "open" | "validated" | "refuted" | "abandoned";
+/**
+ * "stub" (2.1.9 F2) is not agent-driven: it is written only by createConcept
+ * with allow_stub — the conscious bypass for placeholder supports. Updates
+ * FROM stub are free (the owner replaced it with a real claim); no transition
+ * TO stub exists outside creation.
+ */
+export type EpistemicStatus = "open" | "validated" | "refuted" | "abandoned" | "stub";
 
 /**
  * Allowed epistemic transitions. Enforced ONLY at the MCP tool boundary —
@@ -135,6 +142,7 @@ const EPISTEMIC_TRANSITIONS: Record<EpistemicStatus, EpistemicStatus[]> = {
   validated: ["refuted", "abandoned"],
   refuted: ["open"], // reopening, reason mandatory
   abandoned: ["open"],
+  stub: ["open", "validated", "refuted", "abandoned"], // stub replaced by a real claim
 };
 
 /**
@@ -745,6 +753,14 @@ export async function createConcept(
     throw new Error("Concept name must be a non-empty string.");
   }
 
+  // 2.1.9 F2: a stub summary is refused before anything is planned — a fake
+  // support is worse than a missing one because it reads as confirmation in
+  // stats and weak_links. allow_stub is the conscious bypass: the node is
+  // written with epistemic_status = "stub" and stays visible as a weak link.
+  if (STUB_CHECK_KINDS.has(input.kind) && !input.allow_stub && isStubSummary(input.summary, input.kind)) {
+    throw new Error(STUB_REJECTION_MESSAGE);
+  }
+
   const parentId = input.parent_id === "" ? undefined : input.parent_id;
   let id = makeId(input.name, parentId);
 
@@ -771,8 +787,14 @@ export async function createConcept(
 
   // Plan 1 §5.3: initial epistemic state, default open. A `validated` at
   // creation time needs the same scope discipline as a transition.
-  const epistemic = input.epistemic_status ?? "open";
-  validateEpistemicTransition("open", epistemic, input.status_scope);
+  // 2.1.9 F2: allow_stub pins "stub" — the conscious-placeholder marker; the
+  // transition check applies to the agent-driven states only.
+  const epistemic: EpistemicStatus = input.allow_stub
+    ? "stub"
+    : (input.epistemic_status ?? "open");
+  if (!input.allow_stub) {
+    validateEpistemicTransition("open", epistemic, input.status_scope);
+  }
 
   // ---- Plan 3 §4.1.1: resolve the evidence shortcut ----
   // Each item becomes an informed_by edge with `why` as the rationale,

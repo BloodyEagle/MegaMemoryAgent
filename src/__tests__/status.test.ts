@@ -27,12 +27,12 @@ describe("supersedes lifecycle", () => {
     await createConcept(db, {
       name: "Auth Decision",
       kind: "decision",
-      summary: "use session cookies for auth",
+      summary: "auth хранит сессию в cookie и возвращает её на каждый запрос",
     });
     await createConcept(db, {
       name: "Auth Decision v2",
       kind: "decision",
-      summary: "use jwt tokens for auth instead",
+      summary: "auth v2 хранит сессию в jwt-токене и отдаёт её вместо cookie-сессии",
       supersedes: ["auth-decision"],
     });
 
@@ -64,7 +64,7 @@ describe("supersedes lifecycle", () => {
       createConcept(db, {
         name: "Ghost Replacer",
         kind: "decision",
-        summary: "s",
+        summary: "заменитель хранит ссылку на несуществующий узел — supersedes падает после создания",
         supersedes: ["does-not-exist"],
       })
     ).rejects.toThrow(/does-not-exist/);
@@ -77,7 +77,7 @@ describe("supersedes lifecycle", () => {
     await createConcept(db, {
       name: "Temp Feature",
       kind: "feature",
-      summary: "to be removed",
+      summary: "временный узел хранит только пометку к удалению",
     });
     removeConcept(db, { id: "temp-feature", reason: "obsolete" });
     expect(db.getNodeIncludingRemoved("temp-feature")?.status).toBe("deprecated");
@@ -102,8 +102,8 @@ describe("contradicts in listConflicts", () => {
 describe("status counts", () => {
   it("counts statuses for stats", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "A", kind: "feature", summary: "a" });
-    await createConcept(db, { name: "B", kind: "feature", summary: "b", supersedes: ["a"] });
+    await createConcept(db, { name: "A", kind: "feature", summary: "узел a хранит статус для подсчёта" });
+    await createConcept(db, { name: "B", kind: "feature", summary: "узел b хранит статус и вытесняет a через supersedes", supersedes: ["a"] });
     const counts = db.getStatusCounts();
     expect(counts["active"]).toBe(1);
     expect(counts["superseded"]).toBe(1);
@@ -113,11 +113,11 @@ describe("status counts", () => {
 describe("status history (U5)", () => {
   it("supersedes writes active -> superseded with a reason", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "Old Auth", kind: "decision", summary: "cookies" });
+    await createConcept(db, { name: "Old Auth", kind: "decision", summary: "старая auth хранит сессию в cookies" });
     await createConcept(db, {
       name: "New Auth",
       kind: "decision",
-      summary: "jwt",
+      summary: "новая auth хранит сессию в jwt-токене",
       supersedes: ["old-auth"],
     });
 
@@ -130,7 +130,7 @@ describe("status history (U5)", () => {
 
   it("removeConcept writes active -> deprecated with the given reason", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "Temp", kind: "feature", summary: "t" });
+    await createConcept(db, { name: "Temp", kind: "feature", summary: "временный узел хранит причину удаления" });
     removeConcept(db, { id: "temp", reason: "gone from code" });
 
     const hist = db.getStatusHistory("temp");
@@ -142,15 +142,15 @@ describe("status history (U5)", () => {
 
   it("no row when the status does not change", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "Same", kind: "feature", summary: "s" });
+    await createConcept(db, { name: "Same", kind: "feature", summary: "узел хранит неизменный статус active" });
     db.setNodeStatus("same", "active");
     expect(db.getStatusHistory("same")).toHaveLength(0);
   });
 
   it("getAllStatusHistory feeds the timeline (newest first)", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "A", kind: "feature", summary: "a" });
-    await createConcept(db, { name: "B", kind: "feature", summary: "b", supersedes: ["a"] });
+    await createConcept(db, { name: "A", kind: "feature", summary: "узел a хранит статус для подсчёта" });
+    await createConcept(db, { name: "B", kind: "feature", summary: "узел b хранит статус и вытесняет a через supersedes", supersedes: ["a"] });
     removeConcept(db, { id: "b", reason: "cleanup" });
     const all = db.getAllStatusHistory(10);
     expect(all.length).toBeGreaterThanOrEqual(2);
@@ -161,13 +161,13 @@ describe("status history (U5)", () => {
 describe("epistemic status (plan 1)", () => {
   it("create defaults to open; explicit values are accepted", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "Hypothesis", kind: "decision", summary: "maybe" });
+    await createConcept(db, { name: "Hypothesis", kind: "decision", summary: "гипотеза хранит неподтверждённый вывод" });
     expect(db.getNode("hypothesis")?.epistemic_status).toBe("open");
 
     await createConcept(db, {
       name: "Checked Fact",
       kind: "decision",
-      summary: "confirmed",
+      summary: "проверенный факт хранит ссылку на артефакт проверки",
       epistemic_status: "validated",
       status_scope: { env: "ci", artifact: "run-123" },
     });
@@ -176,7 +176,7 @@ describe("epistemic status (plan 1)", () => {
 
   it("invalid transition is rejected; validated without scope/artifact fails", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "Claim", kind: "decision", summary: "x" });
+    await createConcept(db, { name: "Claim", kind: "decision", summary: "узел хранит вывод для эпистемических переходов" });
 
     // open -> validated requires scope with artifact.
     await expect(
@@ -203,7 +203,7 @@ describe("epistemic status (plan 1)", () => {
 
   it("epistemic_status without reason is rejected; reason without status too", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "R", kind: "decision", summary: "x" });
+    await createConcept(db, { name: "R", kind: "decision", summary: "узел хранит вывод для эпистемических переходов" });
     await expect(
       updateConcept(db, { id: "r", changes: { epistemic_status: "refuted" } })
     ).rejects.toThrow(/epistemic_reason/);
@@ -214,8 +214,8 @@ describe("epistemic status (plan 1)", () => {
 
   it("refuted node stays in the graph and surfaces in the refuted block", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "Wrong Guess", kind: "decision", summary: "cache is disk-backed" });
-    await createConcept(db, { name: "Plain Fact", kind: "decision", summary: "something true" });
+    await createConcept(db, { name: "Wrong Guess", kind: "decision", summary: "cache хранит превью на диске и возвращает их — вывод будет опровергнут" });
+    await createConcept(db, { name: "Plain Fact", kind: "decision", summary: "факт хранит истинное утверждение о поведении" });
 
     await updateConcept(db, {
       id: "wrong-guess",
@@ -240,7 +240,7 @@ describe("epistemic status (plan 1)", () => {
 
   it("every epistemic transition writes status_history with field + reason", async () => {
     const db = freshDb();
-    await createConcept(db, { name: "E", kind: "decision", summary: "x" });
+    await createConcept(db, { name: "E", kind: "decision", summary: "узел хранит вывод для эпистемических переходов" });
     await updateConcept(db, { id: "e", changes: { epistemic_status: "refuted", epistemic_reason: "wrong" } });
     await updateConcept(db, { id: "e", changes: { epistemic_status: "open", epistemic_reason: "reopened after discussion" } });
 

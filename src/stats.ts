@@ -4,6 +4,7 @@ import { KnowledgeDB } from "./db.js";
 import { errorBold } from "./cli-utils.js";
 import { listRoots } from "./tools.js";
 import { resolveDbPathOrExit } from "./db-path.js";
+import { countStubSupports } from "./stub.js";
 
 const KIND_ORDER = ["feature", "module", "component", "pattern", "config", "decision"];
 
@@ -197,6 +198,13 @@ export async function runStats(args: string[]): Promise<void> {
     );
     printRow("Edges accepted", formatNumber(prov.edges_accepted), "explicitly accepted auto edges");
     printRow("Decisions w/ support", formatNumber(prov.decisions_with_live_support));
+    // 2.1.9 F2: stub supports read as confirmation — the count sits right
+    // next to the support metric it deflates.
+    printRow(
+      "Stub supports",
+      formatNumber(countStubSupports(db)),
+      "опоры с шаблонным/коротким саммари — утверждения нет"
+    );
     printRow(
       "Decisions w/o live support",
       formatNumber(prov.no_live_supports),

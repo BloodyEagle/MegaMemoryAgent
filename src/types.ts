@@ -88,6 +88,12 @@ export interface CreateConceptInput {
   epistemic_status?: "open" | "validated" | "refuted" | "abandoned";
   /** Required when epistemic_status = validated (JSON: {env?,version?,dataset?,artifact?}). */
   status_scope?: Record<string, unknown>;
+  /**
+   * 2.1.9 F2: conscious bypass of the stub-summary rejection. The node is
+   * written with epistemic_status = "stub" and shows up as a weak link —
+   * a deliberate placeholder, never mistaken for a confirmation.
+   */
+  allow_stub?: boolean;
 }
 
 /** Plan 3 §4.1.1: one evidence item — exactly one of `ref` / `node`, plus `why`. */
@@ -582,6 +588,12 @@ export interface ProvenanceWeakLink {
      * verified (checked/total) instead of silently skipping the rest.
      */
     | "support_check_truncated"
+    /**
+     * 2.1.9 F2: the decision leans on support nodes whose summary is a
+     * template or too short to be a claim. Already-recorded stubs are marked,
+     * never deleted — but they must not read as confirmation.
+     */
+    | "stub_support"
     /** plan-3-fixes-3 D2.4: weak_links were cut to fit the 8 KB response cap. */
     | "weak_links_truncated";
   id?: string;
@@ -906,6 +918,12 @@ export interface ProvenanceSupportDigest {
   claim_digest: string | null;
   status_digest: string | null;
   edge_digest: string;
+  /**
+   * 2.1.9 F2: "stub" — the support's summary is a template / too short to be
+   * a claim (it can never honestly confirm anything); "claim" — a real
+   * assertion. A missing support node (null digests) is "stub" too.
+   */
+  quality: "stub" | "claim";
 }
 
 export interface ProvenanceTraceOutput {

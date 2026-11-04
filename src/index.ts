@@ -386,6 +386,7 @@ async function startMcpServer() {
       created_by_task: z.string().optional().describe("Description of the task that created this concept"),
       epistemic_status: z.enum(["open", "validated", "refuted", "abandoned"]).optional().describe("Initial epistemic state (default: open). 'validated' requires status_scope with an artifact"),
       status_scope: z.record(z.unknown()).optional().describe("Scope of a 'validated' claim, JSON: {env?, version?, dataset?, artifact?} — artifact (test/run id) is mandatory for validated"),
+      allow_stub: z.boolean().optional().describe('Осознанный обход запрета опор-заглушек: узел с шаблонным/коротким саммари запишется с epistemic_status = "stub" и останется слабым звеном в weak_links. Для обычных узлов не передавай — саммари с утверждением не требует обхода'),
     },
     async (params) => {
       try {
@@ -402,6 +403,7 @@ async function startMcpServer() {
           created_by_task: params.created_by_task,
           epistemic_status: params.epistemic_status,
           status_scope: params.status_scope,
+          allow_stub: params.allow_stub,
         });
         // T6: auto-digest the parent when it gained its 5th+ child.
         let digestNote = "";
