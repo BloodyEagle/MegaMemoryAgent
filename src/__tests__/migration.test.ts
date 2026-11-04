@@ -243,6 +243,89 @@ describe("fork migration — downstream compatibility (Б8)", () => {
   });
 });
 
+describe("schema v10 → v11 (2.1.3: revisions + artifacts)", () => {
+  /**
+   * A db exactly as the previous build (2.1.2, schema v10) left it: full
+   * current schema minus the v11 additions, stamped user_version = 10.
+   * Reopening must recreate the tables idempotently and keep every row.
+   */
+  function buildV10Fixture(dbPath: string): void {
+    const db = new KnowledgeDB(dbPath);
+    try {
+      db.insertNode({ id: "d", name: "D", kind: "decision", summary: "d" });
+      db.insertNode({ id: "f", name: "F", kind: "fact", summary: "s-f" });
+      db.insertEdge({ from_id: "d", to_id: "f", relation: "informed_by", description: "why f" });
+      db.upsertSupportBaseline({
+        decision_id: "d",
+        support_id: "f",
+        edge_key: "1",
+        claim_digest: "c",
+        status_digest: "s",
+        edge_digest: "e",
+        format_version: 1,
+        confirmed_at: "2026-01-01T00:00:00.000Z",
+        confirmed_by: "agent",
+        superseded_at: null,
+      });
+    } finally {
+      db.close();
+    }
+    const raw = new Database(dbPath);
+    raw.exec(`
+      DROP TABLE support_revisions;
+      DROP TABLE node_artifacts;
+      ALTER TABLE support_baselines DROP COLUMN artifacts_digest;
+    `);
+    raw.pragma("user_version = 10");
+    raw.close();
+  }
+
+  it("reopening a v10 db recreates both tables and keeps the data", () => {
+    const { dbPath } = freshDir();
+    buildV10Fixture(dbPath);
+
+    const db = new KnowledgeDB(dbPath);
+    try {
+      // the migration ran to the new version
+      expect(db.getUserVersion()).toBe(11);
+      // both tables exist, empty journal: old dbs start honest (no invented
+      // history — the chain opens at the first post-upgrade confirmation)
+      expect(db.hasSupportRevisionsTable()).toBe(true);
+      expect(db.hasNodeArtifactsTable()).toBe(true);
+      expect(db.countSupportRevisions()).toBe(0);
+      expect(db.countNodeArtifacts()).toBe(0);
+      // the snapshot data survived, artifacts_digest back as NULL
+      const row = db.getSupportBaselineRow("d", "f", "1")!;
+      expect(row.claim_digest).toBe("c");
+      expect(row.confirmed_by).toBe("agent");
+      expect(row.artifacts_digest).toBeNull();
+      // column set parity: fresh dbs carry the same artifacts_digest column
+      const cols = (
+        db.pragma("table_info(support_baselines)") as Array<{ name: string }>
+      ).map((c) => c.name);
+      expect(cols[cols.length - 1]).toBe("artifacts_digest");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("a migrated v10 db passes the doctor after 'migrate --apply'", async () => {
+    const { dbPath } = freshDir();
+    buildV10Fixture(dbPath);
+
+    const db = new KnowledgeDB(dbPath);
+    try {
+      await runMigration(db, { apply: true, backup: () => null });
+      const { checks, problems } = runDoctor(db);
+      const journal = checks.find((c) => c.name === "provenance journal");
+      expect(journal?.ok).toBe(true);
+      expect(problems).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe("embedding meta on migration (F10)", () => {
   it("stamps 'unknown' when an upstream db carries vectors without meta", () => {
     const { dbPath } = freshDir();
