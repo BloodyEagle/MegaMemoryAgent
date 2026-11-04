@@ -19,6 +19,7 @@ import {
   computeSupportCheck,
   confirmSupports,
   edgeDigestOf,
+  provenanceMetrics,
   statusDigestOf,
 } from "../support-baselines.js";
 
@@ -302,4 +303,62 @@ describe("2.1.2 F11: dead anchors are walked by keyset, not OFFSET", () => {
     expect(deadQueries[2].args[1]).toBe(ids[399]);
     expect(deadQueries[3].args[1]).toBe(ids[449]);
   });
+});
+
+// ---- F9: метрики работают под бюджетом ----
+
+/** Count the rows the SQL engine hands back for the metric decision scan. */
+function countDecisionRows(db: KnowledgeDB): () => number {
+  const raw = (db as unknown as { db: { prepare: (s: string) => unknown } }).db;
+  const realPrepare = (raw.prepare as (s: string) => {
+    all: (...a: unknown[]) => unknown[];
+  }).bind(raw);
+  let rows = 0;
+  (raw as unknown as { prepare: (s: string) => { all: (...a: unknown[]) => unknown[] } }).prepare =
+    (sql: string) => {
+      const stmt = realPrepare(sql);
+      if (/kind = 'decision'/i.test(sql)) {
+        const realAll = stmt.all.bind(stmt) as (...a: unknown[]) => unknown[];
+        (stmt as unknown as { all: (...a: unknown[]) => unknown[] }).all = (
+          ...a: unknown[]
+        ) => {
+          const out = realAll(...a);
+          rows += out.length;
+          return out;
+        };
+      }
+      return stmt;
+    };
+  return () => rows;
+}
+
+describe("2.1.2 F9: provenance_metrics under budget", () => {
+  it("2000 decisions with budget 1 -> a page, not the whole list", () => {
+    const WIDTH = 2000;
+    db.runInTransaction(() => {
+      for (let i = 0; i < WIDTH; i++) {
+        const did = `d${String(i).padStart(5, "0")}`;
+        const sid = `s${String(i).padStart(5, "0")}`;
+        node(did, "decision", `decision ${did}`);
+        node(sid, "fact", `fact ${sid}`);
+        supportEdge(did, sid);
+      }
+    });
+
+    const stop = countDecisionRows(db);
+    const m = provenanceMetrics(db, new CheckBudget(1, 1_000_000));
+    const materialized = stop();
+    console.log(`[F9] materialized decision rows: ${materialized} (budget 1, ${WIDTH} decisions)`);
+    // The budget bounds the work: a tiny budget must not materialize the
+    // whole decision list.
+    expect(materialized).toBeLessThanOrEqual(3);
+    // One decision got a verdict, the rest are honestly reported as left out.
+    const counted =
+      m.decisions_by_check_state.unchanged +
+      m.decisions_by_check_state.changed +
+      m.decisions_by_check_state.unknown +
+      m.decisions_by_check_state.incomplete;
+    expect(counted).toBe(1);
+    expect(m.metrics_truncated).toBe(true);
+  }, 120_000);
 });

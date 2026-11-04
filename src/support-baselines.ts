@@ -616,41 +616,46 @@ export function provenanceMetrics(
     ) as { n: number }
   ).n;
 
-  const baselineClause = db.hasSupportBaselinesTable()
-    ? `OR EXISTS (SELECT 1 FROM support_baselines b
-                   WHERE b.decision_id = n.id AND b.superseded_at IS NULL)`
-    : "";
-  const decisions = db.execSqlAll(
-    `SELECT n.id,
-            EXISTS (SELECT 1 FROM edges e
-                    WHERE e.from_id = n.id AND e.relation = 'informed_by'
-                      AND e.removed_at IS NULL) AS has_live
-     FROM nodes n
-     WHERE n.removed_at IS NULL AND n.kind = 'decision'
-       AND (n.claim_digest IS NOT NULL
-         OR EXISTS (SELECT 1 FROM edges e
-                    WHERE e.from_id = n.id AND e.relation = 'informed_by'
-                      AND e.removed_at IS NULL)
-         ${baselineClause})
-     ORDER BY n.id`
-  ) as Array<{ id: string; has_live: number }>;
-
+  // 2.1.2 F9: the decision scan is paginated (keyset by id, page size the
+  // budget sizes) — a million decisions under a minimal budget materialize a
+  // page, not the whole sorted list. The counters cover the rows actually
+  // read; anything past the cursor is reported by metrics_truncated.
   const byState = { unchanged: 0, changed: 0, unknown: 0, incomplete: 0 };
   let withLive = 0;
   let noLive = 0;
   let checked = 0;
-  for (const { id, has_live } of decisions) {
-    if (has_live) withLive += 1;
-    else noLive += 1;
-    const view = computeSupportCheck(db, id, budget);
-    // Invariant: the SELECT above guarantees every decision carries a claim
-    // anchor, a live edge or a snapshot row — exactly the inputs
-    // computeSupportCheck needs to return a verdict, so it never returns null
-    // here. The assertion keeps a future WHERE change from silently dropping
-    // decisions from every bucket: it fails loudly instead.
-    byState[view!.state] += 1;
-    checked += 1;
-    if (budget.exhausted) break;
+  let truncated = false;
+  let lastId = "";
+  for (;;) {
+    const take = Math.max(1, Math.min(SUPPORT_PAGE, budget.remainingEdges));
+    const page = db.getMetricDecisionsPage(lastId, take);
+    if (page.length === 0) break;
+    let stop = false;
+    for (const { id, has_live } of page) {
+      lastId = id;
+      if (has_live) withLive += 1;
+      else noLive += 1;
+      const view = computeSupportCheck(db, id, budget);
+      // Invariant: the page query above guarantees every decision carries a
+      // claim anchor, a live edge or a snapshot row — exactly the inputs
+      // computeSupportCheck needs to return a verdict, so it never returns
+      // null here. The assertion keeps a future WHERE change from silently
+      // dropping decisions from every bucket: it fails loudly instead.
+      byState[view!.state] += 1;
+      checked += 1;
+      if (budget.exhausted) {
+        stop = true;
+        break;
+      }
+    }
+    if (stop) {
+      // The budget ran out — the probe (a LIMIT 1 over the same predicate)
+      // tells whether anything is actually left unchecked, so exhaustion
+      // exactly on the last decision is still not a false alarm (F4, 2.1.1).
+      truncated = db.hasMetricDecisionsAfter(lastId);
+      break;
+    }
+    if (page.length < take) break;
   }
 
   const supersededDecisions = db.hasSupportBaselinesTable()
@@ -668,9 +673,9 @@ export function provenanceMetrics(
     no_live_supports: noLive,
     decisions_with_superseded_supports: Number(supersededDecisions),
     decisions_by_check_state: byState,
-    // F4 (2.1.1): true only when decisions were left UNCHECKED — a budget
-    // that runs out exactly on the last decision still produced a verdict
-    // for every row, and calling that "truncated" was a false alarm.
-    metrics_truncated: checked < decisions.length,
+    // F4 (2.1.1) / F9 (2.1.2): true only when decisions were left UNCHECKED —
+    // a budget that runs out exactly on the last decision still produced a
+    // verdict for every row, and calling that "truncated" was a false alarm.
+    metrics_truncated: truncated,
   };
 }
