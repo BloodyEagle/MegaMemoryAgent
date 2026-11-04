@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "libsql";
 import { KnowledgeDB } from "../db.js";
 import { link, createConcept, updateConcept, removeConcept, resolveConflict } from "../tools.js";
 import { provenanceTrace } from "../provenance.js";
@@ -1182,6 +1183,86 @@ describe("F9: edge provenance survives a merge", () => {
       rmTemp(dir);
     }
   });
+
+  it(
+    "41. every created_via value survives the merge as itself (F3, 2.1.1)",
+    () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-baselines-f3-"));
+      try {
+        // Left source: the agent edge (link) and the auto edge (raw row).
+        const aPath = path.join(dir, "a.db");
+        const a = new KnowledgeDB(aPath);
+        a.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
+        a.insertNode({ id: "f1", name: "F1", kind: "config", summary: "f1" });
+        a.insertNode({ id: "f2", name: "F2", kind: "config", summary: "f2" });
+        link(a, { from: "d", to: "f1", relation: "informed_by", description: "why f1" });
+        a.insertEdgeRaw({
+          from_id: "d",
+          to_id: "f2",
+          relation: "informed_by",
+          description: "why f2",
+          created_via: "auto",
+        });
+        a.close();
+
+        // Right source: a pre-v8 database — the edges table has no
+        // created_via/accepted_at columns at all. Reopening re-adds them with
+        // the 'unknown' default, which is exactly the production path for old
+        // files: the origin was never recorded, so 'unknown' is honest.
+        const bPath = path.join(dir, "b.db");
+        const b = new KnowledgeDB(bPath);
+        b.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
+        b.insertNode({ id: "f3", name: "F3", kind: "config", summary: "f3" });
+        b.insertEdgeRaw({ from_id: "d", to_id: "f3", relation: "informed_by", description: "why f3" });
+        b.close();
+        const strip = new Database(bPath);
+        strip.exec(`
+          DROP INDEX IF EXISTS idx_edges_created_via;
+          DROP INDEX IF EXISTS idx_edges_live_from_to;
+          ALTER TABLE edges DROP COLUMN created_via;
+          ALTER TABLE edges DROP COLUMN accepted_at;
+        `);
+        strip.pragma("user_version = 7");
+        strip.close();
+        // Sanity: after the strip+reopen the old row is honestly unknown.
+        const bReopened = new KnowledgeDB(bPath);
+        const bEdge = bReopened.getInformedByEdges("d", "ancestry", false)[0];
+        expect(bEdge.created_via).toBe("unknown");
+        bReopened.close();
+
+        const expectOrigins = (outPath: string): void => {
+          const out = new KnowledgeDB(outPath);
+          try {
+            const byTarget = new Map(
+              out
+                .getInformedByEdges("d", "ancestry", false)
+                .map((e) => [e.to_id, e.created_via])
+            );
+            expect(byTarget.get("f1")).toBe("agent");
+            expect(byTarget.get("f2")).toBe("auto");
+            expect(byTarget.get("f3")).toBe("unknown");
+            expect(byTarget.size).toBe(3);
+          } finally {
+            out.close();
+          }
+        };
+
+        const outAB = path.join(dir, "ab.db");
+        new MergeEngine().merge(aPath, bPath, outAB);
+        expectOrigins(outAB);
+
+        // Both orders: the right-hand copy must travel as faithfully as the
+        // left-hand one — the union path treats the sides symmetrically, this
+        // pins it.
+        const outBA = path.join(dir, "ba.db");
+        new MergeEngine().merge(bPath, aPath, outBA);
+        expectOrigins(outBA);
+      } finally {
+        rmTemp(dir);
+      }
+    },
+    60_000
+  );
 });
 
 describe("F10: the merge carries the OLD claim digest, not the current wording", () => {
