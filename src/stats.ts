@@ -70,6 +70,22 @@ export async function runStats(args: string[]): Promise<void> {
 
   const db = new KnowledgeDB(dbPath);
   try {
+    // F5 (2.1.1): manual journal cleanup — runs the same retention rules the
+    // automatic write-time prune uses, regardless of the write counter, and
+    // reports exactly what it deleted.
+    if (getFlag(args, "--prune") !== undefined) {
+      const { byAge, byCount } = db.pruneTimeline();
+      const total = byAge + byCount;
+      console.log(
+        total > 0
+          ? pc.green(
+              `Timeline pruned: ${formatNumber(total)} entr${total === 1 ? "y" : "ies"} removed ` +
+                `(${formatNumber(byAge)} by age, ${formatNumber(byCount)} over the limit).`
+            )
+          : pc.dim("Timeline pruned: nothing to remove (retention rules are 0 or already satisfied).")
+      );
+    }
+
     const stats = db.getStats();
     const rootCount = db.getRootNodes().length;
     const timelineCount = db.getTimelineBounds().count;

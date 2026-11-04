@@ -6,13 +6,37 @@ import type { NodeRow, EdgeRow, SupportBaselineRow } from "./types.js";
 import { normalizeName } from "./norm.js";
 
 /** Plan 4 (informed_by provenance slice, schema v7); v8 adds support baselines. */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
+
+/**
+ * F5 (2.1.1): timeline retention defaults. The call journal is service
+ * telemetry — useful, but not worth an unbounded file. Configured via
+ * MEGAMEMORY_TIMELINE_RETENTION_DAYS / MEGAMEMORY_TIMELINE_MAX_ENTRIES;
+ * 0 disables a rule. Unlike the provenance audit journal, which keeps its
+ * own 200-runs/90-days rule, this one is trimmed right here.
+ */
+export const TIMELINE_RETENTION_DAYS_DEFAULT = 90;
+export const TIMELINE_MAX_ENTRIES_DEFAULT = 50_000;
+/** Automatic prune rides on writes, at most once per this many inserts. */
+export const TIMELINE_PRUNE_INTERVAL = 500;
+/** Rows deleted per statement — no long write lock over a big backlog. */
+export const TIMELINE_PRUNE_BATCH = 1000;
+
+/** Integer from the environment (per call, plan 3 §11), or the default. */
+function envInt(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return defaultValue;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.trunc(n) : defaultValue;
+}
 
 export class KnowledgeDB {
   private db: Database.Database;
   private dbFile: string;
   private _txDepth = 0;
   private _hasStatusColumn: boolean | undefined;
+  /** F5: inserts since the last automatic timeline prune. */
+  private timelineWritesSincePrune = 0;
 
   /** Absolute path of the backing file; config flags are read per call (plan 3 §11). */
   get dbPath(): string {
@@ -405,6 +429,20 @@ export class KnowledgeDB {
             "ALTER TABLE support_baselines ADD COLUMN superseded_at TEXT"
           );
         }
+      }
+
+      if (currentVersion < 10) {
+        // plan-4-fixes-7 (F2): the live-support pagination used to page with
+        // ORDER BY to_id LIMIT/OFFSET, so every page re-sorted ALL live edges
+        // of the node — a 20 000-support star with a budget of 1 paid for the
+        // whole star. This index gives the keyset walk (to_id > last ORDER BY
+        // to_id LIMIT n) a prefix to read in order: equality on from_id,
+        // relation, removed_at, then to_id in index order — no temp b-tree,
+        // work proportional to the page, not the star. Old dbs get the same
+        // index as fresh ones (CREATE INDEX IF NOT EXISTS — idempotent).
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_edges_live_from_to ON edges(from_id, relation, removed_at, to_id)"
+        );
       }
 
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -1623,19 +1661,27 @@ export class KnowledgeDB {
   /**
    * A deterministic page of live supports (ancestry), ordered by the
    * support's id — the budget cuts the list, so the cut must be stable.
+   *
+   * F2 (2.1.1): keyset pagination, not OFFSET. `ORDER BY to_id LIMIT/OFFSET`
+   * re-sorted every remaining live edge on each page — with a budget of 1 a
+   * 20 000-support star still paid for the whole star per page. `to_id > ?
+   * ORDER BY to_id LIMIT ?` walks the idx_edges_live_from_to prefix instead:
+   * per-page work is the page itself. to_id is unique per (from_id,
+   * relation) — idx_edges_unique — so the cursor cannot skip a row.
    */
   getLiveSupportEdgesPage(
     decisionId: string,
-    offset: number,
+    afterToId: string,
     limit: number
   ): Array<EdgeRow & { other_id: string }> {
     return this.db
       .prepare(
         `SELECT e.*, e.to_id AS other_id FROM edges e
          WHERE e.from_id = ? AND e.relation = 'informed_by' AND e.removed_at IS NULL
-         ORDER BY e.to_id LIMIT ? OFFSET ?`
+           AND e.to_id > ?
+         ORDER BY e.to_id LIMIT ?`
       )
-      .all(decisionId, limit, offset) as Array<EdgeRow & { other_id: string }>;
+      .all(decisionId, afterToId, limit) as Array<EdgeRow & { other_id: string }>;
   }
 
   /**
@@ -2414,7 +2460,103 @@ export class KnowledgeDB {
       is_error: entry.is_error ? 1 : 0,
       affected_ids: JSON.stringify(entry.affected_ids),
     });
+    // F5 (2.1.1): the journal is written on every tool call and nothing used
+    // to trim it — on an active base it grew unbounded inside the very file
+    // the agent carries around. Prune piggybacks on writes, at most once per
+    // TIMELINE_PRUNE_INTERVAL inserts so the common call pays nothing.
+    this.timelineWritesSincePrune += 1;
+    if (this.timelineWritesSincePrune >= TIMELINE_PRUNE_INTERVAL) {
+      this.timelineWritesSincePrune = 0;
+      try {
+        this.pruneTimeline();
+      } catch (err) {
+        // Retention must never break tool execution — the entry above is
+        // already safely stored.
+        console.error(
+          "Timeline prune failed:",
+          err instanceof Error ? err.message : String(err)
+        );
+      }
+    }
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * F5 (2.1.1): enforce the timeline retention rules.
+   *
+   * - age: rows older than timeline_retention_days go;
+   * - count: rows beyond timeline_max_entries (oldest first) go;
+   * - 0 (or negative) in a setting disables that rule entirely — the default
+   *   for anyone who needs the whole journal.
+   *
+   * Both rules delete in batches of TIMELINE_PRUNE_BATCH, each its own
+   * statement: no long write lock over a huge backlog, a concurrent reader
+   * (web explorer) never sees the timeline disappear in one lump.
+   *
+   * Automatic runs (piggybacking on writes) are throttled by the write
+   * counter in insertTimelineEntry — at most once per TIMELINE_PRUNE_INTERVAL
+   * inserts; this method itself always prunes, which is what the manual
+   * `stats --prune` CLI path uses. The provenance audit journal
+   * (provenance_audit_runs) is NOT touched here — it has its own retention
+   * rule (200 runs per root / 90 days, plan 3 §10).
+   */
+  pruneTimeline(): { byAge: number; byCount: number } {
+    const retentionDays = envInt(
+      "MEGAMEMORY_TIMELINE_RETENTION_DAYS",
+      TIMELINE_RETENTION_DAYS_DEFAULT
+    );
+    const maxEntries = envInt(
+      "MEGAMEMORY_TIMELINE_MAX_ENTRIES",
+      TIMELINE_MAX_ENTRIES_DEFAULT
+    );
+
+    let byAge = 0;
+    if (retentionDays > 0) {
+      // datetime('now') stamps rows in "YYYY-MM-DD HH:MM:SS" (UTC); SQLite
+      // computes the cutoff in the same format, so plain string comparison
+      // is exact.
+      for (;;) {
+        const res = this.db
+          .prepare(
+            `DELETE FROM timeline WHERE seq IN (
+               SELECT seq FROM timeline
+               WHERE timestamp < datetime('now', ?)
+               LIMIT ${TIMELINE_PRUNE_BATCH}
+             )`
+          )
+          .run(`-${retentionDays} days`);
+        const deleted = Number(res.changes);
+        byAge += deleted;
+        if (deleted < TIMELINE_PRUNE_BATCH) break;
+      }
+    }
+
+    let byCount = 0;
+    if (maxEntries > 0) {
+      for (;;) {
+        const count = Number(
+          (
+            this.db.prepare("SELECT COUNT(*) AS n FROM timeline").get() as {
+              n: number;
+            }
+          ).n
+        );
+        const excess = count - maxEntries;
+        if (excess <= 0) break;
+        const batch = Math.min(excess, TIMELINE_PRUNE_BATCH);
+        const res = this.db
+          .prepare(
+            `DELETE FROM timeline WHERE seq IN (
+               SELECT seq FROM timeline ORDER BY seq ASC LIMIT ?
+             )`
+          )
+          .run(batch);
+        byCount += Number(res.changes);
+        if (Number(res.changes) < batch) break;
+      }
+    }
+
+    return { byAge, byCount };
   }
 
   getTimelineBounds(): { first: string | null; last: string | null; count: number } {

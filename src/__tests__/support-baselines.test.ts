@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "libsql";
 import { KnowledgeDB } from "../db.js";
 import { link, createConcept, updateConcept, removeConcept, resolveConflict } from "../tools.js";
 import { provenanceTrace } from "../provenance.js";
@@ -843,6 +844,62 @@ describe("F2: the budget bounds the work, not only the verdict", () => {
       if (view.state === "unchanged") expect(view.incomplete).toBe(false);
     }
   });
+
+  it(
+    "39. a 20k star with budget 1 stays under the smoke threshold on the keyset walk (F2, 2.1.1)",
+    () => {
+      buildStar(20_000);
+      const t0 = performance.now();
+      const view = computeSupportCheck(db, "star", new CheckBudget(1, 1_000_000_000))!;
+      const ms = performance.now() - t0;
+      // Same result the offset walk used to produce…
+      expect(view.state).toBe("incomplete");
+      expect(view.unknown_count ?? view.unknown!.length).toBeLessThanOrEqual(1);
+      // …at the plan-4-fixes-7 threshold: per-page work is the page (index
+      // prefix read), not a re-sort of the whole star. The full-scan cost of
+      // this graph is an order of magnitude higher (test 28 does the linear
+      // pass), so 1200 ms leaves linear regressions nowhere to hide.
+      expect(ms).toBeLessThan(1200);
+    },
+    60_000
+  );
+
+  it("40. keyset pages return exactly the full ordered support list (F2, 2.1.1)", () => {
+    const WIDTH = 1000;
+    db.runInTransaction(() => {
+      node("kd", "decision", "decision kd");
+      for (let i = 1; i <= WIDTH; i++) {
+        node(`k${i}`, "config", `s-k${i}`);
+        db.insertEdgeRaw({
+          from_id: "kd",
+          to_id: `k${i}`,
+          relation: "informed_by",
+          description: "why",
+        });
+      }
+    });
+
+    // Walk the pages the way computeSupportCheck does — cursor = last to_id.
+    const walked: string[] = [];
+    let cursor = "";
+    for (;;) {
+      const page = db.getLiveSupportEdgesPage("kd", cursor, 37); // non-divisor on purpose
+      if (page.length === 0) break;
+      for (const e of page) walked.push(e.to_id);
+      cursor = page[page.length - 1].to_id;
+    }
+
+    const canonical = (
+      db.execSqlAll(
+        `SELECT to_id FROM edges
+         WHERE from_id = ? AND relation = 'informed_by' AND removed_at IS NULL
+         ORDER BY to_id`,
+        "kd"
+      ) as Array<{ to_id: string }>
+    ).map((r) => r.to_id);
+    expect(walked).toEqual(canonical);
+    expect(walked).toHaveLength(WIDTH);
+  });
 });
 
 describe("F3: the status axes are confirmed like every other field", () => {
@@ -1089,6 +1146,63 @@ describe("F8: metrics cover decisions without live edges", () => {
   });
 });
 
+describe("F4 (2.1.1): metrics_truncated means decisions left unchecked", () => {
+  it(
+    "42. a budget exhausted exactly on the last decision is not truncation",
+    () => {
+      // Two decisions, one confirmed support each — each check consumes
+      // exactly one edge, so a budget of 2 runs out on the second, last one.
+      confirmedDecision("d1", ["f1"]);
+      confirmedDecision("d2", ["f2"]);
+
+      const m = provenanceMetrics(db, new CheckBudget(2, 1_000_000));
+      expect(m.decisions_by_check_state.unchanged).toBe(2);
+      expect(m.metrics_truncated).toBe(false);
+    }
+  );
+
+  it("43. decisions past the exhausted budget leave metrics_truncated true", () => {
+    confirmedDecision("d1", ["f1"]);
+    confirmedDecision("d2", ["f2"]);
+    confirmedDecision("d3", ["f3"]);
+
+    // Budget 2: d3 never gets a verdict — the flag must say so.
+    const m = provenanceMetrics(db, new CheckBudget(2, 1_000_000));
+    expect(m.metrics_truncated).toBe(true);
+    const counted =
+      m.decisions_by_check_state.unchanged +
+      m.decisions_by_check_state.changed +
+      m.decisions_by_check_state.unknown +
+      m.decisions_by_check_state.incomplete;
+    expect(counted).toBe(2);
+  });
+
+  it("44. a decision with only a claim anchor is counted, not dropped", () => {
+    // Confirmed "no supports": a claim anchor exists, no live edges, no
+    // snapshot rows — the case the deleted dead branch pretended to cover.
+    // The WHERE keeps such decisions in the metric, and computeSupportCheck
+    // gives them an honest verdict (unchanged: confirmed-empty, nothing
+    // moved); the bucket total proves the decision is not lost.
+    node("solo", "decision", "decision solo");
+    confirmSupports(db, {
+      decision_id: "solo",
+      expected_claim_digest: claimDigestOf("decision solo"),
+      items: [],
+    });
+
+    const m = provenanceMetrics(db, new CheckBudget(10, 1_000_000));
+    expect(m.no_live_supports).toBe(1);
+    const counted =
+      m.decisions_by_check_state.unchanged +
+      m.decisions_by_check_state.changed +
+      m.decisions_by_check_state.unknown +
+      m.decisions_by_check_state.incomplete;
+    expect(counted).toBe(1);
+    expect(m.decisions_by_check_state.unchanged).toBe(1);
+    expect(m.metrics_truncated).toBe(false);
+  });
+});
+
 describe("F9: edge provenance survives a merge", () => {
   it("37. created_via and accepted_at travel with the row", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-baselines-f9-"));
@@ -1126,6 +1240,86 @@ describe("F9: edge provenance survives a merge", () => {
       rmTemp(dir);
     }
   });
+
+  it(
+    "41. every created_via value survives the merge as itself (F3, 2.1.1)",
+    () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-baselines-f3-"));
+      try {
+        // Left source: the agent edge (link) and the auto edge (raw row).
+        const aPath = path.join(dir, "a.db");
+        const a = new KnowledgeDB(aPath);
+        a.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
+        a.insertNode({ id: "f1", name: "F1", kind: "config", summary: "f1" });
+        a.insertNode({ id: "f2", name: "F2", kind: "config", summary: "f2" });
+        link(a, { from: "d", to: "f1", relation: "informed_by", description: "why f1" });
+        a.insertEdgeRaw({
+          from_id: "d",
+          to_id: "f2",
+          relation: "informed_by",
+          description: "why f2",
+          created_via: "auto",
+        });
+        a.close();
+
+        // Right source: a pre-v8 database — the edges table has no
+        // created_via/accepted_at columns at all. Reopening re-adds them with
+        // the 'unknown' default, which is exactly the production path for old
+        // files: the origin was never recorded, so 'unknown' is honest.
+        const bPath = path.join(dir, "b.db");
+        const b = new KnowledgeDB(bPath);
+        b.insertNode({ id: "d", name: "D", kind: "decision", summary: "decision d" });
+        b.insertNode({ id: "f3", name: "F3", kind: "config", summary: "f3" });
+        b.insertEdgeRaw({ from_id: "d", to_id: "f3", relation: "informed_by", description: "why f3" });
+        b.close();
+        const strip = new Database(bPath);
+        strip.exec(`
+          DROP INDEX IF EXISTS idx_edges_created_via;
+          DROP INDEX IF EXISTS idx_edges_live_from_to;
+          ALTER TABLE edges DROP COLUMN created_via;
+          ALTER TABLE edges DROP COLUMN accepted_at;
+        `);
+        strip.pragma("user_version = 7");
+        strip.close();
+        // Sanity: after the strip+reopen the old row is honestly unknown.
+        const bReopened = new KnowledgeDB(bPath);
+        const bEdge = bReopened.getInformedByEdges("d", "ancestry", false)[0];
+        expect(bEdge.created_via).toBe("unknown");
+        bReopened.close();
+
+        const expectOrigins = (outPath: string): void => {
+          const out = new KnowledgeDB(outPath);
+          try {
+            const byTarget = new Map(
+              out
+                .getInformedByEdges("d", "ancestry", false)
+                .map((e) => [e.to_id, e.created_via])
+            );
+            expect(byTarget.get("f1")).toBe("agent");
+            expect(byTarget.get("f2")).toBe("auto");
+            expect(byTarget.get("f3")).toBe("unknown");
+            expect(byTarget.size).toBe(3);
+          } finally {
+            out.close();
+          }
+        };
+
+        const outAB = path.join(dir, "ab.db");
+        new MergeEngine().merge(aPath, bPath, outAB);
+        expectOrigins(outAB);
+
+        // Both orders: the right-hand copy must travel as faithfully as the
+        // left-hand one — the union path treats the sides symmetrically, this
+        // pins it.
+        const outBA = path.join(dir, "ba.db");
+        new MergeEngine().merge(bPath, aPath, outBA);
+        expectOrigins(outBA);
+      } finally {
+        rmTemp(dir);
+      }
+    },
+    60_000
+  );
 });
 
 describe("F10: the merge carries the OLD claim digest, not the current wording", () => {

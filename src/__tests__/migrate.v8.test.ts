@@ -50,7 +50,10 @@ describe("migration v7 -> v8 (plan 4 v8: support baselines)", () => {
     openDb = reopened;
     expect(reopened.getUserVersion()).toBe(SCHEMA_VERSION);
     // plan-4-fixes-6: superseded_at lives in v9, on top of the v8 table.
-    expect(SCHEMA_VERSION).toBe(9);
+    // plan-4-fixes-7 (2.1.1): the live-edge index rides as v10 — the v9
+    // stamp already shipped in 2.1.0, so released databases would never
+    // re-run a v9 block; the version keeps moving forward only.
+    expect(SCHEMA_VERSION).toBe(10);
 
     const nodeCols = (
       reopened.pragma("table_info(nodes)") as Array<{ name: string }>
