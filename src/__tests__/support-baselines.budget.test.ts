@@ -65,6 +65,17 @@ function supportEdge(from: string, to: string, description = `why ${to}`) {
   link(db, { from, to, relation: "informed_by", description });
 }
 
+/** Decision with evidence confirmed the plain way (no createConcept needed). */
+function confirmedDecision(id: string, supports: string[]) {
+  node(id, "decision", `decision ${id}`);
+  for (const s of supports) {
+    node(s, "fact");
+    supportEdge(id, s);
+  }
+  confirm(id, supports);
+  return id;
+}
+
 function confirm(decisionId: string, supportIds: string[]) {
   const decision = db.getNode(decisionId)!;
   const edges = db.getInformedByEdges(decisionId, "ancestry", false);
@@ -361,4 +372,83 @@ describe("2.1.2 F9: provenance_metrics under budget", () => {
     expect(counted).toBe(1);
     expect(m.metrics_truncated).toBe(true);
   }, 120_000);
+});
+
+// ---- F14: метрики читают внутри одной транзакции ----
+
+describe("2.1.2 F14: provenance_metrics reads one snapshot", () => {
+  it("the whole call runs inside a read transaction; a concurrent write is refused", () => {
+    confirmedDecision("m1", ["x1"]);
+    confirmedDecision("m2", ["x2"]);
+    node("y", "fact"); // a fresh pair m1 -> y for the concurrent-write probe
+
+    const txnSpy = vi.spyOn(db, "runInTransaction");
+
+    // Second connection: try to write while the metrics read is in flight —
+    // the held read transaction must refuse it (one snapshot, no tearing).
+    const db2 = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
+    // Fail fast instead of waiting the default 5 s per attempt: the point is
+    // that the write is REFUSED inside the read transaction, not how long it
+    // waits first.
+    db2.execSqlRun("PRAGMA busy_timeout = 10");
+    let writeError: unknown = null;
+    let checks = 0;
+    // The page SELECT puts both decisions in one page; the write attempt goes
+    // on the SECOND per-decision check (countLiveInformedByEdges), i.e. while
+    // the read transaction is open and half the answer is already computed.
+    const origCount = db.countLiveInformedByEdges.bind(db);
+    (db as unknown as Record<string, unknown>).countLiveInformedByEdges = (id: string) => {
+      checks += 1;
+      if (checks === 2) {
+        try {
+          db2.insertEdgeRaw({
+            from_id: "m1",
+            to_id: "y",
+            relation: "informed_by",
+            description: "late arrival",
+          });
+        } catch (err) {
+          writeError = err;
+        }
+      }
+      return origCount(id);
+    };
+
+    try {
+      const m = provenanceMetrics(db, new CheckBudget(1000, 1_000_000));
+      expect(checks).toBeGreaterThanOrEqual(2);
+      expect(txnSpy).toHaveBeenCalled();
+      // The concurrent write hit the held read lock — it did not tear the
+      // answer, it was refused while the transaction was open.
+      expect(writeError).not.toBeNull();
+      expect(String(writeError)).toMatch(/BUSY|locked|busy/i);
+      expect(m.metrics_truncated).toBe(false);
+      expect(m.decisions_by_check_state.unchanged).toBe(2);
+    } finally {
+      delete (db as unknown as Record<string, unknown>).getMetricDecisionsPage;
+      db2.close();
+    }
+
+    // After the read transaction released the lock, the same write lands.
+    db2IsClosedRefusedWriteLands();
+  }, 30_000);
+
+  function db2IsClosedRefusedWriteLands(): void {
+    // (Reopening is unnecessary — the refused write is retried on the main
+    // connection to prove it was refused, not lost.)
+    const landed = db.execSqlAll(
+      "SELECT 1 FROM edges WHERE from_id = 'm1' AND to_id = 'y' AND description = 'late arrival'"
+    );
+    expect(landed).toHaveLength(0); // refused write must NOT have landed silently
+    db.insertEdgeRaw({
+      from_id: "m1",
+      to_id: "y",
+      relation: "informed_by",
+      description: "late arrival",
+    });
+    const landedNow = db.execSqlAll(
+      "SELECT 1 FROM edges WHERE from_id = 'm1' AND to_id = 'y' AND description = 'late arrival'"
+    );
+    expect(landedNow).toHaveLength(1);
+  }
 });
