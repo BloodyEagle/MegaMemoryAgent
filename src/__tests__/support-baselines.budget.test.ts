@@ -240,3 +240,66 @@ describe("2.1.2 F8: the fallback snapshot read fetches one row, not the pair his
     expect(materialized).toBeLessThanOrEqual(3);
   }, 120_000);
 });
+
+// ---- F11: мёртвые снимки идут keyset-страницами, не OFFSET ----
+
+describe("2.1.2 F11: dead anchors are walked by keyset, not OFFSET", () => {
+  it("pages enumerate every dead support once, cursor = last support_id, no OFFSET", () => {
+    node("d", "decision", "decision d");
+    const WIDTH = 450;
+    const ids: string[] = [];
+    for (let i = 0; i < WIDTH; i++) ids.push(`s${String(i).padStart(4, "0")}`);
+    for (const id of ids) {
+      node(id, "fact", `fact ${id}`);
+      supportEdge("d", id);
+    }
+    confirm("d", ids);
+    // Tombstone every support edge: all 450 anchors become dead.
+    for (const id of ids) expect(db.deleteEdge("d", id, "informed_by")).toBe(true);
+
+    // Record every dead-page query: its SQL shape and its cursor argument.
+    const raw = (db as unknown as { db: { prepare: (s: string) => unknown } }).db;
+    const realPrepare = raw.prepare.bind(raw) as (s: string) => {
+      all: (...a: unknown[]) => unknown[];
+    };
+    const deadQueries: Array<{ sql: string; args: unknown[] }> = [];
+    (raw as unknown as { prepare: (s: string) => { all: (...a: unknown[]) => unknown[] } }).prepare =
+      (sql: string) => {
+        const stmt = realPrepare(sql);
+        if (/GROUP BY b\.support_id/i.test(sql)) {
+          const realAll = stmt.all.bind(stmt) as (...a: unknown[]) => unknown[];
+          (stmt as unknown as { all: (...a: unknown[]) => unknown[] }).all = (
+            ...a: unknown[]
+          ) => {
+            deadQueries.push({ sql, args: a });
+            return realAll(...a);
+          };
+        }
+        return stmt;
+      };
+
+    // Walk the pages the way computeSupportCheck does — cursor = last id.
+    const walked: string[] = [];
+    let cursor = "";
+    for (;;) {
+      const page = db.getDeadBaselineSupportsPage("d", cursor, 200);
+      if (page.length === 0) break;
+      for (const r of page) walked.push(r.support_id);
+      cursor = page[page.length - 1].support_id;
+    }
+
+    // Complete, ordered, duplicate-free enumeration.
+    expect(walked).toEqual(ids);
+    expect(new Set(walked).size).toBe(WIDTH);
+    // Three full pages (200/200/50) plus one empty terminator query — the
+    // cursor is the last seen support_id each time, never an OFFSET.
+    expect(deadQueries.length).toBe(4);
+    for (const q of deadQueries) {
+      expect(q.sql).toMatch(/support_id > \?/);
+      expect(q.sql).not.toMatch(/OFFSET/i);
+    }
+    expect(deadQueries[1].args[1]).toBe(ids[199]);
+    expect(deadQueries[2].args[1]).toBe(ids[399]);
+    expect(deadQueries[3].args[1]).toBe(ids[449]);
+  });
+});

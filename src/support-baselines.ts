@@ -312,10 +312,12 @@ export function computeSupportCheck(
   // out of the comparison. The scan runs only when the live pass finished —
   // over a truncated live prefix a row past it would be misread as removed.
   if (!exhausted) {
-    let deadProcessed = 0;
+    // 2.1.2 F11: the cursor is the last seen support_id (keyset), not an
+    // OFFSET — each page costs its own rows, not a re-walk of the prefix.
+    let lastSupportId = "";
     for (;;) {
       const take = Math.max(1, Math.min(SUPPORT_PAGE, budget.remainingEdges));
-      const dead = db.getDeadBaselineSupportsPage(nodeId, deadProcessed, take);
+      const dead = db.getDeadBaselineSupportsPage(nodeId, lastSupportId, take);
       if (dead.length === 0) break;
       let stop = false;
       for (const r of dead) {
@@ -329,7 +331,7 @@ export function computeSupportCheck(
           reasons: ["removed"],
           since: r.confirmed_at,
         });
-        deadProcessed++;
+        lastSupportId = r.support_id;
       }
       if (stop || dead.length < take) break;
     }

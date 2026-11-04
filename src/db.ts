@@ -1696,10 +1696,16 @@ export class KnowledgeDB {
    * A deterministic page of dead anchors: active snapshot rows whose support
    * has no live informed_by edge left (node removed or edge tombstoned).
    * One row per support — the latest confirmation wins.
+   *
+   * 2.1.2 F11: keyset pagination (cursor = the last seen support_id), not
+   * OFFSET — a LIMIT/OFFSET page re-walked its whole prefix every time, so a
+   * star with many dead anchors paid quadratic work across pages. The PK
+   * prefix (decision_id, support_id) makes the keyset walk a straight index
+   * read: per-page work is the page itself.
    */
   getDeadBaselineSupportsPage(
     decisionId: string,
-    offset: number,
+    afterSupportId: string,
     limit: number
   ): Array<{ support_id: string; confirmed_at: string }> {
     if (!this.hasSupportBaselinesTable()) return [];
@@ -1708,15 +1714,16 @@ export class KnowledgeDB {
         `SELECT b.support_id, MAX(b.confirmed_at) AS confirmed_at
          FROM support_baselines b
          WHERE b.decision_id = ? AND b.superseded_at IS NULL
+           AND b.support_id > ?
            AND NOT EXISTS (
              SELECT 1 FROM edges e
              WHERE e.from_id = b.decision_id AND e.to_id = b.support_id
                AND e.relation = 'informed_by' AND e.removed_at IS NULL
            )
          GROUP BY b.support_id
-         ORDER BY b.support_id LIMIT ? OFFSET ?`
+         ORDER BY b.support_id LIMIT ?`
       )
-      .all(decisionId, limit, offset) as Array<{
+      .all(decisionId, afterSupportId, limit) as Array<{
       support_id: string;
       confirmed_at: string;
     }>;
