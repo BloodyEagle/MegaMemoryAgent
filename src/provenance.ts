@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import type { KnowledgeDB } from "./db.js";
+import { isNodeExpired } from "./db.js";
 import type { NodeRow } from "./types.js";
 import type {
   ProvenanceTraceInput,
@@ -426,6 +427,9 @@ function traverse(
     epistemic_status: rootRemoved ? null : rootNode!.epistemic_status ?? null,
     depth: 0,
     in_paths: 1,
+    // 2.1.12 F1: просроченный корень не прячется — обход честно идёт, но
+    // пометка говорит «читай как историю, не как факт».
+    ...(!rootRemoved && isNodeExpired(rootNode!) ? { expired: true } : {}),
     ...(rootRemoved ? { removed: true } : {}),
   });
 
@@ -508,6 +512,10 @@ function traverse(
         epistemic_status: isRemoved ? null : other!.epistemic_status ?? null,
         depth: depth + 1,
         in_paths: null,
+        // 2.1.12 F1: просроченный предшественник НЕ обрывает цепочку —
+        // обход, счёт путей и раскрытие продолжаются, но expired: true
+        // отделяет «это было верно тогда» от «это верно сейчас».
+        ...(!isRemoved && isNodeExpired(other!) ? { expired: true } : {}),
         ...(isRemoved ? { removed: true } : {}),
       });
       budget--;
@@ -694,20 +702,23 @@ function weakLinksJsonSize(list: ProvenanceWeakLink[]): number {
 const WEAK_LINK_PRIORITY: Record<ProvenanceWeakLink["type"], number> = {
   refuted: 0,
   abandoned: 1,
-  cycle: 2,
-  support_changed: 3,
+  // 2.1.12 F1: срок годности вышел — тот же класс опасности «читать нельзя,
+  // история видна», что у abandoned.
+  expired: 2,
+  cycle: 3,
+  support_changed: 4,
   // 2.1.3 F2: the source moved while the summary may be untouched — the same
   // danger class as a snapshot divergence, right after it.
-  artifact_changed: 4,
-  support_unreviewed: 5,
-  missing_support: 6,
-  no_support: 7,
-  ungrounded_support: 8,
+  artifact_changed: 5,
+  support_unreviewed: 6,
+  missing_support: 7,
+  no_support: 8,
+  ungrounded_support: 9,
   // 2.1.9 F2: stub supports — same danger class as ungrounded ones.
-  stub_support: 9,
-  no_rationale: 10,
-  support_check_truncated: 11,
-  weak_links_truncated: 12,
+  stub_support: 10,
+  no_rationale: 11,
+  support_check_truncated: 12,
+  weak_links_truncated: 13,
 };
 
 /**
@@ -772,6 +783,15 @@ function weakLinks(
         type: "abandoned",
         id: n.id,
         note: clampNote(`узел "${n.id}" заброшен — вывод может устареть`),
+      });
+    } else if (n.expired) {
+      // 2.1.12 F1: просроченный факт — верно на дату записи, срок вышел.
+      weak.push({
+        type: "expired",
+        id: n.id,
+        note: clampNote(
+          `узел "${n.id}" просрочен (valid_until в прошлом) — утверждение могло перестать быть верным`
+        ),
       });
     }
   }

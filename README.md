@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.11-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.12-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -37,7 +37,7 @@ database at `.megamemory/knowledge.db`.
 | Embeddings | `all-MiniLM-L6-v2`, English-only, dimension hardcoded | `Xenova/multilingual-e5-small` by default (`MEGAMEMORY_EMBED_MODEL`), e5 `passage:`/`query:` prefixes, dimension read from the model, vector search disabled on model mismatch until `megamemory reembed` |
 | Search | cosine similarity only | hybrid: FTS5 + vector fused with RRF, per-hit `via: vector \| fts \| both`, query sanitization for `MATCH`, short-CJK routing, optional trigram index, `name_norm` LIKE fallback |
 | Context | `understand` returns everything it found | `mode: "compact"` by default, bounded by `max_tokens` (1500), summaries trimmed to 240 chars, edges between returned nodes only, `meta.returned / dropped / tokens_estimated` |
-| Freshness | delete or nothing | node `status` (`active`/`superseded`/`deprecated`), `supersedes` and `contradicts` edges, outdated nodes hidden from answers but visible in the graph |
+| Freshness | delete or nothing | node `status` (`active`/`superseded`/`deprecated`), `supersedes` and `contradicts` edges, outdated nodes hidden from answers but visible in the graph; facts expire: `valid_until` drops state claims out of answers after their date |
 | Duplicates | manual merge | `megamemory consolidate` finds embedding-similar pairs (≥ 0.95) and merges them with edge transfer |
 | Long modules | every child read separately | `digest` nodes: one per module, rebuilt after the 5th child, lower search weight |
 | Portability | DB only | `megamemory export --md <dir>` writes one markdown file per node (frontmatter + wiki-links), `--check` for CI |
@@ -76,13 +76,26 @@ call, no follow-up `link` needed:
 ```json
 { "evidence": [
     { "ref": "src/auth/session.ts#L42", "why": "timeout read from the code" },
-    { "node": "req-session-ttl", "why": "the requirement fixed the TTL" }
+    { "node": "req-session-ttl", "why": "the requirement fixed the TTL" },
+    { "ref": "git:tag:v2.1.11", "why": "shipped in that release" }
 ] }
 ```
 
-Each item takes exactly one of `ref` (a file; the node already citing it is
-reused, otherwise a file-fact node is created) or `node` (an existing concept),
-plus a mandatory `why`. Auto-deriving supports from `why` + `file_refs` exists
+Each item takes exactly one of `ref` (a file, a git object, or any other
+identifier; the node already citing it is reused, otherwise a file-fact node is
+created) or `node` (an existing concept), plus a mandatory `why`.
+
+**Git evidence (2.1.12)** — "merged to main", "shipped in 2.1.11" are checked
+against git objects, not files: `git:tag:<name>`, `git:commit:<sha>` (full or
+7+ chars) and `git:branch:<name>` resolve to a commit sha via the LOCAL git
+binary — no network calls, GitHub API is never touched. `check_artifacts` on
+such an anchor reports the resolved sha; the tag moved or the branch advanced
+→ `changed` with both shas in `weak_links`; the ref vanished → `missing`. Use
+`git:branch:` only for "has moved" checks, never as proof of "merged". The
+repository is `--repo PATH` at server start (default: the database directory);
+the path is pinned into `node_artifacts.repo_path` at the first resolution, so
+later checks do not depend on the server's cwd. Auto-deriving supports from
+`why` + `file_refs` exists
 but is **off by default** (`provenance.auto_ground` in `megamemory.config.json`
 next to the database) — server-invented supports must not masquerade as
 agent-declared provenance.
@@ -131,6 +144,31 @@ spaces, punctuation, ё/е) and the summary vector (top-3, cosine threshold
 `MEGAMEMORY_DEDUPE_THRESHOLD`) and returns `duplicate_of` instead of writing a
 second copy — `force: true` overrides consciously. Digests and server-built
 anchors are never deduplicated.
+
+## Facts expire
+
+A journal entry is not knowledge: "PR #3 not opened yet" was true on the day it
+was written and is a lie a day later. Such nodes have no supports, so
+`support_check` never flags them — nothing it tracks has changed. Schema v13
+gives every node an optional `valid_until` (ISO-8601, UTC):
+
+- **When to set it** — any statement about the world as it was: "merged",
+  "release shipped", "PR open", "migration not started". Architecture,
+  conventions and behavior facts stay dateless. The server never invents an
+  expiry — `create_concept` / `update_concept` accept `valid_until`, and
+  leaving it out means the fact is permanent.
+- **What happens on expiry** — the node drops out of `understand` answers
+  (`meta.stale_excluded` counts how many were hidden);
+  `include_stale: true` returns them marked `expired: true`. Nothing is
+  deleted: the node stays in the graph, in `get_concept`, in history — it
+  just stops masquerading as current knowledge.
+- **How it surfaces** — `provenance_trace` does not cut the chain at an
+  expired predecessor: it is still traversed and counted, but marked
+  `expired` and reported as a weak link. `stats` shows an `Expired` line;
+  `doctor` warns when more than 10% of active nodes are past their date.
+- **Superseded is not expired** — the `valid_until` written by `supersedes`
+  is a replacement marker on a node that already left the answers through its
+  own status; the expiry filters only apply to active nodes.
 
 ---
 
@@ -282,10 +320,10 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 
 | Tool | Description |
 |---|---|
-| `understand` | Hybrid search over the graph. `top_k`, `max_tokens`, `mode: "compact" \| "full"`, `include_inactive`. |
+| `understand` | Hybrid search over the graph. `top_k`, `max_tokens`, `mode: "compact" \| "full"`, `include_inactive`, `include_stale` (expired facts). |
 | `get_concept` | Exact-ID lookup with children, edges, incoming edges, parent. |
-| `create_concept` | Add a concept with edges, file refs and `supersedes`. |
-| `update_concept` | Update fields; embeddings are regenerated. |
+| `create_concept` | Add a concept with edges, file refs and `supersedes`; `valid_until` sets the fact's expiry. |
+| `update_concept` | Update fields; embeddings are regenerated. `valid_until: null` clears the expiry. |
 | `link` | Typed relationship between concepts. |
 | `remove_concept` | Soft-delete with a reason; history kept, status set to `deprecated`. |
 | `list_roots` | Top-level concepts with direct children (budgeted). |
@@ -293,6 +331,7 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 | `resolve_conflict` | Resolve a conflict with verified content. |
 | `provenance_trace` | Walk `informed_by` (`ancestry` / `impact`) with honest completeness and weak links first. |
 | `provenance_audit` | Graph-wide provenance audit: weak links, ungrounded decisions, retention of past audits. |
+| `check_artifacts` | Hash a node's file/git-blob artifacts, resolve `git:tag/commit/branch` refs to a sha; divergences surface as `artifact_changed`. |
 
 **Kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest`
 

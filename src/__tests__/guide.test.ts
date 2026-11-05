@@ -170,3 +170,25 @@ describe("сниппет: файл — это ref, а не узел (2.1.9 F3)",
     expect(buildGuideText()).toContain(line!);
   });
 });
+
+describe("срок годности и git-опоры в документации (2.1.12 F4)", () => {
+  it("18. guide содержит правило про valid_until и пример git:-опоры", () => {
+    expect(SNIPPET).toContain("valid_until");
+    expect(SNIPPET).toContain("State claims expire");
+    expect(SNIPPET).toContain('evidence: [{ref: "git:tag:v2.1.11", why}]');
+    expect(SNIPPET).toContain("git:commit:<sha>");
+    // лимит 60 строк сохранён (20)
+    expect(SNIPPET.split("\n").length).toBeLessThanOrEqual(60);
+  });
+
+  it("19. оба README содержат раздел срока годности и пример git:-опоры", () => {
+    const en = fs.readFileSync(path.join(PROJECT_ROOT, "README.md"), "utf-8");
+    const ru = fs.readFileSync(path.join(PROJECT_ROOT, "README.ru.md"), "utf-8");
+    expect(en).toContain("## Facts expire");
+    expect(en).toContain("git:tag:v2.1.11");
+    expect(en).toContain("stale_excluded");
+    expect(ru).toContain("## Срок годности фактов");
+    expect(ru).toContain("git:tag:v2.1.11");
+    expect(ru).toContain("stale_excluded");
+  });
+});

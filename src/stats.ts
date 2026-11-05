@@ -141,6 +141,14 @@ export async function runStats(args: string[]): Promise<void> {
     printRow("Nodes", formatNumber(stats.nodes), `(${formatNumber(rootCount)} root, ${formatNumber(childCount)} children)`);
     printRow("Edges", formatNumber(stats.edges));
     printRow("Removed", formatNumber(stats.removed));
+    // 2.1.12 F1: активные узлы с вышедшим сроком годности — «ещё в графе,
+    // но уже не знания». Superseded/deprecated не считаются: у них своя
+    // строка старости (stale nodes в doctor).
+    printRow(
+      "Expired",
+      formatNumber(db.countExpiredNodes()),
+      "активные узлы с valid_until в прошлом — не отдаются understand"
+    );
     printRow("Timeline", `${formatNumber(timelineCount)} entries`);
     console.log();
 
