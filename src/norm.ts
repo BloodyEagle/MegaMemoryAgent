@@ -14,3 +14,17 @@ export function normalizeName(name: string): string {
     .toLowerCase()
     .normalize("NFC");
 }
+
+/**
+ * 2.1.10 F4: name comparison for the create-time dedupe — регистр, пробелы,
+ * пунктуация, ё/е. normalizeName already folds case and diacritics; this adds
+ * the ё→е fold and dissolves punctuation/digit-adjacent separators into
+ * single spaces, so «Кэш-результатов», "cache results"-style variants and
+ * «Кэш результатов» collapse to one key.
+ */
+export function normalizeNameForDedupe(name: string): string {
+  return normalizeName(name)
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
