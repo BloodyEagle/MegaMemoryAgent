@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.10-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.11-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -115,7 +115,7 @@ and in a merge an edge tombstone wins over a live copy — a severed link does
 not resurrect because the other branch never knew.
 
 **Anchors vs claims (2.1.10)** — a support created by `evidence: [{ref}]` is an
-*anchor*: a small node named after the file (`path:start-end`) with a template
+*anchor*: a small node named after the file (`path:start-end`, or the whole file `plans/report.md`) with a template
 summary ("File-fact node for … — created as a provenance support."). That
 template is **by design** — the anchor exists to carry the link and its
 digests, not to state a thought. Since schema v12 every node carries

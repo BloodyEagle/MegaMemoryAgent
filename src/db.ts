@@ -115,6 +115,7 @@ export class KnowledgeDB {
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("synchronous = NORMAL");
     this.migrate();
+    this.backfillCreatedViaV2();
   }
 
   /** Public: the doctor checks user_version against SCHEMA_VERSION (plan 1 §6). */
@@ -580,6 +581,60 @@ export class KnowledgeDB {
       }
 
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /**
+   * 2.1.11 F1: повторный проход бэкфилла created_via. Миграция v11→v12
+   * выполняется один раз, и базы, уже сидящие на v12, старое правило
+   * (имя обязано кончаться «:строка») прошлись по ним с занесённым
+   * `agent` — ссылки на файл целиком (`plans/report.md`) легитимны, но
+   * остались помечены как ручные заглушки. Правка данных, не структуры:
+   * SCHEMA_VERSION не поднимается, вместо этого идемпотентный шаг при
+   * открытии базы на v12 — перевести на `file_ref` строки `agent`, у
+   * которых все три признака якоря (по ослабленному предикату) выполнены.
+   * Однократность — флаг `created_via_backfill_v2 = done` в meta.
+   */
+  private backfillCreatedViaV2(): void {
+    if (this.getUserVersion() !== SCHEMA_VERSION) return;
+    if (this.getMetaValue("created_via_backfill_v2") === "done") return;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Re-check after acquiring the write lock in case another process
+      // finished the pass first (mirror of migrate()).
+      if (this.getMetaValue("created_via_backfill_v2") === "done") {
+        this.db.exec("COMMIT");
+        return;
+      }
+      const rows = this.db
+        .prepare(
+          "SELECT id, name, summary, file_refs FROM nodes WHERE created_via = 'agent'"
+        )
+        .all() as Array<{
+        id: string;
+        name: string;
+        summary: string | null;
+        file_refs: string | null;
+      }>;
+      const flip = this.db.prepare(
+        "UPDATE nodes SET created_via = 'file_ref' WHERE id = ?"
+      );
+      for (const row of rows) {
+        let refs: string[] | null = null;
+        try {
+          const parsed = row.file_refs ? JSON.parse(row.file_refs) : null;
+          if (Array.isArray(parsed)) refs = parsed.map(String);
+        } catch {
+          refs = null;
+        }
+        if (looksLikeFileRefAnchor(row.summary, row.name, refs)) flip.run(row.id);
+      }
+      this.setMetaValue("created_via_backfill_v2", "done");
       this.db.exec("COMMIT");
     } catch (err) {
       this.db.exec("ROLLBACK");
