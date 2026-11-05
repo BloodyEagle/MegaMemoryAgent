@@ -1,5 +1,7 @@
 import { KnowledgeDB } from "./db.js";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import {
   cosineSimilarity,
   embed,
@@ -10,7 +12,7 @@ import {
   vectorSearchEnabled,
 } from "./embeddings.js";
 import { basicSearch, ftsSearch, hybridSearch, type SearchVia } from "./search.js";
-import { normalizeName } from "./norm.js";
+import { normalizeName, normalizeNameForDedupe } from "./norm.js";
 import type {
   UnderstandInput,
   GetConceptInput,
@@ -745,10 +747,108 @@ function findDuplicateNote(
   return "";
 }
 
+// ---- 2.1.10 F4: дедупликация при создании ----
+
+const DEDUPE_THRESHOLD_DEFAULT = 0.92;
+
+export const DUPLICATE_MESSAGE_PREFIX = "Похожий узел уже есть";
+
+/**
+ * Порог косинуса для семантического канала дедупликации. Читается СВЕЖИМ на
+ * каждый вызов (как provenance-флаги, plan 3 §11): megamemory.config.json
+ * рядом с базой (dedupe.threshold, по умолчанию 0.92), env-переопределение
+ * MEGAMEMORY_DEDUPE_THRESHOLD. Битый конфиг и битый env не роняют вызов —
+ * берётся значение по умолчанию.
+ */
+export function readDedupeThreshold(dbPath: string): number {
+  let threshold = DEDUPE_THRESHOLD_DEFAULT;
+  const file = path.join(
+    path.dirname(path.resolve(dbPath)),
+    "megamemory.config.json"
+  );
+  try {
+    if (fs.existsSync(file)) {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as {
+        dedupe?: { threshold?: unknown };
+      };
+      const t = parsed?.dedupe?.threshold;
+      if (typeof t === "number" && Number.isFinite(t) && t > 0 && t <= 1) {
+        threshold = t;
+      }
+    }
+  } catch {
+    // unreadable config -> default
+  }
+  const raw = process.env.MEGAMEMORY_DEDUPE_THRESHOLD;
+  if (raw !== undefined && raw.trim() !== "") {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0 && n <= 1) threshold = n;
+  }
+  return threshold;
+}
+
+export interface DuplicateHit {
+  id: string;
+  similarity: number;
+  matched_by: "name" | "semantic";
+}
+
+/**
+ * F4: найти дубликат по смыслу ДО вставки. Два канала:
+ *  - имя: normalizeNameForDedupe (регистр, пробелы, пунктуация, ё/е) —
+ *    точное совпадение по всем живым узлам;
+ *  - смысл: вектор саммари против сохранённых векторов, топ-3 кандидатов,
+ *    косинус >= threshold (канал работает только когда вектор включён —
+ *    иначе/embedding null проверка честно сужается до имени).
+ */
+export function findDuplicateConcept(
+  db: KnowledgeDB,
+  opts: { name: string; embedding: Buffer | null; threshold: number }
+): DuplicateHit | null {
+  const nameKey = normalizeNameForDedupe(opts.name);
+  if (nameKey) {
+    const rows = db.execSqlAll(
+      "SELECT id, name FROM nodes WHERE removed_at IS NULL"
+    ) as Array<{ id: string; name: string }>;
+    for (const row of rows) {
+      if (normalizeNameForDedupe(row.name) === nameKey) {
+        return { id: row.id, similarity: 1, matched_by: "name" };
+      }
+    }
+  }
+
+  if (!opts.embedding || opts.embedding.length === 0) return null;
+  const hits = findTopK(
+    opts.embedding,
+    db.getAllActiveNodesWithEmbeddings(),
+    3
+  );
+  for (const hit of hits) {
+    if (hit.similarity >= opts.threshold) {
+      return {
+        id: hit.id,
+        similarity: hit.similarity,
+        matched_by: "semantic",
+      };
+    }
+  }
+  return null;
+}
+
+export interface CreateConceptResult {
+  /** Set when the node was created; absent when refused as a duplicate. */
+  id?: string;
+  message: string;
+  /** F4: set when the dedupe check refused the creation. */
+  duplicate_of?: string;
+  similarity?: number;
+  matched_by?: "name" | "semantic";
+}
+
 export async function createConcept(
   db: KnowledgeDB,
   input: CreateConceptInput
-): Promise<{ id: string; message: string }> {
+): Promise<CreateConceptResult> {
   if (!input.name || input.name.trim().length === 0) {
     throw new Error("Concept name must be a non-empty string.");
   }
@@ -932,6 +1032,32 @@ export async function createConcept(
   const text = embeddingText(input.name, input.kind, input.summary);
   const embedding = await embedForStorage(db, text);
 
+  // ---- 2.1.10 F4: дубликаты по смыслу не создаются ----
+  // Вторая сессия, не посмотревшая базу, записывает ту же работу заново.
+  // Проверка ДО вставки: имя (регистр/пробелы/пунктуация/ё-е) или вектор
+  // саммари (топ-3, порог из конфига, по умолчанию 0.92). Не применяется к
+  // digest (серверная сводка) и к серверным якорям (file_ref создаются
+  // внутри транзакции ниже, мимо этой проверки). force — осознанный обход.
+  if (input.kind !== "digest" && !input.force) {
+    const duplicate = findDuplicateConcept(db, {
+      name: input.name,
+      embedding,
+      threshold: readDedupeThreshold(db.dbPath),
+    });
+    if (duplicate) {
+      const sim = Number(duplicate.similarity.toFixed(4));
+      return {
+        duplicate_of: duplicate.id,
+        similarity: sim,
+        matched_by: duplicate.matched_by,
+        message:
+          `${DUPLICATE_MESSAGE_PREFIX}: "${duplicate.id}" ` +
+          `(matched_by: ${duplicate.matched_by}, similarity ${sim}). ` +
+          "Обнови его или передай force: true.",
+      };
+    }
+  }
+
   db.runInTransaction(() => {
     for (const fact of factNodesToCreate) {
       db.insertNode({
@@ -941,6 +1067,9 @@ export async function createConcept(
         summary: `File-fact node for "${fact.name}" — created as a provenance support.`,
         file_refs: [fact.name],
         embedding: fact.embedding,
+        // 2.1.10 F1: the anchor origin — its template summary is by design,
+        // never a stub.
+        created_via: "file_ref",
       });
       if (fact.embedding) db.upsertVector(fact.id, fact.embedding);
     }
@@ -958,6 +1087,9 @@ export async function createConcept(
         embedding,
         epistemic_status: epistemic,
         status_scope: input.status_scope ? JSON.stringify(input.status_scope) : null,
+        // 2.1.10 F1: an explicit agent call — the only origin whose rows the
+        // stub checks are allowed to incriminate.
+        created_via: "agent",
       },
       [
         ...(input.edges ?? []).map((edge) => ({
@@ -1739,6 +1871,7 @@ export function taskAdd(
     kind: "task",
     summary: `Task: ${name}`,
     epistemic_status: null,
+    created_via: "agent",
   });
   db.setTaskState(id, "open", due ?? null);
   return { id, message: `Task "${id}" added to the open column${due ? `, due ${due}` : ""}.` };

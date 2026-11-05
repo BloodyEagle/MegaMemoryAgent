@@ -60,7 +60,8 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
 8. **Supports:** for a decision/solution pass \`evidence: [{node | ref, why}]\` in the same call
    that creates it; \`why\` names what exactly in the support backs the conclusion — not a
    retelling. A support on a file is a ref — \`evidence: [{ref: "src/x.ts:120-180", why}]\` — not
-   a new node: create a support node only for a thought a link cannot express.
+   a new node: create a support node only for a thought a link cannot express. The ref creates
+   an anchor (a file-named node with a template summary) — that is a support, not a stub.
    \`file_refs\` alone are not supports: the server derives them only with auto_ground
    enabled (off by default). Auto-derived supports are not confirmed evidence — a draft, not a check.
 9. **Confirm versions:** after reading a support, confirm it: \`confirm_supports(decision_id,

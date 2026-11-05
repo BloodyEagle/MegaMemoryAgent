@@ -25,6 +25,11 @@ describe("AGENTS_MD_SNIPPET — онбординг провенанса (2.1.5 F
     expect(SNIPPET).toContain("auto_ground");
   });
 
+  it("2.1.10: ref создаёт якорь — это опора, а не заглушка", () => {
+    expect(SNIPPET).toContain("an anchor (a file-named node with a template summary)");
+    expect(SNIPPET).toContain("not a stub");
+  });
+
   it("учит подтверждению версий и чтению состояний support_check", () => {
     expect(SNIPPET).toContain("confirm_supports(decision_id,");
     expect(SNIPPET).toContain("expected_status_digest");

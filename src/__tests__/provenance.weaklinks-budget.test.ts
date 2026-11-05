@@ -21,12 +21,20 @@ function freshDb(prefix: string): KnowledgeDB {
   return new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
 }
 
-function node(id: string, kind = "config", opts: { epistemic?: string } = {}) {
+function node(
+  id: string,
+  kind = "config",
+  opts: { epistemic?: string; fileRefs?: string[] } = {}
+) {
   db.insertNode({
     id,
     name: id.toUpperCase(),
     kind,
     summary: `s-${id}`,
+    // 2.1.10 F3: с проверкой опор на всех носителях знания узел с опорами
+    // проверяется независимо от kind. В фиксстурах-«звёздах» листьям даны
+    // file_refs, чтобы hub оставался тихим, как до 2.1.10.
+    ...(opts.fileRefs ? { file_refs: opts.fileRefs } : {}),
     ...(opts.epistemic ? { epistemic_status: opts.epistemic } : {}),
   });
 }
@@ -237,8 +245,10 @@ describe("support warning semantics within the budget (unchanged)", () => {
     expect(out.weak_links.some((w) => w.type === "missing_support" && w.count === 1)).toBe(true);
 
     // Same graph, but the third support is grounded — no warning at all.
+    // (u3 carries file_refs: 2.1.10 F3 checks g — a non-decision with a
+    // support — so an ungrounded u3 would now speak for g.)
     node("d2", "decision");
-    node("u3");
+    node("u3", "config", { fileRefs: ["src/u3.ts:1-2"] });
     node("g", "config");
     edge("g", "u3"); // g has a live outgoing informed_by -> grounded
     edge("d2", "u1");
@@ -282,7 +292,12 @@ describe("8 KB weak_links cap (D2.4)", () => {
 
   it("9. 150 no_support records overflow the cap: the marker reports shown/total and the payload fits", () => {
     node("hub");
-    for (let i = 1; i <= 150; i++) node(`d${String(i).padStart(3, "0")}`, "decision");
+    // file_refs on the leaves keep hub quiet under 2.1.10 F3 (hub is a
+    // non-decision with supports — grounded leaves leave it silent).
+    for (let i = 1; i <= 150; i++)
+      node(`d${String(i).padStart(3, "0")}`, "decision", {
+        fileRefs: [`src/d${i}.ts:1-2`],
+      });
     for (let i = 1; i <= 150; i++) edge("hub", `d${String(i).padStart(3, "0")}`);
 
     const out = trace("hub", { maxNodes: 200 });
@@ -299,7 +314,10 @@ describe("8 KB weak_links cap (D2.4)", () => {
     node("hub");
     for (let i = 1; i <= 150; i++) {
       const id = `d${String(i).padStart(3, "0")}`;
-      node(id, "decision", i === 7 ? { epistemic: "refuted" } : {});
+      node(id, "decision", {
+        ...(i === 7 ? { epistemic: "refuted" } : {}),
+        fileRefs: [`src/d${i}.ts:1-2`],
+      });
       edge("hub", id);
     }
 

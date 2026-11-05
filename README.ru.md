@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.9-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.10-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -112,6 +112,24 @@
 с подсказкой, называющей зависимые узлы; `force` переопределяет. Удаления
 оставляют надгробия, и в merge надгробие ребра побеждает живую копию —
 разорванная связь не воскресает от того, что вторая ветка о ней не знала.
+
+**Якоря и утверждения (2.1.10)** — опора, созданная через `evidence: [{ref}]`,
+это *якорь*: маленький узел с именем-файлом (`path:начало-конец`) и шаблонным
+саммари («File-fact node for … — created as a provenance support.»). Шаблон
+так и задуман: якорь существует, чтобы нести связь и её дайджесты, а не
+формулировать мысль. Начиная со схемы v12 каждый узел несёт `created_via`
+(`agent` | `file_ref` | `import` | `auto`), и заглушкой считается только
+ручной узел (`agent`): `stats` делит строку опор на
+`Supports: N (anchors a, claims c)` плюс счётчик `Stubs`, а `weak_links`
+показывает `stub_support` только для ручных шаблонных саммари. Якорь никогда
+не признается заглушкой, а ручной шаблонный текст по-прежнему отбивается —
+различие теперь по происхождению, а не по тексту. Дубли по смыслу не
+создаются: `create_concept` сверяет нормализованное имя (регистр, пробелы,
+пунктуация, ё/е) и вектор саммари (топ-3, порог косинуса `dedupe.threshold`
+в `megamemory.config.json`, по умолчанию 0.92, env
+`MEGAMEMORY_DEDUPE_THRESHOLD`) и возвращает `duplicate_of` вместо второй
+копии — `force: true` обходит осознанно. Дайджесты и серверные якоря
+дедупликации не подлежат.
 
 ---
 

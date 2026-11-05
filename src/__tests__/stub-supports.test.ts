@@ -38,9 +38,16 @@ afterEach(() => {
 const STUB_SUMMARY =
   'File-fact node for "server/src/lib/scanner.ts:817-878" — created as a provenance support.';
 
-/** Raw inserts: заглушки уже записаны до 2.1.9 и не удаляются, только помечаются. */
+/** Raw inserts: заглушки уже записаны до 2.1.9 и не удаляются, только помечаются.
+ * created_via="agent" явно (2.1.10: заглушкой бывает только ручной узел). */
 function node(id: string, kind: string, summary: string): void {
-  db.insertNode({ id, name: id.toUpperCase(), kind: kind as never, summary });
+  db.insertNode({
+    id,
+    name: id.toUpperCase(),
+    kind: kind as never,
+    summary,
+    created_via: "agent",
+  });
 }
 
 function edge(from: string, to: string): void {

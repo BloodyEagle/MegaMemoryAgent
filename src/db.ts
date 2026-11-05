@@ -10,10 +10,11 @@ import type {
   SupportRevisionRow,
 } from "./types.js";
 import { normalizeName } from "./norm.js";
+import { looksLikeFileRefAnchor } from "./stub.js";
 
 /** Plan 4 (informed_by provenance slice, schema v7); v8 baselines, v11 revisions
- * + artifacts. */
-export const SCHEMA_VERSION = 11;
+ * + artifacts, v12 nodes.created_via (anchor vs agent-node). */
+export const SCHEMA_VERSION = 12;
 
 /**
  * 2.1.3 F1: support revision journal defaults. The journal keeps the history
@@ -176,6 +177,13 @@ export class KnowledgeDB {
             -- (a mismatch against the current summary IS the signal).
             claim_digest TEXT,
             claim_digest_at TEXT,
+            -- 2.1.10 (v12): which write path created the node. 'agent' —
+            -- create_concept/task_add, 'file_ref' — server-built file-fact
+            -- anchors (evidence: [{ref}]), 'import' — MergeEngine rows,
+            -- 'auto' — other server writes (digest). NULL only on rows
+            -- written before v12 outside the backfill (merge from an older
+            -- source): unknown origin never incriminates the node.
+            created_via TEXT,
             FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE SET NULL
           );
 
@@ -527,6 +535,50 @@ export class KnowledgeDB {
         }
       }
 
+      if (currentVersion < 12) {
+        // 2.1.10 F1: anchors are not stubs. nodes.created_via separates the
+        // write paths: the template "File-fact node for ..." summary is what
+        // evidence: [{ref}] anchors are SUPPOSED to look like — only
+        // agent-written placeholder summaries remain stubs. Guarded ALTER
+        // (fresh dbs already carry the column from CREATE TABLE), then a
+        // one-time backfill: a row is an anchor when ALL three hold — the
+        // file-fact summary template, file_refs[0] === name, and a name
+        // shaped like "path:line" / "path:start-end". Everything else is a
+        // hand-written node ('agent') — the backfill never leaves NULL behind.
+        const ncols12 = new Set(
+          this.db.prepare("PRAGMA table_info(nodes)").all().map((c: any) => c.name)
+        );
+        if (!ncols12.has("created_via")) {
+          this.db.exec("ALTER TABLE nodes ADD COLUMN created_via TEXT");
+        }
+        const legacyRows = this.db
+          .prepare(
+            "SELECT id, name, summary, file_refs FROM nodes WHERE created_via IS NULL"
+          )
+          .all() as Array<{
+          id: string;
+          name: string;
+          summary: string;
+          file_refs: string | null;
+        }>;
+        const backfill = this.db.prepare(
+          "UPDATE nodes SET created_via = ? WHERE id = ?"
+        );
+        for (const row of legacyRows) {
+          let refs: string[] | null = null;
+          try {
+            const parsed = row.file_refs ? JSON.parse(row.file_refs) : null;
+            if (Array.isArray(parsed)) refs = parsed.map(String);
+          } catch {
+            refs = null;
+          }
+          backfill.run(
+            looksLikeFileRefAnchor(row.summary, row.name, refs) ? "file_ref" : "agent",
+            row.id
+          );
+        }
+      }
+
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       this.db.exec("COMMIT");
     } catch (err) {
@@ -597,10 +649,14 @@ export class KnowledgeDB {
     // Plan 1 §5.3: initial epistemic state, default open (NULL on legacy dbs).
     epistemic_status?: string | null;
     status_scope?: string | null;
+    // 2.1.10 (v12): node origin — 'agent' | 'file_ref' | 'import' | 'auto'.
+    // Every write path must state its own; NULL stays for rows carried over
+    // from sources that predate the column.
+    created_via?: string | null;
   }): void {
     const stmt = this.db.prepare(`
-      INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task, embedding, epistemic_status, status_scope)
-      VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task, @embedding, @epistemic_status, @status_scope)
+      INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task, embedding, epistemic_status, status_scope, created_via)
+      VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task, @embedding, @epistemic_status, @status_scope, @created_via)
     `);
     stmt.run({
       id: node.id,
@@ -614,6 +670,7 @@ export class KnowledgeDB {
       embedding: node.embedding ?? null,
       epistemic_status: node.epistemic_status ?? "open",
       status_scope: node.status_scope ?? null,
+      created_via: node.created_via ?? null,
     });
     this.syncNameNorm(node.id, node.name);
   }
@@ -631,6 +688,7 @@ export class KnowledgeDB {
       embedding: Buffer | null;
       epistemic_status?: string | null;
       status_scope?: string | null;
+      created_via?: string | null;
     },
     edges: Array<{
       to_id: string;
@@ -655,6 +713,7 @@ export class KnowledgeDB {
         embedding: node.embedding,
         epistemic_status: node.epistemic_status,
         status_scope: node.status_scope,
+        created_via: node.created_via,
       });
 
       for (const edge of edges) {
@@ -2653,6 +2712,17 @@ export class KnowledgeDB {
     return this._hasClaimColumns;
   }
 
+  /** 2.1.10 (v12): nodes.created_via present (self-heal for older dbs). */
+  private _hasCreatedViaColumn: boolean | undefined;
+
+  private get hasCreatedViaColumn(): boolean {
+    if (this._hasCreatedViaColumn === undefined) {
+      const cols = this.db.pragma("table_info(nodes)") as Array<{ name: string }>;
+      this._hasCreatedViaColumn = cols.some((c) => c.name === "created_via");
+    }
+    return this._hasCreatedViaColumn;
+  }
+
   insertNodeRaw(node: {
     id: string;
     name: string;
@@ -2682,6 +2752,8 @@ export class KnowledgeDB {
     // a carried-over snapshot keeps pointing at the wording it confirmed.
     claim_digest?: string | null;
     claim_digest_at?: string | null;
+    // 2.1.10 (v12): node origin travels with the row (MergeEngine carry).
+    created_via?: string | null;
   }): void {
     // Б10: fork columns exist only on migrated dbs — compose the column
     // list conditionally so upstream dbs keep working.
@@ -2699,13 +2771,15 @@ export class KnowledgeDB {
       : "";
     const claimCols = this.hasClaimColumns ? ", claim_digest, claim_digest_at" : "";
     const claimParams = this.hasClaimColumns ? ", @claim_digest, @claim_digest_at" : "";
+    const viaCols = this.hasCreatedViaColumn ? ", created_via" : "";
+    const viaParams = this.hasCreatedViaColumn ? ", @created_via" : "";
     const stmt = this.db.prepare(`
       INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task,
         created_at, updated_at, removed_at, removed_reason, embedding,
-        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols})
+        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols}${viaCols})
       VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task,
         @created_at, @updated_at, @removed_at, @removed_reason, @embedding,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams})
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams}${viaParams})
     `);
     const values: Record<string, unknown> = {
       id: node.id,
@@ -2738,6 +2812,9 @@ export class KnowledgeDB {
     if (this.hasClaimColumns) {
       values.claim_digest = (node as { claim_digest?: string | null }).claim_digest ?? null;
       values.claim_digest_at = (node as { claim_digest_at?: string | null }).claim_digest_at ?? null;
+    }
+    if (this.hasCreatedViaColumn) {
+      values.created_via = (node as { created_via?: string | null }).created_via ?? null;
     }
     stmt.run(values);
     this.syncNameNorm(node.id, node.name);

@@ -286,8 +286,9 @@ describe("schema v10 → v11 (2.1.3: revisions + artifacts)", () => {
 
     const db = new KnowledgeDB(dbPath);
     try {
-      // the migration ran to the new version
-      expect(db.getUserVersion()).toBe(11);
+      // the migration ran to the new version (2.1.10: the pin moves with
+      // the schema bump, v11 → v12)
+      expect(db.getUserVersion()).toBe(12);
       // both tables exist, empty journal: old dbs start honest (no invented
       // history — the chain opens at the first post-upgrade confirmation)
       expect(db.hasSupportRevisionsTable()).toBe(true);

@@ -387,6 +387,7 @@ async function startMcpServer() {
       epistemic_status: z.enum(["open", "validated", "refuted", "abandoned"]).optional().describe("Initial epistemic state (default: open). 'validated' requires status_scope with an artifact"),
       status_scope: z.record(z.unknown()).optional().describe("Scope of a 'validated' claim, JSON: {env?, version?, dataset?, artifact?} — artifact (test/run id) is mandatory for validated"),
       allow_stub: z.boolean().optional().describe('Осознанный обход запрета опор-заглушек: узел с шаблонным/коротким саммари запишется с epistemic_status = "stub" и останется слабым звеном в weak_links. Для обычных узлов не передавай — саммари с утверждением не требует обхода'),
+      force: z.boolean().optional().describe("Создать узел, несмотря на найденный дубликат по имени или смыслу (2.1.10): без force близкий узел возвращает duplicate_of вместо создания — обнови существующий узел или передай force осознанно"),
     },
     async (params) => {
       try {
@@ -404,24 +405,30 @@ async function startMcpServer() {
           epistemic_status: params.epistemic_status,
           status_scope: params.status_scope,
           allow_stub: params.allow_stub,
+          force: params.force,
         });
-        // T6: auto-digest the parent when it gained its 5th+ child.
+        // T6: auto-digest the parent when it gained its 5th+ child (nothing
+        // was created on a duplicate refusal — nothing to digest for).
         let digestNote = "";
-        try {
-          const { maybeAutoDigest } = await import("./digest.js");
-          const digest = await maybeAutoDigest(db, params.parent_id ?? null);
-          if (digest) digestNote = ` Digest built: ${digest.digestId}`;
-        } catch {
-          // digest building must never fail the create
+        if (!result.duplicate_of) {
+          try {
+            const { maybeAutoDigest } = await import("./digest.js");
+            const digest = await maybeAutoDigest(db, params.parent_id ?? null);
+            if (digest) digestNote = ` Digest built: ${digest.digestId}`;
+          } catch {
+            // digest building must never fail the create
+          }
         }
 
         timeline.log({
           tool: "create_concept",
           params: { name: params.name, kind: params.kind, parent_id: params.parent_id },
-          result_summary: `created ${result.id}`,
-          is_write: true,
+          result_summary: result.duplicate_of
+            ? `duplicate_of ${result.duplicate_of}`
+            : `created ${result.id}`,
+          is_write: !result.duplicate_of,
           is_error: false,
-          affected_ids: [result.id],
+          affected_ids: result.id ? [result.id] : [],
         });
         return { content: [{ type: "text" as const, text: JSON.stringify({ ...result, message: result.message + digestNote }, null, 2) }] };
       } catch (err) {

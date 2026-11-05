@@ -94,6 +94,12 @@ export interface CreateConceptInput {
    * a deliberate placeholder, never mistaken for a confirmation.
    */
   allow_stub?: boolean;
+  /**
+   * 2.1.10 F4: create anyway when the dedupe check finds a semantic or
+   * name-level duplicate. Without it a near-duplicate request is refused
+   * with duplicate_of — update that node or pass force consciously.
+   */
+  force?: boolean;
 }
 
 /** Plan 3 §4.1.1: one evidence item — exactly one of `ref` / `node`, plus `why`. */
@@ -387,6 +393,10 @@ export interface NodeRow {
   // the old confirmation does not extend to the new wording.
   claim_digest?: string | null;
   claim_digest_at?: string | null;
+  // 2.1.10 (v12): which write path created the node — 'agent' | 'file_ref' |
+  // 'import' | 'auto'. Anchors ('file_ref') never count as stubs; NULL means
+  // the origin is unknown (rows carried over from pre-v12 sources).
+  created_via?: string | null;
 }
 
 export interface EdgeRow {

@@ -4,7 +4,7 @@ import { KnowledgeDB } from "./db.js";
 import { errorBold } from "./cli-utils.js";
 import { listRoots } from "./tools.js";
 import { resolveDbPathOrExit } from "./db-path.js";
-import { countStubSupports } from "./stub.js";
+import { supportQualityBreakdown } from "./stub.js";
 
 const KIND_ORDER = ["feature", "module", "component", "pattern", "config", "decision"];
 
@@ -198,12 +198,22 @@ export async function runStats(args: string[]): Promise<void> {
     );
     printRow("Edges accepted", formatNumber(prov.edges_accepted), "explicitly accepted auto edges");
     printRow("Decisions w/ support", formatNumber(prov.decisions_with_live_support));
-    // 2.1.9 F2: stub supports read as confirmation — the count sits right
-    // next to the support metric it deflates.
+    // 2.1.10 F1: the support line splits by origin — anchors (file-fact
+    // nodes built by evidence: [{ref}]) are supports by design, their
+    // template summary is not a defect; claims are hand-written nodes.
+    const supportSplit = supportQualityBreakdown(db);
     printRow(
-      "Stub supports",
-      formatNumber(countStubSupports(db)),
-      "опоры с шаблонным/коротким саммари — утверждения нет"
+      "Supports",
+      formatNumber(supportSplit.total),
+      `(anchors ${formatNumber(supportSplit.anchors)}, claims ${formatNumber(supportSplit.claims)})`
+    );
+    // 2.1.9 F2 / 2.1.10 F1: stub supports read as confirmation — the count
+    // sits right next to the support metric it deflates. Only hand-written
+    // rows (created_via='agent') count; anchors never do.
+    printRow(
+      "Stubs",
+      formatNumber(supportSplit.stubs),
+      "ручные опоры с шаблонным/коротким саммари — утверждения нет"
     );
     printRow(
       "Decisions w/o live support",

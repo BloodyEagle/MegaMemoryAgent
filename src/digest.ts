@@ -132,6 +132,8 @@ export async function buildDigest(
       file_refs: refs.length > 0 ? refs : null,
       parent_id: moduleId,
       embedding,
+      // 2.1.10 F1: a server write — not an agent node, never a stub subject.
+      created_via: "auto",
     });
   } else {
     db.updateNode(targetId, {
