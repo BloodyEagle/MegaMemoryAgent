@@ -150,13 +150,17 @@ describe("2.1.10 F1: миграция v11 → v12 (бэкфилл created_via)",
       looksLikeFileRefAnchor(ANCHOR_SUMMARY, ANCHOR_NAME + "-copy", [ANCHOR_NAME])
     ).toBe(false);
     expect(looksLikeFileRefAnchor(ANCHOR_SUMMARY, ANCHOR_NAME, null)).toBe(false);
-    // Имя без «:строка»/«:старт-конец» — не якорь, даже при совпадении refs.
+    // 2.1.11 F1: путь без «:строка» — якорь наравне с «path:диапазон».
     expect(
       looksLikeFileRefAnchor(
         ANCHOR_SUMMARY,
         "server/src/lib/scanner.ts",
         ["server/src/lib/scanner.ts"]
       )
+    ).toBe(true);
+    // Обычная фраза (нет разделителя каталогов) — не якорь.
+    expect(
+      looksLikeFileRefAnchor(ANCHOR_SUMMARY, "scanner overview", ["scanner overview"])
     ).toBe(false);
   });
 
@@ -170,6 +174,189 @@ describe("2.1.10 F1: миграция v11 → v12 (бэкфилл created_via)",
       "SELECT count(*) AS n FROM nodes WHERE created_via IS NULL"
     ) as Array<{ n: number }>;
     expect(nulls[0].n).toBe(0);
+  });
+});
+
+describe("2.1.11 F1: повторный проход бэкфилла (якоря без номеров строк)", () => {
+  const WHOLE_FILE = "plans/report.md";
+  const fileFact = (name: string) =>
+    `File-fact node for "${name}" — created as a provenance support.`;
+
+  /**
+   * Репродукция базы на v12 после СТАРОГО бэкфилла: строки уже занесены
+   * `agent` (требование «:строка» не пустило якорь-файл), флага
+   * created_via_backfill_v2 ещё нет — как на живой базе до патча.
+   */
+  function buildOldBackfill(dbPath: string): void {
+    const db = new KnowledgeDB(dbPath);
+    db.insertNode({ id: "d", name: "D", kind: "decision", summary: "решение держит кэш превью" });
+    db.insertNode({
+      id: "whole-file",
+      name: WHOLE_FILE,
+      kind: "feature",
+      summary: fileFact(WHOLE_FILE),
+      file_refs: [WHOLE_FILE],
+      created_via: "agent",
+    });
+    db.insertEdgeRaw({ from_id: "d", to_id: "whole-file", relation: "informed_by", description: "why" });
+    db.close();
+    const raw = new Database(dbPath);
+    raw.exec("DELETE FROM meta WHERE key = 'created_via_backfill_v2'");
+    raw.close();
+  }
+
+  it("1. файл целиком без «:строка» → после прохода file_ref, Stubs не считает", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-backfill-v2-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    buildOldBackfill(dbPath);
+    const db = new KnowledgeDB(dbPath);
+    dbs.push(db);
+    expect(db.getNode("whole-file")!.created_via).toBe("file_ref");
+    expect(supportQualityBreakdown(db)).toEqual({
+      total: 1,
+      anchors: 1,
+      claims: 0,
+      stubs: 0,
+    });
+  });
+
+  it("2. file_refs[0] !== name → остаётся agent, считается заглушкой", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-backfill-v2b-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    const db = new KnowledgeDB(dbPath);
+    db.insertNode({ id: "d", name: "D", kind: "decision", summary: "решение держит кэш превью" });
+    db.insertNode({
+      id: "impostor",
+      name: WHOLE_FILE,
+      kind: "feature",
+      summary: fileFact(WHOLE_FILE),
+      file_refs: ["plans/other.md"],
+      created_via: "agent",
+    });
+    db.insertEdgeRaw({ from_id: "d", to_id: "impostor", relation: "informed_by", description: "why" });
+    db.close();
+    const raw = new Database(dbPath);
+    raw.exec("DELETE FROM meta WHERE key = 'created_via_backfill_v2'");
+    raw.close();
+    const reopened = new KnowledgeDB(dbPath);
+    dbs.push(reopened);
+    expect(reopened.getNode("impostor")!.created_via).toBe("agent");
+    expect(supportQualityBreakdown(reopened)).toEqual({
+      total: 1,
+      anchors: 0,
+      claims: 1,
+      stubs: 1,
+    });
+  });
+
+  it("3. имя вида «src/db.ts:120-180» распознаётся как раньше", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-backfill-v2c-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    const ref = "src/db.ts:120-180";
+    const db = new KnowledgeDB(dbPath);
+    db.insertNode({
+      id: "ranged",
+      name: ref,
+      kind: "feature",
+      summary: fileFact(ref),
+      file_refs: [ref],
+      created_via: "agent",
+    });
+    db.close();
+    const raw = new Database(dbPath);
+    raw.exec("DELETE FROM meta WHERE key = 'created_via_backfill_v2'");
+    raw.close();
+    const reopened = new KnowledgeDB(dbPath);
+    dbs.push(reopened);
+    expect(reopened.getNode("ranged")!.created_via).toBe("file_ref");
+  });
+
+  it("4. нешаблонное саммари не трогается, даже если имя совпадает с file_refs[0]", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-backfill-v2d-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    const db = new KnowledgeDB(dbPath);
+    db.insertNode({
+      id: "claim",
+      name: WHOLE_FILE,
+      kind: "feature",
+      summary: "хранилище возвращает превью по запросу и блокирует доступ без токена",
+      file_refs: [WHOLE_FILE],
+      created_via: "agent",
+    });
+    db.close();
+    const raw = new Database(dbPath);
+    raw.exec("DELETE FROM meta WHERE key = 'created_via_backfill_v2'");
+    raw.close();
+    const reopened = new KnowledgeDB(dbPath);
+    dbs.push(reopened);
+    expect(reopened.getNode("claim")!.created_via).toBe("agent");
+  });
+
+  it("5. повторный запуск прохода ничего не меняет, флаг в meta не перезаписывается", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-backfill-v2e-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    buildOldBackfill(dbPath);
+    const first = new KnowledgeDB(dbPath);
+    expect(first.getNode("whole-file")!.created_via).toBe("file_ref");
+    // Канарка: если проход запустится ещё раз, она перейдёт в file_ref.
+    first.insertNode({
+      id: "canary",
+      name: WHOLE_FILE,
+      kind: "feature",
+      summary: fileFact(WHOLE_FILE),
+      file_refs: [WHOLE_FILE],
+      created_via: "agent",
+    });
+    first.close();
+    const second = new KnowledgeDB(dbPath);
+    dbs.push(second);
+    expect(second.getNode("canary")!.created_via).toBe("agent");
+    expect(second.getNode("whole-file")!.created_via).toBe("file_ref");
+    expect(second.getMetaValue("created_via_backfill_v2")).toBe("done");
+  });
+
+  it("6. stats на фикстуре: Stubs 0 после прохода", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-backfill-v2f-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    const db = new KnowledgeDB(dbPath);
+    db.insertNode({ id: "d", name: "D", kind: "decision", summary: "решение держит кэш превью" });
+    db.insertNode({
+      id: "claim",
+      name: "CLAIM",
+      kind: "feature",
+      summary: "хранилище возвращает превью по запросу и блокирует доступ без токена",
+      created_via: "agent",
+    });
+    db.insertEdgeRaw({ from_id: "d", to_id: "claim", relation: "informed_by", description: "why" });
+    db.insertNode({
+      id: "whole-file",
+      name: WHOLE_FILE,
+      kind: "feature",
+      summary: fileFact(WHOLE_FILE),
+      file_refs: [WHOLE_FILE],
+      created_via: "agent",
+    });
+    db.insertEdgeRaw({ from_id: "d", to_id: "whole-file", relation: "informed_by", description: "why" });
+    db.close();
+    const raw = new Database(dbPath);
+    raw.exec("DELETE FROM meta WHERE key = 'created_via_backfill_v2'");
+    raw.close();
+    const reopened = new KnowledgeDB(dbPath);
+    dbs.push(reopened);
+    expect(reopened.getNode("whole-file")!.created_via).toBe("file_ref");
+
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...args) => {
+      logs.push(args.map(String).join(" "));
+    });
+    try {
+      await runStats(["--db", dbPath]);
+    } finally {
+      spy.mockRestore();
+    }
+    const text = logs.join("\n").replace(/\u001b\[\d+m/g, "");
+    expect(text).toMatch(/Supports:\s*2\s*\(anchors 1, claims 1\)/);
+    expect(text).toMatch(/Stubs:\s*0/);
   });
 });
 

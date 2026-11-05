@@ -66,10 +66,21 @@ export function isStubSummary(
 /**
  * 2.1.10 F1: одноразовый критерий миграции v12 — выглядит ли старая строка
  * как якорь `evidence: [{ref}]`. Три признака сразу: шаблонное саммари
- * file-fact, file_refs[0] совпадает с именем, имя выглядит как
- * «path:строка» или «path:старт-конец». Всё остальное — ручной узел.
+ * file-fact, file_refs[0] совпадает с именем, имя выглядит как путь.
+ * Всё остальное — ручной узел.
+ *
+ * 2.1.11 F1: требование «:строка» снято — ссылка на файл целиком
+ * (`plans/report.md`) тоже законная опора, старый бэкфилл помечал её
+ * `agent` и считал заглушкой. Признак пути: в имени есть разделитель
+ * каталогов — обычная фраза на `/` или `\` не похожа, — и нет пробелов
+ * по краям. Ложные опознания почти исключены: нужны и шаблонное саммари,
+ * и совпадение имени с первым file_ref одновременно.
  */
-export const FILE_REF_NAME_TAIL = /:\d+(?:-\d+)?$/;
+export const FILE_REF_NAME_SHAPE = /[\\/]/;
+
+export function looksLikeFilePath(name: string): boolean {
+  return name.trim() === name && FILE_REF_NAME_SHAPE.test(name);
+}
 
 export function looksLikeFileRefAnchor(
   summary: string | null | undefined,
@@ -78,7 +89,7 @@ export function looksLikeFileRefAnchor(
 ): boolean {
   if (!summary || !STUB_SUMMARY_PATTERN.test(summary)) return false;
   if (!fileRefs || fileRefs.length === 0 || fileRefs[0] !== name) return false;
-  return FILE_REF_NAME_TAIL.test(name);
+  return looksLikeFilePath(name);
 }
 
 export interface SupportQualityBreakdown {
