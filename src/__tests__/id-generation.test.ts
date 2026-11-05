@@ -139,7 +139,9 @@ describe("createConcept collision handling (T10 hardening)", () => {
     ensureSchema(db);
 
     const a = await createConcept(db, { name: "Ёж", kind: "feature", summary: "ёж хранит колючки и сворачивается при угрозе — проверка коллизий слага" });
-    const b = await createConcept(db, { name: "Еж", kind: "feature", summary: "еж без ё пишет те же два символа слага и получает хеш-суффикс" });
+    // force: true — осознанный обход дедупликации 2.1.10 (Ёж/Еж — один
+    // дедуп-ключ), суффикс слага от этого не меняется.
+    const b = await createConcept(db, { name: "Еж", kind: "feature", summary: "еж без ё пишет те же два символа слага и получает хеш-суффикс", force: true });
 
     expect(a.id).toBe("еж");
     expect(b.id).toMatch(/^еж-[0-9a-f]{8}$/);
@@ -149,7 +151,7 @@ describe("createConcept collision handling (T10 hardening)", () => {
 
     // Same name again → "already exists" (update_concept path).
     await expect(
-      createConcept(db, { name: "Еж", kind: "feature", summary: "еж хранит колючки и сворачивается при угрозе — дубль имени" })
+      createConcept(db, { name: "Еж", kind: "feature", summary: "еж хранит колючки и сворачивается при угрозе — дубль имени", force: true })
     ).rejects.toThrow(/already exists/);
   });
 });

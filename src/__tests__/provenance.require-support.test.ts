@@ -14,7 +14,7 @@ vi.mock("../embeddings.js", () => ({
   embeddingText: vi.fn((name: string, kind: string, summary: string) =>
     `${kind}: ${name} — ${summary}`
   ),
-  findTopK: vi.fn(),
+  findTopK: vi.fn(() => []),
   embedForStorage: vi.fn(async () => {
     const embedding = new Float32Array([1, 0, 0]);
     return Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);

@@ -53,11 +53,12 @@ describe("migration v7 -> v8 (plan 4 v8: support baselines)", () => {
     // plan-4-fixes-7 (2.1.1): the live-edge index rides as v10 — the v9
     // stamp already shipped in 2.1.0, so released databases would never
     // re-run a v9 block; the version keeps moving forward only.
-    // 2.1.3: the revision journal + artifact observations ride as v11. This
-    // assert pinned the then-current SCHEMA_VERSION and was updated with the
-    // bump — the old value asserted a falsehood after the bump (see the
-    // 2.1.3 report, «изменённые ассерты»).
-    expect(SCHEMA_VERSION).toBe(11);
+    // 2.1.3: the revision journal + artifact observations ride as v11.
+    // 2.1.10: nodes.created_via rides as v12. This assert pinned the
+    // then-current SCHEMA_VERSION and was updated with the bump — the old
+    // value asserted a falsehood after the bump (see the 2.1.3 report,
+    // «изменённые ассерты»).
+    expect(SCHEMA_VERSION).toBe(12);
 
     const nodeCols = (
       reopened.pragma("table_info(nodes)") as Array<{ name: string }>
