@@ -5,7 +5,7 @@ import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { errorBold, validatePort } from "./cli-utils.js";
-import { resolveDbPathOrExit } from "./db-path.js";
+import { resolveDbPathOrExit, resolveRepoPath } from "./db-path.js";
 import { buildHelp } from "./help.js";
 import { createTimelineLogger } from "./timeline.js";
 import { instructionsStatus } from "./instructions.js";
@@ -208,6 +208,10 @@ async function startMcpServer() {
   // ---- Configuration ----
   // MCP-режим, как и serve, законно создаёт базу при первой установке.
   const DB_PATH = resolveDbPathOrExit(process.argv.slice(2), { allowCreate: true });
+  // 2.1.12 F2: репозиторий для разрешения git:tag/commit/branch-опор
+  // (--repo PATH; по умолчанию — каталог базы). Дальше путь закрепляется
+  // в node_artifacts.repo_path при первом разрешении каждого ref'а.
+  const REPO_PATH = resolveRepoPath(process.argv.slice(2), DB_PATH);
 
   const db = new KnowledgeDB(DB_PATH);
 
@@ -287,6 +291,7 @@ async function startMcpServer() {
       max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the answer (default: 1500)"),
       mode: z.enum(["compact", "full"]).optional().describe("compact (default) trims each node to essentials under the budget; full returns legacy verbose output"),
       include_inactive: z.boolean().optional().describe("Include superseded/deprecated nodes (default: false)"),
+      include_stale: z.boolean().optional().describe("Вернуть и просроченные факты (valid_until в прошлом) — с пометкой expired: true (по умолчанию исключены, meta.stale_excluded считает исключённых)"),
     },
     async (params) => {
       try {
@@ -296,6 +301,7 @@ async function startMcpServer() {
           max_tokens: params.max_tokens,
           mode: params.mode,
           include_inactive: params.include_inactive,
+          include_stale: params.include_stale,
         });
         const returned = result.meta?.returned ?? result.matches.length;
         const ids = result.compact
@@ -388,6 +394,7 @@ async function startMcpServer() {
       status_scope: z.record(z.unknown()).optional().describe("Scope of a 'validated' claim, JSON: {env?, version?, dataset?, artifact?} — artifact (test/run id) is mandatory for validated"),
       allow_stub: z.boolean().optional().describe('Осознанный обход запрета опор-заглушек: узел с шаблонным/коротким саммари запишется с epistemic_status = "stub" и останется слабым звеном в weak_links. Для обычных узлов не передавай — саммари с утверждением не требует обхода'),
       force: z.boolean().optional().describe("Создать узел, несмотря на найденный дубликат по имени или смыслу (2.1.10): без force близкий узел возвращает duplicate_of вместо создания — обнови существующий узел или передай force осознанно"),
+      valid_until: z.string().optional().describe("Срок годности факта (ISO-8601, напр. \"2026-12-31\"). Обязателен для утверждений о состоянии («смержено», «PR открыт», «релиз вышел») — после даты узел выпадает из выдачи (include_stale возвращает с пометкой). Не передавай для вечных знаний (архитектура, соглашения)"),
     },
     async (params) => {
       try {
@@ -406,6 +413,7 @@ async function startMcpServer() {
           status_scope: params.status_scope,
           allow_stub: params.allow_stub,
           force: params.force,
+          valid_until: params.valid_until,
         });
         // T6: auto-digest the parent when it gained its 5th+ child (nothing
         // was created on a duplicate refusal — nothing to digest for).
@@ -459,6 +467,7 @@ async function startMcpServer() {
         epistemic_status: z.enum(["open", "validated", "refuted", "abandoned"]).optional().describe("Epistemic verdict transition; epistemic_reason is mandatory with it. Valid moves: open->validated/refuted/abandoned, validated->refuted/abandoned, refuted->open, abandoned->open"),
         epistemic_reason: z.string().optional().describe("Why this epistemic transition — recorded in status_history, required with epistemic_status"),
         status_scope: z.record(z.unknown()).optional().describe("Scope for 'validated': {env?, version?, dataset?, artifact?}; artifact (test/run id) is mandatory"),
+        valid_until: z.string().nullable().optional().describe("Срок годности факта (ISO-8601); null снимает срок, отсутствие поля оставляет как есть"),
       }),
     },
     async (params) => {
@@ -866,7 +875,7 @@ async function startMcpServer() {
 
   server.tool(
     "check_artifacts",
-    "Проверить внешние артефакты узлов (файлы и git-blob'ы из file_refs): посчитать sha256 содержимого и записать наблюдение. ЯВНЫЙ вызов — ничего не читается и не хешируется само: ни чтение узла, ни трассировка файлы не трогают. Расхождение «наблюдение vs подтверждённый снимок» всплывает в support_check как artifact_changed и в weak_links отдельным типом — это НЕ support_changed: саммари опоры могло остаться прежним, изменился источник. Порядок работы для снимка: check_artifacts по опорам → прочитать digest'ы → confirm_supports (он сохранит текущее состояние артефактов в снимок). Отсутствующий файл — запись missing, не падение. kind=url не поддерживается: сетевые запросы из MCP-сервера — отдельное решение.",
+    "Проверить внешние артефакты узлов (файлы, git-blob'ы и git:-ссылки из file_refs): посчитать sha256 содержимого или разрешить git:tag|commit|branch в sha коммита и записать наблюдение. ЯВНЫЙ вызов — ничего не читается и не хешируется само: ни чтение узла, ни трассировка файлы не трогают. Расхождение «наблюдение vs подтверждённый снимок» всплывает в support_check как artifact_changed и в weak_links отдельным типом — это НЕ support_changed: саммари опоры могло остаться прежним, изменился источник. Порядок работы для снимка: check_artifacts по опорам → прочитать digest'ы → confirm_supports (он сохранит текущее состояние артефактов в снимок). Отсутствующий файл или неразрешившийся ref — запись missing, не падение. Репозиторий для git:-ссылок: --repo при старте сервера (по умолчанию — каталог базы), путь закрепляется в repo_path при первом разрешении. kind=url не поддерживается: сетевые запросы из MCP-сервера — отдельное решение.",
     {
       node_ids: z.array(z.string()).min(1).describe("Узлы, чьи артефакты проверить (refs берутся из file_refs)"),
       max_files: z.number().int().min(1).max(10000).optional().describe("Лимит пар «узел—ref» за вызов (по умолчанию 50); лишние — truncated: true"),
@@ -876,6 +885,7 @@ async function startMcpServer() {
         const result = await checkArtifacts(db, {
           node_ids: params.node_ids,
           max_files: params.max_files,
+          repo: REPO_PATH,
         });
         timeline.log({
           tool: "check_artifacts",

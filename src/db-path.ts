@@ -116,3 +116,54 @@ export function resolveDbPathOrExit(argv: string[], opts?: DbPathOptions): strin
     throw err;
   }
 }
+
+/**
+ * 2.1.12 F2: разобрать `--repo PATH` / `--repo=PATH` из argv — репозиторий
+ * для разрешения git:tag/commit/branch-опор. Тот же стиль, что --db: флаг
+ * дважды — ошибка, значение без пути — ошибка.
+ */
+export function parseRepoFlag(argv: string[]): string | undefined {
+  let found: string | undefined;
+  let count = 0;
+
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === "--repo") {
+      count += 1;
+      const value = argv[i + 1];
+      if (value === undefined || value === "" || value.startsWith("--")) {
+        throw new DbPathError(
+          `Флагу --repo нужно значение пути: --repo <путь-к-репозиторию>.`
+        );
+      }
+      found = value;
+      i += 1;
+    } else if (token.startsWith("--repo=")) {
+      count += 1;
+      const value = token.slice("--repo=".length);
+      if (value === "") {
+        throw new DbPathError(
+          `Флаг --repo= задан без значения: --repo=<путь-к-репозиторию>.`
+        );
+      }
+      found = value;
+    }
+  }
+
+  if (count > 1) {
+    throw new DbPathError(
+      `Флаг --repo указан ${count} раза — неясно, какой репозиторий иметь в виду. Оставь один.`
+    );
+  }
+
+  return found;
+}
+
+/**
+ * Репозиторий для git:-опор: `--repo` → каталог базы (база живёт внутри
+ * репозитория, git сам находит корень по .git вверх по дереву).
+ */
+export function resolveRepoPath(argv: string[], dbPath: string): string {
+  const flag = parseRepoFlag(argv);
+  return path.resolve(flag ?? path.dirname(dbPath));
+}

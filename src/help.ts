@@ -44,6 +44,8 @@ ${pc.bold("Options:")}
   ${pc.cyan("--files-top")} ${pc.dim("N")}   bench: files baseline over the first N unique files in output order ${pc.dim("(default 0 = all; 3 is the honest live-agent number)")}
   ${pc.cyan("--db")} ${pc.dim("PATH")}       Path to knowledge.db for every command that opens the
                 database ${pc.dim("(sources: --db, MEGAMEMORY_DB_PATH, ./.megamemory/knowledge.db)")}
+  ${pc.cyan("--repo")} ${pc.dim("PATH")}     Repository for resolving git:tag/commit/branch supports
+                (MCP server; default: the database directory, pinned per ref on first use)
   ${pc.cyan("--help, -h")}      Show this help
   ${pc.cyan("--version, -v")}   Show version
 

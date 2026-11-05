@@ -100,6 +100,13 @@ export interface CreateConceptInput {
    * with duplicate_of — update that node or pass force consciously.
    */
   force?: boolean;
+  /**
+   * 2.1.12 F1: срок годности факта (ISO-8601, напр. "2026-12-31" или
+   * "2026-12-31T23:59:59Z"). Обязателен для утверждений о состоянии
+   * («смержено», «PR открыт») — без него запись о состоянии со временем
+   * тихо врёт. Сервер срок не придумывает: не передал — узел бессрочный.
+   */
+  valid_until?: string;
 }
 
 /** Plan 3 §4.1.1: one evidence item — exactly one of `ref` / `node`, plus `why`. */
@@ -127,6 +134,11 @@ export interface UpdateConceptInput {
     epistemic_status?: "open" | "validated" | "refuted" | "abandoned";
     epistemic_reason?: string;
     status_scope?: Record<string, unknown>;
+    /**
+     * 2.1.12 F1: срок годности факта (ISO-8601). null снимает срок (факт
+     * снова бессрочный), отсутствие поля оставляет как есть.
+     */
+    valid_until?: string | null;
   };
 }
 
@@ -183,6 +195,11 @@ export interface NodeWithContext {
   /** Lifecycle status (T4); absent only in not-yet-migrated dbs. */
   status?: string;
   valid_until?: string | null;
+  /**
+   * 2.1.12 F1: факт просрочен (valid_until в прошлом). Ставится только при
+   * include_stale: true — по умолчанию такие узлы из выдачи исключены.
+   */
+  expired?: boolean;
   /** Plan 1: epistemic axis + the scope of a `validated` (JSON). */
   epistemic_status?: string | null;
   status_scope?: Record<string, unknown> | null;
@@ -257,6 +274,12 @@ export interface UnderstandInput {
   mode?: "compact" | "full";
   /** Include superseded/deprecated nodes (T4). Default false. */
   include_inactive?: boolean;
+  /**
+   * 2.1.12 F1: вернуть и просроченные факты (valid_until в прошлом) — с
+   * пометкой expired: true. По умолчанию они исключены из выдачи
+   * (meta.stale_excluded считает исключённых).
+   */
+  include_stale?: boolean;
 }
 
 /** One node in compact understand output — everything optional is dropped. */
@@ -286,6 +309,11 @@ export interface CompactMatch {
    * tokens_estimated.
    */
   supports?: Array<{ id: string; name: string; summary: string }>;
+  /**
+   * 2.1.12 F1: the match is past its valid_until — present only when the
+   * caller asked include_stale: true.
+   */
+  expired?: boolean;
 }
 
 export interface UnderstandMeta {
@@ -300,6 +328,12 @@ export interface UnderstandMeta {
    * set of the answer is preserved — folded nodes travel nested.
    */
   supports_inlined?: number;
+  /**
+   * 2.1.12 F1: сколько просроченных фактов (valid_until в прошлом, активных)
+   * найдено запросом, но исключено из выдачи. Ноль — тоже честное число:
+   * молчаливый фильтр выглядел бы как «запрос ничего не нашёл».
+   */
+  stale_excluded?: number;
 }
 
 export interface UnderstandOutput {
@@ -339,6 +373,8 @@ export interface ListRootsOutput {
     kind: NodeKind;
     summary: string;
     children: string[];
+    /** 2.1.12 F1: срок годности корня, если агент его ставил. */
+    valid_until?: string | null;
   }>;
   /** true when roots_compact (budgeted overview) is the payload. */
   compact?: boolean;
@@ -347,6 +383,8 @@ export interface ListRootsOutput {
     name: string;
     kind: NodeKind;
     child_count: number;
+    /** 2.1.12 F1: срок годности корня, если агент его ставил. */
+    valid_until?: string | null;
   }>;
   /** Plan 2 §2: role slots — first in the startup digest. */
   slots?: Array<{ role: string; node_id: string; node_name: string }>;
@@ -571,6 +609,12 @@ export interface ProvenanceWeakLink {
   type:
     | "refuted"
     | "abandoned"
+    /**
+     * 2.1.12 F1: узел просрочен — valid_until в прошлом, но узел всё ещё
+     * активен и в графе. Выдача его уже не показывает; в цепочке он виден
+     * пометкой expired.
+     */
+    | "expired"
     | "no_rationale"
     | "ungrounded_support"
     | "missing_support"
@@ -667,10 +711,13 @@ export interface SupportBaselineRow {
 /** One observed external artifact of a node (node_artifacts row). */
 export interface NodeArtifactRow {
   node_id: string;
-  /** 'file' (path) | 'git_blob' (<rev>:<path>). URLs are out of scope. */
-  kind: "file" | "git_blob";
+  /**
+   * 'file' (path) | 'git_blob' (<rev>:<path>) | 'git_ref' (git:tag|commit|branch:<name>,
+   * digest = resolved commit sha). URLs are out of scope.
+   */
+  kind: "file" | "git_blob" | "git_ref";
   ref: string;
-  /** sha256 of the content; null = the file was missing at the last check. */
+  /** sha256 of the content / resolved sha; null = missing at the last check. */
   digest: string | null;
   /** Previous observed digest — warning text only ("was → became"). */
   prev_digest: string | null;
@@ -681,6 +728,12 @@ export interface NodeArtifactRow {
   changed_at: string | null;
   /** 'agent' | 'cli'. */
   checked_by: string;
+  /**
+   * 2.1.12 F2: репозиторий, в котором git:-ref резолвился в первый раз.
+   * Записывается при разрешении, чтобы повторные проверки не зависели от
+   * cwd сервера. Для file/git_blob всегда null.
+   */
+  repo_path?: string | null;
 }
 
 /** check_artifacts input (2.1.3 F2). */
@@ -690,6 +743,13 @@ export interface CheckArtifactsInput {
   max_files?: number;
   /** Base dir for relative refs and the git working tree (default cwd). */
   cwd?: string;
+  /**
+   * 2.1.12 F2: репозиторий для разрешения git:tag/commit/branch (по
+   * умолчанию — каталог базы). При первом разрешении путь пишется в
+   * node_artifacts.repo_path, последующие проверки идут в него даже из
+   * другого cwd.
+   */
+  repo?: string;
 }
 
 /** One missing ref in the check_artifacts answer. */
@@ -897,6 +957,12 @@ export interface ProvenanceNodeView {
   in_paths_capped?: boolean;
   /** Stub entry for a tombstoned endpoint in retrospective mode. */
   removed?: boolean;
+  /**
+   * 2.1.12 F1: узел просрочен (valid_until в прошлом, активен). Цепочку не
+   * обрывает — предшественник остаётся в обходе и в счёте путей, но читать
+   * его как факт нельзя.
+   */
+  expired?: boolean;
   /** audit only: epistemic_status != validated — this node is not trusted knowledge. */
   at_risk?: boolean;
   /**

@@ -64,6 +64,9 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
    an anchor (a file-named node with a template summary) — that is a support, not a stub.
    \`file_refs\` alone are not supports: the server derives them only with auto_ground
    enabled (off by default). Auto-derived supports are not confirmed evidence — a draft, not a check.
+   A git object is a ref too: \`evidence: [{ref: "git:tag:v2.1.11", why}]\` (also \`git:commit:<sha>\`,
+   \`git:branch:<name>\`) — the anchor resolves to a commit sha with LOCAL git; a moved tag flips
+   \`check_artifacts\` to \`changed\`.
 9. **Confirm versions:** after reading a support, confirm it: \`confirm_supports(decision_id,
    expected_claim_digest, items:[{support_id, expected_claim_digest, expected_status_digest,
    expected_edge_digest}])\` — the decision's digest is \`get_concept.current_digests.claim\`, the
@@ -79,6 +82,10 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
 11. **Asked "does this memory help?"** — don't argue, measure: \`megamemory bench\`
     (\`--baseline files\` vs reading files, \`te\` vs an external structural tool, \`both\`).
     Read \`ratio\` together with \`hit_rate\`: a cheap but wrong answer is not savings.
+12. **State claims expire:** a statement about the world AS IT WAS ("merged", "PR open",
+    "release shipped") MUST carry \`valid_until\` (ISO date) — it drops out of answers after
+    that date (\`include_stale: true\` returns it marked \`expired\`). Architecture and
+    conventions stay dateless; the server never invents an expiry for you.
 ${AGENTS_MD_END}
 `;
 

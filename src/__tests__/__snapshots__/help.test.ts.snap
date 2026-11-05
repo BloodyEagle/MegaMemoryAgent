@@ -38,6 +38,8 @@ Options:
   --files-top N   bench: files baseline over the first N unique files in output order (default 0 = all; 3 is the honest live-agent number)
   --db PATH       Path to knowledge.db for every command that opens the
                 database (sources: --db, MEGAMEMORY_DB_PATH, ./.megamemory/knowledge.db)
+  --repo PATH     Repository for resolving git:tag/commit/branch supports
+                (MCP server; default: the database directory, pinned per ref on first use)
   --help, -h      Show this help
   --version, -v   Show version
 

@@ -448,6 +448,25 @@ export function runDoctor(db: KnowledgeDB): {
   ) as { n: number }).n;
   add("stale nodes", true, `${stale} superseded/deprecated`);
 
+  // ---- 2.1.12 F1: срок годности фактов ----
+  // Просроченные факты уже не отдаются understand, но в графе они видны.
+  // Доля больше 10% активных узлов — база гниёт: владелец либо продлевает
+  // сроки, либо переводит узлы в superseded/refuted.
+  const expiredCount = db.countExpiredNodes();
+  const activeCount = (db.execSqlFirst(
+    hasStatus
+      ? `SELECT count(*) AS n FROM nodes WHERE removed_at IS NULL AND status = 'active'`
+      : "SELECT 0 AS n"
+  ) as { n: number }).n;
+  const expiredRatio = activeCount > 0 ? expiredCount / activeCount : 0;
+  add(
+    "expired nodes",
+    expiredRatio <= 0.1,
+    expiredCount === 0
+      ? "no expired facts"
+      : `${expiredCount} of ${activeCount} active node(s) past valid_until (${Math.round(expiredRatio * 100)}%) — продли valid_until, переведи в superseded или refuted`
+  );
+
   // М8: ids differing only by case collide on case-insensitive filesystems
   // (macOS, Windows) in the markdown export.
   const idRows = db.execSqlAll(

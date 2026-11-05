@@ -14,7 +14,27 @@ import { looksLikeFileRefAnchor } from "./stub.js";
 
 /** Plan 4 (informed_by provenance slice, schema v7); v8 baselines, v11 revisions
  * + artifacts, v12 nodes.created_via (anchor vs agent-node). */
-export const SCHEMA_VERSION = 12;
+// 2.1.12: v13 — node_artifacts.repo_path (F2, где резолвился git:-ref);
+// nodes.valid_until для срока годности фактов (F1) существует с v5 — v13
+// его структуру не трогает, только семантику чтения.
+export const SCHEMA_VERSION = 13;
+
+/**
+ * 2.1.12 F1: просрочен ли факт. Просрочен = жив, активен, valid_until в
+ * прошлом. Superseded/deprecated узлы не «просрочены» — их старость уже
+ * выражена собственным статусом; удалённые не считаются вовсе. Неразбираемая
+ * дата никогда не объявляется просрочкой — молчаливая ложь хуже явной.
+ */
+export function isNodeExpired(
+  node: { status?: string | null; valid_until?: string | null; removed_at?: string | null },
+  now: Date = new Date()
+): boolean {
+  if (node.removed_at) return false;
+  if ((node.status ?? "active") !== "active") return false;
+  if (!node.valid_until) return false;
+  const t = Date.parse(node.valid_until);
+  return !Number.isNaN(t) && t < now.getTime();
+}
 
 /**
  * 2.1.3 F1: support revision journal defaults. The journal keeps the history
@@ -580,6 +600,29 @@ export class KnowledgeDB {
         }
       }
 
+      if (currentVersion < 13) {
+        // 2.1.12 F2: the repository a git: ref was resolved against is pinned
+        // on the row at the FIRST resolution — later checks reuse it instead
+        // of depending on the cwd the server happened to run in. Additive,
+        // guarded: fresh dbs already carry the column from CREATE TABLE.
+        const hasArtifacts13 = this.db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_artifacts'")
+          .get();
+        if (hasArtifacts13) {
+          const acols13 = new Set(
+            this.db.prepare("PRAGMA table_info(node_artifacts)").all().map((c: any) => c.name)
+          );
+          if (!acols13.has("repo_path")) {
+            this.db.exec("ALTER TABLE node_artifacts ADD COLUMN repo_path TEXT");
+          }
+        }
+        // F1: nodes.valid_until exists since v5 and keeps its values (written
+        // by supersedes). v13 adds the expiry READING semantics — the column
+        // itself and the existing data are deliberately left alone: no
+        // backfill, no default. A migrated db looks exactly like it did on
+        // v12 (test 8: migration fills nothing).
+      }
+
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       this.db.exec("COMMIT");
     } catch (err) {
@@ -708,10 +751,16 @@ export class KnowledgeDB {
     // Every write path must state its own; NULL stays for rows carried over
     // from sources that predate the column.
     created_via?: string | null;
+    // 2.1.12 F1: срок годности факта (ISO-8601). NULL = бессрочно. Задаётся
+    // агентом, сервер никогда не выставляет его сам.
+    valid_until?: string | null;
   }): void {
+    // Fork columns exist only on migrated dbs (same guard as insertNodeRaw).
+    const untilCols = this.hasStatusColumn ? ", valid_until" : "";
+    const untilParams = this.hasStatusColumn ? ", @valid_until" : "";
     const stmt = this.db.prepare(`
-      INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task, embedding, epistemic_status, status_scope, created_via)
-      VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task, @embedding, @epistemic_status, @status_scope, @created_via)
+      INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task, embedding, epistemic_status, status_scope, created_via${untilCols})
+      VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task, @embedding, @epistemic_status, @status_scope, @created_via${untilParams})
     `);
     stmt.run({
       id: node.id,
@@ -726,6 +775,7 @@ export class KnowledgeDB {
       epistemic_status: node.epistemic_status ?? "open",
       status_scope: node.status_scope ?? null,
       created_via: node.created_via ?? null,
+      valid_until: node.valid_until ?? null,
     });
     this.syncNameNorm(node.id, node.name);
   }
@@ -744,6 +794,7 @@ export class KnowledgeDB {
       epistemic_status?: string | null;
       status_scope?: string | null;
       created_via?: string | null;
+      valid_until?: string | null;
     },
     edges: Array<{
       to_id: string;
@@ -769,6 +820,7 @@ export class KnowledgeDB {
         epistemic_status: node.epistemic_status,
         status_scope: node.status_scope,
         created_via: node.created_via,
+        valid_until: node.valid_until,
       });
 
       for (const edge of edges) {
@@ -819,6 +871,9 @@ export class KnowledgeDB {
       // null clears the vector (used when the embed model changes and
       // reembed is pending); undefined leaves it untouched.
       embedding?: Buffer | null;
+      // 2.1.12 F1: срок годности факта. undefined = не трогать, null = снять
+      // (факт снова бессрочный), строка = выставить (ISO-8601).
+      valid_until?: string | null;
     }
   ): boolean {
     const fields: string[] = [];
@@ -847,6 +902,10 @@ export class KnowledgeDB {
     if (changes.embedding !== undefined) {
       fields.push("embedding = @embedding");
       values.embedding = changes.embedding;
+    }
+    if (changes.valid_until !== undefined) {
+      fields.push("valid_until = @valid_until");
+      values.valid_until = changes.valid_until;
     }
 
     if (fields.length === 0) return false;
@@ -1980,7 +2039,7 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT node_id, kind, ref, digest, prev_digest, size_bytes,
-                checked_at, changed_at, checked_by
+                checked_at, changed_at, checked_by, repo_path
          FROM node_artifacts WHERE node_id = ?
          ORDER BY kind, ref`
       )
@@ -1994,16 +2053,17 @@ export class KnowledgeDB {
     this.db
       .prepare(
         `INSERT INTO node_artifacts
-           (node_id, kind, ref, digest, prev_digest, size_bytes, checked_at, changed_at, checked_by)
+           (node_id, kind, ref, digest, prev_digest, size_bytes, checked_at, changed_at, checked_by, repo_path)
          VALUES (@node_id, @kind, @ref, @digest, @prev_digest, @size_bytes,
-                 @checked_at, @changed_at, @checked_by)
+                 @checked_at, @changed_at, @checked_by, @repo_path)
          ON CONFLICT(node_id, kind, ref) DO UPDATE SET
            digest = excluded.digest,
            prev_digest = excluded.prev_digest,
            size_bytes = excluded.size_bytes,
            checked_at = excluded.checked_at,
            changed_at = excluded.changed_at,
-           checked_by = excluded.checked_by`
+           checked_by = excluded.checked_by,
+           repo_path = excluded.repo_path`
       )
       .run({
         node_id: row.node_id,
@@ -2015,6 +2075,7 @@ export class KnowledgeDB {
         checked_at: row.checked_at,
         changed_at: row.changed_at ?? null,
         checked_by: row.checked_by,
+        repo_path: row.repo_path ?? null,
       });
   }
 
@@ -2335,6 +2396,28 @@ export class KnowledgeDB {
         .get() as { count: number }
     ).count;
     return { nodes, edges, removed, edges_removed: edgesRemoved };
+  }
+
+  /**
+   * 2.1.12 F1: active, live nodes past their valid_until — факты, которые
+   * ещё в графе, но уже не знания. Сравнение по Date.parse, не по строке:
+   * агент может записать дату в любом ISO-варианте (дата без времени,
+   * смещение +03:00), лексикографика тут врёт. На базах без fork-колонок
+   * (upstream до миграции) — 0: колонки нет, нечего и считать.
+   */
+  countExpiredNodes(now: Date = new Date()): number {
+    if (!this.hasStatusColumn) return 0;
+    const rows = this.db
+      .prepare(
+        "SELECT valid_until FROM nodes WHERE removed_at IS NULL AND status = 'active' AND valid_until IS NOT NULL"
+      )
+      .all() as Array<{ valid_until: string }>;
+    let n = 0;
+    for (const { valid_until } of rows) {
+      const t = Date.parse(valid_until);
+      if (!Number.isNaN(t) && t < now.getTime()) n += 1;
+    }
+    return n;
   }
 
   // ---- Workflow (plan 2, schema v6): slots, tasks, trails ----

@@ -1,4 +1,4 @@
-import { KnowledgeDB } from "./db.js";
+import { KnowledgeDB, isNodeExpired } from "./db.js";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -337,11 +337,34 @@ export function trimSummary(text: string, maxChars = 240): string {
   return text.slice(0, cut).trimEnd() + "…";
 }
 
+/**
+ * 2.1.12 F1: validate the agent-supplied expiry. Any ISO-8601 date/time the
+ * platform parses is accepted ("2026-12-31", "2026-12-31T23:59:59Z",
+ * "2026-12-31T23:59:59+03:00") and stored AS GIVEN — the reading side
+ * compares via Date.parse, not by string shape. undefined = не трогать,
+ * null = снять срок; garbage is a hard error, not a silent no-expiry.
+ */
+export function normalizeValidUntil(
+  value: string | null | undefined,
+  field = "valid_until"
+): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const text = value.trim();
+  if (text === "") return null; // пустая строка = снять срок
+  if (Number.isNaN(Date.parse(text))) {
+    throw new Error(
+      `${field}: "${value}" не разбирается как дата (нужен ISO-8601, напр. "2026-12-31").`
+    );
+  }
+  return text;
+}
+
 /** Compact per-node payload (plan T3): no why, trimmed summary. */
 function compactMatch(
   db: KnowledgeDB,
   node: NodeRow,
-  opts: { score?: number; via?: SearchVia; withContext: boolean }
+  opts: { score?: number; via?: SearchVia; withContext: boolean; expired?: boolean }
 ): CompactMatch {
   const fileRefs = parseFileRefs(node.file_refs);
   const match: CompactMatch = {
@@ -356,6 +379,9 @@ function compactMatch(
       ? { score: opts.score, similarity: opts.score }
       : {}),
     ...(opts.via ? { via: opts.via } : {}),
+    // 2.1.12 F1: пометка живёт только при include_stale: true — обычная
+    // выдача просроченных не показывает вовсе.
+    ...(opts.expired ? { expired: true } : {}),
   };
   if (opts.withContext) {
     match.children = db
@@ -414,7 +440,13 @@ export async function understand(
   // filter and go to a separate output block, because antiknowledge ("where
   // we went wrong") must never disappear behind include_inactive.
   const includeInactive = input.include_inactive ?? false;
-  const nodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
+  // 2.1.12 F1: просроченные факты (valid_until в прошлом) исключаются по
+  // умолчанию; include_stale возвращает их с пометкой expired. Считаются
+  // только активные: superseded/deprecated отфильтрованы своим статусом и
+  // их valid_until — метка замены, а не срок годности утверждения.
+  const includeStale = input.include_stale ?? false;
+  let staleExcluded = 0;
+  const nodes: Array<{ node: NodeRow; score: number; via?: SearchVia; expired: boolean }> = [];
   const refutedNodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
   for (const match of topMatches) {
     const node = db.getNode(match.id);
@@ -425,14 +457,20 @@ export async function understand(
     }
     const status = node.status ?? "active";
     if (!includeInactive && status !== "active") continue;
-    nodes.push({ node, score: match.similarity, via: viaById.get(match.id) });
+    const expired = isNodeExpired(node);
+    if (expired && !includeStale) {
+      staleExcluded += 1;
+      continue;
+    }
+    nodes.push({ node, score: match.similarity, via: viaById.get(match.id), expired });
   }
 
   if (outputMode === "full") {
     const matches: NodeWithContext[] = [];
-    for (const { node, score, via } of nodes) {
+    for (const { node, score, via, expired } of nodes) {
       const ctx = buildNodeWithContext(db, node, score);
       if (via) ctx.via = via;
+      if (expired) ctx.expired = true;
       matches.push(ctx);
     }
     const refuted = refutedNodes.map(({ node, score, via }) => {
@@ -457,6 +495,7 @@ export async function understand(
         returned: matches.length,
         dropped: 0,
         tokens_estimated: estimateTokens(payload),
+        stale_excluded: staleExcluded,
       },
     };
   }
@@ -574,6 +613,7 @@ export async function understand(
       score: nodes[idx].score,
       via: nodes[idx].via,
       withContext: displayList().length < 3,
+      expired: nodes[idx].expired,
     });
     top.push(candidate);
     const projected = projectionTokens();
@@ -601,6 +641,7 @@ export async function understand(
       score: nodes[idx].score,
       via: nodes[idx].via,
       withContext: displayList().length < 3,
+      expired: nodes[idx].expired,
     });
     top.push(candidate);
     const projected = projectionTokens();
@@ -658,6 +699,7 @@ export async function understand(
       tokens_estimated: tokensEstimated,
       estimated_full_tokens: estimatedFullTokens,
       supports_inlined: supportsInlined,
+      stale_excluded: staleExcluded,
     },
   };
 }
@@ -857,6 +899,9 @@ export async function createConcept(
   // support is worse than a missing one because it reads as confirmation in
   // stats and weak_links. allow_stub is the conscious bypass: the node is
   // written with epistemic_status = "stub" and stays visible as a weak link.
+  // 2.1.12 F1: срок годности валидируется ещё раньше — мусорная дата отказывает
+  // записи, не превращаясь в молчаливый «бессрочный».
+  const validUntil = normalizeValidUntil(input.valid_until);
   if (STUB_CHECK_KINDS.has(input.kind) && !input.allow_stub && isStubSummary(input.summary, input.kind)) {
     throw new Error(STUB_REJECTION_MESSAGE);
   }
@@ -1090,6 +1135,8 @@ export async function createConcept(
         // 2.1.10 F1: an explicit agent call — the only origin whose rows the
         // stub checks are allowed to incriminate.
         created_via: "agent",
+        // 2.1.12 F1: срок годности, заданный агентом; undefined -> NULL.
+        valid_until: validUntil ?? null,
       },
       [
         ...(input.edges ?? []).map((edge) => ({
@@ -1190,10 +1237,13 @@ export async function createConcept(
     confirmableSupportIds.size > 0
       ? ` Снимок обоснования записан: подтверждено опор ${confirmableSupportIds.size} (изменение опор теперь видно через provenance_trace).`
       : "";
+  const validNote = validUntil
+    ? ` Срок годности: ${validUntil} — после этой даты узел выпадет из выдачи.`
+    : "";
 
   return {
     id,
-    message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}${confirmNote}`,
+    message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}${confirmNote}${validNote}`,
   };
 }
 
@@ -1206,6 +1256,11 @@ export async function updateConcept(
   if (!existing) {
     throw new Error(`Concept "${input.id}" not found.`);
   }
+
+  // 2.1.12 F1: срок годности — мусорная дата отклоняет всю правку; null
+  // снимает срок. setNodeStatus (supersede) пишет свою дату поверх — это
+  // разные оси: статусная остаётся жизненным циклом узла.
+  const validUntil = normalizeValidUntil(input.changes.valid_until);
 
   // Plan 1 §5.2: epistemic transitions are validated here, at the MCP tool
   // boundary (not inside setNodeStatus/setEpistemicStatus — internal callers
@@ -1243,6 +1298,10 @@ export async function updateConcept(
   const updated = db.updateNode(input.id, {
     ...input.changes,
     embedding,
+    // 2.1.12 F1: undefined (поле не передано) не трогает колонку, null
+    // снимает срок, строка выставляет. spread выше уже несёт значение —
+    // здесь только нормализованная форма.
+    valid_until: validUntil,
   });
 
   if (updated && embedding) {
@@ -1267,7 +1326,14 @@ export async function updateConcept(
     epistemicNote = ` Epistemic status: ${input.changes.epistemic_status}.`;
   }
 
-  return { message: `Updated concept "${input.id}".${epistemicNote}` };
+  const validNote =
+    validUntil === undefined
+      ? ""
+      : validUntil === null
+        ? " Срок годности снят — узел снова бессрочный."
+        : ` Срок годности: ${validUntil} — после этой даты узел выпадет из выдачи.`;
+
+  return { message: `Updated concept "${input.id}".${epistemicNote}${validNote}` };
 }
 
 export function link(
@@ -1387,11 +1453,14 @@ export function listRoots(
       : undefined;
 
   // Budgeted overview (plan T3): id/name/kind + child count, no summary.
+  // 2.1.12 F1: valid_until на корне виден сразу — просроченный корень не
+  // должен выглядеть свежим в стартовом дайджесте.
   const rootsCompact = rootRows.map((root) => ({
     id: root.id,
     name: root.name,
     kind: root.kind as NodeWithContext["kind"],
     child_count: db.getChildren(root.id).length,
+    valid_until: root.valid_until ?? null,
   }));
   // Plan 2 §2/§3: role slots go FIRST in the startup digest, then the top-5
   // of the task board by rot — the burning, not the fresh.
@@ -1440,6 +1509,7 @@ export function listRoots(
       kind: root.kind as NodeWithContext["kind"],
       summary: root.summary,
       children,
+      valid_until: root.valid_until ?? null,
     };
   });
 

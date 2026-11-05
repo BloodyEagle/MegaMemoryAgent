@@ -12,11 +12,11 @@ import type {
 
 /**
  * 2.1.3 F2: digests of the external artifacts a node references (files, git
- * blobs). The explicit check_artifacts is the ONLY writer — reads (including
- * the support check) never hash files: background hashing on every read is
- * both a privacy and a cost decision. kind = 'url' is deliberately out of
- * scope for this release: network access from the MCP server is a separate
- * decision (timeouts, proxies, privacy).
+ * blobs, git refs). The explicit check_artifacts is the ONLY writer — reads
+ * (including the support check) never hash files: background hashing on every
+ * read is both a privacy and a cost decision. kind = 'url' is deliberately
+ * out of scope for this release: network access from the MCP server is a
+ * separate decision (timeouts, proxies, privacy).
  *
  * The verdict for support_check is derived BY CONTENT, not by clocks: at
  * confirmation time the digest of the support's observed artifacts is saved
@@ -25,6 +25,13 @@ import type {
  * the confirmation signals nothing (nothing was saved), a file that changed
  * twice still signals (the comparison is against the confirmed value), and a
  * re-confirmation clears the signal.
+ *
+ * 2.1.12 F2: kind = 'git_ref' — ссылки на объекты git (git:tag:<name>,
+ * git:commit:<sha>, git:branch:<name>). digest = разрешённый sha коммита
+ * (`git rev-parse <ref>^{commit}`); тег переехал / ветка уехала -> другой
+ * sha -> changed; ref исчез -> missing. Сетевых вызовов нет — только
+ * локальный git. Репозиторий закрепляется в repo_path при первом
+ * разрешении: последующие проверки не зависят от cwd сервера.
  */
 
 /** Bump when the payload shape changes; old values honestly stop matching. */
@@ -34,15 +41,38 @@ const ARTIFACTS_DIGEST_VERSION = "v1";
  * the prefix before ':' must be HEAD or 6..40 hex chars. */
 const GIT_REF_RE = /^(HEAD|[0-9a-fA-F]{6,40}):(.+)$/;
 
-export type ArtifactKind = "file" | "git_blob";
+/**
+ * 2.1.12 F2: git:tag:<name> / git:commit:<sha> / git:branch:<name>.
+ * Имя проверяется на безопасность аргумента git (ref не через shell): без
+ * пробелов и управляющих символов, без "..", не начинается с "-" или ".".
+ */
+const GIT_SCHEME_RE = /^git:(tag|commit|branch):([^\s~^:?*\[\\]+)$/;
+/** Полный sha или сокращение от 7 символов (git ambiguity threshold). */
+const GIT_SHA_RE = /^[0-9a-fA-F]{7,40}$/;
+
+export type ArtifactKind = "file" | "git_blob" | "git_ref";
 
 export interface ClassifiedRef {
   kind: ArtifactKind;
   /** For git_blob: the part before ':' ("HEAD", a sha…). */
   rev?: string;
+  /** For git_ref: tag | commit | branch. */
+  scheme?: "tag" | "commit" | "branch";
+  /** For git_ref: имя тега, sha или ветки. */
+  name?: string;
 }
 
 export function classifyRef(ref: string): ClassifiedRef {
+  const g = ref.match(GIT_SCHEME_RE);
+  if (g) {
+    const name = g[2];
+    // Имя не может начинаться с "-", "." — иначе git съест его как флаг.
+    if (name.startsWith("-") || name.startsWith(".") || name.includes("..")) {
+      return { kind: "file" };
+    }
+    if (g[1] === "commit" && !GIT_SHA_RE.test(name)) return { kind: "file" };
+    return { kind: "git_ref", scheme: g[1] as "tag" | "commit" | "branch", name };
+  }
   const m = ref.match(GIT_REF_RE);
   if (m) return { kind: "git_blob", rev: m[1] };
   return { kind: "file" };
@@ -124,7 +154,49 @@ async function hashGitBlob(
     const content = await runGit(["cat-file", "blob", ref], cwd, MAX_BLOB);
     const digest = createHash("sha256").update(content).digest("hex");
     return { digest, size: content.length };
-  } catch {
+  } catch (err) {
+    if (isGitMissing(err)) rethrowGitMissing(err);
+    return null;
+  }
+}
+
+/**
+ * 2.1.12 F2: честная ошибка, когда git-а нет в системе (ENOENT) — тихий
+ * «unchanged» на машине без git хуже явного падения: отсутствие инструмента
+ * не доказывает, что тег не переехал.
+ */
+function isGitMissing(err: unknown): boolean {
+  return err instanceof Error && (err as NodeJS.ErrnoException).code === "ENOENT";
+}
+function rethrowGitMissing(err: unknown): never {
+  throw new Error(
+    "git не найден в системе — git:-опоры не проверить. Установи git или передай --repo с локальной копией."
+  );
+}
+
+/**
+ * 2.1.12 F2: разрешить git:tag|commit|branch в sha коммита
+ * (`git rev-parse --verify <ref>^{commit}`). null — ref не резолвится
+ * (тег не существует, sha не в репо): missing, не падение.
+ * Явные refs/*-пути для tag/branch снимают неоднозначность «тег и ветка
+ * с одним именем».
+ */
+async function resolveGitRefSha(
+  scheme: "tag" | "commit" | "branch",
+  name: string,
+  cwd: string
+): Promise<string | null> {
+  const spec =
+    scheme === "tag"
+      ? `refs/tags/${name}^{commit}`
+      : scheme === "branch"
+        ? `refs/heads/${name}^{commit}`
+        : `${name}^{commit}`;
+  try {
+    const out = (await runGit(["rev-parse", "--verify", spec], cwd, 4096)).toString("utf8").trim();
+    return /^[0-9a-f]{40}$/.test(out) ? out : null;
+  } catch (err) {
+    if (isGitMissing(err)) rethrowGitMissing(err);
     return null;
   }
 }
@@ -198,12 +270,25 @@ export async function checkArtifacts(
         output.truncated = true;
         break outer;
       }
-      const { kind, rev } = classifyRef(ref);
-      const fresh =
-        kind === "git_blob"
-          ? await hashGitBlob(rev!, ref, cwd)
-          : await hashFile(path.isAbsolute(ref) ? ref : path.resolve(cwd, ref));
+      const { kind, rev, scheme, name } = classifyRef(ref);
       const row = existing.get(`${kind}\t${ref}`);
+
+      // 2.1.12 F2: репозиторий для git:-ref — явный input.repo, затем
+      // закреплённый на строке (первое разрешение), затем каталог базы.
+      // Решение пишется обратно в repo_path: следующие проверки идут туда
+      // даже из другого cwd.
+      let repoUsed: string | null = null;
+      let fresh: { digest: string; size: number } | null;
+      if (kind === "git_blob") {
+        fresh = await hashGitBlob(rev!, ref, cwd);
+      } else if (kind === "git_ref") {
+        repoUsed = input.repo ?? row?.repo_path ?? path.dirname(db.dbPath);
+        const sha = await resolveGitRefSha(scheme!, name!, repoUsed);
+        fresh = sha ? { digest: sha, size: 0 } : null;
+      } else {
+        fresh = await hashFile(path.isAbsolute(ref) ? ref : path.resolve(cwd, ref));
+      }
+      const repoPin = kind === "git_ref" ? { repo_path: repoUsed } : {};
 
       if (!fresh) {
         // Missing now. The row keeps the last-seen digest in prev_digest so
@@ -227,6 +312,7 @@ export async function checkArtifacts(
             checked_at: now,
             changed_at: row?.changed_at ?? null,
             checked_by: "agent",
+            ...repoPin,
           });
         }
         output.missing.push({ node_id: nodeId, ref, kind, digest: null, missing: true });
@@ -242,10 +328,12 @@ export async function checkArtifacts(
           ref,
           digest: fresh.digest,
           prev_digest: null,
-          size_bytes: fresh.size,
+          // git_ref не читает blob — размеру взяться неоткуда, null честнее нуля.
+          size_bytes: kind === "git_ref" ? null : fresh.size,
           checked_at: now,
           changed_at: null,
           checked_by: "agent",
+          ...repoPin,
         });
         output.checked += 1;
         continue;
