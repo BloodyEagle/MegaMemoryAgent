@@ -601,6 +601,9 @@ export class MergeEngine {
       // carried-over snapshot keeps pointing at the wording it confirmed.
       claim_digest: node.claim_digest ?? null,
       claim_digest_at: node.claim_digest_at ?? null,
+      // 2.1.10 (v12): the origin travels with the row (undefined on sources
+      // without the column — honestly unknown, never incriminating).
+      created_via: node.created_via ?? null,
     });
   }
 
@@ -640,6 +643,9 @@ export class MergeEngine {
       // Plan 4 (v8): confirmed wording digest travels with the row.
       claim_digest: node.claim_digest ?? null,
       claim_digest_at: node.claim_digest_at ?? null,
+      // 2.1.10 (v12): a NEW row written by the MergeEngine itself — the
+      // conflict copy is an import product, not an agent node.
+      created_via: "import",
     });
   }
 

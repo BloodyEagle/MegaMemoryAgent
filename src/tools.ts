@@ -941,6 +941,9 @@ export async function createConcept(
         summary: `File-fact node for "${fact.name}" — created as a provenance support.`,
         file_refs: [fact.name],
         embedding: fact.embedding,
+        // 2.1.10 F1: the anchor origin — its template summary is by design,
+        // never a stub.
+        created_via: "file_ref",
       });
       if (fact.embedding) db.upsertVector(fact.id, fact.embedding);
     }
@@ -958,6 +961,9 @@ export async function createConcept(
         embedding,
         epistemic_status: epistemic,
         status_scope: input.status_scope ? JSON.stringify(input.status_scope) : null,
+        // 2.1.10 F1: an explicit agent call — the only origin whose rows the
+        // stub checks are allowed to incriminate.
+        created_via: "agent",
       },
       [
         ...(input.edges ?? []).map((edge) => ({
@@ -1739,6 +1745,7 @@ export function taskAdd(
     kind: "task",
     summary: `Task: ${name}`,
     epistemic_status: null,
+    created_via: "agent",
   });
   db.setTaskState(id, "open", due ?? null);
   return { id, message: `Task "${id}" added to the open column${due ? `, due ${due}` : ""}.` };

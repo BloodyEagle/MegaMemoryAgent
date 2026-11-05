@@ -841,12 +841,20 @@ function weakLinks(
   // every direct support of the decision, not just the shown subgraph.
   let supportBudget = maxScanSupports;
   for (const n of result.nodes) {
-    if (n.removed || n.kind !== "decision") continue;
+    // 2.1.10 F3: every knowledge carrier with supports is checked, not only
+    // decisions — a stub under a pattern must speak too. The decision-only
+    // branches stay decision-only: no_support is a decision obligation, and
+    // the support-baseline check states (changed/unknown/incomplete) live on
+    // decisions (inner nodes keep their own 4b record below).
+    if (n.removed) continue;
+    const isDecision = n.kind === "decision";
+    const subject = isDecision ? "решение" : "узел";
     const supports = db
       .getInformedByEdges(n.id, "ancestry", retrospective)
       .map((e) => e.other_id)
       .sort(compareIds); // deterministic pick when the budget cuts the list
     if (supports.length === 0) {
+      if (!isDecision) continue; // нет опор — не о чём говорить
       // Plan 4 v8 §2.1: an explicit "confirmed: no supports" snapshot is a
       // valid state — the warning fires only when the decision was never
       // confirmed as supportless. F6: a recorded snapshot with no live
@@ -865,7 +873,7 @@ function weakLinks(
     // Plan 4 v8 §3/§4: `unknown` and `incomplete` are not cleanliness — the
     // verdict of the support-baseline check travels as a weak link too, so
     // an unreviewed decision is never silently treated as verified.
-    const check = checker.check(n.id);
+    const check = isDecision ? checker.check(n.id) : null;
     if (check && check.state === "changed") {
       const changed = check.changed ?? [];
       const changedTotal = check.changed_count ?? changed.length;
@@ -979,7 +987,7 @@ function weakLinks(
           count: missing.length,
           sample: missing.slice(0, NOTE_SAMPLE),
           note: clampNote(
-            `решение "${n.id}" ссылается на отсутствующие узлы (${idListForNote(missing)})`
+            `${subject} "${n.id}" ссылается на отсутствующие узлы (${idListForNote(missing)})`
           ),
         });
       }
@@ -990,7 +998,7 @@ function weakLinks(
           count: ungrounded.length,
           sample: ungrounded.slice(0, NOTE_SAMPLE),
           note: clampNote(
-            `решение "${n.id}" опирается только на ungrounded-узлы (${idListForNote(ungrounded)})`
+            `${subject} "${n.id}" опирается только на ungrounded-узлы (${idListForNote(ungrounded)})`
           ),
         });
       }
@@ -999,10 +1007,14 @@ function weakLinks(
     // саммари. Уже записанные заглушки не удаляются, но не должны читаться
     // как подтверждение: одна запись на решение, count/sample как у
     // missing_support, срабатывает при хотя бы одной заглушке среди
-    // проверенных опор.
+    // проверенных опор. 2.1.10 F1: только ручные узлы (created_via='agent') —
+    // якорь file_ref обязан выглядеть шаблонно и заглушкой не считается.
     const stubs = checked.filter((sid) => {
       const row = nodeRows.get(sid);
-      return row !== undefined && isStubSummary(row.summary, row.kind);
+      return (
+        row !== undefined &&
+        isStubSummary(row.summary, row.kind, row.created_via)
+      );
     });
     if (stubs.length > 0) {
       weak.push({
@@ -1011,7 +1023,7 @@ function weakLinks(
         count: stubs.length,
         sample: stubs.slice(0, NOTE_SAMPLE),
         note: clampNote(
-          `решение "${n.id}" опирается на заглушки без утверждения (${idListForNote(stubs)}) — замени ref'ом или настоящим саммари, либо подтверди осознанно`
+          `${subject} "${n.id}" опирается на заглушки без утверждения (${idListForNote(stubs)}) — замени ref'ом или настоящим саммари, либо подтверди осознанно`
         ),
       });
     }
@@ -1221,7 +1233,12 @@ export function provenanceTrace(
           // 2.1.9 F2: a stub support can never honestly confirm anything —
           // the quality travels next to the digests so the agent sees it
           // before confirming. A missing node is "stub" (nothing to claim).
-          quality: sup && !isStubSummary(sup.summary, sup.kind) ? "claim" : "stub",
+          // 2.1.10 F1: anchors (file_ref) are claim-grade — their template
+          // summary is by design, not a placeholder.
+          quality:
+            sup && !isStubSummary(sup.summary, sup.kind, sup.created_via)
+              ? "claim"
+              : "stub",
         } as ProvenanceSupportDigest;
       });
     const supportTotal = supportPairs.length;

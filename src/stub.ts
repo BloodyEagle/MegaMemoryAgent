@@ -40,11 +40,20 @@ export const STUB_REJECTION_MESSAGE =
 /**
  * Заглушка ли это саммари для узла такого kind. Пустой текст — тоже заглушка:
  * утверждением он быть не может ни при каком kind из проверяемых.
+ *
+ * 2.1.10 F1: проверка применяется только к узлам, созданным агентом
+ * (created_via = 'agent', значение по умолчанию — вызов на этапе создания
+ * узла, когда строки ещё нет). Якоря (created_via = 'file_ref') не считаются
+ * заглушками никогда — их шаблонное саммари так задумано; прочие происхождения
+ * (import/auto/null) заглушками не называются: неизвестное происхождение не
+ * имеет права изобличать узел.
  */
 export function isStubSummary(
   summary: string | null | undefined,
-  kind: string | null | undefined
+  kind: string | null | undefined,
+  createdVia: string | null | undefined = "agent"
 ): boolean {
+  if (createdVia !== "agent") return false;
   if (kind && (kind === "module" || kind === "digest")) return false;
   const text = (summary ?? "").trim();
   if (!text) return true;
@@ -55,15 +64,58 @@ export function isStubSummary(
 }
 
 /**
- * Сколько живых опор (адресатов живых informed_by рёбер) — заглушки. Один
- * запрос, предикат в JS: шаблон и глаголы в SQL не выражаются.
+ * 2.1.10 F1: одноразовый критерий миграции v12 — выглядит ли старая строка
+ * как якорь `evidence: [{ref}]`. Три признака сразу: шаблонное саммари
+ * file-fact, file_refs[0] совпадает с именем, имя выглядит как
+ * «path:строка» или «path:старт-конец». Всё остальное — ручной узел.
  */
-export function countStubSupports(db: KnowledgeDB): number {
+export const FILE_REF_NAME_TAIL = /:\d+(?:-\d+)?$/;
+
+export function looksLikeFileRefAnchor(
+  summary: string | null | undefined,
+  name: string,
+  fileRefs: string[] | null | undefined
+): boolean {
+  if (!summary || !STUB_SUMMARY_PATTERN.test(summary)) return false;
+  if (!fileRefs || fileRefs.length === 0 || fileRefs[0] !== name) return false;
+  return FILE_REF_NAME_TAIL.test(name);
+}
+
+export interface SupportQualityBreakdown {
+  total: number;
+  anchors: number;
+  claims: number;
+  stubs: number;
+}
+
+/**
+ * 2.1.10 F1: разбивка живых опор (адресатов живых informed_by рёбер) по
+ * происхождению: якоря (file_ref), утверждения (всё остальное) и — внутри
+ * ручных — заглушки. Один запрос, предикат в JS: шаблон и глаголы в SQL не
+ * выражаются.
+ */
+export function supportQualityBreakdown(db: KnowledgeDB): SupportQualityBreakdown {
   const rows = db.execSqlAll(
-    `SELECT nd.id, nd.summary, nd.kind
+    `SELECT nd.id, nd.summary, nd.kind, nd.created_via
      FROM edges e JOIN nodes nd ON nd.id = e.to_id
      WHERE e.relation = 'informed_by' AND e.removed_at IS NULL AND nd.removed_at IS NULL
-     GROUP BY nd.id, nd.summary, nd.kind`
-  ) as Array<{ id: string; summary: string | null; kind: string | null }>;
-  return rows.filter((r) => isStubSummary(r.summary, r.kind)).length;
+     GROUP BY nd.id, nd.summary, nd.kind, nd.created_via`
+  ) as Array<{
+    id: string;
+    summary: string | null;
+    kind: string | null;
+    created_via: string | null;
+  }>;
+  const out: SupportQualityBreakdown = { total: rows.length, anchors: 0, claims: 0, stubs: 0 };
+  for (const r of rows) {
+    if (r.created_via === "file_ref") out.anchors++;
+    else out.claims++;
+    if (isStubSummary(r.summary, r.kind, r.created_via)) out.stubs++;
+  }
+  return out;
+}
+
+/** Сколько живых опор — заглушки (только ручные, created_via = 'agent'). */
+export function countStubSupports(db: KnowledgeDB): number {
+  return supportQualityBreakdown(db).stubs;
 }
