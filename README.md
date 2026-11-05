@@ -114,6 +114,24 @@ a hint naming the dependents; `force` overrides it. Removals leave tombstones,
 and in a merge an edge tombstone wins over a live copy — a severed link does
 not resurrect because the other branch never knew.
 
+**Anchors vs claims (2.1.10)** — a support created by `evidence: [{ref}]` is an
+*anchor*: a small node named after the file (`path:start-end`) with a template
+summary ("File-fact node for … — created as a provenance support."). That
+template is **by design** — the anchor exists to carry the link and its
+digests, not to state a thought. Since schema v12 every node carries
+`created_via` (`agent` | `file_ref` | `import` | `auto`), and only hand-written
+nodes (`agent`) are ever counted as stubs: `stats` splits the support line into
+`Supports: N (anchors a, claims c)` plus a `Stubs` counter, and `weak_links`
+raises `stub_support` only for manual placeholder summaries. An anchor is never
+a stub, and a hand-written template summary is still
+rejected — the difference is the origin, not the text. Near-duplicates are
+refused at creation: `create_concept` compares the normalized name (case,
+spaces, punctuation, ё/е) and the summary vector (top-3, cosine threshold
+`dedupe.threshold` in `megamemory.config.json`, default 0.92, env
+`MEGAMEMORY_DEDUPE_THRESHOLD`) and returns `duplicate_of` instead of writing a
+second copy — `force: true` overrides consciously. Digests and server-built
+anchors are never deduplicated.
+
 ---
 
 ## Measuring the benefit
