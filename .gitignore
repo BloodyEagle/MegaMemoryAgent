@@ -19,3 +19,4 @@ graph-deps.json
 *.db-shm
 *.db-wal
 tmp-upstream-acc/
+plans/
