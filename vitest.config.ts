@@ -15,6 +15,10 @@ import { defineConfig } from "vitest/config";
  *   репо): обычный дефолт 5000 мс. Новый файл, не внесённый в `unit`,
  *   попадает в `db` — безопасное направление асимметрии: тесту разрешено
  *   больше времени, а не меньше.
+ * - Проект `integration` (2.1.13 F6) — HTTP/MCP-интеграции из
+ *   tests/integration: раньше они не входили в стандартный прогон.
+ *   HTTP-тесты поднимают собранный dist — полный прогон требует
+ *   `npm run build` до старта.
  */
 const UNIT_FILES = [
   "docs-anchors",
@@ -41,6 +45,13 @@ export default defineConfig({
           name: "db",
           include: ["src/__tests__/**/*.test.ts"],
           exclude: UNIT_FILES.map((f) => `src/__tests__/${f}.test.ts`),
+          testTimeout: 15_000,
+        },
+      },
+      {
+        test: {
+          name: "integration",
+          include: ["tests/integration/**/*.test.ts"],
           testTimeout: 15_000,
         },
       },

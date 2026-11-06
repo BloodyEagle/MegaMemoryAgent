@@ -37,10 +37,15 @@ function startServe(dbFile: string, extraArgs: string[] = []): Promise<number> {
   port = 43000 + Math.floor(Math.random() * 10000);
   serverOut = "";
   return new Promise((resolve, reject) => {
+    // 2.1.13 F6: FTS-режим (предмет теста — маршруты, не эмбеддинги);
+    // окружение нейтрализовано: путь задаёт только --db.
     child = spawn(
       process.execPath,
       [serveScript, "serve", "--port", String(port), "--db", dbFile, ...extraArgs],
-      { stdio: ["ignore", "pipe", "pipe"] }
+      {
+        env: { ...process.env, MEGAMEMORY_SEARCH: "fts", MEGAMEMORY_DB_PATH: "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      }
     );
     child.stdout?.on("data", (d) => {
       serverOut += String(d);
