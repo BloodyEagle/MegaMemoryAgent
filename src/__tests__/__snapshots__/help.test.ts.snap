@@ -6,7 +6,8 @@ exports[`buildHelp — --db как глобальная опция (2.1.4) > с�
 Commands:
   (no command)    Start the MCP stdio server (invoked by your editor)
   install         Configure editor/agent integration (interactive)
-  serve           Start the web graph explorer (--db PATH)
+  serve           Start the web graph explorer — loopback only (--db PATH; --host 127.0.0.1|::1)
+                Local interface for a human, not a network service: it listens on 127.0.0.1, cross-origin and foreign-Host requests are refused (earlier releases listened on all interfaces — behavior changed).
   stats           Show knowledge graph statistics (--prune trims the call journal; --db PATH)
   merge           Merge two knowledge.db files
   conflicts       List unresolved merge conflicts (--db PATH)
@@ -25,6 +26,7 @@ Commands:
 Options:
   --target NAME    Install target (opencode, claudecode, antigravity, codex)
   --port PORT     Port for the web explorer (default: 4321)
+  --host HOST     Address for the web explorer (127.0.0.1 by default, ::1 for IPv6; wildcard is not accepted)
   --into FILE     Output path for merge (default: overwrites file1)
   --left-label    Label for left side in merge (default: left)
   --right-label   Label for right side in merge (default: right)
@@ -48,6 +50,7 @@ Examples:
   $ megamemory install --target claudecode              Non-interactive Claude Code setup
   $ megamemory serve                                     Open graph explorer at http://localhost:4321
   $ megamemory serve --port 8080                         Custom port
+  $ megamemory serve --host ::1                          IPv6 loopback (default is 127.0.0.1)
   $ megamemory merge main.db feature.db --into merged.db Merge two knowledge DBs
   $ megamemory conflicts                                 View unresolved conflicts
   $ megamemory resolve <group-id> --keep left            Resolve a conflict

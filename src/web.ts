@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { buildNodeWithContext, understand } from "./tools.js";
-import { findDuplicates, mergeNodes } from "./consolidate.js";
+import { findDuplicates, mergeNodes, type MergeNodesResult } from "./consolidate.js";
 import { renderAllMarkdown, renderNodeMarkdown } from "./export.js";
 import { digestSourceChildren } from "./digest.js";
 import { errorBold, askPort } from "./cli-utils.js";
@@ -51,10 +51,9 @@ function resolveWebDir(): string {
 }
 
 function json(res: http.ServerResponse, data: unknown, status = 200): void {
-  res.writeHead(status, {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-  });
+  // F1 2.1.13: без Access-Control-Allow-Origin — интерфейс живёт на том же
+  // origin, а чужие origin отсекаются gate-ом ниже (403 без CORS-заголовков).
+  res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
 }
 
@@ -77,25 +76,89 @@ function parseFileRefs(raw: string | null): string[] | null {
   }
 }
 
-function printBanner(port: number, dbPath: string): void {
+/**
+ * F1 2.1.13: белый список имён хостов для проверки заголовка Host. Сервер
+ * слушает loopback, но одного bind-а мало: DNS rebinding подставляет свой
+ * hostname с целевым портом, и запрос доходит. Имя из белого списка + порт
+ * должны совпадать с фактическими.
+ */
+const ALLOWED_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+function hostMatches(header: string | undefined, port: number): boolean {
+  if (!header) return false;
+  let hostname = header;
+  let hostPort: string | null = null;
+  if (header.startsWith("[")) {
+    // IPv6-литерал: [::1]:4321
+    const close = header.indexOf("]");
+    if (close === -1) return false;
+    hostname = header.slice(0, close + 1);
+    if (header.length > close + 1) {
+      if (header[close + 1] !== ":") return false;
+      hostPort = header.slice(close + 2);
+    }
+  } else {
+    const colon = header.lastIndexOf(":");
+    if (colon !== -1) {
+      hostname = header.slice(0, colon);
+      hostPort = header.slice(colon + 1);
+    }
+  }
+  if (!ALLOWED_HOSTNAMES.has(hostname.toLowerCase())) return false;
+  // Порт в заголовке обязателен к совпадению; отсутствие порта (пустой)
+  // допускаем только для дефолтного 80 — на практике браузер всегда шлёт порт.
+  if (hostPort !== null && hostPort !== "" && hostPort !== String(port)) return false;
+  return true;
+}
+
+/**
+ * F1 2.1.13: same-origin по Origin/Referer. Фактический origin — http и уже
+ * проверенный Host (gate вызывается после hostMatches). Origin есть у
+ * браузерных cross-origin запросов и у fetch-POST; Referer проверяем, когда
+ * Origin не пришёл. Нет ни того, ни другого (curl, Health-check) — пропускаем:
+ * DNS rebinding уже закрыт проверкой Host.
+ */
+function sameOrigin(
+  origin: string | undefined,
+  referer: string | undefined,
+  host: string
+): boolean {
+  const expected = `http://${host.toLowerCase()}`;
+  if (origin !== undefined) return origin.trim().toLowerCase() === expected;
+  if (referer !== undefined) {
+    try {
+      const ref = new URL(referer);
+      return `http://${ref.host.toLowerCase()}` === expected;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function printBanner(actualAddress: string, port: number, dbPath: string): void {
+  const display = actualAddress.includes(":") ? `[${actualAddress}]` : actualAddress;
   console.log();
   console.log(`  ${pc.bold(pc.cyan("megamemory"))} ${pc.green(`v${VERSION}`)} ${pc.dim("explorer")}`);
   console.log();
-  console.log(`  ${pc.dim("➜")}  ${pc.bold("Local:")}   ${pc.cyan(pc.underline(`http://localhost:${port}`))}`);
+  console.log(`  ${pc.dim("➜")}  ${pc.bold("Local:")}   ${pc.cyan(pc.underline(`http://${display}:${port}`))}`);
   console.log(`  ${pc.dim("➜")}  ${pc.bold("DB:")}      ${pc.dim(dbPath)}`);
   console.log();
+  console.log("  Local interface only — not a network service.");
   console.log("  Press Ctrl+C to stop.");
   console.log();
 }
 
 /**
- * Attempt to listen on the given port. If EADDRINUSE, prompt the user
+ * Attempt to listen on the given host+port. If EADDRINUSE, prompt the user
  * for an alternative port and retry. Returns a promise that resolves
- * once the server is listening.
+ * once the server is listening. F1 2.1.13: host обязателен (127.0.0.1 или
+ * явный ::1) — wildcard-слушатель больше не существует.
  */
 function listenWithRetry(
   server: http.Server,
   port: number,
+  host: string,
   dbPath: string,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -109,7 +172,7 @@ function listenWithRetry(
             process.exit(0);
           }
           // Retry with the new port
-          resolve(listenWithRetry(server, newPort, dbPath));
+          resolve(listenWithRetry(server, newPort, host, dbPath));
         } catch (promptErr) {
           reject(promptErr);
         }
@@ -123,15 +186,19 @@ function listenWithRetry(
 
     server.once("error", onError);
 
-    server.listen(port, () => {
+    server.listen(port, host, () => {
       server.removeListener("error", onError);
-      printBanner(port, dbPath);
+      // Фактический адрес из socket-а, а не из аргумента: слушаем то, что
+      // написали. Для 127.0.0.1 это и есть "127.0.0.1".
+      const addr = server.address();
+      const actual = typeof addr === "object" && addr !== null ? addr.address : host;
+      printBanner(actual, port, dbPath);
       resolve();
     });
   });
 }
 
-export async function runServe(port: number): Promise<void> {
+export async function runServe(port: number, host = "127.0.0.1"): Promise<void> {
   // serve и MCP — единственные, кому законно создавать базу: первая установка
   // ещё не имеет knowledge.db, её нельзя встречать ошибкой.
   const dbPath = resolveDbPathOrExit(process.argv.slice(3), { allowCreate: true });
@@ -596,6 +663,21 @@ export async function runServe(port: number): Promise<void> {
     const url = new URL(req.url ?? "/", `http://localhost:${port}`);
     const pathname = url.pathname;
 
+    // ---- F1 2.1.13: gate — Host и Origin до любых маршрутов ----
+    // Host не из белого списка (в т.ч. чужой порт) → 403: защита от DNS
+    // rebinding, одного loopback-bind недостаточно. Ответ один, без
+    // CORS-заголовков.
+    if (!hostMatches(req.headers.host, port)) {
+      json(res, { error: "Forbidden: unknown host" }, 403);
+      return;
+    }
+    // Чужой Origin/Referer → 403 на любом методе; POST дополнительно
+    // проходит same-origin (gate общий — см. sameOrigin).
+    if (!sameOrigin(req.headers.origin, req.headers.referer, req.headers.host!)) {
+      json(res, { error: "Forbidden: cross-origin request" }, 403);
+      return;
+    }
+
     // ---- Routes ----
 
     if (pathname === "/" && req.method === "GET") {
@@ -786,28 +868,68 @@ export async function runServe(port: number): Promise<void> {
     }
 
     if (pathname === "/api/consolidate" && req.method === "POST") {
-      let raw = "";
-      req.on("data", (chunk) => {
-        raw += chunk;
+      // F1 2.1.13: единственный мутирующий маршрут — под замком.
+      // 1) Content-Type строго application/json (charset допустим);
+      // 2) тело ≤ 64 КБ;
+      // 3) ровно один ответ на любой исход, база меняется только после
+      //    успешного разбора и валидации (mergeNodes пишет в транзакции).
+      const contentType = String(req.headers["content-type"] ?? "")
+        .split(";")[0]
+        .trim()
+        .toLowerCase();
+      if (contentType !== "application/json") {
+        req.resume(); // слить тело, чтобы сокет остался пригодным
+        json(res, { error: "Content-Type must be application/json" }, 415);
+        return;
+      }
+      const MAX_BODY = 64 * 1024;
+      const chunks: Buffer[] = [];
+      let size = 0;
+      let tooLarge = false;
+      let responded = false;
+      const respondOnce = (status: number, payload: unknown): void => {
+        if (responded) return;
+        responded = true;
+        json(res, payload, status);
+      };
+      req.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > MAX_BODY) {
+          tooLarge = true;
+          chunks.length = 0;
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("error", () => {
+        respondOnce(400, { error: "Request stream failed; nothing was written" });
       });
       req.on("end", () => {
-        let body: { survivor?: string; other?: string } = {};
+        if (tooLarge) {
+          respondOnce(413, { error: `Request body exceeds the ${MAX_BODY}-byte limit` });
+          return;
+        }
+        let body: { survivor?: unknown; other?: unknown };
         try {
-          body = JSON.parse(raw) as { survivor?: string; other?: string };
+          body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         } catch {
-          json(res, { error: "Invalid JSON body" }, 400);
+          respondOnce(400, { error: "Invalid JSON body" });
           return;
         }
-        if (!body.survivor || !body.other) {
-          json(res, { error: "survivor and other are required" }, 400);
+        const survivor = typeof body.survivor === "string" ? body.survivor.trim() : "";
+        const other = typeof body.other === "string" ? body.other.trim() : "";
+        if (!survivor || !other) {
+          respondOnce(400, { error: "survivor and other are required" });
           return;
         }
+        let result: MergeNodesResult;
         try {
-          const result = mergeNodes(db, body.survivor, body.other);
-          json(res, { ok: true, ...result });
+          result = mergeNodes(db, survivor, other);
         } catch (err) {
-          json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+          respondOnce(400, { error: err instanceof Error ? err.message : String(err) });
+          return;
         }
+        respondOnce(200, { ok: true, ...result });
       });
       return;
     }
@@ -842,11 +964,12 @@ export async function runServe(port: number): Promise<void> {
     }
 
     if (pathname === "/api/events" && req.method === "GET") {
+      // F1 2.1.13: без Access-Control-Allow-Origin — same-origin интерфейсу
+      // SSE не нужен, чужой origin уже отсечён gate-ом.
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
-        "Access-Control-Allow-Origin": "*",
       });
 
       const { nodes, edges } = buildGraphPayload();
@@ -998,7 +1121,7 @@ export async function runServe(port: number): Promise<void> {
     });
   }, 30000);
 
-  await listenWithRetry(server, port, dbPath);
+  await listenWithRetry(server, port, host, dbPath);
 
   // Graceful shutdown
   process.on("SIGINT", () => {
