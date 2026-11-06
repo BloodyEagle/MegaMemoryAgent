@@ -592,7 +592,11 @@ async function startMcpServer() {
     },
     async (params) => {
       try {
-        const result = listRoots(db, { max_tokens: params.max_tokens });
+        // 2.1.13 F3: бюджет считается по сериализованному ответу вместе с
+        // тем, что обработчик добавляет сам (instructions_status, stats) —
+        // оценка listRoots и фактическая выдача MCP не расходятся.
+        const extra = { ...instructionsStatus(VERSION), stats: db.getStats() };
+        const result = listRoots(db, { max_tokens: params.max_tokens, extra_payload: extra });
         const returned = result.meta?.returned ?? result.roots.length;
         timeline.log({
           tool: "list_roots",
@@ -608,7 +612,7 @@ async function startMcpServer() {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({ ...result, ...instructionsStatus(VERSION), stats: db.getStats() }, null, 2),
+              text: JSON.stringify({ ...result, ...extra }, null, 2),
             },
           ],
         };
