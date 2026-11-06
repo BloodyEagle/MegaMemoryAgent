@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { KnowledgeDB } from "./db.js";
 import { estimateTokens, understand } from "./tools.js";
+import { parseRef } from "./refs.js";
 import {
   CheckBudget,
   DEFAULT_MAX_CHECK_BYTES,
@@ -247,19 +248,17 @@ function median(values: number[]): number | null {
 }
 
 /**
- * Split a `path:line` / `path:line-line` suffix off a file ref (plan 2.1.6 F2).
- * The suffix is cut only when the tail after the last `:` is digits or
- * digits-digits. A drive-letter colon (`C:\...`, `C:name`) is never cut —
- * it sits at index 1 — and a colon inside a file name (`a:b.ts`) is safe
- * because the tail after it is not pure digits. The empty suffix (`src/db.ts:`)
- * is not a suffix either: the ref stays whole and resolves as missing.
+ * Split a locator suffix off a file ref (plan 2.1.6 F2; 2.1.13 F2 — реализация
+ * одна, в src/refs.ts). Формы: path, path:12, path:12-30, path#L12,
+ * path#L12-L30. Git-схемы не режутся вовсе: «git:tag:2026» — это тег «2026»,
+ * а не путь «git:tag» с локатором. Windows не задет: буква диска (C:\…, двоеточие
+ * на индексе 1) и двоеточие внутри имени («a:b.ts» — хвост не цифры) остаются.
+ * Пустой суффикс («src/db.ts:») — не суффикс: ссылка остаётся целой и резолвится
+ * как missing.
  */
 export function splitRefSuffix(ref: string): { path: string; suffix: string } {
-  const i = ref.lastIndexOf(":");
-  if (i <= 0 || i === 1) return { path: ref, suffix: "" };
-  const tail = ref.slice(i + 1);
-  if (!/^\d+(?:-\d+)?$/.test(tail)) return { path: ref, suffix: "" };
-  return { path: ref.slice(0, i), suffix: tail };
+  const parsed = parseRef(ref);
+  return { path: parsed.path, suffix: parsed.locator ?? "" };
 }
 
 /**
