@@ -28,6 +28,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("eval")}            Measure search recall@k on the eval set ${pc.dim("(fixtures/eval.jsonl; --db PATH)")}
   ${pc.cyan("guide")}           Print the agent onboarding text ${pc.dim("(the same constant install writes to AGENTS.md)")}
   ${pc.cyan("bench")}           Measure orientation savings: graph vs baseline in tokens ${pc.dim("(--baseline files|te|both; hit_rate@1 next to hit_rate; --db PATH)")}
+  ${pc.cyan("expire")}          Set valid_until on journal/state-claim nodes ${pc.dim("(default: dry-run; --ids a,b | --report FILE; --until DATE|past; --apply; --db PATH)")}
 
 ${pc.bold("Options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME")}    Install target (opencode, claudecode, antigravity, codex)
@@ -62,5 +63,6 @@ ${pc.bold("Examples:")}
   ${pc.dim("$")} megamemory resolve <group-id> --keep left            ${pc.dim("Resolve a conflict")}
   ${pc.dim("$")} megamemory doctor --db /path/to/knowledge.db         ${pc.dim("Check a specific database")}
   ${pc.dim("$")} megamemory repair-ids --apply                        ${pc.dim("Rename broken ids after backup")}
+  ${pc.dim("$")} megamemory expire --ids a,b --until past --apply     ${pc.dim("Expire nodes as of yesterday (dry-run without --apply)")}
 `.trim();
 }

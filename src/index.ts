@@ -21,7 +21,7 @@ const VERSION = JSON.parse(
 
 const HELP = buildHelp(VERSION);
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "expire", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string; host?: string } {
   const portIdx = args.indexOf("--port");
@@ -164,6 +164,21 @@ switch (cmd) {
     const { runBenchCli } = await import("./bench-cli.js");
     await runBenchCli(process.argv.slice(3));
     process.exit(0);
+    break;
+  }
+
+  case "expire": {
+    // 2.1.13 F5: ручное проставление valid_until. Ошибки разбора флагов и
+    // неизвестные id — отказ без записи; process.exit(1) здесь, чтобы ядро
+    // expire-cli оставалось тестируемым (бросает, а не умирает).
+    try {
+      const { runExpire } = await import("./expire-cli.js");
+      await runExpire(process.argv.slice(3));
+      process.exit(0);
+    } catch (err) {
+      errorBold(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
     break;
   }
 

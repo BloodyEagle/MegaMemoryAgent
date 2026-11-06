@@ -22,6 +22,7 @@ Commands:
   eval            Measure search recall@k on the eval set (fixtures/eval.jsonl; --db PATH)
   guide           Print the agent onboarding text (the same constant install writes to AGENTS.md)
   bench           Measure orientation savings: graph vs baseline in tokens (--baseline files|te|both; hit_rate@1 next to hit_rate; --db PATH)
+  expire          Set valid_until on journal/state-claim nodes (default: dry-run; --ids a,b | --report FILE; --until DATE|past; --apply; --db PATH)
 
 Options:
   --target NAME    Install target (opencode, claudecode, antigravity, codex)
@@ -55,5 +56,6 @@ Examples:
   $ megamemory conflicts                                 View unresolved conflicts
   $ megamemory resolve <group-id> --keep left            Resolve a conflict
   $ megamemory doctor --db /path/to/knowledge.db         Check a specific database
-  $ megamemory repair-ids --apply                        Rename broken ids after backup"
+  $ megamemory repair-ids --apply                        Rename broken ids after backup
+  $ megamemory expire --ids a,b --until past --apply     Expire nodes as of yesterday (dry-run without --apply)"
 `;
