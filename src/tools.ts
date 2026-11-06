@@ -360,6 +360,59 @@ export function normalizeValidUntil(
   return text;
 }
 
+/**
+ * 2.1.13 F4: «вечные» утверждения о состоянии. «PR #3 не влит», «релиз
+ * опубликован», «issue закрыт» — верно в момент записи и тихо врёт спустя
+ * месяц, если у узла нет срока годности. Сервер valid_until сам не ставит
+ * («Чего не делать») и запись не блокирует: мягкое предупреждение в ответе
+ * инструмента, решение за агентом. kind=digest — серверная сводка, её не
+ * проверяем.
+ */
+export interface ConceptWarning {
+  code: "state_claim_without_expiry" | "expired_on_create";
+  hint: string;
+}
+
+const STATE_CLAIM_RE =
+  /смержен\w*|влит\w*|не\s+влит|не\s+начат|выпущен\w*|релиз\w*|закрыт\w*|в\s+работе|ожидает\w*|not\s+merged|merged|released|pending|#\d+|\d+\.\d+\.\d+|\d{4}-\d{2}-\d{2}/i;
+
+export function looksLikeStateClaim(summary: string): boolean {
+  return STATE_CLAIM_RE.test(summary);
+}
+
+const STATE_CLAIM_HINT =
+  "Утверждение о состоянии («смержен», номер PR, версия, дата) без срока годности " +
+  "со временем начнёт утверждать то, чего уже нет. Передай valid_until " +
+  "(ISO-8601, напр. \"2026-12-01\") или переформулируй как устойчивое знание.";
+const EXPIRED_HINT =
+  "valid_until уже в прошлом — узел создан, но сразу выпадет из выдачи. Проверь дату или сними срок (null).";
+
+/**
+ * Предупреждения записи узла: срок в прошлом — всегда; утверждение о
+ * состоянии без срока — когда effective expiry отсутствует (undefined или
+ * null = бессрочно).
+ */
+export function conceptWarnings(
+  summary: string,
+  opts: { kind?: string; validUntil: string | null | undefined }
+): ConceptWarning[] {
+  const warnings: ConceptWarning[] = [];
+  if (opts.validUntil) {
+    const t = Date.parse(opts.validUntil);
+    if (!Number.isNaN(t) && t < Date.now()) {
+      warnings.push({ code: "expired_on_create", hint: EXPIRED_HINT });
+    }
+  }
+  if (
+    opts.kind !== "digest" &&
+    looksLikeStateClaim(summary) &&
+    opts.validUntil == null
+  ) {
+    warnings.push({ code: "state_claim_without_expiry", hint: STATE_CLAIM_HINT });
+  }
+  return warnings;
+}
+
 /** Compact per-node payload (plan T3): no why, trimmed summary. */
 function compactMatch(
   db: KnowledgeDB,
@@ -885,6 +938,8 @@ export interface CreateConceptResult {
   duplicate_of?: string;
   similarity?: number;
   matched_by?: "name" | "semantic";
+  /** 2.1.13 F4: мягкие предупреждения — «вечное» утверждение, срок в прошлом. */
+  warnings?: ConceptWarning[];
 }
 
 export async function createConcept(
@@ -902,6 +957,9 @@ export async function createConcept(
   // 2.1.12 F1: срок годности валидируется ещё раньше — мусорная дата отказывает
   // записи, не превращаясь в молчаливый «бессрочный».
   const validUntil = normalizeValidUntil(input.valid_until);
+  // 2.1.13 F4: «вечное» утверждение о состоянии без срока — предупреждение,
+  // не блокировка. digest — серверная сводка, проверка её не касается.
+  const warnings = conceptWarnings(input.summary, { kind: input.kind, validUntil });
   if (STUB_CHECK_KINDS.has(input.kind) && !input.allow_stub && isStubSummary(input.summary, input.kind)) {
     throw new Error(STUB_REJECTION_MESSAGE);
   }
@@ -1099,6 +1157,7 @@ export async function createConcept(
           `${DUPLICATE_MESSAGE_PREFIX}: "${duplicate.id}" ` +
           `(matched_by: ${duplicate.matched_by}, similarity ${sim}). ` +
           "Обнови его или передай force: true.",
+        ...(warnings.length > 0 ? { warnings } : {}),
       };
     }
   }
@@ -1244,6 +1303,7 @@ export async function createConcept(
   return {
     id,
     message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}${confirmNote}${validNote}`,
+    ...(warnings.length > 0 ? { warnings } : {}),
   };
 }
 
@@ -1333,7 +1393,23 @@ export async function updateConcept(
         ? " Срок годности снят — узел снова бессрочный."
         : ` Срок годности: ${validUntil} — после этой даты узел выпадет из выдачи.`;
 
-  return { message: `Updated concept "${input.id}".${epistemicNote}${validNote}` };
+  // 2.1.13 F4: та же проверка при смене саммари. Эффективный срок — тот,
+  // что будет у узла после правки: переданный, а если не передан — прежний
+  // (снятый null считается «бессрочно»).
+  let warnings: ConceptWarning[] = [];
+  if (input.changes.summary !== undefined) {
+    const effectiveExpiry =
+      input.changes.valid_until === undefined ? existing.valid_until : validUntil;
+    warnings = conceptWarnings(input.changes.summary, {
+      kind: input.changes.kind ?? existing.kind,
+      validUntil: effectiveExpiry,
+    });
+  }
+
+  return {
+    message: `Updated concept "${input.id}".${epistemicNote}${validNote}`,
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
 }
 
 export function link(
