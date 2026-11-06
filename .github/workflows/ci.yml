@@ -46,3 +46,8 @@ jobs:
 
       - name: Eval (recall@10)
         run: MEGAMEMORY_DB_PATH=fixtures/demo.db node dist/index.js eval --min 0.8
+
+      # 2.1.13 F6: полный прогон без флагов - unit/db/integration; HTTP-
+      # интеграции проверяют собранный dist, поэтому шаг после npm run build.
+      - name: Full test suite (unit/db/integration)
+        run: npm test

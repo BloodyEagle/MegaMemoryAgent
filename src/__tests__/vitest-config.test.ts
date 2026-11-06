@@ -36,3 +36,21 @@ describe("vitest.config.ts (2.1.12 F3)", () => {
     }
   });
 });
+
+describe("vitest.config.ts — интеграции в общем прогоне (2.1.13 F6)", () => {
+  const config = fs.readFileSync(CONFIG_PATH, "utf8");
+
+  it("33. проект integration объявлен и включает tests/integration", () => {
+    expect(config).toContain('name: "integration"');
+    expect(config).toContain('include: ["tests/integration/**/*.test.ts"]');
+  });
+
+  it("33b. интеграционные файлы существуют на диске и не попадают в db/unit", () => {
+    const integrationDir = path.join(PROJECT_ROOT, "tests", "integration");
+    const files = fs.readdirSync(integrationDir).filter((f) => f.endsWith(".test.ts"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const f of files) {
+      expect(fs.existsSync(path.join(integrationDir, f))).toBe(true);
+    }
+  });
+});

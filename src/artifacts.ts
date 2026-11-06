@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import type { KnowledgeDB } from "./db.js";
+// 2.1.13 F2: разбор ссылок — один модуль для check_artifacts и bench.
+import { classifyRef, parseRef } from "./refs.js";
 import type {
   CheckArtifactsInput,
   CheckArtifactsOutput,
@@ -32,51 +34,16 @@ import type {
  * sha -> changed; ref исчез -> missing. Сетевых вызовов нет — только
  * локальный git. Репозиторий закрепляется в repo_path при первом
  * разрешении: последующие проверки не зависят от cwd сервера.
+ *
+ * 2.1.13 F2: файловые ссылки несут локаторы (src/db.ts:605-643, a.ts#L12).
+ * Файловой системе уходит только путь (src/refs.ts), хеш — по всему файлу:
+ * локатор ограничивает цитирование, не область хеша.
  */
 
 /** Bump when the payload shape changes; old values honestly stop matching. */
 const ARTIFACTS_DIGEST_VERSION = "v1";
 
-/** <rev>:<path> — git blob; a Windows drive path (C:\…) never matches:
- * the prefix before ':' must be HEAD or 6..40 hex chars. */
-const GIT_REF_RE = /^(HEAD|[0-9a-fA-F]{6,40}):(.+)$/;
-
-/**
- * 2.1.12 F2: git:tag:<name> / git:commit:<sha> / git:branch:<name>.
- * Имя проверяется на безопасность аргумента git (ref не через shell): без
- * пробелов и управляющих символов, без "..", не начинается с "-" или ".".
- */
-const GIT_SCHEME_RE = /^git:(tag|commit|branch):([^\s~^:?*\[\\]+)$/;
-/** Полный sha или сокращение от 7 символов (git ambiguity threshold). */
-const GIT_SHA_RE = /^[0-9a-fA-F]{7,40}$/;
-
-export type ArtifactKind = "file" | "git_blob" | "git_ref";
-
-export interface ClassifiedRef {
-  kind: ArtifactKind;
-  /** For git_blob: the part before ':' ("HEAD", a sha…). */
-  rev?: string;
-  /** For git_ref: tag | commit | branch. */
-  scheme?: "tag" | "commit" | "branch";
-  /** For git_ref: имя тега, sha или ветки. */
-  name?: string;
-}
-
-export function classifyRef(ref: string): ClassifiedRef {
-  const g = ref.match(GIT_SCHEME_RE);
-  if (g) {
-    const name = g[2];
-    // Имя не может начинаться с "-", "." — иначе git съест его как флаг.
-    if (name.startsWith("-") || name.startsWith(".") || name.includes("..")) {
-      return { kind: "file" };
-    }
-    if (g[1] === "commit" && !GIT_SHA_RE.test(name)) return { kind: "file" };
-    return { kind: "git_ref", scheme: g[1] as "tag" | "commit" | "branch", name };
-  }
-  const m = ref.match(GIT_REF_RE);
-  if (m) return { kind: "git_blob", rev: m[1] };
-  return { kind: "file" };
-}
+export type { ArtifactKind, ClassifiedRef } from "./refs.js";
 
 /** sha256 over a stream; size counted on the way through. */
 function hashStream(stream: NodeJS.ReadableStream): Promise<{ digest: string; size: number }> {
@@ -286,7 +253,14 @@ export async function checkArtifacts(
         const sha = await resolveGitRefSha(scheme!, name!, repoUsed);
         fresh = sha ? { digest: sha, size: 0 } : null;
       } else {
-        fresh = await hashFile(path.isAbsolute(ref) ? ref : path.resolve(cwd, ref));
+        // 2.1.13 F2: локатор (:12, :12-30, #L12, #L12-L30) снимается перед
+        // файловой системой. Он ограничивает область ЦИТИРОВАНИЯ, не область
+        // хеша — хешируется файл целиком. Ключ строки (kind, ref) остаётся
+        // сырой ссылкой: переименование породило бы дубли и сломало baselines.
+        const parsed = parseRef(ref);
+        fresh = await hashFile(
+          path.isAbsolute(parsed.path) ? parsed.path : path.resolve(cwd, parsed.path)
+        );
       }
       const repoPin = kind === "git_ref" ? { repo_path: repoUsed } : {};
 

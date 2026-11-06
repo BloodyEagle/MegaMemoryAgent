@@ -119,14 +119,16 @@ export async function runStats(args: string[]): Promise<void> {
     const avgTokens = nodes.length > 0 ? Math.ceil(totalTokens / nodes.length) : 0;
 
     // list_roots payload analysis (matches what MCP server actually sends)
+    // 2.1.13 F3: ответ всегда компактный — счётчики из roots_compact.
     const listRootsResult = listRoots(db);
     const listRootsPayload = JSON.stringify({ ...listRootsResult, stats: db.getStats() }, null, 2);
     const listRootsChars = listRootsPayload.length;
     const listRootsTokens = Math.ceil(listRootsChars / 4);
-    const listRootsNodeCount = listRootsResult.roots.reduce(
-      (sum, r) => sum + 1 + r.children.length,
+    const listRootsNodeCount = (listRootsResult.roots_compact ?? []).reduce(
+      (sum, r) => sum + 1 + r.child_count,
       0
     );
+    const listRootsRootCount = (listRootsResult.roots_compact ?? []).length;
 
     // Print output
     console.log(pc.bold(pc.cyan("megamemory stats")));
@@ -153,7 +155,7 @@ export async function runStats(args: string[]): Promise<void> {
     console.log();
 
     console.log(`  ${pc.bold("list_roots")}`);
-    printRow("Nodes", formatNumber(listRootsNodeCount), `(${listRootsResult.roots.length} roots + ${listRootsNodeCount - listRootsResult.roots.length} children)`);
+    printRow("Nodes", formatNumber(listRootsNodeCount), `(${listRootsRootCount} roots + ${listRootsNodeCount - listRootsRootCount} children)`);
     printRow("Response size", `~${formatNumber(listRootsTokens)} tokens`, `(${formatNumber(listRootsChars)} chars)`);
     console.log();
 

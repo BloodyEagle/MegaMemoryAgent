@@ -50,16 +50,35 @@ describe("resolveDbPath — источники пути", () => {
   });
 
   it("2b. без флага и без env — путь по умолчанию в cwd", () => {
-    expect(resolveDbPath([])).toBe(
-      path.join(process.cwd(), ".megamemory", "knowledge.db")
-    );
+    // F6 2.1.13: тест не зависит от .megamemory в репозитории (в CI её нет) —
+    // создаём свою в temp-cwd. Смысл ассерта прежний: источник по умолчанию —
+    // cwd/.megamemory/knowledge.db.
+    const repoCwd = process.cwd();
+    fs.mkdirSync(path.join(tmpDir, ".megamemory"));
+    fs.writeFileSync(path.join(tmpDir, ".megamemory", "knowledge.db"), "placeholder");
+    process.chdir(tmpDir);
+    try {
+      expect(resolveDbPath([])).toBe(
+        path.join(process.cwd(), ".megamemory", "knowledge.db")
+      );
+    } finally {
+      process.chdir(repoCwd);
+    }
   });
 
   it("2c. пустая MEGAMEMORY_DB_PATH считается незаданной", () => {
     process.env.MEGAMEMORY_DB_PATH = "";
-    expect(resolveDbPath([])).toBe(
-      path.join(process.cwd(), ".megamemory", "knowledge.db")
-    );
+    const repoCwd = process.cwd();
+    fs.mkdirSync(path.join(tmpDir, ".megamemory"));
+    fs.writeFileSync(path.join(tmpDir, ".megamemory", "knowledge.db"), "placeholder");
+    process.chdir(tmpDir);
+    try {
+      expect(resolveDbPath([])).toBe(
+        path.join(process.cwd(), ".megamemory", "knowledge.db")
+      );
+    } finally {
+      process.chdir(repoCwd);
+    }
   });
 
   it("3. --db=PATH работает так же, как --db PATH", () => {

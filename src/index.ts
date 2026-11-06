@@ -21,13 +21,15 @@ const VERSION = JSON.parse(
 
 const HELP = buildHelp(VERSION);
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "expire", "--help", "-h", "--version", "-v"]);
 
-function parseFlags(args: string[]): { port?: number; rawPort?: string } {
+function parseFlags(args: string[]): { port?: number; rawPort?: string; host?: string } {
   const portIdx = args.indexOf("--port");
   const rawPort = portIdx !== -1 && args[portIdx + 1] ? args[portIdx + 1] : undefined;
   const port = rawPort ? parseInt(rawPort, 10) : undefined;
-  return { port, rawPort };
+  const hostIdx = args.indexOf("--host");
+  const host = hostIdx !== -1 && args[hostIdx + 1] ? args[hostIdx + 1] : undefined;
+  return { port, rawPort, host };
 }
 
 const cmd = process.argv[2];
@@ -43,6 +45,16 @@ switch (cmd) {
   case "serve": {
     const flags = parseFlags(process.argv.slice(3));
     const port = flags.port ?? 4321;
+    // F1 2.1.13: интерфейс локальный по построению — 127.0.0.1 по умолчанию,
+    // ::1 явным флагом. Wildcard (0.0.0.0/::) и имена хостов не принимаются:
+    // serve — инструмент для человека за машиной, не сетевой сервис.
+    const host = flags.host ?? "127.0.0.1";
+    if (host !== "127.0.0.1" && host !== "::1") {
+      errorBold(
+        `--host поддерживает только 127.0.0.1 (по умолчанию) и ::1 — обозреватель слушает loopback и сетевым сервисом не является.`
+      );
+      process.exit(1);
+    }
 
     const portError = validatePort(port, flags.rawPort);
     if (portError) {
@@ -51,7 +63,7 @@ switch (cmd) {
     }
 
     const { runServe } = await import("./web.js");
-    await runServe(port);
+    await runServe(port, host);
     break;
   }
 
@@ -152,6 +164,21 @@ switch (cmd) {
     const { runBenchCli } = await import("./bench-cli.js");
     await runBenchCli(process.argv.slice(3));
     process.exit(0);
+    break;
+  }
+
+  case "expire": {
+    // 2.1.13 F5: ручное проставление valid_until. Ошибки разбора флагов и
+    // неизвестные id — отказ без записи; process.exit(1) здесь, чтобы ядро
+    // expire-cli оставалось тестируемым (бросает, а не умирает).
+    try {
+      const { runExpire } = await import("./expire-cli.js");
+      await runExpire(process.argv.slice(3));
+      process.exit(0);
+    } catch (err) {
+      errorBold(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
     break;
   }
 
@@ -580,7 +607,11 @@ async function startMcpServer() {
     },
     async (params) => {
       try {
-        const result = listRoots(db, { max_tokens: params.max_tokens });
+        // 2.1.13 F3: бюджет считается по сериализованному ответу вместе с
+        // тем, что обработчик добавляет сам (instructions_status, stats) —
+        // оценка listRoots и фактическая выдача MCP не расходятся.
+        const extra = { ...instructionsStatus(VERSION), stats: db.getStats() };
+        const result = listRoots(db, { max_tokens: params.max_tokens, extra_payload: extra });
         const returned = result.meta?.returned ?? result.roots.length;
         timeline.log({
           tool: "list_roots",
@@ -596,7 +627,7 @@ async function startMcpServer() {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({ ...result, ...instructionsStatus(VERSION), stats: db.getStats() }, null, 2),
+              text: JSON.stringify({ ...result, ...extra }, null, 2),
             },
           ],
         };

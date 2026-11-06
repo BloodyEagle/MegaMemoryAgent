@@ -31,10 +31,16 @@ afterEach(async () => {
 function startServe(dbFile: string): Promise<number> {
   port = 43000 + Math.floor(Math.random() * 10000);
   return new Promise((resolve, reject) => {
-    child = spawn(process.execPath, [serveScript, "serve", "--port", String(port)], {
-      env: { ...process.env, MEGAMEMORY_DB_PATH: dbFile },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // 2.1.13 F6: явный --db вместо MEGAMEMORY_DB_PATH — тест не наследует
+    // окружение; FTS-режим — предмет теста маршруты, модель не тянется.
+    child = spawn(
+      process.execPath,
+      [serveScript, "serve", "--port", String(port), "--db", dbFile],
+      {
+        env: { ...process.env, MEGAMEMORY_SEARCH: "fts", MEGAMEMORY_DB_PATH: "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
     let out = "";
     child.stdout?.on("data", (d) => {
       out += String(d);

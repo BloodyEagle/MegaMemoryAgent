@@ -364,6 +364,23 @@ export interface GetConceptInput {
 export interface ListRootsInput {
   /** Token budget for the overview (default 1500). */
   max_tokens?: number;
+  /**
+   * 2.1.13 F3: то, что MCP-обработчик добавит к ответу (instructions_status,
+   * stats). Бюджет считается по СЕРИАЛИЗОВАННОМУ ответу вместе с этими
+   * полями — оценка функции и реальная выдача не расходятся. В возвращаемый
+   * объект не попадает: обработчик добавляет сам.
+   */
+  extra_payload?: Record<string, unknown>;
+}
+
+/** 2.1.13 F3: meta бюджетного обзора — с пометками сокращения секций. */
+export interface ListRootsMeta extends UnderstandMeta {
+  /** Что-то не поместилось в бюджет (roots/slots/board_top резаны). */
+  truncated?: boolean;
+  /** Сколько ролей не вошло (резерв приоритета: роли → задачи → корни). */
+  dropped_slots?: number;
+  /** Сколько задач (board_top) не вошло. */
+  dropped_board_top?: number;
 }
 
 export interface ListRootsOutput {
@@ -390,7 +407,7 @@ export interface ListRootsOutput {
   slots?: Array<{ role: string; node_id: string; node_name: string }>;
   /** Plan 2 §3: top-5 of the open column by rot. */
   board_top?: Array<{ id: string; name: string; rot?: number; due_at?: string | null }>;
-  meta?: UnderstandMeta;
+  meta?: ListRootsMeta;
 }
 
 // ---- DB row types (raw from SQLite) ----

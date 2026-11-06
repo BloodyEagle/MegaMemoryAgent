@@ -360,6 +360,59 @@ export function normalizeValidUntil(
   return text;
 }
 
+/**
+ * 2.1.13 F4: «вечные» утверждения о состоянии. «PR #3 не влит», «релиз
+ * опубликован», «issue закрыт» — верно в момент записи и тихо врёт спустя
+ * месяц, если у узла нет срока годности. Сервер valid_until сам не ставит
+ * («Чего не делать») и запись не блокирует: мягкое предупреждение в ответе
+ * инструмента, решение за агентом. kind=digest — серверная сводка, её не
+ * проверяем.
+ */
+export interface ConceptWarning {
+  code: "state_claim_without_expiry" | "expired_on_create";
+  hint: string;
+}
+
+const STATE_CLAIM_RE =
+  /смержен\w*|влит\w*|не\s+влит|не\s+начат|выпущен\w*|релиз\w*|закрыт\w*|в\s+работе|ожидает\w*|not\s+merged|merged|released|pending|#\d+|\d+\.\d+\.\d+|\d{4}-\d{2}-\d{2}/i;
+
+export function looksLikeStateClaim(summary: string): boolean {
+  return STATE_CLAIM_RE.test(summary);
+}
+
+const STATE_CLAIM_HINT =
+  "Утверждение о состоянии («смержен», номер PR, версия, дата) без срока годности " +
+  "со временем начнёт утверждать то, чего уже нет. Передай valid_until " +
+  "(ISO-8601, напр. \"2026-12-01\") или переформулируй как устойчивое знание.";
+const EXPIRED_HINT =
+  "valid_until уже в прошлом — узел создан, но сразу выпадет из выдачи. Проверь дату или сними срок (null).";
+
+/**
+ * Предупреждения записи узла: срок в прошлом — всегда; утверждение о
+ * состоянии без срока — когда effective expiry отсутствует (undefined или
+ * null = бессрочно).
+ */
+export function conceptWarnings(
+  summary: string,
+  opts: { kind?: string; validUntil: string | null | undefined }
+): ConceptWarning[] {
+  const warnings: ConceptWarning[] = [];
+  if (opts.validUntil) {
+    const t = Date.parse(opts.validUntil);
+    if (!Number.isNaN(t) && t < Date.now()) {
+      warnings.push({ code: "expired_on_create", hint: EXPIRED_HINT });
+    }
+  }
+  if (
+    opts.kind !== "digest" &&
+    looksLikeStateClaim(summary) &&
+    opts.validUntil == null
+  ) {
+    warnings.push({ code: "state_claim_without_expiry", hint: STATE_CLAIM_HINT });
+  }
+  return warnings;
+}
+
 /** Compact per-node payload (plan T3): no why, trimmed summary. */
 function compactMatch(
   db: KnowledgeDB,
@@ -885,6 +938,8 @@ export interface CreateConceptResult {
   duplicate_of?: string;
   similarity?: number;
   matched_by?: "name" | "semantic";
+  /** 2.1.13 F4: мягкие предупреждения — «вечное» утверждение, срок в прошлом. */
+  warnings?: ConceptWarning[];
 }
 
 export async function createConcept(
@@ -902,6 +957,9 @@ export async function createConcept(
   // 2.1.12 F1: срок годности валидируется ещё раньше — мусорная дата отказывает
   // записи, не превращаясь в молчаливый «бессрочный».
   const validUntil = normalizeValidUntil(input.valid_until);
+  // 2.1.13 F4: «вечное» утверждение о состоянии без срока — предупреждение,
+  // не блокировка. digest — серверная сводка, проверка её не касается.
+  const warnings = conceptWarnings(input.summary, { kind: input.kind, validUntil });
   if (STUB_CHECK_KINDS.has(input.kind) && !input.allow_stub && isStubSummary(input.summary, input.kind)) {
     throw new Error(STUB_REJECTION_MESSAGE);
   }
@@ -1099,6 +1157,7 @@ export async function createConcept(
           `${DUPLICATE_MESSAGE_PREFIX}: "${duplicate.id}" ` +
           `(matched_by: ${duplicate.matched_by}, similarity ${sim}). ` +
           "Обнови его или передай force: true.",
+        ...(warnings.length > 0 ? { warnings } : {}),
       };
     }
   }
@@ -1244,6 +1303,7 @@ export async function createConcept(
   return {
     id,
     message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}${confirmNote}${validNote}`,
+    ...(warnings.length > 0 ? { warnings } : {}),
   };
 }
 
@@ -1333,7 +1393,23 @@ export async function updateConcept(
         ? " Срок годности снят — узел снова бессрочный."
         : ` Срок годности: ${validUntil} — после этой даты узел выпадет из выдачи.`;
 
-  return { message: `Updated concept "${input.id}".${epistemicNote}${validNote}` };
+  // 2.1.13 F4: та же проверка при смене саммари. Эффективный срок — тот,
+  // что будет у узла после правки: переданный, а если не передан — прежний
+  // (снятый null считается «бессрочно»).
+  let warnings: ConceptWarning[] = [];
+  if (input.changes.summary !== undefined) {
+    const effectiveExpiry =
+      input.changes.valid_until === undefined ? existing.valid_until : validUntil;
+    warnings = conceptWarnings(input.changes.summary, {
+      kind: input.changes.kind ?? existing.kind,
+      validUntil: effectiveExpiry,
+    });
+  }
+
+  return {
+    message: `Updated concept "${input.id}".${epistemicNote}${validNote}`,
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
 }
 
 export function link(
@@ -1439,11 +1515,26 @@ export function removeConcept(
   };
 }
 
+/**
+ * 2.1.13 F3: бюджетный обзор стартовой выдачи.
+ *
+ * Прежнее поведение при переполнении — перейти к ПОЛНОМУ ответу — убрано:
+ * превышение лимита увеличивало выдачу вместо того, чтобы её сократить.
+ * Теперь ответ всегда компактный; не помещается — режется с конца приоритета
+ * (роли → задачи → корни), сокращение помечается в meta.
+ *
+ * Бюджет считается по СЕРИАЛИЗОВАННОМУ ответу (indent 2 — как у MCP) вместе
+ * со всем, что добавит обработчик: extra_payload (instructions_status, stats),
+ * hint, slots, board_top, meta. Оценка функции и реальный ответ MCP не
+ * расходятся. Ниже минимума (конверт пустого ответа) — понятная ошибка, не
+ * молчаливое превышение. usage пишется на всех ветках.
+ */
 export function listRoots(
   db: KnowledgeDB,
   input: ListRootsInput = {}
 ): ListRootsOutput & { hint?: string } {
   const maxTokens = input.max_tokens ?? 1500;
+  const extra = input.extra_payload ?? {};
   const rootRows = db.getRootNodes();
 
   const stats = db.getStats();
@@ -1470,50 +1561,138 @@ export function listRoots(
     node_name: s.node_name,
   }));
   const boardTop = computeBoard(db).columns.find((c) => c.name === "open")!.cards.slice(0, 5);
-  const compactProjection = JSON.stringify({
-    slots,
-    board_top: boardTop,
-    roots_compact: rootsCompact,
+
+  /** Сериализованный размер ответа — байт/3, как его увидит модель. */
+  const measure = (payload: unknown): number =>
+    estimateTokens(JSON.stringify(payload, null, 2));
+
+  type RootsCompact = (typeof rootsCompact)[number];
+  type Slots = (typeof slots)[number];
+  type Board = (typeof boardTop)[number];
+
+  const build = (
+    roots: RootsCompact[],
+    slotsCut: Slots[],
+    boardCut: Board[],
+    tokensEstimated: number
+  ): ListRootsOutput & { hint?: string } => ({
+    roots: [],
+    compact: true,
+    roots_compact: roots,
+    slots: slotsCut,
+    board_top: boardCut,
     ...(hint ? { hint } : {}),
+    meta: {
+      returned: roots.length,
+      dropped: rootsCompact.length - roots.length,
+      tokens_estimated: tokensEstimated,
+      truncated:
+        roots.length < rootsCompact.length ||
+        slotsCut.length < slots.length ||
+        boardCut.length < boardTop.length,
+      dropped_slots: slots.length - slotsCut.length,
+      dropped_board_top: boardTop.length - boardCut.length,
+    },
   });
-  if (estimateTokens(compactProjection) <= maxTokens) {
-    db.insertUsage({
-      tool: "list_roots",
-      query: null,
-      nodes: rootsCompact.length,
-      returnedChars: compactProjection.length,
-      returnedTokens: estimateTokens(compactProjection),
-    });
-    return {
-      roots: [],
-      compact: true,
-      roots_compact: rootsCompact,
-      slots,
-      board_top: boardTop,
-      ...(hint ? { hint } : {}),
-      meta: {
-        returned: rootsCompact.length,
-        dropped: 0,
-        tokens_estimated: estimateTokens(compactProjection),
-      },
-    };
+
+  /** Пустой каркас с теми же ключами, что у MCP-ответа, — минимум, ниже
+   * которого ответ сжаться не может (meta, hint, extra). */
+  const envelope = { ...build([], [], [], 0), ...extra };
+  const minBudget = measure(envelope);
+  if (maxTokens < minBudget) {
+    throw new Error(
+      `list_roots: max_tokens=${maxTokens} ниже минимума ${minBudget} — ` +
+        `конверт ответа (meta, hint, slots, board_top, stats, instructions_status) сам этого стоит. ` +
+        `Подними max_tokens (по умолчанию 1500).`
+    );
   }
 
-  // Legacy verbose shape when the compact overview alone busts the budget —
-  // trim the list, never return nothing.
-  const roots = rootRows.map((root) => {
-    const children = db.getChildren(root.id).map((c) => c.name);
-    return {
-      id: root.id,
-      name: root.name,
-      kind: root.kind as NodeWithContext["kind"],
-      summary: root.summary,
-      children,
-      valid_until: root.valid_until ?? null,
+  // Запас на цифры tokens_estimated в meta (после подстановки ответ чуть
+  // растёт) — порезка идёт с зазором, финальный замер честный.
+  const RESERVE = 32;
+  const target = maxTokens - RESERVE;
+
+  const fits = (nRoots: number, nSlots: number, nBoard: number): boolean =>
+    measure({
+      ...build(
+        rootsCompact.slice(0, nRoots),
+        slots.slice(0, nSlots),
+        boardTop.slice(0, nBoard),
+        0
+      ),
+      ...extra,
+    }) <= target;
+
+  let nRoots = rootsCompact.length;
+  let nSlots = slots.length;
+  let nBoard = boardTop.length;
+
+  if (!fits(nRoots, nSlots, nBoard)) {
+    // Режем с конца приоритета (роли → задачи → корни): сначала корни,
+    // затем задачи, роли — последними. Бинарный поиск максимума секции,
+    // которая помещается.
+    const searchMax = (hi: number, fitsAt: (n: number) => boolean): number => {
+      let lo = 0;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi + 1) / 2);
+        if (fitsAt(mid)) lo = mid;
+        else hi = mid - 1;
+      }
+      return lo;
     };
+    if (fits(0, nSlots, nBoard)) {
+      // максимум корней при полных ролях и задачах
+      nRoots = searchMax(rootsCompact.length, (n) => fits(n, nSlots, nBoard));
+    } else {
+      nRoots = 0;
+      if (fits(0, nSlots, 0)) {
+        // максимум задач при полных ролях
+        nBoard = searchMax(boardTop.length, (n) => fits(0, nSlots, n));
+      } else {
+        nBoard = 0;
+        if (fits(0, 0, 0)) {
+          // максимум ролей
+          nSlots = searchMax(slots.length, (n) => fits(0, n, 0));
+        } else {
+          // Конверт с запасом не влезает — ошибки выше быть не должно
+          // (minBudget проверен), но резерва не хватило: отдаём пустой
+          // каркас, честный замер ниже всё равно ≤ maxTokens.
+          nSlots = 0;
+        }
+      }
+    }
+  }
+
+  const payload = build(
+    rootsCompact.slice(0, nRoots),
+    slots.slice(0, nSlots),
+    boardTop.slice(0, nBoard),
+    0
+  );
+  const withExtra = { ...payload, ...extra };
+
+  // Фикспойнт: подставляем tokens_estimated и перемеряем, пока цифры
+  // не перестанут менять размер сериализации (2 итераций достаточно).
+  let tokens = measure(withExtra);
+  for (let i = 0; i < 2; i++) {
+    const next = measure({ ...withExtra, meta: { ...payload.meta, tokens_estimated: tokens } });
+    if (next === tokens) break;
+    tokens = next;
+  }
+  const finalPayload: ListRootsOutput & { hint?: string } = {
+    ...payload,
+    meta: { ...payload.meta!, tokens_estimated: tokens },
+  };
+
+  db.insertUsage({
+    tool: "list_roots",
+    query: null,
+    nodes: nRoots,
+    returnedChars: JSON.stringify({ ...finalPayload, ...extra }, null, 2).length,
+    returnedTokens: tokens,
   });
 
-  return { roots, ...(hint ? { hint } : {}) };
+  return finalPayload;
 }
 
 // ---- Merge conflict tools ----
