@@ -192,3 +192,41 @@ describe("срок годности и git-опоры в документаци�
     expect(ru).toContain("stale_excluded");
   });
 });
+
+describe("документация 2.1.13 (F7)", () => {
+  it("36. --help содержит expire и --host", () => {
+    const help = plain(buildHelp("2.1.13"));
+    expect(help).toMatch(/expire\s+Set valid_until/);
+    expect(help).toContain("--host");
+    expect(help).toContain("loopback");
+  });
+
+  it("37. README ×2: раздел про valid_until с предупреждением и expire", () => {
+    const en = fs.readFileSync(path.join(PROJECT_ROOT, "README.md"), "utf-8");
+    const ru = fs.readFileSync(path.join(PROJECT_ROOT, "README.ru.md"), "utf-8");
+    for (const [name, doc] of [["en", en], ["ru", ru]] as const) {
+      expect(doc, name).toMatch(/## (Facts expire|Срок годности фактов)/);
+      expect(doc, name).toContain("state_claim_without_expiry");
+      expect(doc, name).toContain("expired_on_create");
+      expect(doc, name).toMatch(/megamemory expire --ids/);
+      // локатор: ru — «локатор», en — латиницей
+      expect(doc, name).toMatch(/локатор|locator/i);
+    }
+  });
+
+  it("37b. README ×2: serve — loopback, не сетевой сервис", () => {
+    const en = fs.readFileSync(path.join(PROJECT_ROOT, "README.md"), "utf-8");
+    const ru = fs.readFileSync(path.join(PROJECT_ROOT, "README.ru.md"), "utf-8");
+    expect(en).toMatch(/Loopback only/);
+    expect(en).toMatch(/not a network service/);
+    expect(ru).toContain("Только loopback");
+    expect(ru).toContain("не сетевой сервис");
+  });
+
+  it("38. guide содержит фразу про предупреждение (сниппет <= 60 строк)", () => {
+    expect(SNIPPET).toContain("state_claim_without_expiry");
+    expect(SNIPPET).toContain("a warning, not a refusal");
+    const lines = SNIPPET.split("\n").length;
+    expect(lines).toBeLessThanOrEqual(60);
+  });
+});

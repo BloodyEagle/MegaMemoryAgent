@@ -60,6 +60,15 @@ CI. Run `bench` often (it is cheap and mechanical), run the A/B protocol when
 you need proof the memory actually helps a working agent, not just a reading
 list.
 
+**Scope statement (2.1.13).** `bench` measures **context retrieval and hit
+quality**: the tokens the graph's answer costs and whether the expected nodes
+surfaced. It does **not** measure savings across the whole task execution —
+an agent's edit-and-verify loop, its false starts, its re-reads — those live
+only in the A/B protocol. Consequently: numbers quoted by **external reviews
+of this project are not our measurements** and must not be reproduced in this
+repository's docs, README, or CHANGELOG as if they were — cite your own runs
+or link the review verbatim.
+
 ## How to read the numbers
 
 - **`hit_rate` vs `hit_rate@1`.** `hit_rate` counts a hit when any expected node

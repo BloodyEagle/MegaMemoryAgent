@@ -85,7 +85,9 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
 12. **State claims expire:** a statement about the world AS IT WAS ("merged", "PR open",
     "release shipped") MUST carry \`valid_until\` (ISO date) — it drops out of answers after
     that date (\`include_stale: true\` returns it marked \`expired\`). Architecture and
-    conventions stay dateless; the server never invents an expiry for you.
+    conventions stay dateless; the server never invents an expiry for you. A state-claim
+    summary without a date gets a \`state_claim_without_expiry\` warning in the response —
+    a warning, not a refusal: set the date or reword it as durable knowledge.
 ${AGENTS_MD_END}
 `;
 

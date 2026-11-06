@@ -100,6 +100,17 @@ but is **off by default** (`provenance.auto_ground` in `megamemory.config.json`
 next to the database) — server-invented supports must not masquerade as
 agent-declared provenance.
 
+**File refs with locators (2.1.13)** — a ref may carry a line locator:
+`path`, `path:12`, `path:12-30`, `path#L12`, `path#L12-L30`. The filesystem
+receives only the path (Windows drive letters `C:\`, UNC `\\server\share`,
+colons and `#` inside names are preserved); the locator is kept next to the
+row for display and audit. **The digest is over the whole file** — the locator
+limits the citation scope, not the hash scope: a change on line 500 still
+flips a ref written as `path:12`. Git schemes are recognized first and are
+never cut (`git:tag:2026` is a tag named "2026", not a path with a locator).
+`bench` and `check_artifacts` share one parser (`src/refs.ts`) — a ref means
+the same thing to both.
+
 **Strict mode** — `provenance.require_support: true` refuses a `decision` with
 zero supports: no `evidence`, no `informed_by` edge, and (when auto-derivation
 is on) nothing derived. The refusal says to pass `evidence` in the same call —
@@ -169,6 +180,17 @@ gives every node an optional `valid_until` (ISO-8601, UTC):
 - **Superseded is not expired** — the `valid_until` written by `supersedes`
   is a replacement marker on a node that already left the answers through its
   own status; the expiry filters only apply to active nodes.
+- **The server warns, never blocks (2.1.13)** — a summary that looks like a
+  state claim (merged/released/pending, a PR number, a semver, a date) without
+  `valid_until` gets a `state_claim_without_expiry` warning in the tool
+  response; an expiry already in the past gets `expired_on_create`. The node
+  is still written — setting the date is the agent's call, the server does not
+  invent one. `kind=digest` is exempt.
+- **Manual expiry (2.1.13)** — `megamemory expire --ids a,b --until 2027-01-01
+  [--apply]` (or `--until past` = yesterday) sets `valid_until` on existing
+  nodes; dry-run by default, one unknown id refuses the whole batch, every
+  application writes a `timeline` entry. Cleanup candidates on a live base:
+  run it on a copy, keep useful content by rewriting it instead of expiring.
 
 ---
 
@@ -331,7 +353,7 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 | `resolve_conflict` | Resolve a conflict with verified content. |
 | `provenance_trace` | Walk `informed_by` (`ancestry` / `impact`) with honest completeness and weak links first. |
 | `provenance_audit` | Graph-wide provenance audit: weak links, ungrounded decisions, retention of past audits. |
-| `check_artifacts` | Hash a node's file/git-blob artifacts, resolve `git:tag/commit/branch` refs to a sha; divergences surface as `artifact_changed`. |
+| `check_artifacts` | Hash a node's file/git-blob artifacts (file refs may carry line locators — the whole file is hashed), resolve `git:tag/commit/branch` refs to a sha; divergences surface as `artifact_changed`. |
 
 **Kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest`
 
@@ -344,7 +366,7 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 | Command | What it does |
 |---|---|
 | `megamemory install` | Configure an MCP client |
-| `megamemory serve [--port N]` | Web explorer (graph, search, node cards, Tokens panel, consolidate tab) |
+| `megamemory serve [--port N]` | Web explorer (graph, search, node cards, Tokens panel, consolidate tab). **Loopback only** (`127.0.0.1`, IPv6: `--host ::1`) — a local tool for a human, not a network service; earlier releases listened on all interfaces — behavior changed |
 | `megamemory migrate [--dry-run\|--apply]` | Upgrade an upstream database |
 | `megamemory repair-ids [--apply]` | Rebuild empty / trailing-slash IDs from names |
 | `megamemory reembed` | Recompute embeddings (resumable, batched) |
@@ -356,6 +378,7 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 | `megamemory consolidate [--dry-run\|--apply]` | Find and merge near-duplicate nodes |
 | `megamemory digest [--apply]` | Build or rebuild digest nodes |
 | `megamemory export --md <dir> [--check]` | Markdown export, CI-friendly drift check |
+| `megamemory expire --ids a,b --until D[\|--past]` | Set `valid_until` on journal/state-claim nodes (dry-run by default, `--apply` to write) |
 | `megamemory merge`, `conflicts`, `resolve` | Two-way merge of graphs across branches |
 
 ---
@@ -379,6 +402,7 @@ Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports
 megamemory serve --port 8080
 ```
 
+- **local by construction (2.1.13)**: listens on `127.0.0.1` only (`--host ::1` for IPv6, wildcard refused); foreign `Host` (DNS rebinding guard) and foreign `Origin`/`Referer` requests are refused with 403; the mutating `POST /api/consolidate` requires same-origin, `Content-Type: application/json` and a body under 64 KB. It is a tool for a human at the machine — do not expose it as a network service
 - nodes colored by kind, sized by edge count; `digest` nodes and outdated (`superseded`) nodes are visually distinct
 - `supersedes` edges drawn dashed, status badges in the node card, "show outdated" toggle
 - search hits carry a `via` badge (vector / fts / both) and a budget line: `N nodes, ~X tokens, dropped M · saved ~Z vs full`
