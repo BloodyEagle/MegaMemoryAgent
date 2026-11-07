@@ -47,6 +47,86 @@
     white-space: nowrap;
   }
 
+  /* UX-01 (план 07): сравнение двух нод перед Consolidate. Две независимые
+     панели A/B рядом; на узком экране — последовательно с теми же
+     заголовками. */
+  #consolidate-preview {
+    position: fixed;
+    top: 46px; left: 16px; right: 16px; bottom: 90px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    z-index: 60;
+    overflow-y: auto;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .cc-head { display: flex; align-items: center; gap: 10px; }
+  .cc-title { font-weight: 700; color: var(--text-dim); }
+  .cc-meta { color: var(--text-muted); font-size: 11px; }
+  .cc-stale {
+    color: #f59e0b; font-size: 11px;
+    border: 1px solid #f59e0b55; border-radius: 8px; padding: 1px 8px;
+  }
+  .cc-close {
+    margin-left: auto; background: transparent;
+    border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 8px; cursor: pointer; font-size: 14px; padding: 2px 10px;
+  }
+  .cc-columns { display: flex; gap: 10px; align-items: flex-start; }
+  .ccard {
+    flex: 1 1 0; min-width: 0;
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px;
+    background: var(--surface2);
+  }
+  .ccard-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+  .ccard-side { color: var(--text-dim); font-weight: 700; }
+  .ccard-id { color: #38bdf8; word-break: break-all; }
+  .ccard-badge { color: #f59e0b; font-size: 10px; border: 1px solid #f59e0b55; border-radius: 6px; padding: 0 6px; }
+  .ccard-name { font-size: 13px; margin-bottom: 4px; }
+  .ccard-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .ccard-row { display: flex; gap: 8px; align-items: flex-start; margin: 4px 0; font-size: 11px; flex-wrap: wrap; }
+  .cc-label { color: var(--text-muted); min-width: 130px; flex-shrink: 0; }
+  .cc-text { white-space: pre-wrap; word-break: break-word; }
+  .cc-error { color: #ef4444; }
+  .cc-warn { color: #f59e0b; }
+  .cc-hint { color: var(--text-muted); }
+  .cc-ok { color: #4ade80; }
+  .cc-survivor { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .cc-choice {
+    cursor: pointer; background: var(--bg);
+    border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 4px 10px; font-family: inherit; font-size: 11px;
+  }
+  .cc-choice.chosen { border-color: #4ade80; color: #4ade80; }
+  .cc-choice:disabled { opacity: 0.5; cursor: default; }
+  .cc-effects { border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11px; }
+  .cc-effects-title { color: var(--text-dim); margin-bottom: 6px; }
+  .cc-effect { display: flex; gap: 8px; margin: 3px 0; }
+  .cc-value { word-break: break-word; }
+  .cc-edge { color: #38bdf8; }
+  .cc-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .cc-btn {
+    cursor: pointer; background: #1e2333;
+    border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 8px; padding: 4px 12px; font-family: inherit;
+  }
+  .cc-btn:disabled { opacity: 0.45; cursor: default; }
+  .cc-merge { border-color: #22c55e55; color: #4ade80; }
+  .cc-danger { border-color: #ef444455; color: #ef4444; }
+  .cc-confirm {
+    border: 1px solid #ef444455; border-radius: 10px; padding: 10px;
+    font-size: 11px; display: flex; flex-direction: column; gap: 8px;
+  }
+
+  @media (max-width: 900px) {
+    .cc-columns { flex-direction: column; }
+    .cc-label { min-width: 90px; }
+  }
+
   .search-shell {
     flex: 1;
     max-width: 520px;
@@ -484,6 +564,11 @@
 </head>
 <body>
 
+<div id="transport-error" style="display:none;position:fixed;top:0;left:0;right:0;z-index:10000;background:#7f1d1d;color:#fecaca;font:12px/1.4 ui-monospace,monospace;padding:8px 12px;border-bottom:1px solid #b91c1c;">
+  <span class="te-msg">Server unreachable</span>
+  <button type="button" class="te-retry" style="margin-left:12px;background:#b91c1c;border:0;color:#fff;padding:3px 10px;cursor:pointer;border-radius:4px;">Reload</button>
+</div>
+
 <header>
   <span class="logo">MegaMemory</span>
   <div class="search-shell" id="search-shell">
@@ -604,6 +689,18 @@ function setEmptyStateVisible(visible) {
   el.classList.toggle('visible', Boolean(visible));
 }
 
+// R-08 (plan 08): transport failures must not stay silent — a dead startup
+// or a dead timeline previously died with an unhandled rejection and no
+// visible cue. The banner states where it happened; Reload re-runs init.
+function showTransportError(where, err) {
+  if (typeof console !== 'undefined' && console.error) console.error('Transport error (' + where + '):', err);
+  const el = document.getElementById('transport-error');
+  if (!el) return;
+  const msg = el.querySelector('.te-msg');
+  if (msg) msg.textContent = 'Server unreachable (' + where + ')' + (err && err.message ? ': ' + err.message : '');
+  el.style.display = 'block';
+}
+
 function connectSSE() {
   if (typeof window.EventSource === 'undefined') return;
   if (evtSource) evtSource.close();
@@ -621,10 +718,18 @@ function connectSSE() {
 
   evtSource.onopen = () => {
     sseConnected = true;
+    // UX-01 (план 07): reconnect во время открытого preview помечает его
+    // устаревшим — во время разрыва граф мог измениться; merge сам не
+    // выполняется, пользователю предлагается перечитать.
+    if (ccState && ccState.sawSseError) {
+      ccState.sawSseError = false;
+      markConsolidateStale();
+    }
   };
 
   evtSource.onerror = () => {
     sseConnected = false;
+    if (ccState) ccState.sawSseError = true;
   };
 }
 
@@ -639,9 +744,11 @@ function handleSSE(msg) {
       handleNodeAdded(msg.data);
       break;
     case 'node_updated':
+      ccNoteNodeChange(msg.data && msg.data.id);
       handleNodeUpdated(msg.data);
       break;
     case 'node_removed':
+      ccNoteNodeChange(msg.data && msg.data.id);
       handleNodeRemoved(msg.data);
       break;
     case 'edge_added':
@@ -677,8 +784,18 @@ function refreshSimulation(alphaFloor) {
 
 function handleSseInit(data) {
   if (!data || !Array.isArray(data.nodes) || !Array.isArray(data.edges)) return;
-  if (nodes.length > 0) return;
+  // План 06 (W-06): reconnect заменяет состояние ЦЕЛИКОМ — раньше init
+  // игнорировался при непустом графе, и клиент жил на устаревшем снимке.
+  // Сохраняются только координаты выживших узлов, содержимое и рёбра свежие.
+  const savedCoords = new Map(nodes.map((node) => [node.id, { x: node.x, y: node.y }]));
   buildGraphData({ nodes: data.nodes, edges: data.edges });
+  for (const node of nodes) {
+    const saved = savedCoords.get(node.id);
+    if (saved) {
+      node.x = saved.x;
+      node.y = saved.y;
+    }
+  }
   initSimulation();
 
   if (data.stats || data.kinds) {
@@ -757,10 +874,49 @@ function handleNodeUpdated(data) {
   const node = nodeMap.get(data.id);
   if (!node) return;
 
-  node.name = data.name || node.name;
-  node.kind = data.kind || node.kind;
-  node.summary = data.summary || node.summary;
-  node.color = KIND_COLORS[node.kind] || '#888';
+  // План 06 (W-06): событие применяет ПОЛНУЮ модель, а не удерживает
+  // устаревшие поля: undefined означает «поле не прислоно», а не «оставить
+  // старое значение» — иначе status и parent_id молчали бы вечно.
+  if (data.name !== undefined) node.name = data.name;
+  if (data.kind !== undefined) {
+    node.kind = data.kind;
+    node.color = KIND_COLORS[node.kind] || '#888';
+  }
+  if (data.summary !== undefined) node.summary = data.summary;
+  if (data.status !== undefined) {
+    node.status = data.status || 'active';
+    node.muted = node.status !== 'active';
+  }
+  if (data.edge_count !== undefined) {
+    node.edge_count = data.edge_count;
+    node.radius = Math.max(7, 7 + node.edge_count * 1.5);
+  }
+  if (data.parent_id !== undefined && (data.parent_id || null) !== (node.parent_id || null)) {
+    const oldParentId = node.parent_id;
+    node.parent_id = data.parent_id || null;
+    // Parent-ребро обслуживается здесь же: старое снимается, новое ставится,
+    // счётчик детей у старого родителя пересчитывается.
+    edges = edges.filter((edge) => !(edge.isParentEdge && edgeEndpointId(edge.target) === node.id));
+    const parent = node.parent_id ? nodeMap.get(node.parent_id) : null;
+    if (parent) {
+      parent._hasChildren = true;
+      edges.push({
+        source: parent.id,
+        target: node.id,
+        relation: 'child',
+        description: '',
+        isParentEdge: true,
+        birthTime: performance.now(),
+        drawProgress: 0,
+        pulseTime: null,
+        dimmed: false,
+      });
+    }
+    const oldParent = oldParentId ? nodeMap.get(oldParentId) : null;
+    if (oldParent) {
+      oldParent._hasChildren = nodes.some((n) => n.parent_id === oldParent.id);
+    }
+  }
 
   const now = performance.now();
   node.pulseTime = now;
@@ -772,6 +928,7 @@ function handleNodeUpdated(data) {
     }
   }
 
+  refreshSimulation(0.3);
   spawnFloatingLabel('updated', node, node.color);
 }
 
@@ -906,23 +1063,23 @@ function renderStats(stats) {
       parts.push(`<span class="stat"><span class="dot" style="background:${c}"></span>${kind}: ${count}</span>`);
     }
   }
-  // U1: per-kind filter checkboxes.
+  // U1: per-kind filter checkboxes. W-01 (plan 05): no data in inline JS —
+  // the value travels in a data attribute, the click in delegation.
   parts.push(KIND_ORDER.map(k =>
     `<label class="stat" style="cursor:pointer">
-       <input type="checkbox" ${hiddenKinds.has(k) ? '' : 'checked'}
-              onchange="toggleKind('${k}', this.checked)">
-       <span style="color:${KIND_COLORS[k] || '#888'}">■</span> ${k}
+       <input type="checkbox" data-kind-toggle="${esc(k)}" ${hiddenKinds.has(k) ? '' : 'checked'}>
+       <span style="color:${KIND_COLORS[k] || '#888'}">■</span> ${esc(k)}
      </label>`).join(''));
   // U1: visible/total counter.
   parts.push(`<span class="stat" id="visible-counter"></span>`);
   // T4: status legend + "show outdated" toggle.
   parts.push(`<span class="stat"><span class="dot" style="background:#d97706"></span>superseded</span>`);
   parts.push(`<span class="stat"><span class="dot" style="background:#ef4444"></span>deprecated</span>`);
-  parts.push(`<label class="stat" style="cursor:pointer"><input type="checkbox" id="toggle-outdated" ${hideOutdated ? '' : 'checked'} onchange="hideOutdated = !this.checked"> show outdated</label>`);
+  parts.push(`<label class="stat" style="cursor:pointer"><input type="checkbox" id="toggle-outdated" ${hideOutdated ? '' : 'checked'}> show outdated</label>`);
   // T5: consolidation tab.
-  parts.push(`<button class="stat" id="consolidate-btn" onclick="openConsolidate()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">consolidate…</button>`);
+  parts.push(`<button class="stat" id="consolidate-btn" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">consolidate…</button>`);
   // U2: whole-graph export download.
-  parts.push(`<button class="stat" onclick="location.href=/'api/export.json'" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">export bundle</button>`);
+  parts.push(`<button class="stat" id="export-bundle-btn" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">export bundle</button>`);
   // U3: health chip (async — fetches /api/health once per stats render).
   parts.push(`<span class="stat" id="health-chip">health: …</span>`);
   el.innerHTML = parts.join('');
@@ -1008,40 +1165,445 @@ async function openConsolidate() {
     const candidates = Array.isArray(data.candidates) ? data.candidates : [];
     if (!candidates.length) {
       el.innerHTML = '<span class="stat">no duplicates found — graph is clean</span>' +
-        '<button class="stat" onclick="location.reload()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">close</button>';
+        '<button class="stat" data-action="reload" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">close</button>';
       return;
     }
     const rows = candidates.map(c =>
       `<div class="stat" style="display:flex;gap:8px;align-items:center;border:1px solid #64748b44;border-radius:10px;padding:4px 8px">` +
       `<span style="color:#38bdf8">${esc(c.a)}</span> ≈ <span style="color:#38bdf8">${esc(c.b)}</span>` +
       `<span style="color:#4ade80">${(c.similarity * 100).toFixed(1)}%</span>` +
-      `<button onclick="applyConsolidate('${esc(c.older)}','${esc(c.older === c.a ? c.b : c.a)}')" ` +
-      `style="cursor:pointer;background:#22c55e22;border:1px solid #22c55e55;color:#4ade80;border-radius:8px;padding:2px 8px">merge into ${esc(c.older)}</button></div>`
+      // UX-01 (план 07): действие у пары — «Сравнить», POST делает только
+      // финальное подтверждение в preview. W-01: ids ride in data attributes,
+      // never inside an inline handler string.
+      `<button data-action="consolidate-compare" data-a="${esc(c.a)}" data-b="${esc(c.b)}" data-older="${esc(c.older)}" data-sim="${esc(String(c.similarity))}" ` +
+      `style="cursor:pointer;background:#3b82f622;border:1px solid #3b82f655;color:#38bdf8;border-radius:8px;padding:2px 8px">compare</button>` +
+      `<span style="color:#64748b">recommendation: older ${esc(c.older)}</span></div>`
     ).join('');
     el.innerHTML = `<div style="display:flex;flex-direction:column;gap:4px;width:100%">` +
       `<span class="stat">${candidates.length} duplicate candidate(s)</span>${rows}` +
-      `<button class="stat" onclick="location.reload()" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">close</button></div>`;
+      `<button class="stat" data-action="reload" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">close</button></div>`;
   } catch (err) {
     el.innerHTML = `<span class="stat">consolidate failed: ${esc(String(err))}</span>`;
   }
 }
 
-async function applyConsolidate(survivor, other) {
+// ---- UX-01 (план 07): сравнение двух нод перед Consolidate ----
+// Список кандидатов открывает preview; POST выполняет единственное
+// финальное подтверждение. Отмена/закрытие/просмотр/смена survivor/ошибка
+// GET — ноль POST и ноль мутаций. Все данные едут в data-атрибутах (W-01).
+
+let ccState = null;
+
+function ccSurivorIds(state) {
+  const survivorId = state.survivor === 'A' ? state.a : state.b;
+  const otherId = state.survivor === 'A' ? state.b : state.a;
+  return { survivorId, otherId };
+}
+
+// SSE-событие об изменении одной из нод пары помечает открытый preview
+// устаревшим. merged/busy защищают от пометки событиями самого слияния.
+function ccNoteNodeChange(id) {
+  if (!ccState || ccState.merged || ccState.busy) return;
+  if (id && (id === ccState.a || id === ccState.b)) markConsolidateStale();
+}
+
+function closeConsolidatePreview() {
+  ccState = null;
+  const panel = document.getElementById('consolidate-preview');
+  if (panel) panel.remove();
+}
+
+function markConsolidateStale() {
+  if (!ccState || ccState.merged || ccState.busy) return;
+  ccState.stale = true;
+  ccState.confirmOpen = false;
+  renderConsolidatePreview();
+}
+
+// Открытие preview: обе карточки и последствия грузятся GET-ами; merge
+// остаётся disabled, пока не загружены обе карточки, план выбранной
+// ориентации и не выбран survivor.
+function openConsolidatePreview(a, b, meta) {
+  closeConsolidatePreview();
+  ccState = {
+    a, b,
+    older: (meta && meta.older) || '',
+    similarity: meta && meta.similarity !== undefined ? meta.similarity : null,
+    survivor: null,            // нет скрытого автовыбора: выбор явный
+    cards: { A: null, B: null },
+    plan: null,                // { ok, data } для ориентации (survivorId → otherId)
+    planLoading: false,
+    stale: false,
+    sawSseError: false,
+    conflict: false,
+    busy: false,
+    confirmOpen: false,
+    postError: null,
+    merged: null,
+    loadError: null,
+    gen: 0,
+  };
+  const panel = document.createElement('div');
+  panel.id = 'consolidate-preview';
+  // Делегирование на корне панели (W-01): данные — в data-атрибутах,
+  // ни одного inline-обработчика с интерполяцией id.
+  panel.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const actionEl = target.closest('[data-action]');
+    const action = actionEl ? actionEl.getAttribute('data-action') : null;
+    if (action === 'consolidate-close') { closeConsolidatePreview(); return; }
+    if (action === 'consolidate-survivor') {
+      chooseConsolidateSurvivor(actionEl.getAttribute('data-side') ?? '');
+      return;
+    }
+    if (action === 'consolidate-retry') { void loadConsolidatePreview(); return; }
+    if (action === 'consolidate-merge') {
+      if (!ccState || ccState.busy || ccState.merged) return;
+      ccState.confirmOpen = true;
+      renderConsolidatePreview();
+      return;
+    }
+    if (action === 'consolidate-confirm') { void submitConsolidateMerge(); return; }
+    if (action === 'consolidate-cancel-confirm') {
+      if (!ccState) return;
+      ccState.confirmOpen = false;
+      renderConsolidatePreview();
+      return;
+    }
+    const nav = target.closest('[data-navigate-id]');
+    if (nav) navigateTo(nav.getAttribute('data-navigate-id') ?? '');
+  });
+  document.body.appendChild(panel);
+  renderConsolidatePreview();
+  loadConsolidatePreview();
+}
+
+// (Пере)загрузка карточек и последствий. Всё — GET.
+async function loadConsolidatePreview() {
+  const state = ccState;
+  if (!state) return;
+  const gen = ++state.gen;
+  state.loadError = null;
+  state.cards = { A: null, B: null };
+  state.plan = null;
+  state.planLoading = Boolean(state.survivor);
+  renderConsolidatePreview();
+
+  const loadCard = async (side, id) => {
+    try {
+      const res = await fetch('/api/node/' + encodeURIComponent(id));
+      const data = await res.json();
+      if (!state || state.gen !== gen) return;
+      state.cards[side] = res.ok ? { ok: true, data } : { ok: false, error: (data && data.error) || ('HTTP ' + res.status) };
+    } catch (err) {
+      if (!state || state.gen !== gen) return;
+      state.cards[side] = { ok: false, error: String(err) };
+    }
+    renderConsolidatePreview();
+  };
+
+  await Promise.all([loadCard('A', state.a), loadCard('B', state.b)]);
+  await loadConsolidatePlan(gen);
+}
+
+// Последствия считаются серверным планировщиком (planConsolidation) для
+// текущей ориентации survivor. Смена survivor перезагружает план (GET).
+async function loadConsolidatePlan(gen) {
+  const state = ccState;
+  if (!state || state.gen !== gen || !state.survivor) return;
+  const { survivorId, otherId } = ccSurivorIds(state);
+  state.planLoading = true;
+  renderConsolidatePreview();
+  try {
+    const url = '/api/consolidate/preview?survivor=' + encodeURIComponent(survivorId) +
+      '&other=' + encodeURIComponent(otherId);
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!ccState || ccState !== state || state.gen !== gen) return;
+    state.plan = res.ok ? { ok: true, data } : { ok: false, error: (data && data.error) || ('HTTP ' + res.status) };
+  } catch (err) {
+    if (!ccState || ccState !== state || state.gen !== gen) return;
+    state.plan = { ok: false, error: String(err) };
+  }
+  state.planLoading = false;
+  renderConsolidatePreview();
+}
+
+function chooseConsolidateSurvivor(side) {
+  const state = ccState;
+  if (!state || state.merged || state.busy) return;
+  if (state.survivor === side) return;
+  state.survivor = side;
+  state.confirmOpen = false;
+  state.plan = null;
+  // План перечитывается для новой ориентации — чтение, не мутация.
+  void loadConsolidatePlan(state.gen);
+}
+
+// Финальное подтверждение — единственный POST. Повторный клик блокируется
+// флагом busy; ошибка не теряется: панель остаётся открыта с текстом.
+async function submitConsolidateMerge() {
+  const state = ccState;
+  if (!state || state.busy || state.merged) return;
+  const { survivorId, otherId } = ccSurivorIds(state);
+  const planOk = state.plan && state.plan.ok && !state.plan.data.rejection &&
+    state.plan.data.survivor === survivorId;
+  if (!planOk || !state.survivor) return;
+  state.busy = true;
+  state.confirmOpen = false;
+  state.postError = null;
+  renderConsolidatePreview();
+  const base = state.plan.data.base || {};
   try {
     const res = await fetch('/api/consolidate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ survivor, other }),
+      body: JSON.stringify({
+        survivor: survivorId,
+        other: otherId,
+        base: {
+          ...(base.digest ? { digest: base.digest } : {}),
+          survivor_updated_at: base.survivor_updated_at ?? null,
+          other_updated_at: base.other_updated_at ?? null,
+        },
+      }),
     });
-    const data = await res.json();
-    if (data.error) {
-      alert('merge failed: ' + data.error);
+    let data = {};
+    try { data = await res.json(); } catch { /* пустое тело — обработается ниже */ }
+    if (!ccState || ccState !== state) return;
+    if (res.status === 409 || data.error === 'version_conflict') {
+      // Stale preview: нода изменилась/удалена — перечитываем и просим
+      // подтвердить заново; merge сам не выполняется.
+      state.busy = false;
+      state.conflict = true;
+      await loadConsolidatePreview();
       return;
     }
-    location.reload();
+    if (!res.ok || data.error) {
+      state.busy = false;
+      state.postError = data.error || ('HTTP ' + res.status);
+      renderConsolidatePreview();
+      return;
+    }
+    state.busy = false;
+    state.merged = { survivor: survivorId, removed: otherId };
+    renderConsolidatePreview();
+    await refreshExplorerAfterMerge();
   } catch (err) {
-    alert('merge failed: ' + String(err));
+    if (!ccState || ccState !== state) return;
+    state.busy = false;
+    state.postError = String(err);
+    renderConsolidatePreview();
   }
+}
+
+// После успеха: настоящий survivor виден в панели, граф и кандидаты
+// обновляются перечитыванием (GET), поглощённая нода уходит из графа.
+async function refreshExplorerAfterMerge() {
+  try {
+    const [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()]);
+    if (graphData && Array.isArray(graphData.nodes)) {
+      handleSseInit({ nodes: graphData.nodes, edges: graphData.edges });
+    }
+    renderStats(stats);
+    updateVisibleCounter();
+    await openConsolidate();
+  } catch (err) {
+    // Слияние уже применено; сбой перечитывания показываем, не роняя панель.
+    if (ccState) {
+      ccState.postError = 'merged, but refresh failed: ' + String(err);
+      renderConsolidatePreview();
+    }
+  }
+}
+
+function ccCardHtml(side, id, card, olderId) {
+  const head = `<div class="ccard-head">` +
+    `<span class="ccard-side">${side}</span> <span class="ccard-id">${esc(id)}</span>` +
+    (olderId === id ? ' <span class="ccard-badge">recommended · older</span>' : '') +
+    `</div>`;
+  if (!card) return `<section class="ccard">${head}<div class="ccard-body">loading…</div></section>`;
+  if (!card.ok) {
+    return `<section class="ccard">${head}<div class="ccard-body cc-error">card failed: ${esc(card.error)}</div></section>`;
+  }
+  const d = card.data;
+  const badge = (label, color) =>
+    `<span class="kind-badge" style="background:${color}22;color:${color};border:1px solid ${color}44">${esc(label)}</span>`;
+  const status = d.status || 'active';
+  const statusColor = status === 'active' ? '#4ade80' : status === 'superseded' ? '#f59e0b' : '#ef4444';
+  let h = `<section class="ccard">${head}<div class="ccard-body">`;
+  h += `<div class="ccard-name">${esc(d.name)}</div>`;
+  h += `<div class="ccard-badges">${badge(d.kind, KIND_COLORS[d.kind] || '#888')}${badge(status, statusColor)}`;
+  if (d.epistemic_status) h += badge(d.epistemic_status, '#a855f7');
+  if (d.expired) h += badge('expired', '#f59e0b');
+  if (d.weak_support) h += badge('weak support', '#f59e0b');
+  h += `</div>`;
+  if (d.parent) h += `<div class="ccard-row"><span class="cc-label">parent</span><span class="link-row" data-navigate-id="${esc(d.parent.id)}">${esc(d.parent.name)}</span></div>`;
+  if (d.children && d.children.length) {
+    h += `<div class="ccard-row"><span class="cc-label">children (${d.children.length})</span>` +
+      d.children.map(c => `<span class="child-link" data-navigate-id="${esc(c.id)}">${esc(c.name)}</span>`).join('') + `</div>`;
+  }
+  // Полный текст без обрезания: white-space:pre-wrap, ничего не отрезается.
+  h += `<div class="ccard-row"><span class="cc-label">summary</span><div class="cc-text">${esc(d.summary || '')}</div></div>`;
+  h += `<div class="ccard-row"><span class="cc-label">why</span><div class="cc-text">${esc(d.why || '—')}</div></div>`;
+  if (d.refuted_reason) h += `<div class="ccard-row"><span class="cc-label">refuted reason</span><div class="cc-text">${esc(d.refuted_reason)}</div></div>`;
+  if (d.valid_until) h += `<div class="ccard-row"><span class="cc-label">valid until</span>${esc(String(d.valid_until))}${d.expired ? ' — expired' : ''}</div>`;
+  if (d.status_scope) h += `<div class="ccard-row"><span class="cc-label">scope</span><div class="cc-text">${esc(JSON.stringify(d.status_scope))}</div></div>`;
+  if (d.file_refs && d.file_refs.length) {
+    h += `<div class="ccard-row"><span class="cc-label">files</span>` +
+      d.file_refs.map(f => `<span class="file-ref">${esc(f)}</span>`).join('') + `</div>`;
+  }
+  if (d.informed_by && d.informed_by.length) {
+    h += `<div class="ccard-row"><span class="cc-label">supports (informed_by)</span>` +
+      d.informed_by.map(e =>
+        `<span class="link-row" data-navigate-id="${esc(e.to)}"><span class="rel">informed_by</span> <span class="name">${esc(e.to_name)}</span>` +
+        (e.rationale ? `<span class="desc">${esc(e.rationale)}</span>` : '') +
+        (e.weak ? ' <span style="color:#f59e0b">weak</span>' : '') + `</span>`).join('') + `</div>`;
+  }
+  if (d.informed_by_incoming && d.informed_by_incoming.length) {
+    h += `<div class="ccard-row"><span class="cc-label">relied on by</span>` +
+      d.informed_by_incoming.map(e =>
+        `<span class="link-row" data-navigate-id="${esc(e.from)}"><span class="rel">informed_by</span> <span class="name">${esc(e.from_name)}</span>` +
+        (e.rationale ? `<span class="desc">${esc(e.rationale)}</span>` : '') + `</span>`).join('') + `</div>`;
+  }
+  if (d.edges && d.edges.length) {
+    h += `<div class="ccard-row"><span class="cc-label">outgoing (${d.edges.length})</span>` +
+      d.edges.map(e =>
+        `<span class="link-row" data-navigate-id="${esc(e.to)}"><span class="rel">${esc(e.relation)}</span> <span class="name">${esc(e.to_name)}</span>` +
+        (e.description ? `<span class="desc">${esc(e.description)}</span>` : '') + `</span>`).join('') + `</div>`;
+  }
+  if (d.incoming_edges && d.incoming_edges.length) {
+    h += `<div class="ccard-row"><span class="cc-label">incoming (${d.incoming_edges.length})</span>` +
+      d.incoming_edges.map(e =>
+        `<span class="link-row" data-navigate-id="${esc(e.from)}"><span class="rel">${esc(e.relation)}</span> <span class="name">${esc(e.from_name)}</span>` +
+        (e.description ? `<span class="desc">${esc(e.description)}</span>` : '') + `</span>`).join('') + `</div>`;
+  }
+  if (d.trails && d.trails.length) {
+    h += `<div class="ccard-row"><span class="cc-label">trails</span>` +
+      d.trails.map(t => `<span class="file-ref">${esc(t.id)} · ${esc(t.state)}</span>`).join('') + `</div>`;
+  }
+  if (d.slots && d.slots.length) {
+    h += `<div class="ccard-row"><span class="cc-label">slots</span>` +
+      d.slots.map(s => `<span class="file-ref">${esc(s.project)} / ${esc(s.role)}</span>`).join('') + `</div>`;
+  }
+  if (d.task_state || d.due_at) {
+    h += `<div class="ccard-row"><span class="cc-label">task</span>${esc(d.task_state || '')}${d.due_at ? ' · due ' + esc(String(d.due_at)) : ''}</div>`;
+  }
+  const origin = d.created_via ? d.created_via : 'unknown';
+  h += `<div class="ccard-row"><span class="cc-label">origin</span>${esc(origin)}</div>`;
+  if (d.current_digests && d.current_digests.confirmed_claim) {
+    h += `<div class="ccard-row"><span class="cc-label">confirmed claim</span>yes${d.current_digests.confirmed_claim !== d.current_digests.claim ? ' — wording changed since confirmation' : ''}</div>`;
+  }
+  h += `<div class="ccard-row"><span class="cc-label">timestamps</span>created ${esc(String(d.created_at || '?'))} · updated ${esc(String(d.updated_at || '?'))}</div>`;
+  h += `</div></section>`;
+  return h;
+}
+
+function ccEffectsHtml(state, survivorId, otherId) {
+  if (!state.survivor) {
+    return `<div class="cc-effects"><span class="cc-hint">choose the survivor to compute the consequences — nothing happens until the final confirmation</span></div>`;
+  }
+  if (state.planLoading) return `<div class="cc-effects"><span class="cc-hint">computing consequences…</span></div>`;
+  if (!state.plan) return `<div class="cc-effects"><span class="cc-hint">consequences not loaded</span></div>`;
+  if (!state.plan.ok) {
+    return `<div class="cc-effects"><span class="cc-error">consequences failed: ${esc(state.plan.error)}</span></div>`;
+  }
+  const plan = state.plan.data;
+  if (plan.rejection) {
+    return `<div class="cc-effects"><span class="cc-error">merge is rejected: ${esc(plan.rejection)}</span></div>`;
+  }
+  const row = (label, value) => `<div class="cc-effect"><span class="cc-label">${esc(label)}</span><span class="cc-value">${value}</span></div>`;
+  let h = `<div class="cc-effects">`;
+  h += `<div class="cc-effects-title">Consequences (server planner — the same code apply executes)</div>`;
+  h += row('survivor', `<span style="color:#4ade80">${esc(survivorId)}</span> — сохраняется`);
+  h += row('absorbed', `<span style="color:#ef4444">${esc(otherId)}</span> — удаляется безвозвратно`);
+  h += row('summary', plan.summaryCombines ? 'объединится — текст дубля добавится в конец выжившего' : 'останется без изменений');
+  h += row('why', plan.whySource === 'survivor' ? 'остаётся у выжившего' :
+    plan.whySource === 'other' ? 'возьмётся из дубля' : 'нет ни у одной из нод');
+  h += row('file_refs', plan.refsAdded.length
+    ? `+${plan.refsAdded.length}: ${plan.refsAdded.map(r => esc(r)).join(', ')}` : 'новых ссылок нет');
+  const movedList = plan.edgesToMove.map(e =>
+    `<span class="cc-edge">${esc(e.relation)}: ${esc(e.from_id)} → ${esc(e.to_id)}</span>`).join('');
+  h += row('edges', `${plan.edgesToMove.length} переедут${movedList ? ' — ' + movedList : ''}; ` +
+    `${plan.edgesDropped} не переедут (самопетля или дубль — исчезнут вместе с узлом)`);
+  h += row('children', plan.children.length
+    ? `переедут под выжившего: ${plan.children.map(c => esc(c.id)).join(', ')}` : 'нет детей');
+  h += row('slots', plan.slots.length
+    ? `переедут: ${plan.slots.map(s => esc(`${s.project} / ${s.role}`)).join(', ')}` : 'нет слотов');
+  h += row('trails/artifacts', `${plan.trailMembers} участник(ов) цепочек, ${plan.artifacts} артефакт(ов) переедут`);
+  h += row('confirmations', plan.baselines > 0
+    ? `${plan.baselines} подтверждени(й) переедут` +
+      (plan.confirmationsAffected ? ' и покажут claim_changed — формулировка объединена' : ' без изменения формулировки')
+    : 'подтверждений у дубля нет');
+  h += row('task', plan.taskCarries
+    ? `состояние ${esc(plan.taskState || '')}${plan.dueAt ? ' (due ' + esc(String(plan.dueAt)) + ')' : ''} переедет` : 'не переезжает');
+  h += row('status', plan.statusDiverges
+    ? 'статус дубля НЕ переносится — у выжившего останется его собственный'
+    : 'статусы совпадают');
+  h += `</div>`;
+  return h;
+}
+
+function renderConsolidatePreview() {
+  const panel = document.getElementById('consolidate-preview');
+  if (!panel || !ccState) return;
+  const state = ccState;
+  const { survivorId, otherId } = ccSurivorIds(state);
+
+  let h = `<div class="cc-head"><span class="cc-title">consolidate preview</span>`;
+  h += `<span class="cc-meta">similarity ${state.similarity !== null ? (Number(state.similarity) * 100).toFixed(1) + '%' : '?'} · recommendation: older ${esc(state.older || '?')}</span>`;
+  if (state.stale) h += `<span class="cc-stale">preview stale — graph changed, re-read before merging</span>`;
+  h += `<button class="cc-close" data-action="consolidate-close" title="close (Escape)">×</button></div>`;
+
+  h += `<div class="cc-columns">` +
+    ccCardHtml('A', state.a, state.cards.A, state.older) +
+    ccCardHtml('B', state.b, state.cards.B, state.older) +
+    `</div>`;
+
+  // Явный выбор survivor: рекомендация видна, автовыбора нет.
+  h += `<div class="cc-survivor"><span class="cc-label">survivor</span>` +
+    `<button class="cc-choice${state.survivor === 'A' ? ' chosen' : ''}" data-action="consolidate-survivor" data-side="A" ${state.merged || state.busy ? 'disabled' : ''}>` +
+    `A — ${esc(state.a)}${state.older === state.a ? ' · recommended (older)' : ''}${state.survivor === 'A' ? ' · ✓ chosen' : ''}</button>` +
+    `<button class="cc-choice${state.survivor === 'B' ? ' chosen' : ''}" data-action="consolidate-survivor" data-side="B" ${state.merged || state.busy ? 'disabled' : ''}>` +
+    `B — ${esc(state.b)}${state.older === state.b ? ' · recommended (older)' : ''}${state.survivor === 'B' ? ' · ✓ chosen' : ''}</button></div>`;
+
+  h += ccEffectsHtml(state, survivorId, otherId);
+
+  const bothCards = state.cards.A && state.cards.A.ok && state.cards.B && state.cards.B.ok;
+  const planReady = state.plan && state.plan.ok && !state.plan.data.rejection &&
+    state.plan.data.survivor === survivorId && state.plan.data.other === otherId;
+  const mergeReady = !state.merged && !state.stale && !state.busy && bothCards && planReady && Boolean(state.survivor);
+
+  h += `<div class="cc-status">`;
+  if (state.loadError) h += `<span class="cc-error">${esc(state.loadError)}</span>`;
+  if (state.postError) h += `<span class="cc-error">merge failed: ${esc(state.postError)}</span>`;
+  if (state.conflict && !state.stale) h += `<span class="cc-warn">preview was stale — data re-read, confirm again</span>`;
+  if (state.busy) h += `<span class="cc-hint">merging…</span>`;
+  h += `</div>`;
+
+  h += `<div class="cc-actions">`;
+  const needsRetry = (!bothCards) || (state.plan && !state.plan.ok);
+  if (needsRetry && !state.busy && !state.merged) {
+    h += `<button class="cc-btn" data-action="consolidate-retry">retry load</button>`;
+  }
+  if (state.merged) {
+    h += `<span class="cc-ok">merged: survivor <b>${esc(state.merged.survivor)}</b>, absorbed <b>${esc(state.merged.removed)}</b>` +
+      ` — moved edges are recreated with origin "unknown" (server re-creation, plan 4 v8 §1.3)</span>`;
+    h += `<button class="cc-btn" data-action="consolidate-close">close</button>`;
+  } else {
+    h += `<button class="cc-btn cc-merge" data-action="consolidate-merge" ${mergeReady ? '' : 'disabled'}>Объединить…</button>`;
+  }
+  h += `</div>`;
+
+  if (state.confirmOpen && !state.merged) {
+    h += `<div class="cc-confirm"><div>Final confirmation: merge <b>${esc(otherId)}</b> into <b>${esc(survivorId)}</b>? ` +
+      `The absorbed node is deleted irreversibly; versions are bound to the preview (stale preview → 409, nothing is written).</div>` +
+      `<button class="cc-btn cc-danger" data-action="consolidate-confirm">Объединить ${esc(survivorId)} + ${esc(otherId)}</button>` +
+      `<button class="cc-btn" data-action="consolidate-cancel-confirm">Отмена</button></div>`;
+  }
+
+  panel.innerHTML = h;
 }
 
 // ---- Data model + simulation ----
@@ -1650,7 +2212,7 @@ function showPanel(d) {
   let h = '';
 
   // Header
-  h += `<button id="panel-close" onclick="closePanel()">&times;</button>`;
+  h += `<button id="panel-close">&times;</button>`;
   h += `<div class="panel-name">${esc(d.name)}</div>`;
   h += `<span class="kind-badge" style="background:${color}22;color:${color};border:1px solid ${color}44">${d.kind}</span>`;
   // T4: lifecycle status badge — outdated facts visible without reading the db.
@@ -1675,7 +2237,7 @@ function showPanel(d) {
         if (!el) return;
         let block = '<div class="panel-section"><div class="panel-label">Status history</div><div class="panel-body">';
         for (const h of hist) {
-          block += '<div>' + (h.from_status || '∅') + ' → <b>' + h.to_status + '</b>' +
+          block += '<div>' + esc(String(h.from_status || '∅')) + ' → <b>' + esc(String(h.to_status)) + '</b>' +
             (h.reason ? ' — ' + esc(String(h.reason)) : '') +
             ' <span style="color:#64748b">' + esc(String(h.at)) + '</span></div>';
         }
@@ -1688,10 +2250,11 @@ function showPanel(d) {
   // U2: single-node markdown download.
   h += `<a class="stat" href="/api/node/${encodeURIComponent(d.id)}.md" style="font-size:10px;color:#38bdf8;margin-left:8px">download .md</a>`;
 
-  // Parent breadcrumb
+  // Parent breadcrumb. W-01 (plan 05): the id is a data attribute for the
+  // delegated click handler, never an inline-JS string.
   if (d.parent) {
     h += `<div style="margin-bottom:12px">`;
-    h += `<span class="link-row" style="border:0;padding:0" onclick="navigateTo('${esc(d.parent.id)}')">`;
+    h += `<span class="link-row" style="border:0;padding:0" data-navigate-id="${esc(d.parent.id)}">`;
     h += `<span class="rel">parent</span> <span class="name">${esc(d.parent.name)}</span>`;
     h += `</span></div>`;
   }
@@ -1721,10 +2284,10 @@ function showPanel(d) {
       const sc = '#f59e0b';
       h += ` <span class="kind-badge" style="background:${sc}22;color:${sc};border:1px solid ${sc}44">stale</span>`;
     }
-    h += `<button class="stat" onclick='toggleFocus("${esc(d.id)}", ${JSON.stringify(childIds).replace(/"/g, "&quot;")})' style="cursor:pointer;background:#eab30822;border:1px solid #eab30855;color:#eab308;border-radius:10px;padding:2px 10px;margin-left:8px">${focused ? 'unfocus' : 'focus'}</button>`;
+    h += `<button class="stat" data-focus-center="${esc(d.id)}" data-focus-children="${esc(JSON.stringify(childIds))}" style="cursor:pointer;background:#eab30822;border:1px solid #eab30855;color:#eab308;border-radius:10px;padding:2px 10px;margin-left:8px">${focused ? 'unfocus' : 'focus'}</button>`;
     h += `<div class="panel-section"><div class="panel-label">Source concepts (${d.digest_children.length})${d.stale ? ' — <span style="color:#f59e0b">a source is newer than the digest</span>' : ''}</div><div class="panel-body">`;
     h += d.digest_children.map(c =>
-      `<span class="child-link" onclick="navigateTo('${esc(c.id)}')">${esc(c.name)}</span>`
+      `<span class="child-link" data-navigate-id="${esc(c.id)}">${esc(c.name)}</span>`
     ).join('');
     h += `</div></div>`;
   }
@@ -1733,7 +2296,7 @@ function showPanel(d) {
   if (d.children && d.children.length) {
     h += `<div class="panel-section"><div class="panel-label">Children</div><div class="panel-body">`;
     h += d.children.map(c =>
-      `<span class="child-link" onclick="navigateTo('${esc(c.id)}')">${esc(c.name)}</span>`
+      `<span class="child-link" data-navigate-id="${esc(c.id)}">${esc(c.name)}</span>`
     ).join('');
     h += `</div></div>`;
   }
@@ -1742,8 +2305,8 @@ function showPanel(d) {
   if (d.edges && d.edges.length) {
     h += `<div class="panel-section"><div class="panel-label">Outgoing</div><div class="panel-body">`;
     h += d.edges.map(e =>
-      `<span class="link-row" onclick="navigateTo('${esc(e.to)}')">` +
-      `<span class="rel">${e.relation}</span> <span class="name">${esc(e.to_name)}</span>` +
+      `<span class="link-row" data-navigate-id="${esc(e.to)}">` +
+      `<span class="rel">${esc(e.relation)}</span> <span class="name">${esc(e.to_name)}</span>` +
       (e.description ? `<span class="desc">${esc(e.description)}</span>` : '') +
       `</span>`
     ).join('');
@@ -1754,8 +2317,8 @@ function showPanel(d) {
   if (d.incoming_edges && d.incoming_edges.length) {
     h += `<div class="panel-section"><div class="panel-label">Incoming</div><div class="panel-body">`;
     h += d.incoming_edges.map(e =>
-      `<span class="link-row" onclick="navigateTo('${esc(e.from)}')">` +
-      `<span class="rel">${e.relation}</span> <span class="name">${esc(e.from_name)}</span>` +
+      `<span class="link-row" data-navigate-id="${esc(e.from)}">` +
+      `<span class="rel">${esc(e.relation)}</span> <span class="name">${esc(e.from_name)}</span>` +
       (e.description ? `<span class="desc">${esc(e.description)}</span>` : '') +
       `</span>`
     ).join('');
@@ -1791,7 +2354,7 @@ function navigateTo(id) {
       showPanel(d);
       spawnFloatingLabel(node.kind, node, node.color);
     }
-  });
+  }).catch(err => showTransportError('node panel', err));
 }
 
 // ---- Search ----
@@ -1893,8 +2456,10 @@ function renderSearchResults(query, matches, mode, meta) {
     `;
   });
 
-  const metaLine = data.meta
-    ? `<div class="search-budget">${esc(String(data.meta.returned))} nodes, ~${esc(String(data.meta.tokens_estimated))} tokens, dropped ${esc(String(data.meta.dropped))}</div>`
+  // План 06 (W-03): meta — аргумент renderer, а не глобальная переменная
+  // data (ReferenceError ломал отрисовку каждого живого поиска).
+  const metaLine = meta
+    ? `<div class="search-budget">${esc(String(meta.returned))} nodes, ~${esc(String(meta.tokens_estimated))} tokens, dropped ${esc(String(meta.dropped))}</div>`
     : '';
   resultsEl.innerHTML = metaLine + rows.join('');
   resultsEl.classList.add('open');
@@ -2141,10 +2706,15 @@ async function scrubToStep(stepIndex) {
   );
 
   let data;
-  if (stepIndex >= timelineSteps.length) {
-    data = await fetchGraph();
-  } else {
-    data = await fetchGraphAt(timelineSteps[stepIndex].timestamp);
+  try {
+    if (stepIndex >= timelineSteps.length) {
+      data = await fetchGraph();
+    } else {
+      data = await fetchGraphAt(timelineSteps[stepIndex].timestamp);
+    }
+  } catch (err) {
+    showTransportError('timeline scrub', err);
+    return;
   }
 
   if (!timelineMode || requestId !== timelineFetchId) return;
@@ -2178,6 +2748,32 @@ async function scrubToStep(stepIndex) {
 
   refreshSimulation(0.15);
   setEmptyStateVisible(nodes.length === 0);
+
+  // План 09 (камера timeline): после navigateTo к далёкому узлу новая эпоха
+  // может целиком лечь вне вьюпорта. Если возле центра вьюпорта нет ни одного
+  // узла текущего шага — центрируем камеру на медиане координат узлов (без
+  // анимации: камера должна быть на месте сразу после скраба). Узлы рядом —
+  // камеру не трогаем: не дёргаем её без причины.
+  if (nodes.length > 0) {
+    const centerX = (width / 2 - panX) / zoom;
+    const centerY = (height / 2 - panY) / zoom;
+    const radius = (0.25 * Math.min(width, height)) / zoom;
+    const hasNearbyNode = nodes.some((n) => {
+      const dx = n.x - centerX;
+      const dy = n.y - centerY;
+      return dx * dx + dy * dy <= radius * radius;
+    });
+    if (!hasNearbyNode) {
+      const xs = nodes.map((n) => n.x).sort((a, b) => a - b);
+      const ys = nodes.map((n) => n.y).sort((a, b) => a - b);
+      const mid = xs.length >> 1;
+      const medianX = xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
+      const medianY = ys.length % 2 ? ys[mid] : (ys[mid - 1] + ys[mid]) / 2;
+      cameraAnimation = null;
+      panX = width / 2 - medianX * zoom;
+      panY = height / 2 - medianY * zoom;
+    }
+  }
 }
 
 function startTimelinePlayback() {
@@ -2226,14 +2822,20 @@ async function enterTimelineMode() {
   const kind = document.getElementById('timeline-kind')?.value || 'all';
   let steps = [];
   let source = 'none';
-  if (kind === 'status') {
-    const sj = await (await fetch('/api/timeline?kind=status&limit=50000')).json();
-    steps = Array.isArray(sj.entries) ? sj.entries : [];
-    source = 'status_history';
-  } else {
-    const payload = await fetchTimelineSteps();
-    steps = Array.isArray(payload.entries) ? payload.entries : [];
-    source = payload.source || 'none';
+  try {
+    if (kind === 'status') {
+      const sj = await (await fetch('/api/timeline?kind=status&limit=50000')).json();
+      steps = Array.isArray(sj.entries) ? sj.entries : [];
+      source = 'status_history';
+    } else {
+      const payload = await fetchTimelineSteps();
+      steps = Array.isArray(payload.entries) ? payload.entries : [];
+      source = payload.source || 'none';
+    }
+  } catch (err) {
+    timelineMode = false;
+    showTransportError('timeline', err);
+    return;
   }
   if (steps.length === 0) {
     timelineMode = false;
@@ -2303,7 +2905,9 @@ async function exitTimelineMode() {
       return [`${sid}|${tid}|${edge.relation}`, edge.birthTime];
     })
   );
-  const [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()]);
+  const [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()])
+    .catch(err => { showTransportError('live reload', err); return null; });
+  if (!graphData) return;
   buildGraphData(graphData);
   const now = performance.now();
   for (const node of nodes) {
@@ -2389,11 +2993,79 @@ function setupTimeline() {
   });
 }
 
+// ---- Delegated actions (W-01, plan 05) ----
+
+// No foreign data lives in inline JS: clicks and changes are delegated from
+// the static containers (#stats, #panel-content) and read their ids from
+// data attributes, so a quoted/HTML id stays inert data end to end. This is
+// also the prerequisite for a strict CSP — inline handlers are gone.
+function setupDelegatedActions() {
+  const stats = document.getElementById('stats');
+  if (stats) {
+    stats.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      // UX-01 (план 07): действие у пары — «Сравнить», POST делает только
+      // финальное подтверждение внутри preview.
+      const compare = target.closest('button[data-action="consolidate-compare"]');
+      if (compare) {
+        const sim = Number(compare.getAttribute('data-sim'));
+        void openConsolidatePreview(
+          compare.getAttribute('data-a') ?? '',
+          compare.getAttribute('data-b') ?? '',
+          { older: compare.getAttribute('data-older') ?? '', similarity: Number.isFinite(sim) ? sim : null }
+        );
+        return;
+      }
+      if (target.closest('#consolidate-btn')) { void openConsolidate(); return; }
+      if (target.closest('#export-bundle-btn')) { location.href = '/api/export.json'; return; }
+      if (target.closest('button[data-action="reload"]')) location.reload();
+    });
+    stats.addEventListener('change', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const kind = target.getAttribute('data-kind-toggle');
+      if (kind !== null) { toggleKind(kind, target.checked); return; }
+      if (target.id === 'toggle-outdated') hideOutdated = !target.checked;
+    });
+  }
+
+  const panelContent = document.getElementById('panel-content');
+  if (panelContent) {
+    panelContent.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('#panel-close')) { closePanel(); return; }
+      const focusBtn = target.closest('[data-focus-center]');
+      if (focusBtn) {
+        const childIds = JSON.parse(focusBtn.getAttribute('data-focus-children') || '[]');
+        toggleFocus(focusBtn.getAttribute('data-focus-center') ?? '', childIds);
+        return;
+      }
+      const nav = target.closest('[data-navigate-id]');
+      if (nav) navigateTo(nav.getAttribute('data-navigate-id') ?? '');
+    });
+  }
+
+  // Escape закрывает preview (ноль POST и ноль мутаций).
+  document.addEventListener('keydown', (event) => {
+    if (event && event.key === 'Escape' && ccState) closeConsolidatePreview();
+  });
+}
+
 // ---- Init ----
 
 async function init() {
+  // R-08: scripts run in order, so at this point d3 is either loaded or its
+  // tag failed (vendor file missing AND CDN unreachable). Without this the
+  // page dies in setupCanvas with a bare ReferenceError and no cue.
+  if (typeof d3 === 'undefined') {
+    showTransportError('d3', new Error('graph library failed to load — check the serve banner for the d3 source (vendored file or CDN fallback)'));
+    return;
+  }
   setupCanvas();
   setupCanvasInteraction();
+  setupDelegatedActions();
 
   window.addEventListener('resize', () => {
     setupCanvas();
@@ -2403,7 +3075,13 @@ async function init() {
     }
   });
 
-  const [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()]);
+  let graphData, stats;
+  try {
+    [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()]);
+  } catch (err) {
+    showTransportError('startup', err);
+    return;
+  }
   renderStats(stats);
 
   buildGraphData(graphData);
@@ -2421,6 +3099,17 @@ async function init() {
   connectSSE();
   setupTimeline();
 }
+
+// R-08: wire the transport banner's Reload button once, guarded — the inert
+// audit DOM has no location.
+(function setupTransportBanner() {
+  const el = document.getElementById('transport-error');
+  const btn = el && el.querySelector('.te-retry');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (typeof location !== 'undefined' && typeof location.reload === 'function') location.reload();
+  });
+})();
 
 init();
 </script>

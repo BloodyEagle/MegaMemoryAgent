@@ -5,8 +5,8 @@
 
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
-  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.13-orange?style=flat-square" />
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.9-brightgreen?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.2.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -271,7 +271,7 @@ agent A/B comparison, see [docs/bench-protocol.md](docs/bench-protocol.md).
 
 ## Install
 
-Requires Node.js >= 18. For Russian-only projects a much smaller model (`cointegrated/rubert-tiny2`, 312-dim) works after an ONNX conversion; the model unloads after 5 minutes idle (`MEGAMEMORY_EMBED_IDLE_MS=0` disables that), and `MEGAMEMORY_SEARCH=fts` avoids loading it at all. The embedding model (~120 MB, multilingual) downloads on first use and is
+Requires Node.js >= 20.9 (raised from 18: sharp 0.35, pulled in by the embedding pipeline, needs >= 20.9; dev toolchain — vite/vitest — needs >= 20.19). For Russian-only projects a much smaller model (`cointegrated/rubert-tiny2`, 312-dim) works after an ONNX conversion; the model unloads after 5 minutes idle (`MEGAMEMORY_EMBED_IDLE_MS=0` disables that), and `MEGAMEMORY_SEARCH=fts` avoids loading it at all. The embedding model (~120 MB, multilingual) downloads on first use and is
 cached in `~/.cache/huggingface`.
 
 Install globally from npm:
@@ -335,6 +335,13 @@ megamemory doctor               # health check, exit code 1 on problems
 
 The migration never drops or renames a column, so upstream v1.6.2 still opens a migrated database.
 Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports them explicitly.
+
+Dry-run boundaries (R-05): a `--dry-run` command never writes graph data, but **opening a legacy
+database converts it on open** — backup, one transaction (schema, id repair, FTS rebuild,
+`name_norm`/embed meta backfill), report next to the file. This is deliberate and separate from
+the dry-run promise: the conversion touches schema and hygiene fields, not your claims. The
+exporter owns only the files it renders: `export --check` reports extra `.md` files in the
+directory and never deletes them — prune manually, the exporter has no ownership of the folder.
 
 ---
 

@@ -70,6 +70,20 @@ function envInt(name: string, defaultValue: number): number {
   return Number.isFinite(n) ? Math.trunc(n) : defaultValue;
 }
 
+/**
+ * 08-N1 (план 09): сырая upstream-база (user_version = 0, схема v1.6.2 без
+ * форк-колонок) не открывается конструктором с авто-миграцией — молчаливое
+ * падение «no such column: status» выглядело как повреждение базы. Взамен —
+ * понятная ошибка с кодом и штатным путём починки.
+ */
+export class UpstreamSchemaError extends Error {
+  readonly code = "UPSTREAM_SCHEMA_V0";
+  constructor(message: string) {
+    super(message);
+    this.name = "UpstreamSchemaError";
+  }
+}
+
 export class KnowledgeDB {
   private db: Database.Database;
   private dbFile: string;
@@ -121,7 +135,7 @@ export class KnowledgeDB {
       .run(norm, id);
   }
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, opts: { autoMigrate?: boolean } = {}) {
     // Ensure directory exists
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
@@ -134,6 +148,41 @@ export class KnowledgeDB {
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("synchronous = NORMAL");
+    // 08-N1 (план 09): migrate --apply открывает сырую upstream-базу без
+    // авто-миграции и поднимает схему сам (runPendingMigrations + runMigration).
+    if (opts.autoMigrate === false) return;
+    this.assertMigratable();
+    this.migrate();
+    this.backfillCreatedViaV2();
+  }
+
+  /**
+   * 08-N1 (план 09): user_version = 0 — это либо новая пустая база, либо
+   * сырая upstream (v1.6.2 user_version не ставила). Пустая база создаётся
+   * штатно; на существующей таблице nodes молча мигрировать нельзя — шаг v1
+   * строит индексы по форк-колонкам, которых там нет, и конструктор падал
+   * «no such column: status», что выглядит как повреждение базы.
+   */
+  private assertMigratable(): void {
+    const version = this.getUserVersion();
+    if (version !== 0) return;
+    const hasNodes = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes'")
+      .get();
+    if (!hasNodes) return; // новая база — схема создаётся миграцией
+    throw new UpstreamSchemaError(
+      `База "${this.dbFile}" создана другой версией (user_version = 0 — сырая схема upstream без форк-колонок). ` +
+        `Выполните \`megamemory migrate --apply --db "${this.dbFile}"\` — она поднимет схему и проставит версию.`
+    );
+  }
+
+  /**
+   * 08-N1 (план 09): поднять схему штатными шагами миграции вручную — для
+   * баз, открытых с autoMigrate: false (путь migrate --apply для сырых
+   * upstream-баз). После неё runMigration/ensureSchema добавит форк-колонки
+   * (status, name_norm), FTS и метки.
+   */
+  runPendingMigrations(): void {
     this.migrate();
     this.backfillCreatedViaV2();
   }
@@ -237,15 +286,37 @@ export class KnowledgeDB {
           CREATE INDEX IF NOT EXISTS idx_nodes_removed ON nodes(removed_at);
           CREATE INDEX IF NOT EXISTS idx_nodes_merge_group ON nodes(merge_group);
           CREATE INDEX IF NOT EXISTS idx_nodes_needs_merge ON nodes(needs_merge);
-          CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
-          CREATE INDEX IF NOT EXISTS idx_nodes_name_norm ON nodes(name_norm);
           CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
           CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
           CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
           CREATE INDEX IF NOT EXISTS idx_edges_merge_group ON edges(merge_group);
           CREATE INDEX IF NOT EXISTS idx_edges_needs_merge ON edges(needs_merge);
-          CREATE INDEX IF NOT EXISTS idx_edges_removed ON edges(removed_at);
         `);
+        // 08-N1 (план 09): индексы по колонкам, которых может не быть на
+        // базе, уже имеющей таблицы (сырая upstream: nodes без status/name_norm,
+        // edges без removed_at), строятся только при наличии колонок. На
+        // upstream их добавят более поздние шаги и ensureSchema (migrate
+        // --apply) — раньше именно этот CREATE INDEX валил конструктор
+        // «no such column: status».
+        const v1nodes = new Set(
+          (this.db.prepare("PRAGMA table_info(nodes)").all() as Array<{ name: string }>).map(
+            (c) => c.name
+          )
+        );
+        if (v1nodes.has("status")) {
+          this.db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);");
+        }
+        if (v1nodes.has("name_norm")) {
+          this.db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_norm ON nodes(name_norm);");
+        }
+        const v1edges = new Set(
+          (this.db.prepare("PRAGMA table_info(edges)").all() as Array<{ name: string }>).map(
+            (c) => c.name
+          )
+        );
+        if (v1edges.has("removed_at")) {
+          this.db.exec("CREATE INDEX IF NOT EXISTS idx_edges_removed ON edges(removed_at);");
+        }
       }
 
       if (currentVersion < 2) {
@@ -849,15 +920,21 @@ export class KnowledgeDB {
   }
 
   getNode(id: string): NodeRow | undefined {
-    return this.db
-      .prepare("SELECT * FROM nodes WHERE id = ? AND removed_at IS NULL")
-      .get(id) as NodeRow | undefined;
+    // F-02 (план 03) / план 04: _metadata libsql вырезается у источника —
+    // профилировочный шум не попадает в дайджесты, сравнения состояния и ответы.
+    return this.cleanRow(
+      this.db
+        .prepare("SELECT * FROM nodes WHERE id = ? AND removed_at IS NULL")
+        .get(id) as NodeRow | undefined
+    );
   }
 
   getNodeIncludingRemoved(id: string): NodeRow | undefined {
-    return this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as
-      | NodeRow
-      | undefined;
+    return this.cleanRow(
+      this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as
+        | NodeRow
+        | undefined
+    );
   }
 
   updateNode(
@@ -1626,13 +1703,15 @@ export class KnowledgeDB {
   ): Array<EdgeRow & { other_id: string }> {
     const column = direction === "ancestry" ? "from_id" : "to_id";
     const other = direction === "ancestry" ? "to_id" : "from_id";
-    return this.db
-      .prepare(
-        `SELECT e.*, e.${other} AS other_id FROM edges e
-         WHERE e.${column} = ? AND e.relation = 'informed_by'
-           ${retrospective ? "" : "AND e.removed_at IS NULL"}`
-      )
-      .all(id) as Array<EdgeRow & { other_id: string }>;
+    return (
+      this.db
+        .prepare(
+          `SELECT e.*, e.${other} AS other_id FROM edges e
+           WHERE e.${column} = ? AND e.relation = 'informed_by'
+             ${retrospective ? "" : "AND e.removed_at IS NULL"}`
+        )
+        .all(id) as Array<EdgeRow & { other_id: string }>
+    ).map((r) => this.cleanRow(r)!);
   }
 
   private provenanceAuditReady = false;
@@ -1741,29 +1820,33 @@ export class KnowledgeDB {
 
   getSupportBaselines(decisionId: string): SupportBaselineRow[] {
     if (!this.hasSupportBaselinesTable()) return [];
-    return this.db
-      .prepare(
-        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                artifacts_digest
-         FROM support_baselines WHERE decision_id = ?
-         ORDER BY support_id, confirmed_at, edge_key`
-      )
-      .all(decisionId) as SupportBaselineRow[];
+    return (
+      this.db
+        .prepare(
+          `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                  edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                  artifacts_digest
+           FROM support_baselines WHERE decision_id = ?
+           ORDER BY support_id, confirmed_at, edge_key`
+        )
+        .all(decisionId) as SupportBaselineRow[]
+    ).map((r) => this.cleanRow(r)!);
   }
 
   /** Active (not superseded) rows only — the ones a check compares against. */
   getActiveSupportBaselines(decisionId: string): SupportBaselineRow[] {
     if (!this.hasSupportBaselinesTable()) return [];
-    return this.db
-      .prepare(
-        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                artifacts_digest
-         FROM support_baselines WHERE decision_id = ? AND superseded_at IS NULL
-         ORDER BY support_id, confirmed_at, edge_key`
-      )
-      .all(decisionId) as SupportBaselineRow[];
+    return (
+      this.db
+        .prepare(
+          `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                  edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                  artifacts_digest
+           FROM support_baselines WHERE decision_id = ? AND superseded_at IS NULL
+           ORDER BY support_id, confirmed_at, edge_key`
+        )
+        .all(decisionId) as SupportBaselineRow[]
+    ).map((r) => this.cleanRow(r)!);
   }
 
   /**
@@ -1778,15 +1861,17 @@ export class KnowledgeDB {
     edgeKey: string
   ): SupportBaselineRow | undefined {
     if (!this.hasSupportBaselinesTable()) return undefined;
-    return this.db
-      .prepare(
-        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                artifacts_digest
-         FROM support_baselines
-         WHERE decision_id = ? AND support_id = ? AND edge_key = ? AND superseded_at IS NULL`
-      )
-      .get(decisionId, supportId, edgeKey) as SupportBaselineRow | undefined;
+    return this.cleanRow(
+      this.db
+        .prepare(
+          `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                  edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                  artifacts_digest
+           FROM support_baselines
+           WHERE decision_id = ? AND support_id = ? AND edge_key = ? AND superseded_at IS NULL`
+        )
+        .get(decisionId, supportId, edgeKey) as SupportBaselineRow | undefined
+    );
   }
 
   getAllSupportBaselines(): SupportBaselineRow[] {
@@ -2036,14 +2121,16 @@ export class KnowledgeDB {
   /** All observed artifacts of one node, deterministic (kind, ref) order. */
   getNodeArtifacts(nodeId: string): NodeArtifactRow[] {
     if (!this.hasNodeArtifactsTable()) return [];
-    return this.db
-      .prepare(
-        `SELECT node_id, kind, ref, digest, prev_digest, size_bytes,
-                checked_at, changed_at, checked_by, repo_path
-         FROM node_artifacts WHERE node_id = ?
-         ORDER BY kind, ref`
-      )
-      .all(nodeId) as NodeArtifactRow[];
+    return (
+      this.db
+        .prepare(
+          `SELECT node_id, kind, ref, digest, prev_digest, size_bytes,
+                  checked_at, changed_at, checked_by, repo_path
+           FROM node_artifacts WHERE node_id = ?
+           ORDER BY kind, ref`
+        )
+        .all(nodeId) as NodeArtifactRow[]
+    ).map((r) => this.cleanRow(r)!);
   }
 
   /** Insert or replace one observation row. The caller computes digest /
@@ -2152,14 +2239,16 @@ export class KnowledgeDB {
     afterToId: string,
     limit: number
   ): Array<EdgeRow & { other_id: string }> {
-    return this.db
-      .prepare(
-        `SELECT e.*, e.to_id AS other_id FROM edges e
-         WHERE e.from_id = ? AND e.relation = 'informed_by' AND e.removed_at IS NULL
-           AND e.to_id > ?
-         ORDER BY e.to_id LIMIT ?`
-      )
-      .all(decisionId, afterToId, limit) as Array<EdgeRow & { other_id: string }>;
+    return (
+      this.db
+        .prepare(
+          `SELECT e.*, e.to_id AS other_id FROM edges e
+           WHERE e.from_id = ? AND e.relation = 'informed_by' AND e.removed_at IS NULL
+             AND e.to_id > ?
+           ORDER BY e.to_id LIMIT ?`
+        )
+        .all(decisionId, afterToId, limit) as Array<EdgeRow & { other_id: string }>
+    ).map((r) => this.cleanRow(r)!);
   }
 
   /**
@@ -2248,11 +2337,13 @@ export class KnowledgeDB {
   // ---- Query methods ----
 
   getChildren(parentId: string): NodeRow[] {
-    return this.db
-      .prepare(
-        "SELECT * FROM nodes WHERE parent_id = ? AND removed_at IS NULL"
-      )
-      .all(parentId) as NodeRow[];
+    return (
+      this.db
+        .prepare(
+          "SELECT * FROM nodes WHERE parent_id = ? AND removed_at IS NULL"
+        )
+        .all(parentId) as NodeRow[]
+    ).map((r) => this.cleanRow(r)!);
   }
 
   getOutgoingEdges(
@@ -2299,6 +2390,82 @@ export class KnowledgeDB {
         "SELECT * FROM nodes WHERE parent_id IS NULL AND removed_at IS NULL ORDER BY name"
       )
       .all() as NodeRow[];
+  }
+
+  /**
+   * План 09 (R-06a): сколько живых корней всего — счётчик без чтения их строк.
+   * list_roots отчитывается meta.dropped/truncated от полного числа, даже когда
+   * сами корни читает страницами.
+   */
+  countRootNodes(): number {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM nodes WHERE parent_id IS NULL AND removed_at IS NULL"
+      )
+      .get() as { count: number };
+    return row.count;
+  }
+
+  /**
+   * План 09 (R-06a): страница корней только с колонками стартового дайджеста.
+   * SELECT * тянет embedding и служебные колонки, которые list_roots не
+   * читает, — на большой граф это лишние сотни мегабайт в RSS. Кейсет
+   * (name, id): на уникальных именах порядок тот же, что у getRootNodes()
+   * (ORDER BY name), на совпадающих — детерминированный.
+   */
+  getRootOverviewPage(
+    after: { name: string; id: string } | null,
+    limit: number
+  ): Array<{ id: string; name: string; kind: string; valid_until: string | null }> {
+    if (after === null) {
+      return this.db
+        .prepare(
+          `SELECT id, name, kind, valid_until FROM nodes
+           WHERE parent_id IS NULL AND removed_at IS NULL
+           ORDER BY name, id LIMIT ?`
+        )
+        .all(limit) as Array<{
+        id: string;
+        name: string;
+        kind: string;
+        valid_until: string | null;
+      }>;
+    }
+    return this.db
+      .prepare(
+        `SELECT id, name, kind, valid_until FROM nodes
+         WHERE parent_id IS NULL AND removed_at IS NULL
+           AND (name > ? OR (name = ? AND id > ?))
+         ORDER BY name, id LIMIT ?`
+      )
+      .all(after.name, after.name, after.id, limit) as Array<{
+      id: string;
+      name: string;
+      kind: string;
+      valid_until: string | null;
+    }>;
+  }
+
+  /**
+   * План 09 (R-06a): число живых детей для набора родителей — один запрос с
+   * GROUP BY на чанк вместо запроса на каждого ребёнка (классический N+1:
+   * 10k корней раньше стоили 10k prepare). parent_id индексирован, чанк
+   * выбирает все группы одним проходом по индексу.
+   */
+  getChildCounts(parentIds: string[], chunkSize = 500): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (let i = 0; i < parentIds.length; i += chunkSize) {
+      const chunk = parentIds.slice(i, i + chunkSize);
+      const rows = this.db
+        .prepare(
+          `SELECT parent_id, COUNT(*) AS cnt FROM nodes
+           WHERE removed_at IS NULL AND parent_id IN (${chunk.map(() => "?").join(",")})
+           GROUP BY parent_id`
+        )
+        .all(...chunk) as Array<{ parent_id: string; cnt: number }>;
+      for (const row of rows) counts.set(row.parent_id, row.cnt);
+    }
+    return counts;
   }
 
   getAllActiveNodesWithEmbeddings(): Array<{
@@ -2473,13 +2640,15 @@ export class KnowledgeDB {
   }
 
   getSlot(project: string, role: string): { node_id: string; node_name: string; updated_at: string } | undefined {
-    return this.db
-      .prepare(
-        `SELECT s.node_id, n.name AS node_name, s.updated_at
-         FROM slots s JOIN nodes n ON n.id = s.node_id AND n.removed_at IS NULL
-         WHERE s.project = ? AND s.role = ?`
-      )
-      .get(project, role) as { node_id: string; node_name: string; updated_at: string } | undefined;
+    return this.cleanRow(
+      this.db
+        .prepare(
+          `SELECT s.node_id, n.name AS node_name, s.updated_at
+           FROM slots s JOIN nodes n ON n.id = s.node_id AND n.removed_at IS NULL
+           WHERE s.project = ? AND s.role = ?`
+        )
+        .get(project, role) as { node_id: string; node_name: string; updated_at: string } | undefined
+    );
   }
 
   /** Release the role without touching the node itself (plan 2 §2 rule 4). */
@@ -2498,6 +2667,18 @@ export class KnowledgeDB {
          WHERE s.project = ? ORDER BY s.role`
       )
       .all(project) as Array<{ role: string; node_id: string; node_name: string; updated_at: string }>;
+  }
+
+  /**
+   * UX-01 (план 07): роли, которые держит узел, — на карточке. База без
+   * таблицы slots (pre-v6) честно отвечает пустым списком, а не ошибкой.
+   */
+  getSlotsForNode(nodeId: string): Array<{ project: string; role: string }> {
+    const hasSlots = (this.db.pragma("table_info(slots)") as Array<{ name: string }>).length > 0;
+    if (!hasSlots) return [];
+    return this.db
+      .prepare("SELECT project, role FROM slots WHERE node_id = ? ORDER BY project, role")
+      .all(nodeId) as Array<{ project: string; role: string }>;
   }
 
   // ---- Task board (plan 2 §3) ----
@@ -2617,17 +2798,33 @@ export class KnowledgeDB {
   }
 
   getTrail(id: string): { id: string; name: string; summary: string; stale: number; created_at: string; updated_at: string | null } | undefined {
-    return this.db
-      .prepare("SELECT * FROM trails WHERE id = ?")
-      .get(id) as never;
+    return this.cleanRow(
+      this.db
+        .prepare("SELECT * FROM trails WHERE id = ?")
+        .get(id) as { id: string; name: string; summary: string; stale: number; created_at: string; updated_at: string | null } | undefined
+    );
   }
 
   getTrailMembers(trailId: string): Array<{ position: number; node_id: string; fingerprint: string }> {
-    return this.db
-      .prepare(
-        "SELECT position, node_id, fingerprint FROM trail_members WHERE trail_id = ? ORDER BY position"
-      )
-      .all(trailId) as Array<{ position: number; node_id: string; fingerprint: string }>;
+    return (
+      this.db
+        .prepare(
+          "SELECT position, node_id, fingerprint FROM trail_members WHERE trail_id = ? ORDER BY position"
+        )
+        .all(trailId) as Array<{ position: number; node_id: string; fingerprint: string }>
+    ).map((m) => this.cleanRow(m)!);
+  }
+
+  /**
+   * libsql вешает на каждую строку `_metadata: { duration }` — шум
+   * профилировщика statement'а, а не данные. В JSON-ответах он выглядит как
+   * поле записи и ломает сравнение сохранённого и прочитанного состояния
+   * (F-02, S-03: перенос цепочек/слотов вербатим).
+   */
+  private cleanRow<T>(row: T | undefined | null): T | undefined {
+    if (row === undefined || row === null) return undefined;
+    const { _metadata, ...rest } = row as T & { _metadata?: unknown };
+    return rest as T;
   }
 
   /** Trails that reference a node — used by removal notes and node cards. */
@@ -2649,21 +2846,42 @@ export class KnowledgeDB {
       .run(stale ? 1 : 0, trailId);
   }
 
-  /** trail_refresh: overwrite all member fingerprints with the current ones. */
+  /**
+   * trail_refresh: overwrite member fingerprints with the current ones.
+   * Plan 04 K-09: a refresh re-snapshots ELIGIBLE members only and never
+   * launders reasoning — a member that is removed, refuted, abandoned or
+   * expired cannot be made fresh by re-hashing it: its saved fingerprint
+   * stays, and the chain keeps (or gains) its stale flag. A hard-deleted
+   * member is still an error — the chain is broken, only a rebuild helps.
+   */
   refreshTrailFingerprints(trailId: string): void {
     this.runInTransaction(() => {
       const members = this.getTrailMembers(trailId);
       const stmt = this.db.prepare(
         "UPDATE trail_members SET fingerprint = ? WHERE trail_id = ? AND position = ?"
       );
+      let ineligible = false;
       for (const m of members) {
+        const row = this.getNodeIncludingRemoved(m.node_id);
+        if (!row) {
+          throw new Error(`Member "${m.node_id}" no longer exists — chain is broken, refresh impossible.`);
+        }
+        if (
+          row.removed_at ||
+          row.epistemic_status === "refuted" ||
+          row.epistemic_status === "abandoned" ||
+          isNodeExpired(row)
+        ) {
+          ineligible = true;
+          continue;
+        }
         const fp = this.nodeFingerprint(m.node_id);
         if (fp === null) {
           throw new Error(`Member "${m.node_id}" no longer exists — chain is broken, refresh impossible.`);
         }
         stmt.run(fp, trailId, m.position);
       }
-      this.setTrailStale(trailId, false);
+      this.setTrailStale(trailId, ineligible);
     });
   }
 
@@ -2861,6 +3079,18 @@ export class KnowledgeDB {
     return this._hasCreatedViaColumn;
   }
 
+  /** Plan 2 (v6): task board columns — merge carries them with the row (F-02, S-03). */
+  private _hasTaskColumns: boolean | undefined;
+
+  private get hasTaskColumns(): boolean {
+    if (this._hasTaskColumns === undefined) {
+      const cols = this.db.pragma("table_info(nodes)") as Array<{ name: string }>;
+      this._hasTaskColumns =
+        cols.some((c) => c.name === "task_state") && cols.some((c) => c.name === "due_at");
+    }
+    return this._hasTaskColumns;
+  }
+
   insertNodeRaw(node: {
     id: string;
     name: string;
@@ -2892,6 +3122,10 @@ export class KnowledgeDB {
     claim_digest_at?: string | null;
     // 2.1.10 (v12): node origin travels with the row (MergeEngine carry).
     created_via?: string | null;
+    // F-02 (S-03): task board state travels with the row — merge непустой
+    // базы с пустой больше не превращает задачу с дедлайном в ноду с NULL.
+    task_state?: string | null;
+    due_at?: string | null;
   }): void {
     // Б10: fork columns exist only on migrated dbs — compose the column
     // list conditionally so upstream dbs keep working.
@@ -2911,13 +3145,15 @@ export class KnowledgeDB {
     const claimParams = this.hasClaimColumns ? ", @claim_digest, @claim_digest_at" : "";
     const viaCols = this.hasCreatedViaColumn ? ", created_via" : "";
     const viaParams = this.hasCreatedViaColumn ? ", @created_via" : "";
+    const taskCols = this.hasTaskColumns ? ", task_state, due_at" : "";
+    const taskParams = this.hasTaskColumns ? ", @task_state, @due_at" : "";
     const stmt = this.db.prepare(`
       INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task,
         created_at, updated_at, removed_at, removed_reason, embedding,
-        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols}${viaCols})
+        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols}${viaCols}${taskCols})
       VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task,
         @created_at, @updated_at, @removed_at, @removed_reason, @embedding,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams}${viaParams})
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams}${viaParams}${taskParams})
     `);
     const values: Record<string, unknown> = {
       id: node.id,
@@ -2953,6 +3189,10 @@ export class KnowledgeDB {
     }
     if (this.hasCreatedViaColumn) {
       values.created_via = (node as { created_via?: string | null }).created_via ?? null;
+    }
+    if (this.hasTaskColumns) {
+      values.task_state = (node as { task_state?: string | null }).task_state ?? null;
+      values.due_at = (node as { due_at?: string | null }).due_at ?? null;
     }
     stmt.run(values);
     this.syncNameNorm(node.id, node.name);

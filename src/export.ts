@@ -11,6 +11,11 @@ import type { NodeRow } from "./types.js";
  *   the graph changed;
  * - frontmatter: id, name, kind, status, parent, outgoing edges, updated_at;
  * - body: summary, why, children.
+ *
+ * S-02 (plan 05): ids are data, not paths. Segments are sanitized and the
+ * final relative path is containment-checked; distinct ids that sanitize to
+ * the same filename are a hard error, never a silent overwrite. --check
+ * reports drift (including extra files) and deletes nothing (R-05).
  */
 
 export interface ExportDiff {
@@ -18,15 +23,45 @@ export interface ExportDiff {
   missing: string[];
   differing: string[];
   extra: string[];
-  /** М8: extra files removed by --check. */
-  pruned?: number;
+}
+
+/**
+ * S-02 (plan 05): a stored id reaches the filesystem, and an imported db may
+ * hold ids the slug rules would never produce ("../x", "a\\b", "C:\\x").
+ * Render and write refuse to leave the export directory instead of trusting
+ * the id.
+ */
+export class ExportPathError extends Error {}
+
+// Windows silently strips trailing dots/spaces on lookup and keeps device
+// names out of the user's reach — both would collide or misbehave on write.
+const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+function sanitizeExportSegment(part: string): string {
+  const safe = part.replace(/[<>:"|?*\\]/g, "_").replace(/[. ]+$/g, "");
+  if (safe === "" || safe === "." || safe === "..") return "_";
+  return WINDOWS_RESERVED.test(safe) ? `_${safe}` : safe;
 }
 
 function nodeFileName(id: string): string {
   // id is unique and slug-safe (unicode-aware makeId + repair), but may
-  // contain "/" — that becomes a subdirectory, Obsidian-friendly.
-  const safe = id.split("/").map((part) => part.replace(/[<>:"|?*\\]/g, "_")).join("/");
-  return `${safe || "node"}.md`;
+  // contain "/" — that becomes a subdirectory, Obsidian-friendly. An
+  // imported db bypassed makeId, so every segment is sanitized here (S-02).
+  const safe = id.split("/").map(sanitizeExportSegment).join("/");
+  const rel = `${safe || "node"}.md`;
+  // Containment guard on the final relative path — defense in depth:
+  // no absolute form, no remaining "." / ".." segments, no backslashes.
+  if (
+    path.posix.isAbsolute(rel) ||
+    path.win32.isAbsolute(rel) ||
+    rel.includes("\\") ||
+    rel.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    throw new ExportPathError(
+      `node id produces an unsafe export filename that could escape the target directory: ${JSON.stringify(id)}`
+    );
+  }
+  return rel;
 }
 
 function frontmatterValue(value: string): string {
@@ -121,19 +156,41 @@ export function renderAllMarkdown(db: KnowledgeDB): Map<string, string> {
         to_id: e.to_id,
         description: e.description,
       }));
+    const filename = nodeFileName(node.id);
+    // S-02: distinct ids may sanitize to the same filename ("same?name" and
+    // "same*name"). Silently overwriting the Map entry would lose a node —
+    // fail loudly instead.
+    if (files.has(filename)) {
+      throw new ExportPathError(
+        `export filename collision: two different node ids map to the same file "${filename}" ` +
+          `(one of them is ${JSON.stringify(node.id)}); rename one of the nodes before exporting`
+      );
+    }
     files.set(
-      nodeFileName(node.id),
+      filename,
       renderNodeMarkdown(node, outgoing, children)
     );
   }
   return files;
 }
 
-/** Write all files; creates subdirectories as needed. */
+/**
+ * Write all files; creates subdirectories as needed. Every resolved path is
+ * checked against the target directory right before the write (S-02), and
+ * the whole render — including collision and safety validation — happens
+ * before the first byte hits the disk.
+ */
 export function exportMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
   const files = renderAllMarkdown(db);
+  const root = path.resolve(dir);
   for (const [rel, content] of files) {
-    const full = path.join(dir, rel);
+    const full = path.resolve(root, rel);
+    const contained = path.relative(root, full);
+    if (contained === "" || contained.startsWith("..") || path.isAbsolute(contained)) {
+      throw new ExportPathError(
+        `export path escapes the target directory: ${JSON.stringify(rel)}`
+      );
+    }
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, content, "utf8");
   }
@@ -143,6 +200,12 @@ export function exportMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
 /**
  * Compare on-disk files with the current render (for CI --check mode).
  * Returns the diff; a non-empty diff means exit code 1.
+ *
+ * R-05 (plan 05): --check reports extra .md files but never deletes them —
+ * the exporter has no ownership of the directory, and the old М8 prune
+ * silently removed user-written notes (manual.md, nested notes) that only
+ * happened to end with .md. Pruning is now a deliberate act: clean the
+ * directory yourself once the diff says what is extra.
  */
 export function checkMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
   const expected = renderAllMarkdown(db);
@@ -160,8 +223,8 @@ export function checkMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
     if (onDisk !== content) differing.push(rel);
   }
 
-  // Extra .md files on disk that the graph no longer produces — pruned
-  // right away (М8): --check leaves the directory exactly in sync.
+  // Extra .md files on disk that the graph no longer produces — reported,
+  // not deleted (see the R-05 note above).
   const walk = (d: string): void => {
     for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
       const full = path.join(d, entry.name);
@@ -169,14 +232,11 @@ export function checkMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
         walk(full);
       } else if (entry.name.endsWith(".md")) {
         const rel = path.relative(dir, full).split(path.sep).join("/");
-        if (!expected.has(rel)) {
-          fs.unlinkSync(full);
-          extra.push(rel);
-        }
+        if (!expected.has(rel)) extra.push(rel);
       }
     }
   };
   if (fs.existsSync(dir)) walk(dir);
 
-  return { written: 0, missing, differing, extra, pruned: extra.length };
+  return { written: 0, missing, differing, extra };
 }

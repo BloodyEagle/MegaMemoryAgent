@@ -39,7 +39,7 @@ describe("findDuplicates", () => {
     setEmbedding(db, "dup-b", [0.99, 0.1, 0, 0]); // ≈0.995 cosine
     setEmbedding(db, "other", [0, 1, 0, 0]); // orthogonal
 
-    const candidates = findDuplicates(db, { threshold: 0.95 });
+    const { candidates } = findDuplicates(db, { threshold: 0.95 });
     expect(candidates).toHaveLength(1);
     const c = candidates[0];
     expect([c.a, c.b].sort()).toEqual(["dup-a", "dup-b"]);
@@ -57,6 +57,71 @@ describe("findDuplicates", () => {
     const before = db.getAllNodesRaw().length;
     findDuplicates(db, { threshold: 0.9 });
     expect(db.getAllNodesRaw().length).toBe(before);
+  });
+});
+
+describe("findDuplicates blocking (R-06b, план 09)", () => {
+  it("группа из 500 одинаковых имён не вешает процесс: время ограничено, усечение честное", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      for (let i = 0; i < 500; i++) {
+        db.insertNode({ id: `same-${i}`, name: "Same", kind: "module", summary: `s ${i}` });
+      }
+    });
+    for (let i = 0; i < 500; i++) setEmbedding(db, `same-${i}`, [1, 0, 0, 0]);
+
+    const { candidates, candidates_truncated } = findDuplicates(db, { threshold: 0.9 });
+    // Предел на узел (50) ограничивает выдачу: усечение видно в отчёте, а не молчит.
+    expect(candidates.length).toBeLessThanOrEqual(100);
+    expect(candidates_truncated).toBeGreaterThan(0);
+    // Все усечённые пары — выше порога, попарная схожесть единица.
+    for (const c of candidates) expect(c.similarity).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it("большая группа: одинаковые имена находятся, разные имена с одинаковым вектором — нет (документированный компромисс)", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      // Пара с одинаковыми именами — попадает в один блок.
+      db.insertNode({ id: "twin-a", name: "Twin Alpha", kind: "module", summary: "first" });
+      db.insertNode({ id: "twin-b", name: "Twin Alpha", kind: "module", summary: "second" });
+      // Пара с разными именами и одинаковым вектором — блоки разные.
+      db.insertNode({ id: "solo-one", name: "Solo One", kind: "module", summary: "one" });
+      db.insertNode({ id: "solo-two", name: "Solo Two", kind: "module", summary: "two" });
+      // Наполнители с уникальными именами до большой группы (порог блокинга 200).
+      for (let i = 0; i < 250; i++) {
+        db.insertNode({ id: `filler-${i}`, name: `Unique Filler ${i}`, kind: "module", summary: `f ${i}` });
+      }
+    });
+    for (const id of ["twin-a", "twin-b", "solo-one", "solo-two"]) {
+      setEmbedding(db, id, [1, 0, 0, 0]);
+    }
+    for (let i = 0; i < 250; i++) {
+      setEmbedding(db, `filler-${i}`, [0, 1, 0, 0]);
+    }
+
+    const { candidates, candidates_truncated } = findDuplicates(db, { threshold: 0.95 });
+    const pairs = candidates.map((c) => [c.a, c.b].sort().join("|"));
+    expect(pairs).toContain("twin-a|twin-b");
+    expect(pairs).not.toContain("solo-one|solo-two");
+    expect(candidates_truncated).toBe(0); // давления на предел не было
+  });
+
+  it("имена отличаются только регистром и пунктуацией — один блок, пара находится", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      db.insertNode({ id: "case-a", name: "Payment Module", kind: "module", summary: "a" });
+      db.insertNode({ id: "case-b", name: "payment—module!!", kind: "module", summary: "b" });
+      for (let i = 0; i < 250; i++) {
+        db.insertNode({ id: `pad-${i}`, name: `Filler Node ${i}`, kind: "module", summary: `p ${i}` });
+      }
+    });
+    setEmbedding(db, "case-a", [1, 0, 0, 0]);
+    setEmbedding(db, "case-b", [1, 0, 0, 0]);
+    for (let i = 0; i < 250; i++) setEmbedding(db, `pad-${i}`, [0, 1, 0, 0]);
+
+    const { candidates } = findDuplicates(db, { threshold: 0.95 });
+    const pairs = candidates.map((c) => [c.a, c.b].sort().join("|"));
+    expect(pairs).toContain("case-a|case-b");
   });
 });
 
@@ -107,7 +172,7 @@ describe("М7: digest excluded from consolidation", () => {
     db.insertNode({ id: "m/d2", name: "Digest two", kind: "digest", summary: "digest payload 2", parent_id: "m" });
     setEmbedding(db, "m/d1", [1, 0, 0, 0]);
     setEmbedding(db, "m/d2", [1, 0, 0, 0]);
-    const candidates = findDuplicates(db, { threshold: 0.9 });
+    const { candidates } = findDuplicates(db, { threshold: 0.9 });
     expect(candidates).toHaveLength(0);
   });
 });

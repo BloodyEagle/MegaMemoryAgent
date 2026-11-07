@@ -105,7 +105,10 @@ describe("megamemory bench (2.1.5 F3)", () => {
     ];
     const report = await runBench(db, questions, opts());
     const q = report.questions[0];
-    expect(q.graph_tokens).toBe(0);
+    // План 06 (K-03): оценка честная — пустой ответ стоит конверт+meta
+    // (~130 токенов), нулём он больше не притворяется.
+    expect(q.graph_tokens).toBeGreaterThan(0);
+    expect(q.graph_tokens).toBeLessThanOrEqual(200);
     expect(q.ratio_files).toBeNull();
     expect(q.hit).toBe(false);
     expect(report.hit_rate).toBe(0);
@@ -824,7 +827,13 @@ describe("megamemory bench 2.1.6 — честные цифры", () => {
     const coldReport = { ...report, cold_start: true };
     expect(questionNotes(coldReport.questions[0], coldReport)).toContain("cold-start");
     expect(questionNotes(coldReport.questions[1], coldReport)).not.toContain("cold-start");
-    expect(questionNotes(report.questions[0], report)).not.toContain("cold-start");
+    // Явно тёплый отчёт: флаг cold_start в сыром report зависит от машины
+    // (на холодном FS CI первый запрос пересекает порог 5× median — это
+    // честный вердикт detectColdStart, а не поведение questionNotes).
+    const warmReport = { ...report, cold_start: false };
+    expect(questionNotes(warmReport.questions[0], warmReport)).not.toContain(
+      "cold-start"
+    );
     // формат списка id: до 10 целиком, дальше +N
     expect(formatIdList(["a", "b"])).toBe(" (ids: a, b)");
     expect(formatIdList(Array.from({ length: 12 }, (_, i) => `n${i}`))).toContain("+2");

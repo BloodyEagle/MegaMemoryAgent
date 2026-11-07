@@ -196,10 +196,20 @@ export interface NodeWithContext {
   status?: string;
   valid_until?: string | null;
   /**
-   * 2.1.12 F1: факт просрочен (valid_until в прошлом). Ставится только при
-   * include_stale: true — по умолчанию такие узлы из выдачи исключены.
+   * 2.1.12 F1: факт просрочен (valid_until в прошлом). В выдаче поиска
+   * ставится только при include_stale: true — по умолчанию такие узлы
+   * исключены; на карточке узла считается всегда.
    */
   expired?: boolean;
+  /**
+   * UX-01 (план 07): происхождение записи (v12), задача и роли узла —
+   * сравнение перед слиянием показывает то, что переедет или потеряется
+   * вместе с дублем.
+   */
+  created_via?: string | null;
+  task_state?: string | null;
+  due_at?: string | null;
+  slots?: Array<{ project: string; role: string }>;
   /** Plan 1: epistemic axis + the scope of a `validated` (JSON). */
   epistemic_status?: string | null;
   status_scope?: Record<string, unknown> | null;
@@ -243,18 +253,29 @@ export interface NodeWithContext {
 }
 
 /**
- * 2.1.7 F1: the current digests of one node's wording. `claim` comes from the
- * confirmed snapshot when one exists (source: "snapshot" — the confirmation
- * belongs to the wording the agent saw; a rewritten summary refuses this
- * value with version_conflict, which is the point), otherwise it is computed
- * from the live summary (source: "computed" — the value a FIRST confirmation
- * needs). `status` is always the current status-axes digest: the node-level
- * snapshot tracks the claim only, there is nothing to take it from.
+ * 2.1.7 F1, revised by plan 04 K-10: the digests of one node's wording with
+ * the current and the confirmed versions carried SEPARATELY — the old shape
+ * reported the confirmed snapshot AS the current digest, so after an edit a
+ * re-read returned the stale value again and confirm → edit → reread →
+ * confirm never converged.
+ *
+ * `claim` is ALWAYS the digest of the live summary — the exact value
+ * confirm_supports compares against, confirmable right after a re-read.
+ * `confirmed_claim` documents the version the confirmation was made on (what
+ * the snapshot pins; a divergence against it is reported by support_check,
+ * it is not a confirmable value). `status` is always the current status-axes
+ * digest: the node-level snapshot tracks the claim only, there is nothing to
+ * take it from.
  */
 export interface CurrentDigestsView {
   claim: string;
   status: string;
   format_version: number;
+  /** The confirmed snapshot's claim digest; null = never confirmed. */
+  confirmed_claim: string | null;
+  /** When the snapshot was written (confirm_supports); null = never. */
+  confirmed_at: string | null;
+  /** Whether the node carries a confirmed claim snapshot. */
   source: "computed" | "snapshot";
 }
 
@@ -280,6 +301,34 @@ export interface UnderstandInput {
    * (meta.stale_excluded считает исключённых).
    */
   include_stale?: boolean;
+  /**
+   * План 06 (K-03): всё, что обработчик MCP добавит к ответу
+   * (instructions_stale, instructions_version, server_version). Бюджет
+   * считается по СЕРИАЛИЗОВАННОМУ wire-ответу вместе с этими полями —
+   * оценка функции и фактическая выдача не расходятся. В возвращаемый
+   * объект не попадает: обработчик добавляет сам.
+   */
+  extra_payload?: Record<string, unknown>;
+}
+
+/**
+ * План 06 (K-02): вложенная опора сохраняет квалификацию знания — статус
+ * жизненного цикла, эпистемическую ось, пометку просрочки и признак
+ * слабости. Отсутствие поля в проекции — дефект, а не «нет данных».
+ */
+export interface NestedSupportView {
+  id: string;
+  name: string;
+  summary: string;
+  /** Lifecycle status (active/superseded/deprecated). */
+  status: string;
+  /** Epistemic axis (null = не оценивалось). */
+  epistemic_status?: string | null;
+  file_refs?: string[] | null;
+  /** past valid_until — при include_stale: true. */
+  expired?: boolean;
+  /** refuted/abandoned/ungrounded — цитировать как знание нельзя. */
+  weak?: boolean;
 }
 
 /** One node in compact understand output — everything optional is dropped. */
@@ -290,6 +339,11 @@ export interface CompactMatch {
   status: string;
   /** Plan 1: epistemic axis, shown so refuted nodes are never mistaken for facts. */
   epistemic_status?: string | null;
+  /**
+   * План 06 (K-04): причина опровержения едет и в compact-выдаче —
+   * «антизнание с причиной» не только в full-режиме.
+   */
+  refuted_reason?: string | null;
   /** Truncated to <=240 chars at a word boundary. */
   summary: string;
   file_refs: string[] | null;
@@ -306,9 +360,10 @@ export interface CompactMatch {
    * no supports of its own) instead of competing for a top slot: a support
    * shares the query terms with its decision and used to push the decision
    * off rank 1. Does not occupy a top_k slot; its tokens ARE counted in
-   * tokens_estimated.
+   * tokens_estimated. План 06 (K-02): несёт квалификацию знания — см.
+   * NestedSupportView.
    */
-  supports?: Array<{ id: string; name: string; summary: string }>;
+  supports?: NestedSupportView[];
   /**
    * 2.1.12 F1: the match is past its valid_until — present only when the
    * caller asked include_stale: true.
@@ -334,6 +389,18 @@ export interface UnderstandMeta {
    * молчаливый фильтр выглядел бы как «запрос ничего не нашёл».
    */
   stale_excluded?: number;
+  /**
+   * План 06 (K-01): сколько неактивных (superseded/deprecated) найдено
+   * запросом, но исключено без include_inactive. Отдельно от усечённых
+   * (dropped) — счётчики фильтра и счётчики нарезки не смешиваются.
+   */
+  inactive_excluded?: number;
+  /**
+   * План 06 (K-03/K-04): что-то не поместилось в бюджет (узлы или refuted
+   * порезаны). tokens_estimated при этом остаётся честным числом
+   * фактической выдачи.
+   */
+  truncated?: boolean;
 }
 
 export interface UnderstandOutput {
@@ -565,6 +632,11 @@ export interface ResolveConflictInput {
     file_refs?: string[];
   };
   reason: string;
+  /**
+   * F-03.1 (план 03): какой вариант выживает при «keep left/right» из CLI.
+   * MCP-вызов не задаёт его — базой становится первая живая копия группы.
+   */
+  prefer?: "left" | "right";
 }
 
 export interface MergeResult {
@@ -584,6 +656,18 @@ export interface MergeResult {
    * (confirmed_by rewritten to 'import'). Absent when there was nothing.
    */
   baselinesCarried?: number;
+  /**
+   * F-02 (план 03, S-03): workflow-строки, перенесённые из входов (слоты,
+   * цепочки с участниками, артефакты, история статусов, алиасы). Absent
+   * when there was nothing.
+   */
+  workflowCarried?: number;
+  /**
+   * F-02 (план 03): расхождения workflow-содержимого между входами (слот,
+   * цепочка или алиас с тем же ключом, но другим значением). Не разрешаются
+   * молчаливым удалением — left первым, right заполняет только отсутствующее.
+   */
+  workflowConflicts?: number;
 }
 
 // ---- Provenance tools (plan 3 §4.2) ----
@@ -931,6 +1015,15 @@ export interface ConfirmSupportsItem {
   expected_status_digest?: string;
   /** The rationale digest as the agent read it. */
   expected_edge_digest: string;
+  /**
+   * R-04 (plan 04): the combined digest of the support's ACTIVE artifact
+   * observations as the agent read them (provenance_trace.supports[] carries
+   * it in artifacts_digest). Optional, but enforced when present: a
+   * check_artifacts by someone else between the read and this confirm
+   * refuses with version_conflict — an observation the agent never read is
+   * never confirmed.
+   */
+  expected_artifacts_digest?: string | null;
 }
 
 export interface ConfirmSupportsInput {
@@ -1011,6 +1104,14 @@ export interface ProvenanceSupportDigest {
   claim_digest: string | null;
   status_digest: string | null;
   edge_digest: string;
+  /**
+   * R-04 (plan 04): the combined digest of the support's ACTIVE artifact
+   * observations (the last explicit check_artifacts, filtered to refs still
+   * in file_refs). null = nothing observed. The value to pass into
+   * confirm_supports as expected_artifacts_digest when the agent wants the
+   * artifact state pinned to what it read.
+   */
+  artifacts_digest: string | null;
   /**
    * 2.1.9 F2: "stub" — the support's summary is a template / too short to be
    * a claim (it can never honestly confirm anything); "claim" — a real

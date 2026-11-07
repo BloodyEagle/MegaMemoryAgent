@@ -165,7 +165,7 @@ describe("digest in search", () => {
 });
 
 describe("digestSourceChildren (U4)", () => {
-  it("returns sibling source concepts, never the digest itself; stale on newer child", async () => {
+  it("returns sibling source concepts, never the digest itself; stale on a changed source (plan 04 K-08)", async () => {
     const db = freshDb();
     makeModuleWithChildren(db, 5);
     const built = await buildDigest(db, "mod", { embed: false });
@@ -177,10 +177,16 @@ describe("digestSourceChildren (U4)", () => {
     expect(info.children.every((c) => c.kind !== "digest")).toBe(true);
     expect(info.stale).toBe(false);
 
-    // A sibling updated after the digest -> stale.
+    // K-08: staleness is derived by content against the recorded membership —
+    // a timestamp-only touch with unchanged meaning is NOT stale.
     db.execSqlRun(
       "UPDATE nodes SET updated_at = datetime('now', '+1 hour') WHERE id = 'mod/child-1'"
     );
+    info = digestSourceChildren(db, digestId);
+    expect(info.stale).toBe(false);
+
+    // A sibling whose meaning moved after the digest -> stale.
+    db.updateNode("mod/child-1", { summary: "The rewritten independent measurement of child one." });
     info = digestSourceChildren(db, digestId);
     expect(info.stale).toBe(true);
   });

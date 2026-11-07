@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { KnowledgeDB } from "./db.js";
-import { artifactsDigestOf } from "./artifacts.js";
+import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import type {
   ConfirmSupportsInput,
   ConfirmSupportsOutput,
@@ -301,11 +301,13 @@ export function computeSupportCheck(
         if (edgeDigestOf(edge.description) !== anchor.edge_digest) reasons.push("rationale");
         // 2.1.3 F2: the artifact verdict is derived BY CONTENT — the snapshot
         // saved the combined digest of the support's observed artifacts; the
-        // current observation must still match it. NULL on either side means
-        // "nothing observed": honestly no signal, never a false change. No
-        // file is read here — the rows are the last explicit check_artifacts
-        // observation. The extra rows are materialized work: they pay the
-        // budget too.
+        // current observation must still match it. Plan 04 K-11: only rows
+        // whose ref is still in the support's file_refs feed the digest —
+        // withdrawn references turn into history, and the digest honestly
+        // moves (an empty active set after the last ref was removed is a
+        // divergence from a non-null snapshot, not silence). No file is read
+        // here — the rows are the last explicit check_artifacts observation.
+        // The extra rows are materialized work: they pay the budget too.
         let artifactChanged = false;
         let artifactPreviews: SupportArtifactChange[] = [];
         if (anchor.artifacts_digest !== null && anchor.artifacts_digest !== undefined) {
@@ -314,8 +316,8 @@ export function computeSupportCheck(
             exhausted = true;
             break;
           }
-          const currentArtifacts = artifactsDigestOf(artRows);
-          if (currentArtifacts !== null && currentArtifacts !== anchor.artifacts_digest) {
+          const currentArtifacts = artifactsDigestOf(activeArtifactRows(support, artRows));
+          if (currentArtifacts !== anchor.artifacts_digest) {
             artifactChanged = true;
             artifactChangedTotal += 1;
             // ≤3 newest divergences — warning text, not a report.
@@ -620,6 +622,28 @@ export function confirmSupports(
             `(ожидался ${item.expected_edge_digest.slice(0, 12)}…, текущий ${currentEdgeDigest.slice(0, 12)}…)`
         );
       }
+      // R-04 (plan 04): the artifact observation gets the same treatment as
+      // the textual axes — when the agent pins the version it read, a
+      // check_artifacts by someone else between the read and this confirm
+      // refuses instead of confirming an unread observation.
+      const currentArtifactsDigest = artifactsDigestOf(
+        activeArtifactRows(support, db.getNodeArtifacts(supportId))
+      );
+      if (item.expected_artifacts_digest !== undefined) {
+        if (item.expected_artifacts_digest !== null && typeof item.expected_artifacts_digest !== "string") {
+          mismatches.push(
+            `опора "${supportId}": expected_artifacts_digest должен быть строкой или null — подтверждать можно ` +
+              `только прочитанное состояние наблюдений (перечитай опору через provenance_trace.supports[] и повтори)`
+          );
+        } else if (item.expected_artifacts_digest !== currentArtifactsDigest) {
+          mismatches.push(
+            `опора "${supportId}": наблюдения артефактов изменились с момента чтения ` +
+              `(ожидался ${item.expected_artifacts_digest === null ? "null" : item.expected_artifacts_digest.slice(0, 12) + "…"}, ` +
+              `текущий ${currentArtifactsDigest === null ? "null" : currentArtifactsDigest.slice(0, 12) + "…"}) — ` +
+              `между чтением и подтверждением кто-то вызвал check_artifacts`
+          );
+        }
+      }
       planned.push({
         edgeId: edge.id,
         auto: (edge as EdgeRow).created_via === "auto",
@@ -636,7 +660,9 @@ export function confirmSupports(
           // 2.1.3 F2: the confirmed artifacts state — what the agent saw
           // (the rows are the last explicit check_artifacts observation).
           // NULL when nothing was observed: no signal until a check exists.
-          artifacts_digest: artifactsDigestOf(db.getNodeArtifacts(supportId)),
+          // Plan 04 K-11: the ACTIVE set only — refs withdrawn from the node
+          // before the confirmation do not pin the snapshot.
+          artifacts_digest: currentArtifactsDigest,
         },
       });
     }

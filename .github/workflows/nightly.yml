@@ -9,6 +9,13 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22", cache: npm }
       - run: npm ci
+      # C-08: a clean checkout has no dist. The integration project in
+      # vitest.config.ts spawns the compiled CLI, so build must precede the
+      # suite — otherwise the nightly only passes on machines with a stale
+      # local dist. Smoke proves the freshly built artifact starts.
+      - run: npm run build
+      - name: Smoke (compiled CLI starts)
+        run: node dist/index.js --help
       - uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface

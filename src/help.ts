@@ -41,7 +41,10 @@ ${pc.bold("Options:")}
   ${pc.cyan("--json")}          Machine-readable output for conflicts
   ${pc.cyan("--questions")} ${pc.dim("FILE")}  bench: jsonl with questions ${pc.dim('({"id","query","expect_nodes"?})')}
   ${pc.cyan("--baseline")}      bench: what the graph is measured against ${pc.dim("(files | te | both; default files)")}
-  ${pc.cyan("--te-cmd")} ${pc.dim("CMD")}    bench: external structural tool for te/both, {query} is substituted
+  ${pc.cyan("--te-exec")} ${pc.dim("PROG")}  bench: structured te runner, literal argv without a shell;
+                the query goes where an --te-arg contains {query} (default arg: {query})
+  ${pc.cyan("--te-cmd")} ${pc.dim("CMD")}    bench: trusted shell template for te/both, {query} is substituted —
+                the string is parsed by cmd.exe/sh, so %VARS% and quotes are shell semantics
   ${pc.cyan("--file-limit")} ${pc.dim("KB")} bench: files over the limit are counted by size ${pc.dim("(default 200)")}
   ${pc.cyan("--ref-root")} ${pc.dim("PATH")}  bench: extra root for relative file_refs, repeatable ${pc.dim("(first hit wins; try git root, then cwd)")}
   ${pc.cyan("--files-top")} ${pc.dim("N")}   bench: files baseline over the first N unique files in output order ${pc.dim("(default 0 = all; 3 is the honest live-agent number)")}

@@ -44,8 +44,13 @@ jobs:
             src/__tests__/context-budget.test.ts \
             --reporter=dot
 
+      # 08-N2 (план 09): фикстуры только для чтения — eval работает на копии
+      # demo.db; открытие фикстуры на месте оставляет сайдкар (-shm) в
+      # fixtures/ и страж repo-hygiene валит прогон.
       - name: Eval (recall@10)
-        run: MEGAMEMORY_DB_PATH=fixtures/demo.db node dist/index.js eval --min 0.8
+        run: |
+          cp fixtures/demo.db "$RUNNER_TEMP/eval-demo.db"
+          MEGAMEMORY_DB_PATH="$RUNNER_TEMP/eval-demo.db" node dist/index.js eval --min 0.8
 
       # 2.1.13 F6: полный прогон без флагов - unit/db/integration; HTTP-
       # интеграции проверяют собранный dist, поэтому шаг после npm run build.

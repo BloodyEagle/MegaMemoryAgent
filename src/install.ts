@@ -25,6 +25,18 @@ interface StepResult {
   error?: string;
 }
 
+/**
+ * План 06 (C-01): структурированный итог установки — CLI ставит exit code
+ * по нему, а не делает exit(0) всегда. Пропущенные шаги (после провала
+ * критического) считаются отдельно: skipped — не успех.
+ */
+export interface InstallOutcome {
+  ok: boolean;
+  succeeded: number;
+  failed: Array<{ target: string; targetLabel: string; name: string; error?: string }>;
+  skipped: Array<{ target: string; targetLabel: string; name: string }>;
+}
+
 interface CommandRuntime {
   opencodeCommand: string[];
   stdioCommand: string;
@@ -494,28 +506,84 @@ function buildCodexToml(runtime: CommandRuntime): string {
   return `[mcp_servers.megamemory]\ncommand = "${escapedCommand}"\nargs = ${argsToml}\n`;
 }
 
+/** Table key of a TOML header line ("[a.b]" / "[[a.b]]"), or null. Quoted
+ * keys containing "]" are out of scope — real MCP config names never have them. */
+function tomlHeaderKey(rawLine: string): string | null {
+  const line = rawLine.replace(/\r$/, "");
+  const m = /^\s*\[\[?\s*([^\]]*?)\s*\]?\]\s*(?:#.*)?$/.exec(line);
+  return m ? m[1] : null;
+}
+
+/** Odd number of """ or ''' delimiters on one line toggles multi-line state,
+ * so a "[table]"-looking line inside a string value is never a real header. */
+function togglesMultilineString(rawLine: string): boolean {
+  const line = rawLine.replace(/\r$/, "");
+  const count = (seq: string): number => line.split(seq).length - 1;
+  return count('"""') % 2 === 1 || count("'''") % 2 === 1;
+}
+
+/**
+ * C-02 (plan 05): replace exactly the target TOML table. A table runs from
+ * its header to the NEXT table header — and `[mcp_servers.megamemory-dev]`
+ * is a different server whose bytes must survive untouched, so any header
+ * line ends the region. (The old regex skipped megamemory-prefixed siblings
+ * as if they belonged to the target and deleted them with it.) When the
+ * target is absent the section is appended; neighboring bytes are kept as-is.
+ */
 function replaceOrAppendTomlSection(
   existing: string,
-  sectionHeader: string,
+  sectionKey: string,
   newSection: string
-): string {
-  const headerIndex = existing.indexOf(sectionHeader);
+): { content: string; existed: boolean } {
+  const lines = existing.split("\n");
+  let headerIndex = -1;
+  let endIndex = lines.length;
+  let inMultiline = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (inMultiline) {
+      if (togglesMultilineString(lines[i])) inMultiline = false;
+      continue;
+    }
+    if (togglesMultilineString(lines[i])) {
+      inMultiline = true;
+      continue;
+    }
+    const key = tomlHeaderKey(lines[i]);
+    if (key === null) continue;
+    if (headerIndex === -1) {
+      if (key === sectionKey) headerIndex = i;
+    } else {
+      endIndex = i;
+      break;
+    }
+  }
   if (headerIndex === -1) {
     const separator = existing.endsWith("\n") ? "\n" : "\n\n";
-    return existing + separator + newSection;
+    return { content: existing + separator + newSection, existed: false };
   }
-  const afterHeader = existing.indexOf("\n", headerIndex);
-  if (afterHeader === -1) {
-    return existing.slice(0, headerIndex) + newSection;
+  const before = lines.slice(0, headerIndex).join("\n");
+  const after = lines.slice(endIndex).join("\n");
+  const block = newSection.replace(/\n$/, "");
+  return {
+    content: (before ? `${before}\n` : "") + `${block}\n${after}`,
+    existed: true,
+  };
+}
+
+/**
+ * C-02 (plan 05): sibling temp file + rename — a failed or interrupted write
+ * can never leave a truncated config behind; the previous bytes stay intact
+ * until the rename succeeds.
+ */
+function writeFileSyncAtomic(filePath: string, content: string): void {
+  const tmp = `${filePath}.megamemory-tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, content, "utf-8");
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* the tmp file is best-effort */ }
+    throw err;
   }
-  const rest = existing.slice(afterHeader + 1);
-  const nextSectionMatch = rest.match(/^\[(?!mcp_servers\.megamemory)/m);
-  if (nextSectionMatch && nextSectionMatch.index !== undefined) {
-    return (
-      existing.slice(0, headerIndex) + newSection + rest.slice(nextSectionMatch.index)
-    );
-  }
-  return existing.slice(0, headerIndex) + newSection;
 }
 
 function writeCodexTomlFallback(runtime: CommandRuntime): void {
@@ -524,20 +592,19 @@ function writeCodexTomlFallback(runtime: CommandRuntime): void {
 
   if (fs.existsSync(CODEX_CONFIG_PATH)) {
     const existing = fs.readFileSync(CODEX_CONFIG_PATH, "utf-8");
-    const updated = replaceOrAppendTomlSection(
+    const { content: updated, existed } = replaceOrAppendTomlSection(
       existing,
-      "[mcp_servers.megamemory]",
+      "mcp_servers.megamemory",
       tomlBlock
     );
-    const existed = existing.includes("[mcp_servers.megamemory]");
-    fs.writeFileSync(CODEX_CONFIG_PATH, updated);
+    writeFileSyncAtomic(CODEX_CONFIG_PATH, updated);
     success(
       existed
         ? `Updated megamemory MCP in ${pc.dim(CODEX_CONFIG_PATH)}`
         : `Added megamemory MCP to ${pc.dim(CODEX_CONFIG_PATH)}`
     );
   } else {
-    fs.writeFileSync(CODEX_CONFIG_PATH, tomlBlock);
+    writeFileSyncAtomic(CODEX_CONFIG_PATH, tomlBlock);
     success(`Created ${pc.dim(CODEX_CONFIG_PATH)}`);
   }
   info(
@@ -697,7 +764,7 @@ async function chooseTargetsInteractively(): Promise<InstallTarget[]> {
   );
 }
 
-export async function runInstall(args: string[]): Promise<void> {
+export async function runInstall(args: string[]): Promise<InstallOutcome> {
   console.log();
   console.log(`  ${pc.bold(pc.cyan("megamemory"))} ${pc.dim("install")}`);
   console.log();
@@ -713,7 +780,6 @@ export async function runInstall(args: string[]): Promise<void> {
     console.log(pc.dim(`  Example: ${pc.cyan("megamemory install --target claudecode")}`));
     console.log();
     process.exit(1);
-    return;
   }
 
   if (targets.length === 0) {
@@ -723,10 +789,11 @@ export async function runInstall(args: string[]): Promise<void> {
   if (targets.length === 0) {
     warn("No targets selected. Nothing to do.");
     console.log();
-    return;
+    return { ok: true, succeeded: 0, failed: [], skipped: [] };
   }
 
   const steps: StepResult[] = [];
+  const skipped: Array<{ target: string; targetLabel: string; name: string }> = [];
 
   for (const target of targets) {
     const targetConfig = targetConfigs[target];
@@ -756,6 +823,16 @@ export async function runInstall(args: string[]): Promise<void> {
 
         if (step.critical) {
           warn(`Skipping remaining ${targetConfig.label} steps because ${step.name} failed.`);
+          // План 06 (C-01): пропущенные шаги фиксируются явно — оставшиеся
+          // шаги цели не были выполнены, и молча считать target настроенным
+          // нельзя.
+          for (const rest of targetConfig.steps.slice(i + 1)) {
+            skipped.push({
+              target,
+              targetLabel: targetConfig.label,
+              name: rest.name,
+            });
+          }
           break;
         }
       }
@@ -796,5 +873,29 @@ export async function runInstall(args: string[]): Promise<void> {
     console.log();
     console.log(pc.dim(`  Steps that succeeded will still work. Fix the issues above and re-run.`));
   }
+  if (skipped.length > 0) {
+    console.log(
+      `  ${pc.yellow(`${skipped.length} step(s) skipped:`)}`
+    );
+    for (const item of skipped) {
+      console.log(`    ${pc.dim("-")} ${item.targetLabel} — ${item.name}`);
+    }
+  }
   console.log();
+  const outcome: InstallOutcome = {
+    ok: failed.length === 0,
+    succeeded: steps.length - failed.length,
+    failed: failed.map((f) => ({
+      target: f.target,
+      targetLabel: f.targetLabel,
+      name: f.name,
+      error: f.error,
+    })),
+    skipped,
+  };
+  // План 06 (C-01): провал виден и прямому вызывающему runInstall —
+  // process.exitCode даёт ненулевой код завершения процесса без выброса
+  // exit-а в in-process вызывающих (те читают структурированный итог).
+  if (!outcome.ok) process.exitCode = 1;
+  return outcome;
 }

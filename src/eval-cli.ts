@@ -7,19 +7,73 @@ import { errorBold, success, info, heading, warn } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 
 /**
+ * План 06 (C-03): строгий разбор числовых флагов ДО открытия БД.
+ * parseFloat("nope") давал NaN, сравнение `recall < NaN` всегда было false —
+ * quality gate молча отключался. Частичный разбор ("0.5junk") запрещён:
+ * значение разбирается целиком или команда отказывает.
+ */
+function strictMin(raw: string | undefined): number {
+  const flag = "--min";
+  if (raw === undefined || raw.trim() === "") {
+    errorBold(`${flag}: требуется числовое значение в [0, 1]`);
+    process.exit(1);
+  }
+  const text = raw.trim();
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(text)) {
+    errorBold(`${flag}: "${raw}" не разбирается как конечное число`);
+    process.exit(1);
+  }
+  const value = Number(text);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    errorBold(`${flag}: ${raw} вне допустимого диапазона [0, 1]`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function strictK(raw: string | undefined): number {
+  const flag = "--k";
+  if (raw === undefined || raw.trim() === "") {
+    errorBold(`${flag}: требуется целое положительное значение`);
+    process.exit(1);
+  }
+  const text = raw.trim();
+  if (!/^\+?\d+$/.test(text) || !Number.isInteger(Number(text)) || Number(text) < 1) {
+    errorBold(`${flag}: "${raw}" — нужно целое положительное число`);
+    process.exit(1);
+  }
+  return Number(text);
+}
+
+/** Значение флага в формах `--flag X` и `--flag=X`; null = флага нет. */
+function flagValue(args: string[], flag: string): string | null | undefined {
+  const eq = `${flag}=`;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === flag) return args[i + 1]; // undefined = флаг без значения
+    if (typeof args[i] === "string" && args[i].startsWith(eq)) {
+      return args[i].slice(eq.length);
+    }
+  }
+  return null;
+}
+
+/**
  * `megamemory eval [--file <jsonl>] [--k 10] [--min 0.8]`
  *
  * Measures recall@k of the live search stack against an eval set
  * (fixtures/eval.jsonl by default). Exit 1 below --min — CI-friendly.
  */
 export async function runEvalCli(args: string[]): Promise<void> {
+  // Числовые флаги валидируются первыми — никакая БД не открывается и
+  // никаких файлов не создаётся до того, как argv признан корректным.
+  const minRaw = flagValue(args, "--min");
+  const kRaw = flagValue(args, "--k");
+  const min = minRaw === null ? 0.8 : strictMin(minRaw);
+  const k = kRaw === null ? 10 : strictK(kRaw);
+
   const fileIdx = args.indexOf("--file");
   const file =
     fileIdx !== -1 ? args[fileIdx + 1] : path.join("fixtures", "eval.jsonl");
-  const kIdx = args.indexOf("--k");
-  const k = kIdx !== -1 ? parseInt(args[kIdx + 1], 10) : 10;
-  const minIdx = args.indexOf("--min");
-  const min = minIdx !== -1 ? parseFloat(args[minIdx + 1]) : 0.8;
 
   if (!fs.existsSync(file)) {
     errorBold(`Eval set not found: ${file}`);

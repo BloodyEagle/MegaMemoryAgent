@@ -5,8 +5,8 @@
 
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
-  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.13-orange?style=flat-square" />
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.9-brightgreen?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.2.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -269,7 +269,7 @@ megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline bo
 
 ## Установка
 
-Нужен Node.js >= 18. Для чисто русских проектов подойдёт значительно меньшая модель (`cointegrated/rubert-tiny2`, 312-мерная) после конвертации в ONNX; модель выгружается после 5 минут простоя (`MEGAMEMORY_EMBED_IDLE_MS=0` отключает выгрузку), а `MEGAMEMORY_SEARCH=fts` не загружает её вовсе. Модель эмбеддингов (~120 МБ, мультиязычная) скачивается при первом
+Нужен Node.js >= 20.9 (поднят с 18: sharp 0.35 из цепочки эмбеддингов требует >= 20.9; dev-инструментарий — vite/vitest — требует >= 20.19). Для чисто русских проектов подойдёт значительно меньшая модель (`cointegrated/rubert-tiny2`, 312-мерная) после конвертации в ONNX; модель выгружается после 5 минут простоя (`MEGAMEMORY_EMBED_IDLE_MS=0` отключает выгрузку), а `MEGAMEMORY_SEARCH=fts` не загружает её вовсе. Модель эмбеддингов (~120 МБ, мультиязычная) скачивается при первом
 запуске и кешируется в `~/.cache/huggingface`.
 
 Установка глобально из npm:
@@ -334,6 +334,13 @@ megamemory doctor               # проверка здоровья, код вы
 Миграция не удаляет и не переименовывает столбцы, поэтому upstream v1.6.2 открывает
 мигрированную базу. Узлы, потерянные в upstream из-за пустых id, восстановить нельзя —
 `--dry-run` честно их показывает.
+
+Границы dry-run (R-05): команда с `--dry-run` не пишет данные графа, но **открытие legacy-базы
+конвертирует её при открытии** — бэкап, одна транзакция (схема, починка id, перестройка FTS,
+бэкфилл `name_norm`/embed meta), отчёт рядом с файлом. Это осознанное поведение и оно отделено
+от обещания dry-run: конвертация трогает схему и гигиену, а не сами утверждения. Экспортёр
+владеет только теми файлами, которые сам рендерит: `export --check` показывает лишние `.md`
+файлы в каталоге и никогда их не удаляет — prune вручную, каталог экспортёру не принадлежит.
 
 ---
 

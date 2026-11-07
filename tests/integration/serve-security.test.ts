@@ -1,5 +1,4 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { spawn, type ChildProcess } from "child_process";
 import http from "node:http";
 import net from "node:net";
 import fs from "node:fs";
@@ -8,73 +7,42 @@ import path from "node:path";
 import { KnowledgeDB } from "../../src/db.js";
 import { ensureSchema } from "../../src/migrate-schema.js";
 import { cleanupDir } from "../../src/__tests__/helpers/cleanup.js";
+import { AuditCleanupError, auditFixture, type AuditFixture } from "../../src/__tests__/helpers/audit.js";
+import { startAuditHttp } from "../../src/__tests__/helpers/audit-http.js";
 
 // F1 2.1.13: обозреватель слушает только loopback, без wildcard-CORS,
 // POST /api/consolidate защищён (same-origin, application/json, 64 КБ).
 // Сервер собирается из dist — перед прогоном нужен npm run build (F6).
 
-const repoRoot = path.resolve(import.meta.dirname, "../..");
-const serveScript = path.join(repoRoot, "dist", "index.js");
 const MAX_BODY = 64 * 1024;
 
-let child: ChildProcess | null = null;
+let serverFixture: AuditFixture | null = null;
 let tmpDir: string | null = null;
 let port = 0;
 let serverOut = "";
 
 afterEach(async () => {
-  if (child) {
-    child.kill();
-    child = null;
+  const errors: unknown[] = [];
+  try {
+    await serverFixture?.close();
+  } catch (error) {
+    errors.push(error);
+  } finally {
+    serverFixture = null;
+    if (tmpDir) {
+      try { await cleanupDir(tmpDir); } catch (error) { errors.push(error); }
+      tmpDir = null;
+    }
   }
-  if (tmpDir) {
-    await cleanupDir(tmpDir);
-    tmpDir = null;
-  }
+  if (errors.length) throw new AuditCleanupError("HTTP fixture cleanup failed", { cause: new AggregateError(errors) });
 });
 
-function startServe(dbFile: string, extraArgs: string[] = []): Promise<number> {
-  port = 43000 + Math.floor(Math.random() * 10000);
-  serverOut = "";
-  return new Promise((resolve, reject) => {
-    // 2.1.13 F6: FTS-режим (предмет теста — маршруты, не эмбеддинги);
-    // окружение нейтрализовано: путь задаёт только --db.
-    child = spawn(
-      process.execPath,
-      [serveScript, "serve", "--port", String(port), "--db", dbFile, ...extraArgs],
-      {
-        env: { ...process.env, MEGAMEMORY_SEARCH: "fts", MEGAMEMORY_DB_PATH: "" },
-        stdio: ["ignore", "pipe", "pipe"],
-      }
-    );
-    child.stdout?.on("data", (d) => {
-      serverOut += String(d);
-    });
-    child.stderr?.on("data", (d) => {
-      serverOut += String(d);
-    });
-    child.on("exit", (code) =>
-      reject(new Error(`serve exited early (${code}): ${serverOut}`))
-    );
-
-    const started = Date.now();
-    const poll = async (): Promise<void> => {
-      while (Date.now() - started < 20000) {
-        try {
-          const res = await fetch(`http://127.0.0.1:${port}/api/stats`);
-          if (res.ok) {
-            resolve(port);
-            return;
-          }
-        } catch {
-          // not up yet
-        }
-        await new Promise((r) => setTimeout(r, 200));
-      }
-      reject(new Error(`serve did not start in 20s: ${serverOut}`));
-    };
-    void poll();
-  });
+async function startServe(dbFile: string, extraArgs: string[] = []): Promise<number> {
+  serverFixture = auditFixture();
+  const server = await startAuditHttp(serverFixture, dbFile, { extraArgs });
+  port = server.port;
+  serverOut = server.diagnostics();
+  return port;
 }
 
 function makeDb(dir: string, name: string): { dir: string; file: string; count: number } {
@@ -192,6 +160,37 @@ describe("serve security (F1 2.1.13)", () => {
       headers: { host: `127.0.0.1:${port}` },
     });
     expect(ok.status).toBe(200);
+  });
+
+  it("rejects malformed Host forms: bare IPv6 and a portless Host on a non-80 port", { timeout: 45000 }, async () => {
+    const db = makeDb(os.tmpdir(), "hostform");
+    tmpDir = db.dir;
+    await startServe(db.file);
+
+    // R-08: `::1` без скобок — не валидная форма Host (браузеры шлют
+    // `[::1]:port`). Раньше проходила через whitelist-запись "::1".
+    const bare6 = await request({ host: "127.0.0.1", port }, "/api/stats", {
+      headers: { host: `::1:${port}` },
+    });
+    expect(bare6.status).toBe(403);
+
+    // Host без порта допустим только для дефолтного 80 — на любом другом
+    // порту это не браузерная форма (браузер всегда шлёт порт).
+    const portless = await request({ host: "127.0.0.1", port }, "/api/stats", {
+      headers: { host: "localhost" },
+    });
+    expect(portless.status).toBe(403);
+
+    // Легитимные формы не задеты: скобочный IPv6 и localhost с портом.
+    const bracketed = await request({ host: "127.0.0.1", port }, "/api/stats", {
+      headers: { host: `[::1]:${port}` },
+    });
+    expect(bracketed.status).toBe(200);
+
+    const withPort = await request({ host: "127.0.0.1", port }, "/api/stats", {
+      headers: { host: `localhost:${port}` },
+    });
+    expect(withPort.status).toBe(200);
   });
 
   it("rejects a foreign Origin with 403 and no CORS header", { timeout: 45000 }, async () => {
