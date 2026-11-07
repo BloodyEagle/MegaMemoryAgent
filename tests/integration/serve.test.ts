@@ -1,73 +1,41 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { spawn, type ChildProcess } from "child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../../src/db.js";
 import { ensureSchema } from "../../src/migrate-schema.js";
 import { cleanupDir } from "../../src/__tests__/helpers/cleanup.js";
+import { AuditCleanupError, auditFixture, type AuditFixture } from "../../src/__tests__/helpers/audit.js";
+import { startAuditHttp } from "../../src/__tests__/helpers/audit-http.js";
 
 // Integration (plan 3.3): real HTTP server on an ephemeral port, real
 // cyrillic ids through the URL layer, killed afterwards.
 
-const repoRoot = path.resolve(import.meta.dirname, "../..");
-const serveScript = path.join(repoRoot, "dist", "index.js");
-
-let child: ChildProcess | null = null;
+let serverFixture: AuditFixture | null = null;
 let tmpDir: string | null = null;
 let port = 0;
 
 afterEach(async () => {
-  if (child) {
-    child.kill();
-    child = null;
+  const errors: unknown[] = [];
+  try {
+    await serverFixture?.close();
+  } catch (error) {
+    errors.push(error);
+  } finally {
+    serverFixture = null;
+    if (tmpDir) {
+      try { await cleanupDir(tmpDir); } catch (error) { errors.push(error); }
+      tmpDir = null;
+    }
   }
-  if (tmpDir) {
-    await cleanupDir(tmpDir);
-    tmpDir = null;
-  }
+  if (errors.length) throw new AuditCleanupError("HTTP fixture cleanup failed", { cause: new AggregateError(errors) });
 });
 
-function startServe(dbFile: string): Promise<number> {
-  port = 43000 + Math.floor(Math.random() * 10000);
-  return new Promise((resolve, reject) => {
-    // 2.1.13 F6: явный --db вместо MEGAMEMORY_DB_PATH — тест не наследует
-    // окружение; FTS-режим — предмет теста маршруты, модель не тянется.
-    child = spawn(
-      process.execPath,
-      [serveScript, "serve", "--port", String(port), "--db", dbFile],
-      {
-        env: { ...process.env, MEGAMEMORY_SEARCH: "fts", MEGAMEMORY_DB_PATH: "" },
-        stdio: ["ignore", "pipe", "pipe"],
-      }
-    );
-    let out = "";
-    child.stdout?.on("data", (d) => {
-      out += String(d);
-    });
-    child.stderr?.on("data", (d) => {
-      out += String(d);
-    });
-    child.on("exit", (code) => reject(new Error(`serve exited early (${code}): ${out}`)));
-
-    const started = Date.now();
-    const poll = async (): Promise<void> => {
-      while (Date.now() - started < 20000) {
-        try {
-          const res = await fetch(`http://127.0.0.1:${port}/api/stats`);
-          if (res.ok) {
-            resolve(port);
-            return;
-          }
-        } catch {
-          // not up yet
-        }
-        await new Promise((r) => setTimeout(r, 200));
-      }
-      reject(new Error(`serve did not start in 20s: ${out}`));
-    };
-    void poll();
-  });
+async function startServe(dbFile: string): Promise<number> {
+  serverFixture = auditFixture();
+  const server = await startAuditHttp(serverFixture, dbFile);
+  port = server.port;
+  return port;
 }
 
 describe("serve integration", () => {

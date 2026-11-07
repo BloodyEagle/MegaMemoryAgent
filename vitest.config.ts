@@ -43,6 +43,7 @@ export default defineConfig({
       {
         test: {
           name: "db",
+          execArgv: ["--expose-gc"], // libsql releases closed native handles after collection.
           include: ["src/__tests__/**/*.test.ts"],
           exclude: UNIT_FILES.map((f) => `src/__tests__/${f}.test.ts`),
           testTimeout: 15_000,
@@ -51,6 +52,7 @@ export default defineConfig({
       {
         test: {
           name: "integration",
+          execArgv: ["--expose-gc"],
           include: ["tests/integration/**/*.test.ts"],
           testTimeout: 15_000,
         },
