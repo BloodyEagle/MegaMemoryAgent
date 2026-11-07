@@ -52,7 +52,7 @@ import {
   journalSnapshotWrite,
   statusDigestOf,
 } from "./support-baselines.js";
-import { artifactsDigestOf } from "./artifacts.js";
+import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary } from "./stub.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
@@ -1282,7 +1282,11 @@ export async function createConcept(
           confirmed_at: now,
           confirmed_by: "agent",
           // 2.1.3 F2: the confirmed artifacts state at the moment of the call.
-          artifacts_digest: artifactsDigestOf(db.getNodeArtifacts(e.other_id)),
+          // Plan 04 K-11: the ACTIVE observation set only — refs already
+          // withdrawn from the support stay history, not part of the pin.
+          artifacts_digest: artifactsDigestOf(
+            activeArtifactRows(support, db.getNodeArtifacts(e.other_id))
+          ),
         };
         // 2.1.3 F1: the journal is written where the snapshot is written —
         // this carve-out is a first confirmation, so it opens the chain with

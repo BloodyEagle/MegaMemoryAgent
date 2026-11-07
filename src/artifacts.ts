@@ -169,6 +169,35 @@ async function resolveGitRefSha(
 }
 
 /**
+ * Plan 04 K-11: the ACTIVE observation set — observed rows whose ref is still
+ * among the node's current file_refs. Observations of references that have
+ * since been removed from the node stay in node_artifacts as history (their
+ * checked_at/changed_at are kept), but they must not feed the artifacts
+ * digest: the composition of refs is itself versioned evidence, so
+ * withdrawing/replacing the last file_ref changes the digest the confirmed
+ * snapshot holds. Rows are the caller's fetch — the helper only filters.
+ */
+export function activeArtifactRows(
+  node: { file_refs: string | null },
+  rows: NodeArtifactRow[]
+): NodeArtifactRow[] {
+  let refs: string[] = [];
+  if (node.file_refs) {
+    try {
+      const parsed: unknown = JSON.parse(node.file_refs);
+      if (Array.isArray(parsed)) {
+        refs = parsed.filter((r): r is string => typeof r === "string");
+      }
+    } catch {
+      refs = [];
+    }
+  }
+  if (refs.length === 0) return [];
+  const active = new Set(refs);
+  return rows.filter((r) => active.has(r.ref));
+}
+
+/**
  * The combined artifacts digest of a node: sha256 over its observed artifact
  * rows sorted by (kind, ref). A missing row digest contributes the empty
  * string. NULL when the node has no observed artifacts — "nothing observed"
