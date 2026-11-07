@@ -642,6 +642,21 @@ export class MergeEngine {
       result.baselinesCarried = carriedLeft + carriedRight;
     }
 
+    // ---- F-02 (S-03): перенос workflow-состояния ----
+    // Задачи (колонки узлов — выше), слоты, сохранённые цепочки с
+    // отпечатками, артефакты, история статусов, алиасы. Left первым, right
+    // заполняет только отсутствующее; расхождение содержимого — в отчёт
+    // (workflowConflicts), молчаливого удаления нет. Телеметрия
+    // (timeline/usage) не переносится: журнал операций не знание.
+    const workflowLeft = this.carryWorkflowTables(leftDb, outputDb, "left", idRemapping);
+    const workflowRight = this.carryWorkflowTables(rightDb, outputDb, "right", idRemapping);
+    if (workflowLeft.carried + workflowRight.carried > 0) {
+      result.workflowCarried = workflowLeft.carried + workflowRight.carried;
+    }
+    if (workflowLeft.conflicts + workflowRight.conflicts > 0) {
+      result.workflowConflicts = workflowLeft.conflicts + workflowRight.conflicts;
+    }
+
     // ---- PASS 3: re-validate the informed_by DAG over the combined graph ----
     // Plan 3 §2 (invariants 2, 3): two individually-acyclic inputs can form a
     // cycle in their union. A cycle brought in by a merge does NOT abort the
@@ -701,6 +716,9 @@ export class MergeEngine {
       // 2.1.10 (v12): the origin travels with the row (undefined on sources
       // without the column — honestly unknown, never incriminating).
       created_via: node.created_via ?? null,
+      // F-02 (S-03): задача с дедлайном остаётся задачей с дедлайном.
+      task_state: node.task_state ?? null,
+      due_at: node.due_at ?? null,
     });
   }
 
@@ -743,7 +761,230 @@ export class MergeEngine {
       // 2.1.10 (v12): a NEW row written by the MergeEngine itself — the
       // conflict copy is an import product, not an agent node.
       created_via: "import",
+      // F-02 (S-03): состояние задачи каждого варианта едет со своей копией.
+      task_state: node.task_state ?? null,
+      due_at: node.due_at ?? null,
     });
+  }
+
+  /**
+   * F-02 (план 03, S-03): перенос workflow-таблиц — слоты, сохранённые
+   * цепочки с отпечатками участников, артефакты, история статусов, алиасы.
+   * Merge непустой базы с пустой больше не теряет исполнителя роли,
+   * участников цепочки и дедлайн.
+   *
+   * Политика для каждого сгустка детерминирована: left первым, right
+   * заполняет только отсутствующее (PK уже занят — строка не трогается);
+   * расхождение содержимого считается конфликтом и попадает в отчёт
+   * (workflowConflicts), молчаливого удаления нет. node_id перемапливается
+   * на вариант своей стороны; отпечатки участников и временные метки едут
+   * вербатим — «перенести знание» не значит «переподтвердить его».
+   * Телеметрия (timeline, usage) не переносится: это журнал операций,
+   * а не знание.
+   */
+  private carryWorkflowTables(
+    sourceDb: KnowledgeDB,
+    outputDb: KnowledgeDB,
+    side: "left" | "right",
+    idRemapping: Map<string, string>
+  ): { carried: number; conflicts: number } {
+    let carried = 0;
+    let conflicts = 0;
+
+    const hasTable = (name: string): boolean =>
+      sourceDb.execSqlFirst(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        name
+      ) !== undefined;
+
+    const resolveNodeId = (id: string): string => {
+      if (outputDb.getNodeIncludingRemoved(id)) return id;
+      const remapped = idRemapping.get(`${side}:${stripMergeSuffix(id)}`);
+      return remapped ?? id;
+    };
+
+    // Слоты: (project, role) → node_id.
+    if (hasTable("slots")) {
+      const rows = sourceDb.execSqlAll(
+        "SELECT project, role, node_id, updated_at FROM slots"
+      ) as Array<{ project: string; role: string; node_id: string; updated_at: string }>;
+      for (const row of rows) {
+        const nodeId = resolveNodeId(row.node_id);
+        const existing = outputDb.execSqlFirst(
+          "SELECT node_id FROM slots WHERE project = ? AND role = ?",
+          row.project,
+          row.role
+        ) as { node_id: string } | undefined;
+        if (existing) {
+          if (existing.node_id !== nodeId) conflicts++;
+          continue;
+        }
+        outputDb.execSqlRun(
+          "INSERT INTO slots (project, role, node_id, updated_at) VALUES (?, ?, ?, ?)",
+          row.project,
+          row.role,
+          nodeId,
+          row.updated_at
+        );
+        carried++;
+      }
+    }
+
+    // Цепочки и участники: отпечатки остаются как сохранены.
+    if (hasTable("trails")) {
+      const trails = sourceDb.execSqlAll(
+        "SELECT id, name, summary, stale, created_at, updated_at FROM trails"
+      ) as Array<{
+        id: string; name: string; summary: string; stale: number;
+        created_at: string; updated_at: string | null;
+      }>;
+      for (const t of trails) {
+        const existing = outputDb.execSqlFirst(
+          "SELECT name, summary, stale FROM trails WHERE id = ?",
+          t.id
+        ) as { name: string; summary: string; stale: number } | undefined;
+        if (existing) {
+          if (existing.name !== t.name || existing.summary !== t.summary || existing.stale !== t.stale) {
+            conflicts++;
+          }
+          continue;
+        }
+        outputDb.execSqlRun(
+          "INSERT INTO trails (id, name, summary, stale, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+          t.id,
+          t.name,
+          t.summary,
+          t.stale,
+          t.created_at,
+          t.updated_at
+        );
+        carried++;
+      }
+    }
+    if (hasTable("trail_members")) {
+      const members = sourceDb.execSqlAll(
+        "SELECT trail_id, position, node_id, fingerprint FROM trail_members"
+      ) as Array<{ trail_id: string; position: number; node_id: string; fingerprint: string }>;
+      for (const m of members) {
+        const nodeId = resolveNodeId(m.node_id);
+        const existing = outputDb.execSqlFirst(
+          "SELECT node_id, fingerprint FROM trail_members WHERE trail_id = ? AND position = ?",
+          m.trail_id,
+          m.position
+        ) as { node_id: string; fingerprint: string } | undefined;
+        if (existing) {
+          if (existing.node_id !== nodeId || existing.fingerprint !== m.fingerprint) conflicts++;
+          continue;
+        }
+        outputDb.execSqlRun(
+          "INSERT INTO trail_members (trail_id, position, node_id, fingerprint) VALUES (?, ?, ?, ?)",
+          m.trail_id,
+          m.position,
+          nodeId,
+          m.fingerprint
+        );
+        carried++;
+      }
+    }
+
+    // Артефакты: наблюдения внешних источников едут со своей нодой.
+    if (hasTable("node_artifacts")) {
+      const rows = sourceDb.execSqlAll("SELECT * FROM node_artifacts") as Array<Record<string, unknown>>;
+      for (const row of rows) {
+        const nodeId = resolveNodeId(String(row.node_id));
+        const existing = outputDb.execSqlFirst(
+          "SELECT 1 FROM node_artifacts WHERE node_id = ? AND kind = ? AND ref = ?",
+          nodeId,
+          String(row.kind),
+          String(row.ref)
+        );
+        if (existing) {
+          if ((row.digest ?? null) !== ((existing as { digest?: unknown }).digest ?? null)) conflicts++;
+          continue;
+        }
+        outputDb.execSqlRun(
+          `INSERT INTO node_artifacts (node_id, kind, ref, digest, prev_digest, size_bytes, checked_at, changed_at, checked_by, repo_path)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          nodeId,
+          row.kind ?? null,
+          row.ref ?? null,
+          row.digest ?? null,
+          row.prev_digest ?? null,
+          row.size_bytes ?? null,
+          row.checked_at ?? null,
+          row.changed_at ?? null,
+          row.checked_by ?? null,
+          row.repo_path ?? null
+        );
+        carried++;
+      }
+    }
+
+    // История статусов: один и тот же переход на обеих сторонах не дублируется.
+    if (hasTable("status_history")) {
+      const historyHasField = (sourceDb.pragma("table_info(status_history)") as Array<{ name: string }>)
+        .some((c) => c.name === "field");
+      const rows = sourceDb.execSqlAll(
+        historyHasField
+          ? "SELECT node_id, from_status, to_status, reason, field, at FROM status_history"
+          : "SELECT node_id, from_status, to_status, reason, at FROM status_history"
+      ) as Array<Record<string, unknown>>;
+      const seen = new Set<string>();
+      for (const row of rows) {
+        const nodeId = resolveNodeId(String(row.node_id));
+        const field = historyHasField ? String(row.field ?? "status") : "status";
+        const key = JSON.stringify([nodeId, row.from_status, row.to_status, row.reason, field, row.at]);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const duplicate = outputDb.execSqlFirst(
+          "SELECT 1 FROM status_history WHERE node_id = ? AND from_status IS ? AND to_status = ? AND reason IS ? AND field = ? AND at = ?",
+          nodeId,
+          row.from_status ?? null,
+          row.to_status,
+          row.reason ?? null,
+          field,
+          row.at
+        );
+        if (duplicate) continue;
+        outputDb.execSqlRun(
+          "INSERT INTO status_history (node_id, from_status, to_status, reason, field, at) VALUES (?, ?, ?, ?, ?, ?)",
+          nodeId,
+          row.from_status ?? null,
+          row.to_status,
+          row.reason ?? null,
+          field,
+          row.at
+        );
+        carried++;
+      }
+    }
+
+    // Алиасы: новый id перемапливается, старый остаётся разрешимым.
+    if (hasTable("aliases")) {
+      const rows = sourceDb.execSqlAll(
+        "SELECT old_id, new_id, renamed_at FROM aliases"
+      ) as Array<{ old_id: string; new_id: string; renamed_at: string }>;
+      for (const row of rows) {
+        const newId = resolveNodeId(row.new_id);
+        const existing = outputDb.execSqlFirst(
+          "SELECT new_id FROM aliases WHERE old_id = ?",
+          row.old_id
+        ) as { new_id: string } | undefined;
+        if (existing) {
+          if (existing.new_id !== newId) conflicts++;
+          continue;
+        }
+        outputDb.execSqlRun(
+          "INSERT INTO aliases (old_id, new_id, renamed_at) VALUES (?, ?, ?)",
+          row.old_id,
+          newId,
+          row.renamed_at
+        );
+        carried++;
+      }
+    }
+
+    return { carried, conflicts };
   }
 
   /**

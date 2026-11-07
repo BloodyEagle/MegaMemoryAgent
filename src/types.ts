@@ -584,6 +584,18 @@ export interface MergeResult {
    * (confirmed_by rewritten to 'import'). Absent when there was nothing.
    */
   baselinesCarried?: number;
+  /**
+   * F-02 (план 03, S-03): workflow-строки, перенесённые из входов (слоты,
+   * цепочки с участниками, артефакты, история статусов, алиасы). Absent
+   * when there was nothing.
+   */
+  workflowCarried?: number;
+  /**
+   * F-02 (план 03): расхождения workflow-содержимого между входами (слот,
+   * цепочка или алиас с тем же ключом, но другим значением). Не разрешаются
+   * молчаливым удалением — left первым, right заполняет только отсутствующее.
+   */
+  workflowConflicts?: number;
 }
 
 // ---- Provenance tools (plan 3 §4.2) ----
