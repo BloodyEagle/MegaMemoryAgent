@@ -26,6 +26,7 @@ import {
   statusDigestOf,
 } from "./support-baselines.js";
 import { isStubSummary } from "./stub.js";
+import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 
 // ---- Config flags (plan 3 §4.1.3, §11) ----
 
@@ -1254,6 +1255,12 @@ export function provenanceTrace(
           claim_digest: sup ? claimDigestOf(sup.summary) : null,
           status_digest: sup ? statusDigestOf(sup.status, sup.epistemic_status) : null,
           edge_digest: edgeDigestOf(description),
+          // R-04 (plan 04): the ACTIVE observation set of the support — the
+          // value the agent can pin as expected_artifacts_digest, so a
+          // check_artifacts between the read and the confirm is caught.
+          artifacts_digest: sup
+            ? artifactsDigestOf(activeArtifactRows(sup, db.getNodeArtifacts(sid)))
+            : null,
           // 2.1.9 F2: a stub support can never honestly confirm anything —
           // the quality travels next to the digests so the agent sees it
           // before confirming. A missing node is "stub" (nothing to claim).

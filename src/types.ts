@@ -959,6 +959,15 @@ export interface ConfirmSupportsItem {
   expected_status_digest?: string;
   /** The rationale digest as the agent read it. */
   expected_edge_digest: string;
+  /**
+   * R-04 (plan 04): the combined digest of the support's ACTIVE artifact
+   * observations as the agent read them (provenance_trace.supports[] carries
+   * it in artifacts_digest). Optional, but enforced when present: a
+   * check_artifacts by someone else between the read and this confirm
+   * refuses with version_conflict — an observation the agent never read is
+   * never confirmed.
+   */
+  expected_artifacts_digest?: string | null;
 }
 
 export interface ConfirmSupportsInput {
@@ -1039,6 +1048,14 @@ export interface ProvenanceSupportDigest {
   claim_digest: string | null;
   status_digest: string | null;
   edge_digest: string;
+  /**
+   * R-04 (plan 04): the combined digest of the support's ACTIVE artifact
+   * observations (the last explicit check_artifacts, filtered to refs still
+   * in file_refs). null = nothing observed. The value to pass into
+   * confirm_supports as expected_artifacts_digest when the agent wants the
+   * artifact state pinned to what it read.
+   */
+  artifacts_digest: string | null;
   /**
    * 2.1.9 F2: "stub" — the support's summary is a template / too short to be
    * a claim (it can never honestly confirm anything); "claim" — a real

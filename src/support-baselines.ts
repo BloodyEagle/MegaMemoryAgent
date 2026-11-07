@@ -622,6 +622,28 @@ export function confirmSupports(
             `(ожидался ${item.expected_edge_digest.slice(0, 12)}…, текущий ${currentEdgeDigest.slice(0, 12)}…)`
         );
       }
+      // R-04 (plan 04): the artifact observation gets the same treatment as
+      // the textual axes — when the agent pins the version it read, a
+      // check_artifacts by someone else between the read and this confirm
+      // refuses instead of confirming an unread observation.
+      const currentArtifactsDigest = artifactsDigestOf(
+        activeArtifactRows(support, db.getNodeArtifacts(supportId))
+      );
+      if (item.expected_artifacts_digest !== undefined) {
+        if (item.expected_artifacts_digest !== null && typeof item.expected_artifacts_digest !== "string") {
+          mismatches.push(
+            `опора "${supportId}": expected_artifacts_digest должен быть строкой или null — подтверждать можно ` +
+              `только прочитанное состояние наблюдений (перечитай опору через provenance_trace.supports[] и повтори)`
+          );
+        } else if (item.expected_artifacts_digest !== currentArtifactsDigest) {
+          mismatches.push(
+            `опора "${supportId}": наблюдения артефактов изменились с момента чтения ` +
+              `(ожидался ${item.expected_artifacts_digest === null ? "null" : item.expected_artifacts_digest.slice(0, 12) + "…"}, ` +
+              `текущий ${currentArtifactsDigest === null ? "null" : currentArtifactsDigest.slice(0, 12) + "…"}) — ` +
+              `между чтением и подтверждением кто-то вызвал check_artifacts`
+          );
+        }
+      }
       planned.push({
         edgeId: edge.id,
         auto: (edge as EdgeRow).created_via === "auto",
@@ -640,9 +662,7 @@ export function confirmSupports(
           // NULL when nothing was observed: no signal until a check exists.
           // Plan 04 K-11: the ACTIVE set only — refs withdrawn from the node
           // before the confirmation do not pin the snapshot.
-          artifacts_digest: artifactsDigestOf(
-            activeArtifactRows(support, db.getNodeArtifacts(supportId))
-          ),
+          artifacts_digest: currentArtifactsDigest,
         },
       });
     }
