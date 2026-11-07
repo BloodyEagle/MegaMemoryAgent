@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import fs from "node:fs";
 import { KnowledgeDB } from "./db.js";
 import { ensureSchema } from "./migrate-schema.js";
 import type { NodeRow, EdgeRow, MergeResult } from "./types.js";
@@ -113,15 +114,42 @@ export class MergeEngine {
     const leftLabel = options?.leftLabel ?? "left";
     const rightLabel = options?.rightLabel ?? "right";
 
+    // S-04: output публикуется атомарно. Новый файл собирается в памяти и
+    // выгружается одним VACUUM INTO — провал merge вообще не создаёт
+    // outputPath. Для существующего output (--into) атомарность даёт
+    // транзакция: откат оставляет файл байт-в-байт прежним.
+    const existedBefore = fs.existsSync(outputPath);
     const leftDb = new KnowledgeDB(leftPath);
     const rightDb = new KnowledgeDB(rightPath);
-    const outputDb = new KnowledgeDB(outputPath);
+    const outputDb = new KnowledgeDB(existedBefore ? outputPath : ":memory:");
     // Б10: the merged output must carry the fork schema (status/valid_from/
     // valid_until), otherwise lifecycle data is dropped during branch merges.
     ensureSchema(outputDb);
 
     try {
-      return this.performMerge(leftDb, rightDb, outputDb, leftLabel, rightLabel);
+      const result = outputDb.runInTransaction(() => {
+        // S-04: порядок записи родители-до-дети больше не нужен — проверки
+        // FK отложены до COMMIT, поэтому повреждённый родитель из импорта
+        // валит весь merge, а не одну вставку.
+        outputDb.pragma("defer_foreign_keys = ON");
+        const result = this.performMerge(leftDb, rightDb, outputDb, leftLabel, rightLabel);
+        // Явная проверка даёт внятное сообщение вместо общего сбоя COMMIT.
+        const violations = outputDb.pragma("foreign_key_check") as Array<unknown>;
+        if (violations.length > 0) {
+          throw new Error(
+            `Merge rejected: the merged graph has ${violations.length} foreign key violation(s) ` +
+              `(first: ${JSON.stringify(violations[0])}) — fix the source and retry. Nothing was published.`
+          );
+        }
+        return result;
+      });
+      if (!existedBefore) {
+        // Публикация готового снимка: VACUUM INTO вне транзакции пишет
+        // полный файл целиком — частичный output невозможен, файл никем
+        // не держится открытым (rename после close на Windows держит EBUSY).
+        outputDb.execSqlRun("VACUUM INTO ?", outputPath);
+      }
+      return result;
     } finally {
       leftDb.close();
       rightDb.close();
@@ -204,12 +232,8 @@ export class MergeEngine {
 
     const now = new Date().toISOString().replace("T", " ").replace("Z", "");
 
-    // Track which IDs were suffixed (for edge remapping)
-    const idRemapping = new Map<string, string>(); // "side:originalId" → suffixedId
-
-    // Deferred edge operations — we insert all nodes first, then edges,
-    // to avoid FOREIGN KEY constraint failures when edges reference nodes
-    // that haven't been inserted yet.
+    // Deferred edge operations — nodes are inserted first, then edges, so a
+    // deferred edge never references a node that has not been inserted yet.
     type DeferredEdge = {
       from_id: string;
       to_id: string;
@@ -233,14 +257,7 @@ export class MergeEngine {
       accepted_at: string | null;
     };
     const deferredEdges: DeferredEdge[] = [];
-    const insertedNodeIds = new Set<string>();
     const seenPreexistingEdgeKeys = new Set<string>();
-
-    const insertNodeOnce = (node: NodeRow): void => {
-      if (insertedNodeIds.has(node.id)) return;
-      this.insertNodeAsIs(outputDb, node);
-      insertedNodeIds.add(node.id);
-    };
 
     const deferPreexistingEdge = (
       e: EdgeRow,
@@ -278,10 +295,21 @@ export class MergeEngine {
       });
     };
 
-    // ---- PASS 1: Insert all nodes ----
+    // ---- PASS 0: план идентичностей ДО любой записи (S-04) ----
+    // Какая копия станет ::left/::right, какая останется чистой — решается
+    // сразу для всех canonical id, поэтому parent_id ребёнка можно
+    // перемапить на вариант своего родителя ещё до вставки, даже если
+    // родитель идёт позже ребёнка в порядке входов.
 
-    // Track which canonical IDs were processed as conflicts vs clean
+    type NodeDecision =
+      | { kind: "only"; row: NodeRow; side: "left" | "right"; finalId: string }
+      | { kind: "identical"; row: NodeRow; finalId: string }
+      | { kind: "conflict"; left: NodeRow; right: NodeRow; mergeGroup: string }
+      | { kind: "preexisting"; rows: Array<{ row: NodeRow; side: "left" | "right" }> };
+
+    const decisions = new Map<string, NodeDecision>();
     const conflictIds = new Set<string>();
+    const idRemapping = new Map<string, string>(); // "side:canonicalId" → suffixedId
 
     for (const id of allIds) {
       const leftVariants = leftVariantsByCanonical.get(id) ?? [];
@@ -289,7 +317,7 @@ export class MergeEngine {
       const leftNode = leftNodeMap.get(id);
       const rightNode = rightNodeMap.get(id);
 
-      // Handle pre-existing conflicts (nodes already have ::left/::right IDs from prior merge).
+      // Pre-existing conflicts (nodes already carry ::left/::right from a prior merge).
       const preexistingLeft = leftVariants.filter(
         (n) => n.needs_merge === 1 && !!n.merge_group && hasMergeSuffix(n.id)
       );
@@ -298,14 +326,19 @@ export class MergeEngine {
       );
 
       if (preexistingLeft.length > 0 || preexistingRight.length > 0) {
+        // Все неразрешённые копии едут как есть. Первая сторона выигрывает id
+        // при вставке, но в решении остаются ВСЕ копии — рёбра каждой должны
+        // переехать, иначе tombstone одной стороны потеряется (S-05).
+        decisions.set(id, {
+          kind: "preexisting",
+          rows: [
+            ...preexistingLeft.map((row) => ({ row, side: "left" as const })),
+            ...preexistingRight.map((row) => ({ row, side: "right" as const })),
+          ],
+        });
+
+        // Clean nodes remap onto a valid conflicted target.
         const preexistingAll = [...preexistingLeft, ...preexistingRight];
-
-        // Carry forward all unresolved versions as-is.
-        for (const node of preexistingAll) {
-          insertNodeOnce(node);
-        }
-
-        // Ensure edges from clean nodes can still remap to a valid conflicted target.
         const leftTarget =
           preexistingAll.find((n) => n.id.endsWith(MERGE_SUFFIX_LEFT)) ??
           preexistingAll[0];
@@ -317,110 +350,143 @@ export class MergeEngine {
         if (leftTarget) idRemapping.set(`left:${id}`, leftTarget.id);
         if (rightTarget) idRemapping.set(`right:${id}`, rightTarget.id);
 
-        // Carry forward outgoing edges from conflicted source nodes.
-        for (const node of preexistingLeft) {
-          const edges = leftEdgeMap.get(node.id) ?? [];
-          for (const e of edges) {
-            deferPreexistingEdge(e, "left");
-          }
-        }
-        for (const node of preexistingRight) {
-          const edges = rightEdgeMap.get(node.id) ?? [];
-          for (const e of edges) {
-            deferPreexistingEdge(e, "right");
-          }
-        }
-
         conflictIds.add(id);
         continue;
       }
 
       if (!leftNode && rightNode) {
-        // Only in right
-        insertNodeOnce(rightNode);
-        if (rightNode.removed_at) {
-          result.removedClean++;
-        } else {
-          result.clean++;
-        }
+        decisions.set(id, { kind: "only", row: rightNode, side: "right", finalId: id });
+        if (rightNode.removed_at) result.removedClean++;
+        else result.clean++;
       } else if (leftNode && !rightNode) {
-        // Only in left
-        insertNodeOnce(leftNode);
-        if (leftNode.removed_at) {
-          result.removedClean++;
-        } else {
-          result.clean++;
-        }
+        decisions.set(id, { kind: "only", row: leftNode, side: "left", finalId: id });
+        if (leftNode.removed_at) result.removedClean++;
+        else result.clean++;
       } else if (leftNode && rightNode) {
         if (nodesAreIdentical(leftNode, rightNode)) {
-          // Identical — keep left's copy
-          insertNodeOnce(leftNode);
-          if (leftNode.removed_at) {
-            result.removedClean++;
-          } else {
-            result.clean++;
-          }
+          // Identical — left's copy is the keeper.
+          decisions.set(id, { kind: "identical", row: leftNode, finalId: id });
+          if (leftNode.removed_at) result.removedClean++;
+          else result.clean++;
         } else {
-          // Conflict — insert both with suffixed IDs
-          conflictIds.add(id);
+          // Conflict — both copies with suffixed ids and a fresh group.
           const mergeGroup = randomUUID();
           result.mergeGroups.push(mergeGroup);
           result.conceptConflicts++;
+          conflictIds.add(id);
+          idRemapping.set(`left:${id}`, `${id}${MERGE_SUFFIX_LEFT}`);
+          idRemapping.set(`right:${id}`, `${id}${MERGE_SUFFIX_RIGHT}`);
+          decisions.set(id, { kind: "conflict", left: leftNode, right: rightNode, mergeGroup });
+        }
+      }
+    }
 
-          const leftSuffixed = `${id}${MERGE_SUFFIX_LEFT}`;
-          const rightSuffixed = `${id}${MERGE_SUFFIX_RIGHT}`;
+    // ---- PASS 0b: финальные строки — parent_id перемаплен на вариант своей стороны ----
+    const remapParent = (
+      parentId: string | null,
+      side: "left" | "right"
+    ): string | null => {
+      if (!parentId) return null;
+      const canonical = stripMergeSuffix(parentId);
+      if (!conflictIds.has(canonical)) return parentId;
+      return (
+        idRemapping.get(`${side}:${canonical}`) ??
+        idRemapping.get(`${side === "left" ? "right" : "left"}:${canonical}`) ??
+        parentId
+      );
+    };
 
-          idRemapping.set(`left:${id}`, leftSuffixed);
-          idRemapping.set(`right:${id}`, rightSuffixed);
+    const insertedNodeIds = new Set<string>();
+    const insertPlanned = (row: NodeRow): void => {
+      if (insertedNodeIds.has(row.id)) return;
+      this.insertNodeAsIs(outputDb, row);
+      insertedNodeIds.add(row.id);
+    };
 
-          this.insertConflictNode(outputDb, leftNode, leftSuffixed, mergeGroup, leftLabel, now);
-          this.insertConflictNode(outputDb, rightNode, rightSuffixed, mergeGroup, rightLabel, now);
+    for (const [id, d] of decisions) {
+      if (d.kind === "only") {
+        insertPlanned({ ...d.row, id: d.finalId, parent_id: remapParent(d.row.parent_id, d.side) });
+      } else if (d.kind === "identical") {
+        insertPlanned({ ...d.row, id: d.finalId, parent_id: remapParent(d.row.parent_id, "left") });
+      } else if (d.kind === "conflict") {
+        this.insertConflictNode(
+          outputDb,
+          { ...d.left, parent_id: remapParent(d.left.parent_id, "left") },
+          `${id}${MERGE_SUFFIX_LEFT}`,
+          d.mergeGroup,
+          leftLabel,
+          now
+        );
+        insertedNodeIds.add(`${id}${MERGE_SUFFIX_LEFT}`);
+        this.insertConflictNode(
+          outputDb,
+          { ...d.right, parent_id: remapParent(d.right.parent_id, "right") },
+          `${id}${MERGE_SUFFIX_RIGHT}`,
+          d.mergeGroup,
+          rightLabel,
+          now
+        );
+        insertedNodeIds.add(`${id}${MERGE_SUFFIX_RIGHT}`);
+      } else {
+        for (const { row, side } of d.rows) {
+          insertPlanned({ ...row, parent_id: remapParent(row.parent_id, side) });
+        }
+      }
+    }
 
-          // Defer edge handling for conflicting nodes
-          const leftNodeEdges = leftEdgeMap.get(id) ?? [];
-          const rightNodeEdges = rightEdgeMap.get(id) ?? [];
-          const edgesConflict = !edgeSetsAreIdentical(leftNodeEdges, rightNodeEdges);
+    // ---- Отложенные рёбра конфликтных и pre-existing веток ----
+    for (const [id, d] of decisions) {
+      if (d.kind === "conflict") {
+        const leftNodeEdges = leftEdgeMap.get(id) ?? [];
+        const rightNodeEdges = rightEdgeMap.get(id) ?? [];
+        const edgesConflict = !edgeSetsAreIdentical(leftNodeEdges, rightNodeEdges);
 
-          if (edgesConflict && (leftNodeEdges.length > 0 || rightNodeEdges.length > 0)) {
-            result.edgeConflicts++;
-          }
+        if (edgesConflict && (leftNodeEdges.length > 0 || rightNodeEdges.length > 0)) {
+          result.edgeConflicts++;
+        }
 
-          for (const e of leftNodeEdges) {
-            deferredEdges.push({
-              from_id: leftSuffixed,
-              to_id: e.to_id, // will be remapped in pass 2
-              relation: e.relation,
-              description: e.description,
-              created_at: e.created_at,
-              merge_group: edgesConflict ? mergeGroup : null,
-              needs_merge: edgesConflict ? 1 : 0,
-              source_branch: edgesConflict ? leftLabel : null,
-              merge_timestamp: edgesConflict ? now : null,
-              removed_at: e.removed_at ?? null,
-              _originSide: "left",
-              _srcEdgeIds: [{ side: "left", id: e.id }],
-              created_via: e.created_via ?? "unknown",
-              accepted_at: e.accepted_at ?? null,
-            });
-          }
+        for (const e of leftNodeEdges) {
+          deferredEdges.push({
+            from_id: `${id}${MERGE_SUFFIX_LEFT}`,
+            to_id: e.to_id, // will be remapped in pass 2
+            relation: e.relation,
+            description: e.description,
+            created_at: e.created_at,
+            merge_group: edgesConflict ? d.mergeGroup : null,
+            needs_merge: edgesConflict ? 1 : 0,
+            source_branch: edgesConflict ? leftLabel : null,
+            merge_timestamp: edgesConflict ? now : null,
+            removed_at: e.removed_at ?? null,
+            _originSide: "left",
+            _srcEdgeIds: [{ side: "left", id: e.id }],
+            created_via: e.created_via ?? "unknown",
+            accepted_at: e.accepted_at ?? null,
+          });
+        }
 
-          for (const e of rightNodeEdges) {
-            deferredEdges.push({
-              from_id: rightSuffixed,
-              to_id: e.to_id, // will be remapped in pass 2
-              relation: e.relation,
-              description: e.description,
-              created_at: e.created_at,
-              merge_group: edgesConflict ? mergeGroup : null,
-              needs_merge: edgesConflict ? 1 : 0,
-              source_branch: edgesConflict ? rightLabel : null,
-              merge_timestamp: edgesConflict ? now : null,
-              removed_at: e.removed_at ?? null,
-              _originSide: "right",
-              _srcEdgeIds: [{ side: "right", id: e.id }],
-              created_via: e.created_via ?? "unknown",
-              accepted_at: e.accepted_at ?? null,
-            });
+        for (const e of rightNodeEdges) {
+          deferredEdges.push({
+            from_id: `${id}${MERGE_SUFFIX_RIGHT}`,
+            to_id: e.to_id, // will be remapped in pass 2
+            relation: e.relation,
+            description: e.description,
+            created_at: e.created_at,
+            merge_group: edgesConflict ? d.mergeGroup : null,
+            needs_merge: edgesConflict ? 1 : 0,
+            source_branch: edgesConflict ? rightLabel : null,
+            merge_timestamp: edgesConflict ? now : null,
+            removed_at: e.removed_at ?? null,
+            _originSide: "right",
+            _srcEdgeIds: [{ side: "right", id: e.id }],
+            created_via: e.created_via ?? "unknown",
+            accepted_at: e.accepted_at ?? null,
+          });
+        }
+      } else if (d.kind === "preexisting") {
+        for (const { row, side } of d.rows) {
+          const edges = (side === "left" ? leftEdgeMap : rightEdgeMap).get(row.id) ?? [];
+          for (const e of edges) {
+            deferPreexistingEdge(e, side);
           }
         }
       }
