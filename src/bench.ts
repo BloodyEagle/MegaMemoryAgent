@@ -536,8 +536,11 @@ export async function runBench(
   // F3: the git root is one lookup per run, not per question.
   const resolveGitRoot = opts.resolveGitRoot ?? defaultResolveGitRoot;
   const gitRoot = await resolveGitRoot(root);
-  // F3: ref → resolved absolute path, cached for the whole run so the same
-  // ref is not re-statted 14 times. First root to hit wins, deterministically.
+  // F3, уточнено планом 06 (C-05): (цепочка корней, ref) → разрешённый
+  // абсолютный путь, кэш на весь прогон. Ключ включает ЦЕПОЧКУ корней
+  // вопроса: один и тот же ref в разных проектах обязан разрешаться
+  // по-разному (1/100 в прямом и обратном порядке вопросов), а miss по
+  // одной цепочке не отравляет следующий вопрос с другой цепочкой.
   const refCache = new Map<string, { abs: string | null; label: RefRootLabel }>();
 
   const results: QuestionResult[] = [];
@@ -549,6 +552,10 @@ export async function runBench(
     const timeToGraphMs = performance.now() - t0;
     const graphTokens = r.meta?.tokens_estimated ?? 0;
     const matches = r.compact ?? [];
+    // План 06 (K-03): tokens_estimated честный — пустой ответ стоит конверт.
+    // «Граф-ответа нет» теперь значит «в выдаче нет узлов», не «ноль токенов».
+    const hasGraphAnswer =
+      matches.length > 0 || (r.refuted?.length ?? 0) > 0 || (r.matches?.length ?? 0) > 0;
     const ids = matches.map((m) => m.id);
     // 2.1.7 F3: nested supports are part of the answer — the rank space is
     // the union: top level in output order, a folded support at its
@@ -604,12 +611,16 @@ export async function runBench(
         }
       }
 
-      // F2: split the :line suffix, then F3: resolve against the root chain
+      // F2: split the :line suffix, then F3: resolve against the root chain.
+      // План 06 (C-05): ключ кэша — вся цепочка корней этого вопроса плюс
+      // ref; baseline инвариантен к порядку вопросов.
+      const chainKey = chain.map((entry) => entry.dir).join("::");
       const resolved: { ref: string; clean: string; abs: string | null }[] = [];
       for (const ref of refOrder) {
         const { path: clean, suffix } = splitRefSuffix(ref);
         if (suffix) lineRefs += 1;
-        const cached = refCache.get(ref);
+        const cacheKey = `${chainKey}::${ref}`;
+        const cached = refCache.get(cacheKey);
         if (cached) {
           resolved.push({ ref, clean, abs: cached.abs });
           continue;
@@ -620,13 +631,13 @@ export async function runBench(
           try {
             fs.statSync(candidate);
             abs = candidate;
-            refCache.set(ref, { abs, label: rootEntry.label });
+            refCache.set(cacheKey, { abs, label: rootEntry.label });
             break;
           } catch {
             // try the next root
           }
         }
-        if (abs === null) refCache.set(ref, { abs: null, label: "cwd" });
+        if (abs === null) refCache.set(cacheKey, { abs: null, label: "cwd" });
         resolved.push({ ref, clean, abs });
       }
 
@@ -745,10 +756,14 @@ export async function runBench(
       baseline_files_tokens: baselineFiles,
       baseline_files_top_tokens: baselineFilesTop,
       baseline_te_tokens: baselineTe,
-      ratio_files: baselineFiles !== null ? ratio(baselineFiles, graphTokens) : null,
+      ratio_files:
+        hasGraphAnswer && baselineFiles !== null ? ratio(baselineFiles, graphTokens) : null,
       ratio_files_top:
-        baselineFilesTop !== null ? ratio(baselineFilesTop, graphTokens) : null,
-      ratio_te: baselineTe !== null ? ratio(baselineTe, graphTokens) : null,
+        hasGraphAnswer && baselineFilesTop !== null
+          ? ratio(baselineFilesTop, graphTokens)
+          : null,
+      ratio_te:
+        hasGraphAnswer && baselineTe !== null ? ratio(baselineTe, graphTokens) : null,
       estimated,
       missing_files: missing,
       line_refs: lineRefs,

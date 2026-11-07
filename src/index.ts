@@ -37,8 +37,10 @@ const cmd = process.argv[2];
 switch (cmd) {
   case "install": {
     const { runInstall } = await import("./install.js");
-    await runInstall(process.argv.slice(3));
-    process.exit(0);
+    // План 06 (C-01): провал критического шага настройки — неуспех процесса,
+    // а не exit(0): CI и скрипты обязаны видеть, что установка не прошла.
+    const outcome = await runInstall(process.argv.slice(3));
+    process.exit(outcome.ok ? 0 : 1);
     break;
   }
 
@@ -322,6 +324,10 @@ async function startMcpServer() {
     },
     async (params) => {
       try {
+        // План 06 (K-03): instructions_status едет в budget как extra_payload —
+        // оценка функции считается по тому же wire-ответу, который обработчик
+        // реально отправляет (см. сериализатор в understand).
+        const instructions = instructionsStatus(VERSION);
         const result = await understand(db, {
           query: params.query,
           top_k: params.top_k,
@@ -329,6 +335,7 @@ async function startMcpServer() {
           mode: params.mode,
           include_inactive: params.include_inactive,
           include_stale: params.include_stale,
+          extra_payload: { ...instructions },
         });
         const returned = result.meta?.returned ?? result.matches.length;
         const ids = result.compact
@@ -346,7 +353,7 @@ async function startMcpServer() {
         // already reads — it cannot see stderr.
         return {
           content: [
-            { type: "text" as const, text: JSON.stringify({ ...result, ...instructionsStatus(VERSION) }, null, 2) },
+            { type: "text" as const, text: JSON.stringify({ ...result, ...instructions }, null, 2) },
           ],
         };
       } catch (err) {

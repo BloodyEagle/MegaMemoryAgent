@@ -105,7 +105,10 @@ describe("megamemory bench (2.1.5 F3)", () => {
     ];
     const report = await runBench(db, questions, opts());
     const q = report.questions[0];
-    expect(q.graph_tokens).toBe(0);
+    // План 06 (K-03): оценка честная — пустой ответ стоит конверт+meta
+    // (~130 токенов), нулём он больше не притворяется.
+    expect(q.graph_tokens).toBeGreaterThan(0);
+    expect(q.graph_tokens).toBeLessThanOrEqual(200);
     expect(q.ratio_files).toBeNull();
     expect(q.hit).toBe(false);
     expect(report.hit_rate).toBe(0);
