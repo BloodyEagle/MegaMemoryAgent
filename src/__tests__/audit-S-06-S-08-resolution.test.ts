@@ -94,4 +94,40 @@ describe("S-08 consolidation validates distinct live identities", () => {
     expect(() => mergeNodes(db, "survivor", "other")).toThrow();
     expect(sqlState(db)).toEqual(afterMerge);
   });
+
+  // F-03 (план 03): участники workflow не теряются молча вместе с дублем.
+  it("moves children, slot, trail membership and task state to the survivor", () => {
+    const db = database("workflow.db");
+    addNode(db, "survivor", { summary: "First wording" });
+    addNode(db, "other", { kind: "task", summary: "Second wording" });
+    addNode(db, "child", { parent_id: "other" });
+    addNode(db, "peer", { kind: "fact" });
+    db.setTaskState("other", "open", "2030-06-01");
+    db.setSlot("project", "handoff", "other");
+    db.insertTrail({ id: "trail", name: "Chain", summary: "Saved reasoning", node_ids: ["peer", "other"] });
+    const savedMembers = db.getTrailMembers("trail");
+
+    expect(mergeNodes(db, "survivor", "other")).toEqual({ survivor: "survivor", removed: "other" });
+
+    const survivor = db.getNode("survivor")!;
+    expect(survivor.task_state).toBe("open");
+    expect(survivor.due_at).toBe("2030-06-01");
+    expect(db.getNode("child")?.parent_id).toBe("survivor");
+    expect(db.getSlot("project", "handoff")?.node_id).toBe("survivor");
+    expect(db.getTrailMembers("trail")).toEqual(
+      savedMembers.map((m) => ({ ...m, node_id: m.node_id === "other" ? "survivor" : m.node_id }))
+    );
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("rejects consolidation into a descendant without changing the graph", () => {
+    const db = database("cycle.db");
+    addNode(db, "root", { summary: "Root" });
+    addNode(db, "mid", { parent_id: "root" });
+    addNode(db, "leaf", { parent_id: "mid" });
+    const before = sqlState(db);
+
+    expect(() => mergeNodes(db, "leaf", "root")).toThrow(/cycle/i);
+    expect(sqlState(db)).toEqual(before);
+  });
 });

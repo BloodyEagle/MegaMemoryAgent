@@ -131,6 +131,126 @@ export interface MergeNodesResult {
 }
 
 /**
+ * F-03 (план 03, S-08): self-consolidation and dead participants are rejected
+ * BEFORE the transaction — `mergeNodes(db, 'only', 'only')` used to pass both
+ * lookups, "merge" the node into itself and then hard-delete it.
+ */
+function assertConsolidatable(
+  db: KnowledgeDB,
+  survivorId: string,
+  otherId: string
+): void {
+  if (survivorId === otherId) {
+    throw new Error(
+      `Cannot consolidate "${survivorId}" into itself — survivor and duplicate must be distinct live nodes.`
+    );
+  }
+  const survivor = db.getNode(survivorId);
+  const other = db.getNodeIncludingRemoved(otherId);
+  if (!survivor || !other) {
+    throw new Error(`Cannot merge: node not found (${survivorId} / ${otherId}).`);
+  }
+  if (survivor.removed_at !== null || other.removed_at !== null) {
+    const state = (n: NodeRow) => (n.removed_at !== null ? "removed" : "live");
+    throw new Error(
+      `Cannot merge: both nodes must be alive ` +
+        `(${survivorId}: ${state(survivor)}, ${otherId}: ${state(other)}).`
+    );
+  }
+}
+
+/**
+ * F-03 (план 03): перенос workflow-состояния удаляемого узла на выжившего.
+ * Дети, слоты, участники сохранённых цепочек, артефакты, снимки опор и
+ * алиасы не должны исчезать молча вместе с узлом (FK обнулил бы детей,
+ * слот и членство в цепочке потеряли бы исполнителя). Рёбра не трогаются:
+ * их переносит вызывающая сторона, которая знает, живут ли копии.
+ *
+ * Снимки опор (support_baselines) без OR IGNORE-коллизии переезжают на
+ * выжившего; несместившиеся строки остаются с id удалённого узла как явное
+ * свидетельство утраты — таблица без FK и существует именно для этого.
+ * Задача: состояние выжившего приоритетно, дубликат заполняет только пустое.
+ */
+export function transferNodeIdentity(
+  db: KnowledgeDB,
+  fromId: string,
+  toId: string
+): void {
+  // Survivor inside the removed node's subtree would turn the subtree into a
+  // parent cycle — refuse the whole operation instead of corrupting the hierarchy.
+  let cursor: NodeRow | undefined = db.getNodeIncludingRemoved(toId);
+  const seen = new Set<string>();
+  while (cursor?.parent_id) {
+    if (cursor.parent_id === fromId || seen.has(cursor.parent_id)) {
+      throw new Error(
+        `Cannot merge "${fromId}" into "${toId}": the survivor lies inside the removed node's subtree — the hierarchy would become a cycle.`
+      );
+    }
+    seen.add(cursor.parent_id);
+    cursor = db.getNodeIncludingRemoved(cursor.parent_id);
+  }
+
+  db.execSqlRun(
+    "UPDATE nodes SET parent_id = ?, updated_at = datetime('now') WHERE parent_id = ? AND id != ?",
+    toId,
+    fromId,
+    toId
+  );
+  db.execSqlRun(
+    "UPDATE slots SET node_id = ?, updated_at = datetime('now') WHERE node_id = ?",
+    toId,
+    fromId
+  );
+  // Fingerprints travel verbatim: the saved reasoning stays as saved; the
+  // staleness check is trail_refresh's explicit job, not a silent rewrite.
+  db.execSqlRun(
+    "UPDATE trail_members SET node_id = ? WHERE node_id = ?",
+    toId,
+    fromId
+  );
+  // OR IGNORE: a colliding observation (node_id, kind, ref) means the survivor
+  // already tracks that artifact — the duplicate row is the same observation,
+  // the leftover is removed with the node.
+  db.execSqlRun(
+    "UPDATE OR IGNORE node_artifacts SET node_id = ? WHERE node_id = ?",
+    toId,
+    fromId
+  );
+  db.execSqlRun("DELETE FROM node_artifacts WHERE node_id = ?", fromId);
+  db.execSqlRun(
+    "UPDATE OR IGNORE support_baselines SET decision_id = ? WHERE decision_id = ?",
+    toId,
+    fromId
+  );
+  db.execSqlRun(
+    "UPDATE OR IGNORE support_baselines SET support_id = ? WHERE support_id = ?",
+    toId,
+    fromId
+  );
+  db.execSqlRun(
+    "UPDATE aliases SET new_id = ? WHERE new_id = ?",
+    toId,
+    fromId
+  );
+
+  const survivor = db.getNode(toId);
+  const from = db.getNodeIncludingRemoved(fromId);
+  if (
+    survivor &&
+    from &&
+    (survivor.task_state ?? null) === null &&
+    (from.task_state ?? null) !== null
+  ) {
+    db.execSqlRun(
+      "UPDATE nodes SET task_state = ?, due_at = ?, updated_at = datetime('now') WHERE id = ?",
+      from.task_state,
+      from.due_at,
+      toId
+    );
+  }
+}
+
+/**
  * Merge node `other` into `survivor`: combine summary/why/file_refs, move
  * edges, hard-delete the other node. Caller decides which one survives —
  * findDuplicates marks the older one.
@@ -140,11 +260,11 @@ export function mergeNodes(
   survivorId: string,
   otherId: string
 ): MergeNodesResult {
-  const survivor = db.getNode(survivorId);
-  const other = db.getNodeIncludingRemoved(otherId);
-  if (!survivor || !other) {
-    throw new Error(`Cannot merge: node not found (${survivorId} / ${otherId}).`);
-  }
+  // S-08: до транзакции — самослияние и мёртвые участники отвергаются без
+  // единой записи; повторный запрос по уже удалённому узлу тоже сюда попадает.
+  assertConsolidatable(db, survivorId, otherId);
+  const survivor = db.getNode(survivorId)!;
+  const other = db.getNodeIncludingRemoved(otherId)!;
 
   db.runInTransaction(() => {
     // Combine summary (skip when identical or already contained).
@@ -207,6 +327,10 @@ export function mergeNodes(
         via: "unknown",
       });
     }
+
+    // F-03: дети, слоты, цепочки, артефакты, снимки и алиасы следуют за
+    // выжившим — участники не теряются молча вместе с дублем.
+    transferNodeIdentity(db, otherId, survivorId);
 
     // hardDeleteNode removes remaining edges of the other node.
     db.hardDeleteNode(otherId);
