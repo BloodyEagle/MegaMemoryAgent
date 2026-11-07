@@ -169,6 +169,35 @@ async function resolveGitRefSha(
 }
 
 /**
+ * Plan 04 K-11: the ACTIVE observation set — observed rows whose ref is still
+ * among the node's current file_refs. Observations of references that have
+ * since been removed from the node stay in node_artifacts as history (their
+ * checked_at/changed_at are kept), but they must not feed the artifacts
+ * digest: the composition of refs is itself versioned evidence, so
+ * withdrawing/replacing the last file_ref changes the digest the confirmed
+ * snapshot holds. Rows are the caller's fetch — the helper only filters.
+ */
+export function activeArtifactRows(
+  node: { file_refs: string | null },
+  rows: NodeArtifactRow[]
+): NodeArtifactRow[] {
+  let refs: string[] = [];
+  if (node.file_refs) {
+    try {
+      const parsed: unknown = JSON.parse(node.file_refs);
+      if (Array.isArray(parsed)) {
+        refs = parsed.filter((r): r is string => typeof r === "string");
+      }
+    } catch {
+      refs = [];
+    }
+  }
+  if (refs.length === 0) return [];
+  const active = new Set(refs);
+  return rows.filter((r) => active.has(r.ref));
+}
+
+/**
  * The combined artifacts digest of a node: sha256 over its observed artifact
  * rows sorted by (kind, ref). A missing row digest contributes the empty
  * string. NULL when the node has no observed artifacts — "nothing observed"
@@ -211,7 +240,12 @@ export async function checkArtifacts(
       `check_artifacts: max_files должен быть целым ≥ 1, получено: ${String(input.max_files)}.`
     );
   }
-  const cwd = input.cwd ?? process.cwd();
+  // R-04 (plan 04): an explicitly passed cwd is the override — it re-pins the
+  // root on the observation rows. When not passed, the pinned root wins, so
+  // one raw ref cannot silently switch files or repositories between checks
+  // (git:-refs were pinned this way since 2.1.12; file refs are pinned now).
+  const explicitCwd = input.cwd ?? null;
+  const cwd = explicitCwd ?? process.cwd();
 
   const output: CheckArtifactsOutput = { checked: 0, changed: [], missing: [], truncated: false };
   const now = new Date().toISOString();
@@ -243,13 +277,19 @@ export async function checkArtifacts(
       // 2.1.12 F2: репозиторий для git:-ref — явный input.repo, затем
       // закреплённый на строке (первое разрешение), затем каталог базы.
       // Решение пишется обратно в repo_path: следующие проверки идут туда
-      // даже из другого cwd.
+      // даже из другого cwd. R-04: файловые и git_blob-ссылки закрепляются
+      // так же — корень, от которого резолвится относительный путь, пишется
+      // в repo_path при первом наблюдении и переопределяется только явным
+      // cwd в вызове.
       let repoUsed: string | null = null;
+      let baseUsed: string;
       let fresh: { digest: string; size: number } | null;
       if (kind === "git_blob") {
-        fresh = await hashGitBlob(rev!, ref, cwd);
+        baseUsed = explicitCwd ?? row?.repo_path ?? cwd;
+        fresh = await hashGitBlob(rev!, ref, baseUsed);
       } else if (kind === "git_ref") {
         repoUsed = input.repo ?? row?.repo_path ?? path.dirname(db.dbPath);
+        baseUsed = repoUsed;
         const sha = await resolveGitRefSha(scheme!, name!, repoUsed);
         fresh = sha ? { digest: sha, size: 0 } : null;
       } else {
@@ -258,11 +298,12 @@ export async function checkArtifacts(
         // хеша — хешируется файл целиком. Ключ строки (kind, ref) остаётся
         // сырой ссылкой: переименование породило бы дубли и сломало baselines.
         const parsed = parseRef(ref);
+        baseUsed = explicitCwd ?? row?.repo_path ?? cwd;
         fresh = await hashFile(
-          path.isAbsolute(parsed.path) ? parsed.path : path.resolve(cwd, parsed.path)
+          path.isAbsolute(parsed.path) ? parsed.path : path.resolve(baseUsed, parsed.path)
         );
       }
-      const repoPin = kind === "git_ref" ? { repo_path: repoUsed } : {};
+      const repoPin = { repo_path: baseUsed };
 
       if (!fresh) {
         // Missing now. The row keeps the last-seen digest in prev_digest so
@@ -274,6 +315,7 @@ export async function checkArtifacts(
             prev_digest: row.digest,
             checked_at: now,
             changed_at: now,
+            ...repoPin,
           });
         } else {
           db.upsertNodeArtifact({
@@ -321,6 +363,7 @@ export async function checkArtifacts(
           size_bytes: fresh.size,
           checked_at: now,
           changed_at: now,
+          ...repoPin,
         });
         output.changed.push({ node_id: nodeId, ref, old: null, new: fresh.digest });
         output.checked += 1;
@@ -329,8 +372,9 @@ export async function checkArtifacts(
 
       if (fresh.digest === row.digest) {
         // Same content: only the check time moves; prev_digest/changed_at are
-        // NOT touched — a steady re-check must not look like a change.
-        db.upsertNodeArtifact({ ...row, checked_at: now });
+        // NOT touched — a steady re-check must not look like a change. The
+        // pin follows the resolution root that was actually used.
+        db.upsertNodeArtifact({ ...row, checked_at: now, ...repoPin });
         output.checked += 1;
         continue;
       }
@@ -342,6 +386,7 @@ export async function checkArtifacts(
         size_bytes: fresh.size,
         checked_at: now,
         changed_at: now,
+        ...repoPin,
       });
       output.changed.push({ node_id: nodeId, ref, old: row.digest, new: fresh.digest });
       output.checked += 1;

@@ -52,7 +52,7 @@ import {
   journalSnapshotWrite,
   statusDigestOf,
 } from "./support-baselines.js";
-import { artifactsDigestOf } from "./artifacts.js";
+import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary } from "./stub.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
@@ -148,17 +148,37 @@ const EPISTEMIC_TRANSITIONS: Record<EpistemicStatus, EpistemicStatus[]> = {
   stub: ["open", "validated", "refuted", "abandoned"], // stub replaced by a real claim
 };
 
+/** `validated` needs a scope with an artifact — no self-confirmation (plan 1 §5.2). */
+function requireValidatedScope(scope?: Record<string, unknown>): void {
+  const artifact = scope && typeof scope === "object" ? (scope as { artifact?: unknown }).artifact : undefined;
+  if (!scope || typeof scope !== "object" || !artifact) {
+    throw new Error(
+      `epistemic_status "validated" requires status_scope with an "artifact" ` +
+        `(id of the test/benchmark run that confirms it). Without an external ` +
+        `artifact the agent would be confirming its own claim.`
+    );
+  }
+}
+
 /**
  * Validate an agent-driven epistemic transition. Throws with a human-readable
  * message on an illegal move; `validated` additionally requires a scope with
  * an artifact (an agent confirming a fact by itself is circular validation).
+ *
+ * Plan 04 K-06: a same-status write is not a transition — the only kind that
+ * goes through is a SCOPE replacement, and for `validated` it obeys the same
+ * artifact rule (the old early return let a repeated `validated` skip the
+ * check while the write still erased status_scope to NULL).
  */
 export function validateEpistemicTransition(
   from: EpistemicStatus | null,
   to: EpistemicStatus,
   scope?: Record<string, unknown>
 ): void {
-  if (from === to) return; // rewrite with a new reason/scope is a no-op
+  if (from === to) {
+    if (to === "validated") requireValidatedScope(scope);
+    return;
+  }
   const allowed = from === null ? ["validated", "refuted", "abandoned"] : EPISTEMIC_TRANSITIONS[from];
   if (!allowed.includes(to)) {
     throw new Error(
@@ -167,14 +187,7 @@ export function validateEpistemicTransition(
     );
   }
   if (to === "validated") {
-    const artifact = scope && typeof scope === "object" ? (scope as { artifact?: unknown }).artifact : undefined;
-    if (!scope || typeof scope !== "object" || !artifact) {
-      throw new Error(
-        `epistemic_status "validated" requires status_scope with an "artifact" ` +
-          `(id of the test/benchmark run that confirms it). Without an external ` +
-          `artifact the agent would be confirming its own claim.`
-      );
-    }
+    requireValidatedScope(scope);
   }
 }
 
@@ -787,18 +800,22 @@ export function getConcept(
 }
 
 /**
- * 2.1.7 F1: the current digests of one node — computed from live exports of
- * support-baselines, never re-hashed here. A confirmed node reports its
- * snapshot claim (source: "snapshot"): the confirmation belongs to the
- * wording it was made on, and a stale value refusing confirm_supports IS the
- * divergence signal. status has no node-level snapshot — always current.
+ * 2.1.7 F1, revised by plan 04 K-10: the two versions travel SEPARATELY.
+ * `claim` is the CURRENT computed digest — the value confirm_supports
+ * compares against, so confirm → edit → reread → confirm converges instead
+ * of looping on the stale snapshot value. `confirmed_claim` documents what
+ * the confirmation was made on (the snapshot pins it; a divergence against
+ * it is the support_check signal, not a confirmable value). status has no
+ * node-level snapshot — always current.
  */
 function currentDigestsOf(node: NodeRow): CurrentDigestsView {
   const snapshotClaim = node.claim_digest ?? null;
   return {
-    claim: snapshotClaim ?? claimDigestOf(node.summary),
+    claim: claimDigestOf(node.summary),
     status: statusDigestOf(node.status, node.epistemic_status),
     format_version: BASELINE_FORMAT_VERSION,
+    confirmed_claim: snapshotClaim,
+    confirmed_at: node.claim_digest_at ?? null,
     source: snapshotClaim !== null ? "snapshot" : "computed",
   };
 }
@@ -985,6 +1002,21 @@ export async function createConcept(
     throw new Error(`Parent concept "${parentId}" does not exist.`);
   }
 
+  // Plan 04 K-05: every supersedes target is verified BEFORE anything is
+  // written. The old flow failed on a missing target only AFTER the node,
+  // its supports and the snapshots were already committed ("Created X, but
+  // supersedes targets not found") — an error the agent could not safely
+  // retry. Validation is pre-work; the writes themselves run in the same
+  // transaction as the node below, so a target that disappears concurrently
+  // rolls the whole creation back.
+  const supersedesIds = input.supersedes ?? [];
+  if (supersedesIds.length > 0) {
+    const missing = supersedesIds.filter((t) => !db.nodeExists(t));
+    if (missing.length > 0) {
+      throw new Error(`supersedes: targets not found: ${missing.join(", ")}.`);
+    }
+  }
+
   // Plan 3 §4.1.3/§11: the provenance flags are read fresh on every call —
   // flipping them in the config file changes behavior without a restart.
   const provenanceConfig = readProvenanceConfig(db.dbPath);
@@ -1163,6 +1195,12 @@ export async function createConcept(
     }
   }
 
+  // T4: mark replaced concepts — edges new--supersedes-->old, old nodes
+  // become superseded with valid_until = now. Plan 04 K-05: the writes run
+  // INSIDE the creation transaction (targets validated above), so a failure
+  // leaves no node, no supports, no snapshots and no status history behind.
+  let supersededIds: string[] = [];
+
   db.runInTransaction(() => {
     for (const fact of factNodesToCreate) {
       db.insertNode({
@@ -1244,7 +1282,11 @@ export async function createConcept(
           confirmed_at: now,
           confirmed_by: "agent",
           // 2.1.3 F2: the confirmed artifacts state at the moment of the call.
-          artifacts_digest: artifactsDigestOf(db.getNodeArtifacts(e.other_id)),
+          // Plan 04 K-11: the ACTIVE observation set only — refs already
+          // withdrawn from the support stay history, not part of the pin.
+          artifacts_digest: artifactsDigestOf(
+            activeArtifactRows(support, db.getNodeArtifacts(e.other_id))
+          ),
         };
         // 2.1.3 F1: the journal is written where the snapshot is written —
         // this carve-out is a first confirmation, so it opens the chain with
@@ -1252,6 +1294,16 @@ export async function createConcept(
         journalSnapshotWrite(db, row, now);
         db.upsertSupportBaseline(row);
       }
+    }
+
+    if (supersedesIds.length > 0) {
+      const { superseded, missing } = db.supersedeNodes(id, supersedesIds);
+      if (missing.length > 0) {
+        throw new Error(
+          `supersedes: targets disappeared mid-call: ${missing.join(", ")} — nothing was written.`
+        );
+      }
+      supersededIds = superseded;
     }
   });
   if (embedding) {
@@ -1267,19 +1319,9 @@ export async function createConcept(
     embedding,
   });
 
-  // T4: mark replaced concepts — edges new--supersedes-->old, old nodes
-  // become superseded with valid_until = now.
-  let supersededNote = "";
-  if (input.supersedes && input.supersedes.length > 0) {
-    const { superseded, missing } = db.supersedeNodes(id, input.supersedes);
-    if (missing.length > 0) {
-      throw new Error(
-        `Created "${id}", but supersedes targets not found: ${missing.join(", ")}. ` +
-          `Superseded: ${superseded.join(", ") || "none"}.`
-      );
-    }
-    supersededNote = ` Superseded: ${superseded.join(", ")}.`;
-  }
+  // T4: the supersede result is already committed (same transaction above).
+  const supersededNote =
+    supersededIds.length > 0 ? ` Superseded: ${supersededIds.join(", ")}.` : "";
 
   // Plan 3 §4.1.1/§4.1.2: the agent must see what the shortcut did. F6: the
   // count is the number of DISTINCT nodes a support edge was actually written
@@ -1327,26 +1369,23 @@ export async function updateConcept(
   // boundary (not inside setNodeStatus/setEpistemicStatus — internal callers
   // like soft-delete and merge must never be blocked). reason is mandatory
   // together with epistemic_status; validated additionally requires a scope
-  // with an artifact.
-  let scope: Record<string, unknown> | undefined;
+  // with an artifact. The transition itself is re-validated inside the write
+  // transaction against the FRESH state (K-07) — a concurrent update must not
+  // carry a banned transition out of a stale snapshot.
   if (input.changes.epistemic_status !== undefined) {
     if (!input.changes.epistemic_reason || input.changes.epistemic_reason.trim().length === 0) {
       throw new Error(
         `Changing epistemic_status requires a non-empty "epistemic_reason" — every transition is recorded in status_history.`
       );
     }
-    scope = input.changes.status_scope;
-    validateEpistemicTransition(
-      (existing.epistemic_status ?? null) as EpistemicStatus | null,
-      input.changes.epistemic_status,
-      scope
-    );
   } else if (input.changes.epistemic_reason !== undefined) {
     throw new Error(`"epistemic_reason" without "epistemic_status" is a no-op — pass both or neither.`);
   }
 
   // If summary or name changed, regenerate embedding (skip when the vector
-  // path is disabled pending reembed — reembed will fill it in)
+  // path is disabled pending reembed — reembed will fill it in). Inference
+  // runs BEFORE the write transaction — no model work under the write lock
+  // (plan 04, F-04.5).
   let embedding: Buffer | undefined;
   if (input.changes.summary !== undefined || input.changes.name !== undefined) {
     const name = input.changes.name ?? existing.name;
@@ -1356,35 +1395,116 @@ export async function updateConcept(
     embedding = (await embedForStorage(db, text)) ?? undefined;
   }
 
-  const updated = db.updateNode(input.id, {
-    ...input.changes,
-    embedding,
-    // 2.1.12 F1: undefined (поле не передано) не трогает колонку, null
-    // снимает срок, строка выставляет. spread выше уже несёт значение —
-    // здесь только нормализованная форма.
-    valid_until: validUntil,
+  let epistemicNote = "";
+  let noChanges = false;
+  db.runInTransaction(() => {
+    // K-07: validation and writes read the SAME state — the fresh read inside
+    // BEGIN IMMEDIATE keeps a concurrent update from carrying out a banned
+    // epistemic transition or a banned kind conversion from a stale snapshot.
+    const current = db.getNode(input.id);
+    if (!current) {
+      throw new Error(`Concept "${input.id}" not found.`);
+    }
+
+    // K-07: the RESULTING state is validated like create would. A kind change
+    // must not launder a placeholder summary past create-time guarantees, and
+    // feature -> decision must not bypass require_support.
+    const resultingKind = input.changes.kind ?? current.kind;
+    const resultingSummary = input.changes.summary ?? current.summary;
+    if (isStubSummary(resultingSummary, resultingKind, current.created_via)) {
+      throw new Error(
+        `update_concept: итоговое саммари — заглушка, а не утверждение о поведении.\n${STUB_REJECTION_MESSAGE}`
+      );
+    }
+    if (
+      input.changes.kind !== undefined &&
+      input.changes.kind !== current.kind &&
+      resultingKind === "decision" &&
+      readProvenanceConfig(db.dbPath).require_support
+    ) {
+      // Смена на decision не обходит require_support: update не принимает
+      // evidence, поэтому отказ называет конкретный следующий шаг.
+      const hasSupports = db.getInformedByEdges(input.id, "ancestry", false).length > 0;
+      if (!hasSupports) {
+        throw new Error(
+          `update_concept: смена вида на decision отклонена — у узла нет ни одной опоры. ` +
+            `Шаг: добавь опору — link "${input.id}" -> <узел-источник> relation=informed_by с рационалом ` +
+            `«что именно в источнике подтверждает вывод», затем повтори обновление. ` +
+            `Новое решение создавай через create_concept с evidence в том же вызове.`
+        );
+      }
+    }
+
+    // K-06: epistemic axis. A repeat of the SAME status without a new scope is
+    // a true no-op — the stored scope and the history stay untouched (the old
+    // code wrote status_scope = NULL over the artifact here). A same-status
+    // write WITH a scope is a scope revision: it obeys the transition rules
+    // above and is recorded in status_history as a revision.
+    let epistemicWrite: {
+      to: EpistemicStatus;
+      reason: string;
+      scope: Record<string, unknown> | null;
+      revision: boolean;
+    } | null = null;
+    if (input.changes.epistemic_status !== undefined) {
+      const from = (current.epistemic_status ?? null) as EpistemicStatus | null;
+      const to = input.changes.epistemic_status;
+      if (from === to && input.changes.status_scope === undefined) {
+        // настоящий no-op: ось не трогаем вообще
+      } else {
+        validateEpistemicTransition(from, to, input.changes.status_scope);
+        epistemicWrite = {
+          to,
+          reason: input.changes.epistemic_reason!,
+          scope: input.changes.status_scope ?? null,
+          revision: from === to,
+        };
+      }
+    }
+
+    const updated = db.updateNode(input.id, {
+      ...input.changes,
+      embedding,
+      // 2.1.12 F1: undefined (поле не передано) не трогает колонку, null
+      // снимает срок, строка выставляет. spread выше уже несёт значение —
+      // здесь только нормализованная форма.
+      valid_until: validUntil,
+    });
+
+    // Plan 1: the epistemic write happens after the content update; both run
+    // in this one transaction, so a failed validation leaves nothing behind.
+    if (epistemicWrite) {
+      db.setEpistemicStatus(
+        input.id,
+        epistemicWrite.to,
+        epistemicWrite.reason,
+        epistemicWrite.scope
+      );
+      if (epistemicWrite.revision) {
+        // K-06: the scope replacement is a real revision — setEpistemicStatus
+        // itself skips same-status history rows, so the revision is recorded
+        // explicitly.
+        db.recordStatusHistory(
+          input.id,
+          epistemicWrite.to,
+          epistemicWrite.to,
+          epistemicWrite.reason,
+          "epistemic_status"
+        );
+      }
+      epistemicNote = ` Epistemic status: ${epistemicWrite.to}.`;
+    }
+
+    if (!updated && !epistemicWrite) noChanges = true;
   });
 
-  if (updated && embedding) {
+  if (embedding) {
     // В17: keep the native vector copy in sync.
     db.upsertVector(input.id, embedding);
   }
 
-  if (!updated && input.changes.epistemic_status === undefined) {
+  if (noChanges) {
     return { message: `No changes applied to "${input.id}"` };
-  }
-
-  // Plan 1: the epistemic write happens after the content update so a failed
-  // transition validation above never leaves a half-applied epistemic change.
-  let epistemicNote = "";
-  if (input.changes.epistemic_status !== undefined) {
-    db.setEpistemicStatus(
-      input.id,
-      input.changes.epistemic_status,
-      input.changes.epistemic_reason!,
-      scope ?? null
-    );
-    epistemicNote = ` Epistemic status: ${input.changes.epistemic_status}.`;
   }
 
   const validNote =
@@ -1956,6 +2076,12 @@ export function computeBoard(db: KnowledgeDB): BoardOutput {
  * Per-member state of a saved chain, evaluated at read time (plan 2 §1): a
  * member whose fingerprint no longer matches makes the chain `stale`; a
  * member that no longer exists at all makes it `broken` — nothing to refresh.
+ *
+ * Plan 04 K-09: freshness of the SNAPSHOT and fitness of the REASONING are
+ * separate — a member that can no longer back any reasoning (refuted,
+ * abandoned, expired) is stale however well its fingerprint matches. Expiry
+ * is computed on the fresh clock at read time; it is never hashed into the
+ * fingerprint, so natural expiry stales the chain without any write.
  */
 export function trailMemberStates(
   db: KnowledgeDB,
@@ -1980,6 +2106,21 @@ export function trailMemberStates(
     if (node.removed_at) {
       view.state = "stale";
       view.reason = `member "${m.node_id}" was removed (${node.removed_reason ?? "no reason recorded"})`;
+      return view;
+    }
+    if (node.epistemic_status === "refuted") {
+      view.state = "stale";
+      view.reason = `member "${m.node_id}" опровергнут — вывод на нём строить нельзя (причина в карточке узла)`;
+      return view;
+    }
+    if (node.epistemic_status === "abandoned") {
+      view.state = "stale";
+      view.reason = `member "${m.node_id}" заброшен — вывод может устареть`;
+      return view;
+    }
+    if (isNodeExpired(node)) {
+      view.state = "stale";
+      view.reason = `member "${m.node_id}" просрочен (valid_until ${node.valid_until}) — утверждение могло перестать быть верным`;
       return view;
     }
     const now = db.nodeFingerprint(m.node_id);

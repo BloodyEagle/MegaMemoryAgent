@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
 import type { KnowledgeDB } from "./db.js";
+import { isNodeExpired } from "./db.js";
 import { embeddingText, embedForStorage } from "./embeddings.js";
 import { makeId } from "./tools.js";
+import type { NodeRow } from "./types.js";
 
 /**
  * Digest nodes (plan T6): one derived node per module compressing its
@@ -9,6 +12,14 @@ import { makeId } from "./tools.js";
  *
  * Summary: "<N> concepts: name1 — summary1; name2 — summary2; …" capped at
  * 800 chars. file_refs: union of children's refs, max 10.
+ *
+ * Plan 04 K-08 / F-06: the digest knows the exact set of sources it was
+ * built from and their meaning-versions (digest_sources, created lazily —
+ * no schema bump, same pattern as status_history). staleness is derived by
+ * CONTENT: membership differs, or a member's meaning-version moved — not by
+ * comparing timestamps of whoever happens to remain. Expiry is computed at
+ * read time and never hashed; a legacy digest without a recorded membership
+ * falls back to the old timestamp heuristic.
  */
 
 export const DIGEST_MAX_SUMMARY = 800;
@@ -37,6 +48,102 @@ function existingDigest(db: KnowledgeDB, moduleId: string): string | undefined {
   return row?.id;
 }
 
+// ---- Plan 04 K-08: recorded membership of a digest ----
+
+interface DigestSourceRecord {
+  node_id: string;
+  version: string;
+}
+
+function hasDigestSourcesTable(db: KnowledgeDB): boolean {
+  return (
+    db.execSqlFirst(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='digest_sources'"
+    ) !== undefined
+  );
+}
+
+function ensureDigestSourcesTable(db: KnowledgeDB): void {
+  db.execSqlRun(`CREATE TABLE IF NOT EXISTS digest_sources (
+    digest_id TEXT PRIMARY KEY,
+    sources TEXT NOT NULL
+  )`);
+}
+
+/** null = nothing recorded (legacy digest or missing table) — timestamp fallback. */
+function readDigestSources(
+  db: KnowledgeDB,
+  digestId: string
+): DigestSourceRecord[] | null {
+  if (!hasDigestSourcesTable(db)) return null;
+  const row = db.execSqlFirst(
+    "SELECT sources FROM digest_sources WHERE digest_id = ?",
+    digestId
+  ) as { sources: string } | undefined;
+  if (!row) return null;
+  try {
+    const parsed: unknown = JSON.parse(row.sources);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter(
+      (r): r is DigestSourceRecord =>
+        r !== null && typeof r === "object" &&
+        typeof (r as DigestSourceRecord).node_id === "string" &&
+        typeof (r as DigestSourceRecord).version === "string"
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The meaning-version of one source: summary + lifecycle status + epistemic
+ * status + valid_until VALUE (expiry itself is computed at read time, never
+ * hashed — a clock passage must not require a rewrite). name, parent_id and
+ * timestamps are excluded — a rename does not change what the digest says.
+ */
+function sourceVersion(child: NodeRow): string {
+  return createHash("sha1")
+    .update(
+      [
+        child.summary,
+        child.status ?? "active",
+        child.epistemic_status ?? "",
+        child.valid_until ?? "",
+      ].join("\n")
+    )
+    .digest("hex");
+}
+
+function writeDigestSources(
+  db: KnowledgeDB,
+  digestId: string,
+  sources: DigestSourceRecord[]
+): void {
+  ensureDigestSourcesTable(db);
+  db.execSqlRun(
+    `INSERT INTO digest_sources (digest_id, sources) VALUES (?, ?)
+     ON CONFLICT(digest_id) DO UPDATE SET sources = excluded.sources`,
+    digestId,
+    JSON.stringify(sources)
+  );
+}
+
+/**
+ * K-08: eligible digest sources — live non-digest children that can still
+ * back a "current knowledge" summary: lifecycle status active (superseded /
+ * deprecated do not republish), epistemic status not refuted/abandoned, and
+ * not expired (expiry is computed at read time, on the fresh clock).
+ */
+export function digestEligibleChildren(db: KnowledgeDB, parentId: string): NodeRow[] {
+  return db.getChildren(parentId).filter((c) => {
+    if (c.kind === "digest") return false;
+    if ((c.status ?? "active") !== "active") return false;
+    if (c.epistemic_status === "refuted" || c.epistemic_status === "abandoned") return false;
+    if (isNodeExpired(c)) return false;
+    return true;
+  });
+}
+
 export interface DigestChild {
   id: string;
   name: string;
@@ -45,9 +152,13 @@ export interface DigestChild {
 }
 
 /**
- * U4: the source concepts behind a digest — its SIBLINGS in the module
- * (the digest is itself a child of the module). stale = any source concept
- * was updated after the digest, i.e. the summary may be out of date.
+ * U4, revised by plan 04 K-08: the source concepts behind a digest — its
+ * SIBLINGS in the module (the digest is itself a child of the module),
+ * filtered to the same eligibility the build used. stale is derived by
+ * content against the RECORDED membership: any id that appeared, disappeared
+ * or changed its meaning-version marks the summary out of date — deleting
+ * the only source or reparenting it stales the digest even though nobody's
+ * timestamp moved. Reading writes nothing.
  */
 export function digestSourceChildren(
   db: KnowledgeDB,
@@ -57,16 +168,31 @@ export function digestSourceChildren(
   if (!digest || digest.kind !== "digest") {
     throw new Error(`Node "${digestId}" is not a digest.`);
   }
-  const children = db
-    .getChildren(digest.parent_id ?? "")
-    .filter((c) => c.kind !== "digest" && c.id !== digestId)
-    .map((c) => ({
-      id: c.id,
-      name: c.name,
-      kind: c.kind,
-      updated_at: c.updated_at,
-    }));
-  const stale = children.some((c) => c.updated_at > digest.updated_at);
+  const children = digestEligibleChildren(db, digest.parent_id ?? "").map((c) => ({
+    id: c.id,
+    name: c.name,
+    kind: c.kind,
+    updated_at: c.updated_at,
+  }));
+  const recorded = readDigestSources(db, digestId);
+  let stale: boolean;
+  if (recorded === null) {
+    // Legacy digest built before the membership table existed: the old
+    // timestamp heuristic, honestly weaker than the content comparison.
+    stale = children.some((c) => c.updated_at > digest.updated_at);
+  } else {
+    const currentIds = new Set(children.map((c) => c.id));
+    const recordedIds = new Set(recorded.map((r) => r.node_id));
+    const sameSet =
+      currentIds.size === recordedIds.size &&
+      [...currentIds].every((id) => recordedIds.has(id));
+    stale =
+      !sameSet ||
+      children.some((c) => {
+        const rec = recorded.find((r) => r.node_id === c.id)!;
+        return rec.version !== sourceVersion(db.getNode(c.id)!);
+      });
+  }
   return { children, stale };
 }
 
@@ -81,10 +207,10 @@ export async function buildDigest(
     throw new Error(`Module "${moduleId}" not found.`);
   }
 
-  // Exclude any existing digest — it is a derived node, not a concept.
-  const children = db
-    .getChildren(moduleId)
-    .filter((c) => c.kind !== "digest");
+  // K-08: only eligible children feed the summary — a refuted/abandoned/
+  // superseded/expired source must not be republished as current knowledge
+  // through a searchable digest.
+  const children = digestEligibleChildren(db, moduleId);
   const name = digestName(module.name);
   const digestId = makeId(name, moduleId);
 
@@ -117,30 +243,46 @@ export async function buildDigest(
   const existingId = existingDigest(db, moduleId);
   const created = existingId === undefined;
   const targetId = existingId ?? digestId;
-
-  if (created) {
-    const embedding =
-      opts.embed === false
-        ? null
-        : await embedForStorage(db, embeddingText(name, "digest", summary));
-    db.insertNode({
-      id: targetId,
-      name,
-      kind: "digest",
-      summary,
-      why: `Auto-generated digest of "${module.name}" children.`,
-      file_refs: refs.length > 0 ? refs : null,
-      parent_id: moduleId,
-      embedding,
-      // 2.1.10 F1: a server write — not an agent node, never a stub subject.
-      created_via: "auto",
-    });
-  } else {
-    db.updateNode(targetId, {
-      summary,
-      file_refs: refs.length > 0 ? refs : [],
-    });
+  // F-06.3: text and embedding move together — a refreshed digest must not
+  // keep the vector of the previous wording. undefined leaves the column
+  // untouched (embed: false), null clears it (model disabled → reembed).
+  let embedding: Buffer | null | undefined;
+  if (!created && opts.embed !== false) {
+    embedding = await embedForStorage(db, embeddingText(name, "digest", summary));
   }
+
+  db.runInTransaction(() => {
+    if (created) {
+      db.insertNode({
+        id: targetId,
+        name,
+        kind: "digest",
+        summary,
+        why: `Auto-generated digest of "${module.name}" children.`,
+        file_refs: refs.length > 0 ? refs : null,
+        parent_id: moduleId,
+        embedding: opts.embed === false ? null : (embedding as Buffer | null),
+        // 2.1.10 F1: a server write — not an agent node, never a stub subject.
+        created_via: "auto",
+      });
+    } else {
+      db.updateNode(targetId, {
+        summary,
+        file_refs: refs.length > 0 ? refs : [],
+        ...(embedding !== undefined ? { embedding } : {}),
+      });
+    }
+    // F-06.3: keep the native vector copy in sync with the text.
+    if (embedding) db.upsertVector(targetId, embedding);
+
+    // K-08: record what this digest was built from — the exact set of
+    // sources and their meaning-versions, one atomic write with the node.
+    writeDigestSources(
+      db,
+      targetId,
+      children.map((c) => ({ node_id: c.id, version: sourceVersion(c) }))
+    );
+  });
 
   return { moduleId, digestId: targetId, created, children: children.length };
 }
@@ -161,7 +303,8 @@ function scanDigestCandidates(
       ) as Array<{ id: string }>).map((r) => r.id);
   return ids.map((id) => ({
     id,
-    children: db.getChildren(id).filter((c) => c.kind !== "digest").length,
+    // K-08: the count that would actually be built — eligible sources only.
+    children: digestEligibleChildren(db, id).length,
   }));
 }
 
@@ -231,7 +374,7 @@ export async function maybeAutoDigest(
   if (process.env.MEGAMEMORY_AUTO_DIGEST === "0") return null;
   if (!parentId || !db.nodeExists(parentId)) return null;
   if (existingDigest(db, parentId) !== undefined) return null;
-  const children = db.getChildren(parentId).filter((c) => c.kind !== "digest");
+  const children = digestEligibleChildren(db, parentId);
   if (children.length < DIGEST_MIN_CHILDREN) return null;
   return buildDigest(db, parentId);
 }
