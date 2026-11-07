@@ -1,4 +1,4 @@
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -95,10 +95,30 @@ export interface TeRunResult {
   durationMs: number;
 }
 
+/**
+ * C-06 (plan 05): the structured query→runner boundary. The query travels as
+ * ONE literal argv entry — no shell, no quoting, no %-expansion on Windows.
+ */
+export interface TeRunnerSpec {
+  /** Program to run, executed directly (no shell). */
+  executable: string;
+  /**
+   * Argv prefix; the entry containing the {query} placeholder receives the
+   * literal query in its place. At least one entry must contain {query}.
+   */
+  args: string[];
+}
+
 export interface BenchOptions {
   baseline: BenchBaselineMode;
   /** Run-level te command template with {query}; required in te/both mode unless every question carries te_cmd or a preset. */
   teCmd?: string;
+  /**
+   * Structured runner (C-06, plan 05) — the default boundary for the query:
+   * executable + literal argv, spawned without a shell. Takes precedence
+   * over teCmd and per-question te_cmd.
+   */
+  teRunner?: TeRunnerSpec;
   fileLimitBytes?: number;
   /** Root for resolving relative file_refs (default: process.cwd()). */
   root?: string;
@@ -111,6 +131,11 @@ export interface BenchOptions {
    * Default: child_process.exec with a 60 s cap per command.
    */
   runTeCommand?: (cmd: string) => Promise<TeRunResult>;
+  /**
+   * Injectable structured runner for tests. Default: spawn without a shell,
+   * 60 s cap, timeout kills only this runner's own process tree.
+   */
+  runTeProgram?: (executable: string, args: string[]) => Promise<TeRunResult>;
   /**
    * Injectable git root lookup (plan 2.1.6 F3). Default: `git rev-parse --show-toplevel`
    * run from the cwd; null when git is absent or the cwd is not a repository.
@@ -295,6 +320,10 @@ function ratio(baseline: number, graph: number): number | null {
  * {query} substitution. POSIX: single quotes with the standard quote-dance.
  * Windows: double quotes with MSVCRT-style escaping (\" and \\) — what node
  * and most argv-parsing tools expect via cmd.exe.
+ *
+ * C-06 (plan 05): this quoting is inherently lossy (%VAR% expands even in
+ * cmd.exe quotes) — shell templates are the explicitly trusted mode; the
+ * default boundary is TeRunnerSpec + runTeProgram, which quotes nothing.
  */
 export function substituteQuery(template: string, query: string): string {
   const escaped =
@@ -321,6 +350,103 @@ async function defaultRunTeCommand(cmd: string): Promise<TeRunResult> {
         (tail ? `\n${tail}` : `\n${e.message}`)
     );
   }
+}
+
+const TE_PROGRAM_TIMEOUT_MS = 60_000;
+const TE_PROGRAM_MAX_BUFFER = 16 * 1024 * 1024;
+
+/**
+ * C-06 (plan 05): the default structured runner — argv goes to the child
+ * literally (no shell on any platform), so %VARS%, quotes, ampersands,
+ * backslashes and unicode stay data. On timeout only this runner's own
+ * process tree is killed: taskkill /T on Windows, the process group on
+ * POSIX (SIGTERM, then SIGKILL). Failures carry the exit status and a
+ * bounded stderr tail.
+ */
+async function defaultRunTeProgram(executable: string, args: string[]): Promise<TeRunResult> {
+  const t0 = performance.now();
+  return new Promise<TeRunResult>((resolve, reject) => {
+    const child = spawn(executable, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      // Own process group on POSIX so the timeout can signal the tree.
+      detached: process.platform !== "win32",
+    });
+    let stdout = "";
+    let stderr = "";
+    let truncated = false;
+    let killedByTimeout = false;
+    let settled = false;
+    const finish = (build: () => TeRunResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(escalateTimer);
+      let result: TeRunResult;
+      try {
+        result = build();
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      resolve(result);
+    };
+    const killTree = (signal: NodeJS.Signals): void => {
+      if (child.pid === undefined) return;
+      if (process.platform === "win32") {
+        // taskkill is a fixed system binary called with argv — no shell.
+        const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+        killer.on("error", () => child.kill(signal));
+      } else {
+        try { process.kill(-child.pid, signal); } catch { child.kill(signal); }
+      }
+    };
+    // SIGTERM first so a well-behaved te tool can flush; SIGKILL if it ignores it.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      killedByTimeout = true;
+      killTree("SIGTERM");
+    }, TE_PROGRAM_TIMEOUT_MS);
+    const escalateTimer = setTimeout(() => {
+      if (!settled && killedByTimeout) killTree("SIGKILL");
+    }, TE_PROGRAM_TIMEOUT_MS + 5_000);
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      if (stdout.length < TE_PROGRAM_MAX_BUFFER) stdout += chunk;
+      else truncated = true;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      if (stderr.length < TE_PROGRAM_MAX_BUFFER) stderr += chunk;
+      else truncated = true;
+    });
+    child.on("error", (err: Error) => {
+      finish(() => { throw new BenchError(`the te program could not be started: ${executable}\n${err.message}`); });
+    });
+    child.on("close", (code, signal) => {
+      if (code === 0 && signal === null) {
+        finish(() => ({ stdout, durationMs: performance.now() - t0 }));
+        return;
+      }
+      const tail = stderr.trim().split("\n").slice(-3).join("\n");
+      const status = killedByTimeout
+        ? "killed by the 60 s timeout (own process tree terminated)"
+        : signal !== null
+          ? `terminated by ${signal}`
+          : `exit code ${code}`;
+      finish(() => {
+        throw new BenchError(
+          `the te program failed: ${executable} ${args.join(" ")} (${status})` +
+            (truncated ? " [output truncated at 16 MB]" : "") +
+            (tail ? `\n${tail}` : "")
+        );
+      });
+    });
+  });
 }
 
 /** F3: git root of the cwd, or null when git is absent or the cwd is not a repository. */
@@ -403,6 +529,7 @@ export async function runBench(
   const fileLimitBytes = opts.fileLimitBytes ?? DEFAULT_FILE_LIMIT_BYTES;
   const root = opts.root ?? process.cwd();
   const runTe = opts.runTeCommand ?? defaultRunTeCommand;
+  const runTeProgram = opts.runTeProgram ?? defaultRunTeProgram;
   const mode = opts.baseline;
   const filesTopN = opts.filesTopN ?? 0;
 
@@ -549,21 +676,39 @@ export async function runBench(
         usedPreset = true;
         timeToTeMs = 0;
       } else {
-        const template = q.te_cmd ?? opts.teCmd;
-        if (!template) {
-          throw new BenchError(
-            `Question "${q.id}": --baseline te needs a command template with {query} — ` +
-              'pass --te-cmd "tool path {query}" for the run or "te_cmd" for this question.'
-          );
+        // C-06 (plan 05): the structured executable+argv runner is the
+        // default boundary and takes precedence; a shell template (--te-cmd /
+        // per-question te_cmd) is the explicitly trusted mode — the user
+        // vouched for the whole string, shell semantics included.
+        if (opts.teRunner) {
+          if (!opts.teRunner.args.some((a) => a.includes("{query}"))) {
+            throw new BenchError(
+              `Question "${q.id}": the structured te runner needs one argv entry containing {query}, got: ` +
+                JSON.stringify(opts.teRunner.args)
+            );
+          }
+          const args = opts.teRunner.args.map((a) => a.split("{query}").join(q.query));
+          const run = await runTeProgram(opts.teRunner.executable, args);
+          baselineTe = estimateTokens(run.stdout);
+          timeToTeMs = run.durationMs;
+        } else {
+          const template = q.te_cmd ?? opts.teCmd;
+          if (!template) {
+            throw new BenchError(
+              `Question "${q.id}": --baseline te needs a command template with {query} — ` +
+                'pass --te-exec/--te-arg (no shell) or --te-cmd "tool path {query}" (trusted shell) for the run, ' +
+                'or "te_cmd" for this question.'
+            );
+          }
+          if (!template.includes("{query}")) {
+            throw new BenchError(
+              `Question "${q.id}": the te command template must contain {query}, got: ${template}`
+            );
+          }
+          const run = await runTe(substituteQuery(template, q.query));
+          baselineTe = estimateTokens(run.stdout);
+          timeToTeMs = run.durationMs;
         }
-        if (!template.includes("{query}")) {
-          throw new BenchError(
-            `Question "${q.id}": the te command template must contain {query}, got: ${template}`
-          );
-        }
-        const run = await runTe(substituteQuery(template, q.query));
-        baselineTe = estimateTokens(run.stdout);
-        timeToTeMs = run.durationMs;
       }
     }
 

@@ -52,7 +52,7 @@ describe("markdown export", () => {
     exportMarkdown(db, outDir);
 
     // Everything in sync.
-    expect(checkMarkdown(db, outDir)).toEqual({ written: 0, missing: [], differing: [], extra: [], pruned: 0 });
+    expect(checkMarkdown(db, outDir)).toEqual({ written: 0, missing: [], differing: [], extra: [] });
 
     // Change one file on disk.
     fs.writeFileSync(path.join(outDir, "alpha.md"), "tampered", "utf8");
@@ -72,15 +72,14 @@ describe("markdown export", () => {
     expect(checkMarkdown(db, outDir).differing).toEqual([]);
   });
 
-  it("--check prunes orphan .md files (М8)", () => {
+  it("--check reports orphan .md files without deleting them (R-05, plan 05)", () => {
     const db = freshDb();
     db.insertNode({ id: "solo", name: "Solo", kind: "feature", summary: "one" });
     exportMarkdown(db, outDir);
     fs.writeFileSync(path.join(outDir, "orphan.md"), "stale", "utf8");
     const diff = checkMarkdown(db, outDir);
     expect(diff.extra).toEqual(["orphan.md"]);
-    expect(diff.pruned).toBe(1);
-    expect(fs.existsSync(path.join(outDir, "orphan.md"))).toBe(false);
+    expect(fs.existsSync(path.join(outDir, "orphan.md"))).toBe(true);
   });
 
   it("renderNodeMarkdown is deterministic (two calls, same bytes)", () => {

@@ -17,8 +17,8 @@ import {
 
 /**
  * `megamemory bench --db <база> --questions q.jsonl [--baseline files|te|both]
- *                 [--te-cmd "tool path {query}"] [--file-limit KB]
- *                 [--ref-root PATH]... [--files-top N]`
+ *                 [--te-exec PROGRAM [--te-arg ARG]...] | [--te-cmd "tool path {query}"]
+ *                 [--file-limit KB] [--ref-root PATH]... [--files-top N]`
  *
  * Печатает таблицу по вопросам и итог: медиана отношения, суммарные токены,
  * число вопросов, где граф проиграл (ratio < 1), hit_rate и hit_rate@1 рядом с
@@ -28,7 +28,9 @@ import {
 function usage(): string {
   return [
     "Usage: megamemory bench --db <knowledge.db> --questions <file.jsonl>",
-    "                        [--baseline files|te|both] [--te-cmd \"tool path {query}\"]",
+    "                        [--baseline files|te|both]",
+    "                        [--te-exec PROGRAM [--te-arg ARG]...]  (literal argv, no shell)",
+    '                        | [--te-cmd "tool path {query}"]       (trusted shell template)',
     "                        [--file-limit KB] [--ref-root PATH]... [--files-top N]",
   ].join("\n");
 }
@@ -216,6 +218,12 @@ export async function runBenchCli(args: string[]): Promise<void> {
   const questionsFile = flag("--questions");
   const baselineRaw = flag("--baseline");
   const teCmd = flag("--te-cmd");
+  const teExec = flag("--te-exec");
+  // --te-arg повторяемый: argv записей structured-раннера (C-06, plan 05).
+  const teArgs: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--te-arg") teArgs.push(args[i + 1] ?? "");
+  }
   const fileLimitRaw = flag("--file-limit");
   const filesTopRaw = flag("--files-top");
   // --ref-root повторяемый: собираем все значения по порядку
@@ -255,9 +263,24 @@ export async function runBenchCli(args: string[]): Promise<void> {
     }
     fileLimitBytes = parsed * 1024;
   }
-  if ((baseline === "te" || baseline === "both") && !teCmd) {
+  if (teExec && teCmd) {
+    errorBold(`--te-exec и --te-cmd взаимоисключающи: structured-режим (--te-exec, argv без shell) или доверенный shell-шаблон (--te-cmd).\n${usage()}`);
+    process.exit(1);
+  }
+  if (teArgs.some((r) => r === "" || r === undefined)) {
+    errorBold(`--te-arg: каждому флагу нужен аргумент.\n${usage()}`);
+    process.exit(1);
+  }
+  if (teArgs.length > 0 && !teExec) {
+    errorBold(`--te-arg требует --te-exec PROGRAM.\n${usage()}`);
+    process.exit(1);
+  }
+  const teRunner = teExec
+    ? { executable: teExec, args: teArgs.length > 0 ? teArgs : ["{query}"] }
+    : undefined;
+  if ((baseline === "te" || baseline === "both") && !teRunner && !teCmd) {
     // Ошибка будет для вопросов без te_cmd/preset — но предупреждение раньше ошибки честнее.
-    info("--baseline te/both: вопросы без te_cmd и без baseline_te_tokens падают — задай --te-cmd с {query}.");
+    info("--baseline te/both: вопросы без te_cmd и без baseline_te_tokens падают — задай --te-exec с --te-arg {query} или --te-cmd с {query}.");
   }
 
   let text: string;
@@ -282,6 +305,7 @@ export async function runBenchCli(args: string[]): Promise<void> {
     const report = await runBench(db, questions!, {
       baseline,
       teCmd,
+      teRunner,
       fileLimitBytes,
       refRoots,
       filesTopN,

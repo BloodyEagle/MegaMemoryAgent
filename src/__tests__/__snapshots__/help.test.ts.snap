@@ -35,7 +35,10 @@ Options:
   --json          Machine-readable output for conflicts
   --questions FILE  bench: jsonl with questions ({"id","query","expect_nodes"?})
   --baseline      bench: what the graph is measured against (files | te | both; default files)
-  --te-cmd CMD    bench: external structural tool for te/both, {query} is substituted
+  --te-exec PROG  bench: structured te runner, literal argv without a shell;
+                the query goes where an --te-arg contains {query} (default arg: {query})
+  --te-cmd CMD    bench: trusted shell template for te/both, {query} is substituted —
+                the string is parsed by cmd.exe/sh, so %VARS% and quotes are shell semantics
   --file-limit KB bench: files over the limit are counted by size (default 200)
   --ref-root PATH  bench: extra root for relative file_refs, repeatable (first hit wins; try git root, then cwd)
   --files-top N   bench: files baseline over the first N unique files in output order (default 0 = all; 3 is the honest live-agent number)
