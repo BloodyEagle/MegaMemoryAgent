@@ -800,18 +800,22 @@ export function getConcept(
 }
 
 /**
- * 2.1.7 F1: the current digests of one node — computed from live exports of
- * support-baselines, never re-hashed here. A confirmed node reports its
- * snapshot claim (source: "snapshot"): the confirmation belongs to the
- * wording it was made on, and a stale value refusing confirm_supports IS the
- * divergence signal. status has no node-level snapshot — always current.
+ * 2.1.7 F1, revised by plan 04 K-10: the two versions travel SEPARATELY.
+ * `claim` is the CURRENT computed digest — the value confirm_supports
+ * compares against, so confirm → edit → reread → confirm converges instead
+ * of looping on the stale snapshot value. `confirmed_claim` documents what
+ * the confirmation was made on (the snapshot pins it; a divergence against
+ * it is the support_check signal, not a confirmable value). status has no
+ * node-level snapshot — always current.
  */
 function currentDigestsOf(node: NodeRow): CurrentDigestsView {
   const snapshotClaim = node.claim_digest ?? null;
   return {
-    claim: snapshotClaim ?? claimDigestOf(node.summary),
+    claim: claimDigestOf(node.summary),
     status: statusDigestOf(node.status, node.epistemic_status),
     format_version: BASELINE_FORMAT_VERSION,
+    confirmed_claim: snapshotClaim,
+    confirmed_at: node.claim_digest_at ?? null,
     source: snapshotClaim !== null ? "snapshot" : "computed",
   };
 }

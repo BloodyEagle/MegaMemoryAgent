@@ -1226,9 +1226,13 @@ export function provenanceTrace(
       removedRoot || rootNode === undefined
         ? null
         : {
-            claim: rootNode.claim_digest ?? claimDigestOf(rootNode.summary),
+            // K-10 (plan 04): claim is the CURRENT computed digest — the
+            // confirmable one; the confirmed snapshot travels separately.
+            claim: claimDigestOf(rootNode.summary),
             status: statusDigestOf(rootNode.status, rootNode.epistemic_status),
             format_version: BASELINE_FORMAT_VERSION,
+            confirmed_claim: rootNode.claim_digest ?? null,
+            confirmed_at: rootNode.claim_digest_at ?? null,
             source: rootNode.claim_digest !== null ? "snapshot" : "computed",
           };
     const liveEdges = removedRoot

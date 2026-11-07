@@ -243,18 +243,29 @@ export interface NodeWithContext {
 }
 
 /**
- * 2.1.7 F1: the current digests of one node's wording. `claim` comes from the
- * confirmed snapshot when one exists (source: "snapshot" — the confirmation
- * belongs to the wording the agent saw; a rewritten summary refuses this
- * value with version_conflict, which is the point), otherwise it is computed
- * from the live summary (source: "computed" — the value a FIRST confirmation
- * needs). `status` is always the current status-axes digest: the node-level
- * snapshot tracks the claim only, there is nothing to take it from.
+ * 2.1.7 F1, revised by plan 04 K-10: the digests of one node's wording with
+ * the current and the confirmed versions carried SEPARATELY — the old shape
+ * reported the confirmed snapshot AS the current digest, so after an edit a
+ * re-read returned the stale value again and confirm → edit → reread →
+ * confirm never converged.
+ *
+ * `claim` is ALWAYS the digest of the live summary — the exact value
+ * confirm_supports compares against, confirmable right after a re-read.
+ * `confirmed_claim` documents the version the confirmation was made on (what
+ * the snapshot pins; a divergence against it is reported by support_check,
+ * it is not a confirmable value). `status` is always the current status-axes
+ * digest: the node-level snapshot tracks the claim only, there is nothing to
+ * take it from.
  */
 export interface CurrentDigestsView {
   claim: string;
   status: string;
   format_version: number;
+  /** The confirmed snapshot's claim digest; null = never confirmed. */
+  confirmed_claim: string | null;
+  /** When the snapshot was written (confirm_supports); null = never. */
+  confirmed_at: string | null;
+  /** Whether the node carries a confirmed claim snapshot. */
   source: "computed" | "snapshot";
 }
 
