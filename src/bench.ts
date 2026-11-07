@@ -549,6 +549,10 @@ export async function runBench(
     const timeToGraphMs = performance.now() - t0;
     const graphTokens = r.meta?.tokens_estimated ?? 0;
     const matches = r.compact ?? [];
+    // План 06 (K-03): tokens_estimated честный — пустой ответ стоит конверт.
+    // «Граф-ответа нет» теперь значит «в выдаче нет узлов», не «ноль токенов».
+    const hasGraphAnswer =
+      matches.length > 0 || (r.refuted?.length ?? 0) > 0 || (r.matches?.length ?? 0) > 0;
     const ids = matches.map((m) => m.id);
     // 2.1.7 F3: nested supports are part of the answer — the rank space is
     // the union: top level in output order, a folded support at its
@@ -745,10 +749,14 @@ export async function runBench(
       baseline_files_tokens: baselineFiles,
       baseline_files_top_tokens: baselineFilesTop,
       baseline_te_tokens: baselineTe,
-      ratio_files: baselineFiles !== null ? ratio(baselineFiles, graphTokens) : null,
+      ratio_files:
+        hasGraphAnswer && baselineFiles !== null ? ratio(baselineFiles, graphTokens) : null,
       ratio_files_top:
-        baselineFilesTop !== null ? ratio(baselineFilesTop, graphTokens) : null,
-      ratio_te: baselineTe !== null ? ratio(baselineTe, graphTokens) : null,
+        hasGraphAnswer && baselineFilesTop !== null
+          ? ratio(baselineFilesTop, graphTokens)
+          : null,
+      ratio_te:
+        hasGraphAnswer && baselineTe !== null ? ratio(baselineTe, graphTokens) : null,
       estimated,
       missing_files: missing,
       line_refs: lineRefs,

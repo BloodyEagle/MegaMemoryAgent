@@ -291,6 +291,34 @@ export interface UnderstandInput {
    * (meta.stale_excluded считает исключённых).
    */
   include_stale?: boolean;
+  /**
+   * План 06 (K-03): всё, что обработчик MCP добавит к ответу
+   * (instructions_stale, instructions_version, server_version). Бюджет
+   * считается по СЕРИАЛИЗОВАННОМУ wire-ответу вместе с этими полями —
+   * оценка функции и фактическая выдача не расходятся. В возвращаемый
+   * объект не попадает: обработчик добавляет сам.
+   */
+  extra_payload?: Record<string, unknown>;
+}
+
+/**
+ * План 06 (K-02): вложенная опора сохраняет квалификацию знания — статус
+ * жизненного цикла, эпистемическую ось, пометку просрочки и признак
+ * слабости. Отсутствие поля в проекции — дефект, а не «нет данных».
+ */
+export interface NestedSupportView {
+  id: string;
+  name: string;
+  summary: string;
+  /** Lifecycle status (active/superseded/deprecated). */
+  status: string;
+  /** Epistemic axis (null = не оценивалось). */
+  epistemic_status?: string | null;
+  file_refs?: string[] | null;
+  /** past valid_until — при include_stale: true. */
+  expired?: boolean;
+  /** refuted/abandoned/ungrounded — цитировать как знание нельзя. */
+  weak?: boolean;
 }
 
 /** One node in compact understand output — everything optional is dropped. */
@@ -301,6 +329,11 @@ export interface CompactMatch {
   status: string;
   /** Plan 1: epistemic axis, shown so refuted nodes are never mistaken for facts. */
   epistemic_status?: string | null;
+  /**
+   * План 06 (K-04): причина опровержения едет и в compact-выдаче —
+   * «антизнание с причиной» не только в full-режиме.
+   */
+  refuted_reason?: string | null;
   /** Truncated to <=240 chars at a word boundary. */
   summary: string;
   file_refs: string[] | null;
@@ -317,9 +350,10 @@ export interface CompactMatch {
    * no supports of its own) instead of competing for a top slot: a support
    * shares the query terms with its decision and used to push the decision
    * off rank 1. Does not occupy a top_k slot; its tokens ARE counted in
-   * tokens_estimated.
+   * tokens_estimated. План 06 (K-02): несёт квалификацию знания — см.
+   * NestedSupportView.
    */
-  supports?: Array<{ id: string; name: string; summary: string }>;
+  supports?: NestedSupportView[];
   /**
    * 2.1.12 F1: the match is past its valid_until — present only when the
    * caller asked include_stale: true.
@@ -345,6 +379,18 @@ export interface UnderstandMeta {
    * молчаливый фильтр выглядел бы как «запрос ничего не нашёл».
    */
   stale_excluded?: number;
+  /**
+   * План 06 (K-01): сколько неактивных (superseded/deprecated) найдено
+   * запросом, но исключено без include_inactive. Отдельно от усечённых
+   * (dropped) — счётчики фильтра и счётчики нарезки не смешиваются.
+   */
+  inactive_excluded?: number;
+  /**
+   * План 06 (K-03/K-04): что-то не поместилось в бюджет (узлы или refuted
+   * порезаны). tokens_estimated при этом остаётся честным числом
+   * фактической выдачи.
+   */
+  truncated?: boolean;
 }
 
 export interface UnderstandOutput {

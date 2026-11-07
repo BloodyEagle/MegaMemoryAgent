@@ -28,6 +28,7 @@ import type {
   ListConflictsOutput,
   ConflictGroup,
   CompactMatch,
+  NestedSupportView,
   UnderstandMeta,
   CurrentDigestsView,
   NodeRow,
@@ -440,10 +441,18 @@ function compactMatch(
     kind: node.kind as CompactMatch["kind"],
     status: node.status ?? "active",
     epistemic_status: node.epistemic_status ?? null,
+    // План 06 (K-04): «антизнание с причиной» и в compact — причина была
+    // только в full-режиме, в компактной выдаче опровержение теряло смысл.
+    ...(node.epistemic_status === "refuted"
+      ? { refuted_reason: db.getLatestEpistemicReason(node.id, "refuted") }
+      : {}),
     summary: trimSummary(node.summary),
     file_refs: fileRefs,
+    // План 06 (K-03): RRF-score несёт 17 значащих цифр и дублируется в
+    // similarity — в компактной выдаче обе округляются до 4 знаков,
+    // иначе мусорные байты съедают бюджет ответа.
     ...(opts.score !== undefined
-      ? { score: opts.score, similarity: opts.score }
+      ? { score: Number(opts.score.toFixed(4)), similarity: Number(opts.score.toFixed(4)) }
       : {}),
     ...(opts.via ? { via: opts.via } : {}),
     // 2.1.12 F1: пометка живёт только при include_stale: true — обычная
@@ -477,6 +486,13 @@ export async function understand(
   const maxTokens = input.max_tokens ?? 1500;
   const outputMode = input.mode ?? "compact";
 
+  // План 06 (K-01): пул кандидатов шире top_k — фильтр актуальности
+  // применяется ДО финальной нарезки. Раньше top_k резал выдачу поиска, и
+  // просроченный/неактивный первый хит оставлял ответ пустым (при top_k=1
+  // следующий живой не добирался). Пул ограничен — это ограниченный добор,
+  // а не сканирование всей базы.
+  const searchPool = Math.min(50, Math.max(topK * 2, topK + 10));
+
   // Search mode (plan T2): hybrid by default — RRF over FTS + vector.
   // Vector-only runs when MEGAMEMORY_SEARCH=vector; text-only for fts, or
   // when vectors are disabled (model mismatch pending reembed).
@@ -485,7 +501,7 @@ export async function understand(
   const viaById = new Map<string, SearchVia>();
 
   if (mode === "hybrid") {
-    const hits = await hybridSearch(db, input.query, { topK });
+    const hits = await hybridSearch(db, input.query, { topK: searchPool });
     topMatches = hits.map((h) => ({ id: h.id, similarity: h.score }));
     for (const h of hits) viaById.set(h.id, h.via);
   } else if (mode === "vector" && vectorSearchEnabled(db)) {
@@ -494,9 +510,9 @@ export async function understand(
       return { matches: [], compact: [], meta: { returned: 0, dropped: 0, tokens_estimated: 0 } };
     }
     const queryEmbedding = await embed(queryText(input.query));
-    topMatches = findTopK(queryEmbedding, candidates, topK);
+    topMatches = findTopK(queryEmbedding, candidates, searchPool);
   } else {
-    topMatches = basicSearch(db, input.query, topK);
+    topMatches = basicSearch(db, input.query, searchPool);
   }
 
   // T4 will filter superseded/deprecated here unless include_inactive.
@@ -513,7 +529,9 @@ export async function understand(
   // их valid_until — метка замены, а не срок годности утверждения.
   const includeStale = input.include_stale ?? false;
   let staleExcluded = 0;
-  const nodes: Array<{ node: NodeRow; score: number; via?: SearchVia; expired: boolean }> = [];
+  let inactiveExcluded = 0;
+  // План 06 (K-01): фильтр идёт по всему пулу, нарезка top_k — после него.
+  const eligible: Array<{ node: NodeRow; score: number; via?: SearchVia; expired: boolean }> = [];
   const refutedNodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
   for (const match of topMatches) {
     const node = db.getNode(match.id);
@@ -523,18 +541,24 @@ export async function understand(
       continue;
     }
     const status = node.status ?? "active";
-    if (!includeInactive && status !== "active") continue;
+    if (!includeInactive && status !== "active") {
+      inactiveExcluded += 1;
+      continue;
+    }
     const expired = isNodeExpired(node);
     if (expired && !includeStale) {
       staleExcluded += 1;
       continue;
     }
-    nodes.push({ node, score: match.similarity, via: viaById.get(match.id), expired });
+    eligible.push({ node, score: match.similarity, via: viaById.get(match.id), expired });
   }
+  // top_k — это верхний уровень compact-выдачи; вложенные опоры слотов не
+  // занимают, поэтому нарезка применяется к размещению (placeLoop), а не к
+  // списку кандидатов.
 
   if (outputMode === "full") {
     const matches: NodeWithContext[] = [];
-    for (const { node, score, via, expired } of nodes) {
+    for (const { node, score, via, expired } of eligible.slice(0, topK)) {
       const ctx = buildNodeWithContext(db, node, score);
       if (via) ctx.via = via;
       if (expired) ctx.expired = true;
@@ -560,23 +584,63 @@ export async function understand(
       refuted,
       meta: {
         returned: matches.length,
-        dropped: 0,
+        dropped: eligible.length - matches.length,
         tokens_estimated: estimateTokens(payload),
         stale_excluded: staleExcluded,
+        inactive_excluded: inactiveExcluded,
       },
     };
   }
 
-  // compact: keep adding nodes while the serialized result fits the budget.
-  // First 3 nodes get children+edges; the rest stay bare.
-  // В15: the would-be full-mode cost for the same hits, measured once.
-  const fullProjection = nodes.map(({ node }) => buildNodeWithContext(db, node));
-  const estimatedFullTokens = estimateTokens(JSON.stringify(fullProjection));
+  // ---- compact: единый сериализатор бюджета и MCP-ответа (план 06, K-03) ----
+  //
+  // Бюджет считается по ТОЙ ЖЕ форме, которую обработчик реально отправляет:
+  // pretty (indent 2) внутри MCP-конверта {content:[{type,text}]}, со всеми
+  // секциями (refuted, edges_between, meta) и extra_payload обработчика
+  // (instructions_stale, server_version). Раньше оценка считала minified
+  // обрезанный объект без refuted и конверта — при max_tokens=500 восемь
+  // refuted дали реальные 1469 токенов при tokens_estimated: 0.
+
+  const extra = input.extra_payload ?? {};
+
+  const edgesFor = (list: Array<{ id: string }>) =>
+    list.length >= 2
+      ? (db.execSqlAll(
+          `SELECT DISTINCT from_id, to_id, relation FROM edges
+           WHERE removed_at IS NULL
+             AND from_id IN (${list.map(() => "?").join(",")})
+             AND to_id IN (${list.map(() => "?").join(",")})`,
+          ...list.map((m) => m.id),
+          ...list.map((m) => m.id)
+        ) as Array<{ from_id: string; to_id: string; relation: string }>).map(
+          (e) => ({ from: e.from_id, to: e.to_id, relation: e.relation })
+        )
+      : [];
+
+  /** Wire-ответ, как его соберёт MCP-обработчик (см. index.ts). */
+  const wireEnvelope = (payload: unknown): string =>
+    JSON.stringify({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
+
+  const measure = (payload: unknown): number => estimateTokens(wireEnvelope(payload));
+
+  // План 06 (K-03, работа 5): полный граф ради оценки «сэкономленных
+  // токенов» на каждом compact-запросе не строим — стоимость full-режима
+  // оцениваем по уже прочитанным строкам: сырые (необрезанные) summary и
+  // why плюс константа на детей/рёбра/трейлы карточки.
+  const FULL_CARD_OVERHEAD_TOKENS = 60;
+  const fullModeCandidates = eligible.slice(0, topK);
+  const estimatedFullTokens = fullModeCandidates.reduce(
+    (sum, { node }) =>
+      sum +
+      estimateTokens(node.summary) +
+      (node.why ? estimateTokens(node.why) : 0) +
+      FULL_CARD_OVERHEAD_TOKENS,
+    0
+  );
 
   // Plan 1 §5.3: separate "refuted" block, marked and with the reason —
-  // these are not facts and must not blend into the match list. Built before
-  // the budget loop so the early-return below still carries it.
-  const refuted = refutedNodes.map(({ node, score, via }) =>
+  // these are not facts and must not blend into the match list.
+  const refutedAll = refutedNodes.map(({ node, score, via }) =>
     compactMatch(db, node, { score, via, withContext: false })
   );
 
@@ -590,11 +654,11 @@ export async function understand(
   // make the answer stays a standalone fact on the top level — knowledge is
   // never hidden, only regrouped.
 
-  const candidateIds = new Set(nodes.map((n) => n.node.id));
-  const nodeRowById = new Map(nodes.map((n) => [n.node.id, n.node]));
+  const candidateIds = new Set(eligible.map((n) => n.node.id));
+  const nodeRowById = new Map(eligible.map((n) => [n.node.id, n.node]));
   // Live informed_by supports of every candidate that are candidates too.
   const supportIdsOf = new Map<string, string[]>();
-  for (const { node } of nodes) {
+  for (const { node } of eligible) {
     supportIdsOf.set(
       node.id,
       db
@@ -605,7 +669,7 @@ export async function understand(
   }
 
   const top: CompactMatch[] = [];
-  let nestedByHost = new Map<string, Array<{ id: string; name: string; summary: string }>>();
+  let nestedByHost = new Map<string, NestedSupportView[]>();
   let foldedIds = new Set<string>();
 
   /** The answer's top level: placed candidates minus the folded ones. */
@@ -617,15 +681,54 @@ export async function understand(
       nestedByHost.has(m.id) ? { ...m, supports: nestedByHost.get(m.id) } : m
     );
 
-  /** Same projection convention the budget loop always used. */
-  const projectionTokens = (): number =>
-    estimateTokens(
-      JSON.stringify({
-        matches: [],
-        compact: withNested(displayList()),
-        meta: { returned: displayList().length, dropped: 0, tokens_estimated: 0 },
-      })
+  const metaFor = (
+    tokens: number,
+    dropped: number,
+    truncated: boolean
+  ): UnderstandMeta => ({
+    returned: displayList().length,
+    dropped,
+    tokens_estimated: tokens,
+    estimated_full_tokens: estimatedFullTokens,
+    supports_inlined: foldedIds.size,
+    stale_excluded: staleExcluded,
+    inactive_excluded: inactiveExcluded,
+    truncated,
+  });
+
+  /** Тот объект, который уйдёт по проводу (со всеми секциями и extra). */
+  const buildPayload = (
+    compactList: CompactMatch[],
+    refutedList: CompactMatch[],
+    meta: UnderstandMeta
+  ) => ({
+    matches: [],
+    compact: compactList,
+    refuted: refutedList,
+    edges_between: edgesFor(compactList),
+    meta,
+    ...extra,
+  });
+
+  /** Мера текущей формы ответа с заданным списком refuted (числа-заглушки). */
+  const measureWith = (refutedList: CompactMatch[]): number =>
+    measure(buildPayload(withNested(displayList()), refutedList, metaFor(0, 0, false)));
+
+  // Ниже минимума — понятный отказ: пустой конверт (meta + instructions +
+  // MCP-обёртка) сам стоит токенов.
+  const minBudget = measure(buildPayload([], [], metaFor(0, 0, false)));
+  if (maxTokens < minBudget) {
+    throw new Error(
+      `understand: max_tokens=${maxTokens} ниже минимума ${minBudget} — ` +
+        `конверт ответа (meta, instructions, MCP-обёртка) сам этого стоит. ` +
+        `Подними max_tokens (по умолчанию 1500).`
     );
+  }
+
+  // Запас на рост чисел в meta (tokens_estimated и др. подставляются в
+  // последнюю очередь) — порезка идёт с зазором, финальный замер честный.
+  const RESERVE = 16;
+  const target = maxTokens - RESERVE;
 
   /**
    * Fold pass — recomputed from scratch, so repeated calls (after each
@@ -640,6 +743,9 @@ export async function understand(
    * A support whose every host is folding stays on the top level: nesting it
    * under a folded host would break the depth contract. Returns the number
    * of folded supports after the pass.
+   *
+   * План 06 (K-02): проекция вложенной опоры сохраняет квалификацию знания —
+   * lifecycle, эпистемическую ось, expiry и признак слабости.
    */
   const foldSupports = (): number => {
     const inTop = new Set(top.map((m) => m.id));
@@ -649,7 +755,7 @@ export async function understand(
         if (sid !== h.id && inTop.has(sid)) foldSet.add(sid);
       }
     }
-    const nextNested = new Map<string, Array<{ id: string; name: string; summary: string }>>();
+    const nextNested = new Map<string, NestedSupportView[]>();
     for (const sup of top) {
       if (!foldSet.has(sup.id)) continue;
       const row = nodeRowById.get(sup.id);
@@ -658,7 +764,20 @@ export async function understand(
         if (h.id === sup.id || foldSet.has(h.id)) continue;
         if (supportIdsOf.get(h.id)?.includes(sup.id)) {
           const bucket = nextNested.get(h.id) ?? [];
-          bucket.push({ id: sup.id, name: row.name, summary: trimSummary(row.summary) });
+          bucket.push({
+            id: sup.id,
+            name: sup.name,
+            summary: trimSummary(row.summary),
+            status: sup.status,
+            epistemic_status: sup.epistemic_status ?? null,
+            file_refs: parseFileRefs(row.file_refs),
+            ...(sup.expired ? { expired: true } : {}),
+            ...(row.epistemic_status === "abandoned" ||
+            row.epistemic_status === "refuted" ||
+            isUngrounded(db, row)
+              ? { weak: true }
+              : {}),
+          });
           nextNested.set(h.id, bucket);
           break;
         }
@@ -672,64 +791,102 @@ export async function understand(
   let tokensEstimated = 0;
   let idx = 0;
 
-  // Phase A — the plain top-level fill, unchanged: the first node always
-  // fits, the rest stop at the budget. The cut index is remembered instead
-  // of returning early: folding can free a slot for the tail (F2).
-  for (; idx < nodes.length; idx++) {
-    const candidate = compactMatch(db, nodes[idx].node, {
-      score: nodes[idx].score,
-      via: nodes[idx].via,
-      withContext: displayList().length < 3,
-      expired: nodes[idx].expired,
-    });
-    top.push(candidate);
-    const projected = projectionTokens();
-    // Always return at least one node, budget or not.
-    if (displayList().length > 1 && projected > maxTokens) {
-      top.pop();
-      break; // idx stays on the unplaced candidate
+  /**
+   * Размещение верхнего уровня: top_k ограничивает ВЕРХНИЙ уровень
+   * (вложенные опоры слотов не занимают), бюджет меряется по фактической
+   * форме ответа — с refuted, edges_between, meta и extra_payload. Складывание
+   * опор запускается после каждого размещения: сложившаяся опора освобождает
+   * слот верхнего уровня для следующего кандидата (placeLoop повторно вызывается
+   * после сокращения refuted — добор ограничен тем же циклом).
+   */
+  let refutedShown = refutedAll;
+  let truncated = false;
+  let refutedCut = 0;
+
+  const placeLoop = (): void => {
+    while (idx < eligible.length) {
+      if (foldedIds.has(eligible[idx].node.id)) {
+        idx += 1; // уже в ответе, вложенно
+        continue;
+      }
+      if (displayList().length >= topK) {
+        if (foldSupports() > 0) continue; // слот освобождён — добираем
+        break; // top_k заполнен верхним уровнем
+      }
+      const candidate = compactMatch(db, eligible[idx].node, {
+        score: eligible[idx].score,
+        via: eligible[idx].via,
+        withContext: displayList().length < 3,
+        expired: eligible[idx].expired,
+      });
+      top.push(candidate);
+      const projected = measureWith(refutedShown);
+      // План 06 (K-03): кап держится и на первой ноде — гигантская карточка
+      // (длинные id/refs/рёбра) вылетает так же, как остальные; усечение
+      // помечается в meta, а пустой конверт ниже минимума отсечён выше.
+      if (projected > target) {
+        top.pop();
+        truncated = true; // бюджетное усечение, а не лимит top_k
+        break;
+      }
+      idx += 1;
+      tokensEstimated = projected;
+      if (foldSupports() > 0) tokensEstimated = measureWith(refutedShown);
     }
-    tokensEstimated = projected;
+  };
+
+  placeLoop();
+
+  // План 06 (K-04): refuted участвует в бюджете. Пока честная мера выше
+  // цели — режем refuted с конца (ранг худший первым); причина остаётся у
+  // выживших. Усечённые считаются в dropped, сокращение помечается.
+  while (measureWith(refutedShown) > target && refutedShown.length > 0) {
+    refutedShown = refutedShown.slice(0, -1);
+    refutedCut += 1;
+    truncated = true;
   }
 
-  // Phase B — fold supports whose decision made the answer.
-  if (foldSupports() > 0) tokensEstimated = projectionTokens();
-
-  // Phase C — a folded support freed its top_k slot: refill from where the
-  // budget stopped (top_k stays filled by the top level, not by the fold).
-  // Every newly placed node can fold its own supports; the loop resumes at
-  // the same index after each fold until the budget is full again.
-  while (idx < nodes.length) {
-    if (foldedIds.has(nodes[idx].node.id)) {
-      idx += 1; // already in the answer, nested
-      continue;
-    }
-    const candidate = compactMatch(db, nodes[idx].node, {
-      score: nodes[idx].score,
-      via: nodes[idx].via,
-      withContext: displayList().length < 3,
-      expired: nodes[idx].expired,
-    });
-    top.push(candidate);
-    const projected = projectionTokens();
-    if (projected > maxTokens) {
-      top.pop();
-      break; // budget full again
-    }
-    idx += 1;
-    tokensEstimated = projected;
-    if (foldSupports() > 0) tokensEstimated = projectionTokens();
-  }
+  // Освободившиеся токены — ограниченный добор матчей.
+  placeLoop();
 
   const compact = withNested(displayList());
-  const dropped = nodes.length - top.length;
+  // План 06 (K-01): счётчики не смешиваются — dropped считает усечённых
+  // (top_k/бюджет, включая порезанных refuted), фильтрованные живут в
+  // stale_excluded/inactive_excluded.
+  const dropped = eligible.length - top.length + refutedCut;
   const supportsInlined = foldedIds.size;
 
+  // Финальная честная мера: число токенов само едет в meta, поэтому замер
+  // повторяется до стабильности разрядов (число в payload == число в мере).
+  const edgesBetween = edgesFor(compact);
+  const measureFinal = (tokens: number): number =>
+    measure({
+      matches: [],
+      compact,
+      refuted: refutedShown,
+      edges_between: edgesBetween,
+      meta: metaFor(tokens, dropped, false),
+      ...extra,
+    });
+  tokensEstimated = measureFinal(0);
+  for (let i = 0; i < 3; i++) {
+    const next = measureFinal(tokensEstimated);
+    if (next === tokensEstimated) break;
+    tokensEstimated = next;
+  }
+  // Первая нода может игнорировать лимит («always return at least one») —
+  // тогда метка усечения обязательна: не утверждаем, что ответ уложился.
+  // (truncated: true короче false — замер с false остаётся верхней оценкой.)
+  if (tokensEstimated > maxTokens) truncated = true;
+  const payloadMeta = metaFor(tokensEstimated, dropped, truncated);
   const payload = JSON.stringify({
+    matches: [],
     compact,
-    refuted,
-    meta: { returned: compact.length, dropped: 0, tokens_estimated: tokensEstimated },
+    refuted: refutedShown,
+    edges_between: edgesBetween,
+    meta: payloadMeta,
   });
+
   db.insertUsage({
     tool: "understand",
     query: input.query,
@@ -739,35 +896,12 @@ export async function understand(
     estimatedFullTokens,
   });
 
-  // В14: relations between the returned nodes only.
-  const ids = compact.map((m) => m.id);
-  const edgesBetween =
-    ids.length >= 2
-      ? (db.execSqlAll(
-          `SELECT DISTINCT from_id, to_id, relation FROM edges
-           WHERE removed_at IS NULL
-             AND from_id IN (${ids.map(() => "?").join(",")})
-             AND to_id IN (${ids.map(() => "?").join(",")})`,
-          ...ids,
-          ...ids
-        ) as Array<{ from_id: string; to_id: string; relation: string }>).map(
-          (e) => ({ from: e.from_id, to: e.to_id, relation: e.relation })
-        )
-      : [];
-
   return {
     matches: [],
     compact,
-    refuted,
+    refuted: refutedShown,
     edges_between: edgesBetween,
-    meta: {
-      returned: compact.length,
-      dropped,
-      tokens_estimated: tokensEstimated,
-      estimated_full_tokens: estimatedFullTokens,
-      supports_inlined: supportsInlined,
-      stale_excluded: staleExcluded,
-    },
+    meta: payloadMeta,
   };
 }
 
