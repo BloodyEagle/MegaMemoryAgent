@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mergeNodes } from "../consolidate.js";
+import { describeConsolidation, mergeNodes } from "../consolidate.js";
 import { MergeEngine } from "../merge.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { provenanceTrace } from "../provenance.js";
@@ -128,6 +128,40 @@ describe("S-08 consolidation validates distinct live identities", () => {
     const before = sqlState(db);
 
     expect(() => mergeNodes(db, "leaf", "root")).toThrow(/cycle/i);
+    expect(sqlState(db)).toEqual(before);
+  });
+
+  // F-03.6 (план 03): read-only описание последствий для preview плана 07 —
+  // валидация та же, что в apply, ничего не пишется.
+  it("preview describes consequences, writes nothing and previews the rejection", () => {
+    const db = database("preview.db");
+    addNode(db, "survivor", { summary: "First wording" });
+    addNode(db, "other", { kind: "task", summary: "Second wording", file_refs: ["src/shared.ts"] });
+    addNode(db, "child", { parent_id: "other" });
+    addNode(db, "peer", { kind: "fact" });
+    db.setTaskState("other", "open", "2030-06-01");
+    db.setSlot("project", "handoff", "other");
+    db.insertTrail({ id: "trail", name: "Chain", summary: "Saved reasoning", node_ids: ["peer", "other"] });
+    db.insertEdge({ from_id: "other", to_id: "peer", relation: "connects_to", description: "Outgoing link" });
+    const before = sqlState(db);
+
+    const preview = describeConsolidation(db, "survivor", "other");
+    expect(preview.rejection).toBeUndefined();
+    expect(sqlState(db)).toEqual(before);
+    expect(preview).toMatchObject({
+      survivor: "survivor",
+      other: "other",
+      summaryCombines: true,
+      refsAdded: 1,
+      edgesToMove: 1,
+      children: 1,
+      trailMembers: 1,
+      taskCarries: true,
+    });
+    expect(preview.slots).toEqual([{ project: "project", role: "handoff" }]);
+
+    const rejected = describeConsolidation(db, "child", "other");
+    expect(rejected.rejection).toMatch(/cycle/i);
     expect(sqlState(db)).toEqual(before);
   });
 });

@@ -292,6 +292,144 @@ export function moveNodeEdges(
   return moved;
 }
 
+export interface ConsolidationPreview {
+  survivor: string;
+  other: string;
+  /** Контент дубля войдёт в саммари выжившего. */
+  summaryCombines: boolean;
+  /** Сколько file_refs дубля добавится к выжившему. */
+  refsAdded: number;
+  /** Сколько рёбер переедет на выжившего (живые и надгробия, минус дедуп). */
+  edgesToMove: number;
+  children: number;
+  slots: Array<{ project: string; role: string }>;
+  trailMembers: number;
+  artifacts: number;
+  baselines: number;
+  /** Состояние задачи дубля переедет (у выжившего пусто). */
+  taskCarries: boolean;
+  /** Отказ и его причина — до транзакции, ничего не пишется. */
+  rejection?: string;
+}
+
+/**
+ * F-03.6 (план 03): read-only описание последствий слияния для preview
+ * плана 07. Валидация — та же, что в apply (assertConsolidatable + та же
+ * проверка цикла по поддереву), подсчёты — теми же запросами, которыми
+ * apply переносит строки. Ни граф, ни снимки, ни история не пишутся.
+ */
+export function describeConsolidation(
+  db: KnowledgeDB,
+  survivorId: string,
+  otherId: string
+): ConsolidationPreview {
+  let rejection: string | undefined;
+  try {
+    assertConsolidatable(db, survivorId, otherId);
+    // Цикл по поддереву — та же проверка, что в transferNodeIdentity.
+    let cursor = db.getNodeIncludingRemoved(survivorId);
+    const seen = new Set<string>();
+    while (cursor?.parent_id) {
+      if (cursor.parent_id === otherId || seen.has(cursor.parent_id)) {
+        throw new Error(
+          `Cannot merge "${otherId}" into "${survivorId}": the survivor lies inside the removed node's subtree — the hierarchy would become a cycle.`
+        );
+      }
+      seen.add(cursor.parent_id);
+      cursor = db.getNodeIncludingRemoved(cursor.parent_id);
+    }
+  } catch (err) {
+    rejection = err instanceof Error ? err.message : String(err);
+    return {
+      survivor: survivorId,
+      other: otherId,
+      summaryCombines: false,
+      refsAdded: 0,
+      edgesToMove: 0,
+      children: 0,
+      slots: [],
+      trailMembers: 0,
+      artifacts: 0,
+      baselines: 0,
+      taskCarries: false,
+      rejection,
+    };
+  }
+
+  const survivor = db.getNode(survivorId)!;
+  const other = db.getNodeIncludingRemoved(otherId)!;
+  const summaryCombines =
+    !!other.summary &&
+    !survivor.summary.includes(other.summary) &&
+    other.summary !== survivor.summary;
+
+  const parseRefs = (raw: string | null): string[] => {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  };
+  const survivorRefs = new Set(parseRefs(survivor.file_refs));
+  const refsAdded = parseRefs(other.file_refs).filter((r) => !survivorRefs.has(r)).length;
+
+  const existingEdges = new Set(
+    [...db.getOutgoingEdges(survivorId), ...db.getIncomingEdges(survivorId)].map(
+      (e) => `${e.from_id}|${e.to_id}|${e.relation}`
+    )
+  );
+  const rawEdges = db
+    .getAllEdgesRaw()
+    .filter((e) => e.from_id === otherId || e.to_id === otherId);
+  const edgesToMove = rawEdges.filter((e) => {
+    const from = e.from_id === otherId ? survivorId : e.from_id;
+    const to = e.to_id === otherId ? survivorId : e.to_id;
+    return from !== to && !existingEdges.has(`${from}|${to}|${e.relation}`);
+  }).length;
+
+  const childrenRow = db.execSqlFirst(
+    "SELECT COUNT(*) AS n FROM nodes WHERE parent_id = ? AND id != ?",
+    otherId,
+    survivorId
+  ) as { n: number };
+  const slots = (
+    db.execSqlAll("SELECT project, role FROM slots WHERE node_id = ?", otherId) as Array<{
+      project: string;
+      role: string;
+    }>
+  ).map((s) => ({ ...s }));
+  const trailMembersRow = db.execSqlFirst(
+    "SELECT COUNT(*) AS n FROM trail_members WHERE node_id = ?",
+    otherId
+  ) as { n: number };
+  const artifactsRow = db.execSqlFirst(
+    "SELECT COUNT(*) AS n FROM node_artifacts WHERE node_id = ?",
+    otherId
+  ) as { n: number };
+  const baselinesRow = db.execSqlFirst(
+    "SELECT COUNT(*) AS n FROM support_baselines WHERE decision_id = ? OR support_id = ?",
+    otherId,
+    otherId
+  ) as { n: number };
+
+  return {
+    survivor: survivorId,
+    other: otherId,
+    summaryCombines,
+    refsAdded,
+    edgesToMove,
+    children: childrenRow.n,
+    slots,
+    trailMembers: trailMembersRow.n,
+    artifacts: artifactsRow.n,
+    baselines: baselinesRow.n,
+    taskCarries:
+      (survivor.task_state ?? null) === null && (other.task_state ?? null) !== null,
+  };
+}
+
 /**
  * Merge node `other` into `survivor`: combine summary/why/file_refs, move
  * edges, hard-delete the other node. Caller decides which one survives —
