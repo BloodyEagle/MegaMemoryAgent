@@ -536,8 +536,11 @@ export async function runBench(
   // F3: the git root is one lookup per run, not per question.
   const resolveGitRoot = opts.resolveGitRoot ?? defaultResolveGitRoot;
   const gitRoot = await resolveGitRoot(root);
-  // F3: ref → resolved absolute path, cached for the whole run so the same
-  // ref is not re-statted 14 times. First root to hit wins, deterministically.
+  // F3, уточнено планом 06 (C-05): (цепочка корней, ref) → разрешённый
+  // абсолютный путь, кэш на весь прогон. Ключ включает ЦЕПОЧКУ корней
+  // вопроса: один и тот же ref в разных проектах обязан разрешаться
+  // по-разному (1/100 в прямом и обратном порядке вопросов), а miss по
+  // одной цепочке не отравляет следующий вопрос с другой цепочкой.
   const refCache = new Map<string, { abs: string | null; label: RefRootLabel }>();
 
   const results: QuestionResult[] = [];
@@ -608,12 +611,16 @@ export async function runBench(
         }
       }
 
-      // F2: split the :line suffix, then F3: resolve against the root chain
+      // F2: split the :line suffix, then F3: resolve against the root chain.
+      // План 06 (C-05): ключ кэша — вся цепочка корней этого вопроса плюс
+      // ref; baseline инвариантен к порядку вопросов.
+      const chainKey = chain.map((entry) => entry.dir).join("::");
       const resolved: { ref: string; clean: string; abs: string | null }[] = [];
       for (const ref of refOrder) {
         const { path: clean, suffix } = splitRefSuffix(ref);
         if (suffix) lineRefs += 1;
-        const cached = refCache.get(ref);
+        const cacheKey = `${chainKey}::${ref}`;
+        const cached = refCache.get(cacheKey);
         if (cached) {
           resolved.push({ ref, clean, abs: cached.abs });
           continue;
@@ -624,13 +631,13 @@ export async function runBench(
           try {
             fs.statSync(candidate);
             abs = candidate;
-            refCache.set(ref, { abs, label: rootEntry.label });
+            refCache.set(cacheKey, { abs, label: rootEntry.label });
             break;
           } catch {
             // try the next root
           }
         }
-        if (abs === null) refCache.set(ref, { abs: null, label: "cwd" });
+        if (abs === null) refCache.set(cacheKey, { abs: null, label: "cwd" });
         resolved.push({ ref, clean, abs });
       }
 

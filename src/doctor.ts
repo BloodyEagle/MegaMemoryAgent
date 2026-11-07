@@ -199,9 +199,10 @@ export function runDoctor(db: KnowledgeDB): {
   // with the content table and throws on any mismatch (stale rowids too).
   let ftsDrift: string | null = null;
   if (fts) {
-    // Sample nodes: a MATCH on the name's first token must surface the
-    // node's own rowid. After a VACUUM the index keeps stale rowids,
-    // so the probe misses the moved node.
+    // План 06 (C-04): проба ищет ИМЯ узла (первый токен) и ждёт его rowid
+    // в выдаче — раньше интерполяция была экранирована, и MATCH шёл по
+    // фиксированной строке: ноль проб считался «нет drift», а неработающий
+    // индекс выглядел исправным.
     const sample = db.execSqlAll(
       "SELECT rowid, name FROM nodes WHERE removed_at IS NULL ORDER BY rowid DESC LIMIT 20"
     ) as Array<{ rowid: number; name: string }>;
@@ -211,7 +212,7 @@ export function runDoctor(db: KnowledgeDB): {
       const token = node.name.trim().split(/\s+/)[0];
       if (!token) continue;
       try {
-        const phrase = `"\${token.replace(/\"/g, '""')}"*`;
+        const phrase = `"${token.replace(/"/g, '""')}"*`;
         const hits = db.execSqlAll(
           "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT 1000",
           phrase
@@ -223,6 +224,11 @@ export function runDoctor(db: KnowledgeDB): {
       }
     }
     ftsDrift = summarizeFtsProbe(probes, misses);
+    if (ftsDrift === null && probes === 0 && nodesCount > 0) {
+      // План 06 (C-04): ни одной пробы не выполнилось — индекс НЕ ПРОВЕРЕН,
+      // и это не «здоров» (пустая база 0/0 остаётся корректным случаем).
+      ftsDrift = `index not verifiable: 0 probes against ${nodesCount} rows`;
+    }
   }
   const ftsOk = Boolean(fts) && ftsCount === nodesCount && ftsDrift === null;
   add(
