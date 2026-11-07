@@ -88,7 +88,7 @@ function parseFileRefs(raw: string | null): string[] | null {
  * hostname с целевым портом, и запрос доходит. Имя из белого списка + порт
  * должны совпадать с фактическими.
  */
-const ALLOWED_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const ALLOWED_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 function hostMatches(header: string | undefined, port: number): boolean {
   if (!header) return false;
@@ -111,9 +111,17 @@ function hostMatches(header: string | undefined, port: number): boolean {
     }
   }
   if (!ALLOWED_HOSTNAMES.has(hostname.toLowerCase())) return false;
-  // Порт в заголовке обязателен к совпадению; отсутствие порта (пустой)
-  // допускаем только для дефолтного 80 — на практике браузер всегда шлёт порт.
-  if (hostPort !== null && hostPort !== "" && hostPort !== String(port)) return false;
+  // R-08 (план 08): порт в заголовке обязан совпадать, а его отсутствие
+  // (нет двоеточия или пустой после двоеточия) допустимо только для
+  // дефолтного 80 — раньше форма без порта проходила на любом порту
+  // (комментарий обещал «только 80», код этого не проверял). Браузер на
+  // нестандартном порту всегда шлёт порт, так что легитимных форм это
+  // не режет.
+  if (hostPort === null || hostPort === "") {
+    if (port !== 80) return false;
+  } else if (hostPort !== String(port)) {
+    return false;
+  }
   return true;
 }
 
