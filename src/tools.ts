@@ -985,6 +985,21 @@ export async function createConcept(
     throw new Error(`Parent concept "${parentId}" does not exist.`);
   }
 
+  // Plan 04 K-05: every supersedes target is verified BEFORE anything is
+  // written. The old flow failed on a missing target only AFTER the node,
+  // its supports and the snapshots were already committed ("Created X, but
+  // supersedes targets not found") — an error the agent could not safely
+  // retry. Validation is pre-work; the writes themselves run in the same
+  // transaction as the node below, so a target that disappears concurrently
+  // rolls the whole creation back.
+  const supersedesIds = input.supersedes ?? [];
+  if (supersedesIds.length > 0) {
+    const missing = supersedesIds.filter((t) => !db.nodeExists(t));
+    if (missing.length > 0) {
+      throw new Error(`supersedes: targets not found: ${missing.join(", ")}.`);
+    }
+  }
+
   // Plan 3 §4.1.3/§11: the provenance flags are read fresh on every call —
   // flipping them in the config file changes behavior without a restart.
   const provenanceConfig = readProvenanceConfig(db.dbPath);
@@ -1163,6 +1178,12 @@ export async function createConcept(
     }
   }
 
+  // T4: mark replaced concepts — edges new--supersedes-->old, old nodes
+  // become superseded with valid_until = now. Plan 04 K-05: the writes run
+  // INSIDE the creation transaction (targets validated above), so a failure
+  // leaves no node, no supports, no snapshots and no status history behind.
+  let supersededIds: string[] = [];
+
   db.runInTransaction(() => {
     for (const fact of factNodesToCreate) {
       db.insertNode({
@@ -1253,6 +1274,16 @@ export async function createConcept(
         db.upsertSupportBaseline(row);
       }
     }
+
+    if (supersedesIds.length > 0) {
+      const { superseded, missing } = db.supersedeNodes(id, supersedesIds);
+      if (missing.length > 0) {
+        throw new Error(
+          `supersedes: targets disappeared mid-call: ${missing.join(", ")} — nothing was written.`
+        );
+      }
+      supersededIds = superseded;
+    }
   });
   if (embedding) {
     // В17: keep the native vector copy in sync.
@@ -1267,19 +1298,9 @@ export async function createConcept(
     embedding,
   });
 
-  // T4: mark replaced concepts — edges new--supersedes-->old, old nodes
-  // become superseded with valid_until = now.
-  let supersededNote = "";
-  if (input.supersedes && input.supersedes.length > 0) {
-    const { superseded, missing } = db.supersedeNodes(id, input.supersedes);
-    if (missing.length > 0) {
-      throw new Error(
-        `Created "${id}", but supersedes targets not found: ${missing.join(", ")}. ` +
-          `Superseded: ${superseded.join(", ") || "none"}.`
-      );
-    }
-    supersededNote = ` Superseded: ${superseded.join(", ")}.`;
-  }
+  // T4: the supersede result is already committed (same transaction above).
+  const supersededNote =
+    supersededIds.length > 0 ? ` Superseded: ${supersededIds.join(", ")}.` : "";
 
   // Plan 3 §4.1.1/§4.1.2: the agent must see what the shortcut did. F6: the
   // count is the number of DISTINCT nodes a support edge was actually written
