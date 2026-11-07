@@ -6,6 +6,33 @@ const foreignId = `foreign'\"<audit-marker>&-узел`;
 const literal = `Текст <audit-marker>не HTML</audit-marker> & ' "`;
 const normalId = "normal-child";
 
+/** Консервативный план последствий (planConsolidation) для preview-reply. */
+function consolidatePlanFixture(survivor: string, other: string) {
+  return {
+    survivor,
+    other,
+    base: { digest: "a".repeat(64), survivor_updated_at: "2026-11-07 10:00:00", other_updated_at: "2026-11-07 10:00:00" },
+    summaryCombines: true,
+    finalSummary: "combined summary",
+    whySource: "survivor",
+    finalWhy: "kept why",
+    fileRefs: [],
+    refsAdded: [],
+    edgesToMove: [],
+    edgesDropped: 0,
+    children: [],
+    slots: [],
+    trailMembers: 0,
+    artifacts: 0,
+    baselines: 0,
+    taskCarries: false,
+    taskState: null,
+    dueAt: null,
+    statusDiverges: false,
+    confirmationsAffected: false,
+  };
+}
+
 type Surface = "parent" | "children" | "outgoing" | "incoming" | "digest sources" | "digest focus";
 const surfaces: Surface[] = ["parent", "children", "outgoing", "incoming", "digest sources", "digest focus"];
 
@@ -79,46 +106,131 @@ describe("W-01 — foreign IDs remain data in every explorer action", () => {
     } finally { ui.close(); }
   });
 
+  // UX-01 (план 07): действие у пары — «Сравнить»; POST делает только
+  // финальное подтверждение. Инвариант W-01 прежний: кавычки/HTML в id
+  // остаются данными на каждом шаге — рендер, разбор обработчиков, POST.
   it.each(["survivor", "other"] as const)("Consolidate keeps the quoted %s ID inert through rendering and handler parsing", async (position) => {
     const a = position === "survivor" ? foreignId : "safe-survivor";
     const b = position === "other" ? foreignId : "safe-other";
-    const ui = await auditDom({ reply: ({ url, method }) => url === "/api/consolidate"
-      ? { body: method === "GET" ? { candidates: [{ a, b, older: a, similarity: 0.9 }] } : { ok: true } } : undefined });
+    const previewUrl = (survivor: string, other: string) =>
+      `/api/consolidate/preview?survivor=${encodeURIComponent(survivor)}&other=${encodeURIComponent(other)}`;
+    const ui = await auditDom({
+      reply: ({ url, method }) => {
+        if (url === "/api/consolidate") {
+          return { body: method === "GET" ? { candidates: [{ a, b, older: a, similarity: 0.9 }] } : { ok: true, survivor: "done", removed: "gone" } };
+        }
+        if (url === previewUrl(a, b)) return { body: consolidatePlanFixture(a, b) };
+        if (url === previewUrl(b, a)) return { body: consolidatePlanFixture(b, a) };
+        if (url === `/api/node/${encodeURIComponent(a)}`) return { body: graphNode(a, { name: "Card A" }) };
+        if (url === `/api/node/${encodeURIComponent(b)}`) return { body: graphNode(b, { name: "Card B" }) };
+        return undefined;
+      },
+    });
     try {
       ui.dispatch(ui.element("#consolidate-btn"), "click");
       await ui.settle();
       const stats = ui.element("#stats");
       expect(stats.textContent).toContain(foreignId);
       expect(stats.querySelectorAll("audit-marker")).toHaveLength(0);
-      expect(stats.querySelectorAll("button").some((button) => button.textContent.startsWith("merge into "))).toBe(true);
       expect(ui.handlerErrors(stats)).toEqual([]);
-      const merge = stats.querySelectorAll("button").find((button) => button.textContent.startsWith("merge into "))!;
-      ui.dispatch(merge, "click");
+      const compare = stats.querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-compare");
+      expect(compare).toBeDefined();
+      ui.dispatch(compare!, "click");
+      await ui.settle();
+      // До финального подтверждения — только GET.
+      expect(ui.requests.filter((request) => request.method === "POST")).toHaveLength(0);
+      const panel = ui.element("#consolidate-preview");
+      expect(panel.textContent).toContain(foreignId);
+      expect(panel.querySelectorAll("audit-marker")).toHaveLength(0);
+      expect(ui.handlerErrors(panel)).toEqual([]);
+      const choose = panel.querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-survivor"
+          && (button.textContent ?? "").includes(foreignId));
+      expect(choose).toBeDefined();
+      ui.dispatch(choose!, "click");
+      await ui.settle();
+      // После выбора survivor серверный планировщик отрисовал последствия.
+      const withEffects = ui.element("#consolidate-preview");
+      expect(withEffects.textContent).toContain("Consequences");
+      expect(withEffects.querySelectorAll("audit-marker")).toHaveLength(0);
+      const merge = ui.element("#consolidate-preview").querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-merge");
+      expect(merge).toBeDefined();
+      expect(merge!.hasAttribute("disabled")).toBe(false);
+      ui.dispatch(merge!, "click");
+      await ui.settle();
+      const confirm = ui.element("#consolidate-preview").querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-confirm");
+      expect(confirm).toBeDefined();
+      ui.dispatch(confirm!, "click");
       await ui.settle();
       const posts = ui.requests.filter((request) => request.method === "POST");
       expect(posts).toHaveLength(1);
-      expect(JSON.parse(posts[0].body!)).toEqual({ survivor: a, other: b });
-      expect(ui.location.reloads).toBe(1);
+      const body = JSON.parse(posts[0].body!);
+      expect(body.survivor).toBe(position === "survivor" ? a : b);
+      expect(body.other).toBe(position === "survivor" ? b : a);
+      expect(body.base.digest).toEqual(expect.any(String));
+      // Успех обновляет граф перечитыванием (GET), без location.reload.
+      expect(ui.location.reloads).toBe(0);
       expect(ui.alerts).toEqual([]);
+      expect(ui.errors).toEqual([]);
     } finally { ui.close(); }
   });
 
   it("Consolidate sends exact normal IDs through the actual click handler", async () => {
-    const ui = await auditDom({ reply: ({ url, method }) => url === "/api/consolidate"
-      ? { body: method === "GET" ? { candidates: [{ a: "older", b: "newer", older: "older", similarity: 0.9 }] } : { ok: true } }
-      : undefined });
+    const previewUrl = (survivor: string, other: string) =>
+      `/api/consolidate/preview?survivor=${encodeURIComponent(survivor)}&other=${encodeURIComponent(other)}`;
+    const ui = await auditDom({
+      reply: ({ url, method }) => {
+        if (url === "/api/consolidate") {
+          return {
+            body: method === "GET"
+              ? { candidates: [{ a: "older", b: "newer", older: "older", similarity: 0.9 }] }
+              : { ok: true, survivor: "older", removed: "newer" },
+          };
+        }
+        if (url === previewUrl("older", "newer")) return { body: consolidatePlanFixture("older", "newer") };
+        if (url === previewUrl("newer", "older")) return { body: consolidatePlanFixture("newer", "older") };
+        if (url === "/api/node/older") return { body: graphNode("older", { name: "Older" }) };
+        if (url === "/api/node/newer") return { body: graphNode("newer", { name: "Newer" }) };
+        return undefined;
+      },
+    });
     try {
       ui.dispatch(ui.element("#consolidate-btn"), "click");
       await ui.settle();
-      const merge = ui.element("#stats").querySelectorAll("button").find((button) => button.textContent === "merge into older");
-      expect(merge).toBeDefined();
+      const compare = ui.element("#stats").querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-compare");
+      expect(compare).toBeDefined();
+      ui.dispatch(compare!, "click");
+      await ui.settle();
+      // Явный выбор survivor: рекомендация (older) видна, но выбора нет,
+      // пока пользователь не кликнул.
+      const chooseOlder = ui.element("#consolidate-preview").querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-survivor"
+          && (button.textContent ?? "").includes("older"));
+      expect(chooseOlder).toBeDefined();
+      const mergeBefore = ui.element("#consolidate-preview").querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-merge");
+      expect(mergeBefore!.hasAttribute("disabled")).toBe(true);
+      ui.dispatch(chooseOlder!, "click");
+      await ui.settle();
+      const merge = ui.element("#consolidate-preview").querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-merge");
+      expect(merge!.hasAttribute("disabled")).toBe(false);
       ui.dispatch(merge!, "click");
+      await ui.settle();
+      const confirm = ui.element("#consolidate-preview").querySelectorAll("button")
+        .find((button) => button.getAttribute("data-action") === "consolidate-confirm");
+      ui.dispatch(confirm!, "click");
       await ui.settle();
       const post = ui.requests.find((request) => request.method === "POST");
       expect(post?.url).toBe("/api/consolidate");
-      expect(JSON.parse(post!.body!)).toEqual({ survivor: "older", other: "newer" });
-      expect(ui.location.reloads).toBe(1);
+      expect(JSON.parse(post!.body!)).toMatchObject({ survivor: "older", other: "newer" });
+      expect(ui.location.reloads).toBe(0);
       expect(ui.alerts).toEqual([]);
+      expect(ui.errors).toEqual([]);
     } finally { ui.close(); }
   });
 

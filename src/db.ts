@@ -2522,6 +2522,18 @@ export class KnowledgeDB {
       .all(project) as Array<{ role: string; node_id: string; node_name: string; updated_at: string }>;
   }
 
+  /**
+   * UX-01 (план 07): роли, которые держит узел, — на карточке. База без
+   * таблицы slots (pre-v6) честно отвечает пустым списком, а не ошибкой.
+   */
+  getSlotsForNode(nodeId: string): Array<{ project: string; role: string }> {
+    const hasSlots = (this.db.pragma("table_info(slots)") as Array<{ name: string }>).length > 0;
+    if (!hasSlots) return [];
+    return this.db
+      .prepare("SELECT project, role FROM slots WHERE node_id = ? ORDER BY project, role")
+      .all(nodeId) as Array<{ project: string; role: string }>;
+  }
+
   // ---- Task board (plan 2 §3) ----
 
   setTaskState(id: string, taskState: "open" | "done" | null, dueAt: string | null | undefined): boolean {

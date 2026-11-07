@@ -47,6 +47,86 @@
     white-space: nowrap;
   }
 
+  /* UX-01 (план 07): сравнение двух нод перед Consolidate. Две независимые
+     панели A/B рядом; на узком экране — последовательно с теми же
+     заголовками. */
+  #consolidate-preview {
+    position: fixed;
+    top: 46px; left: 16px; right: 16px; bottom: 90px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    z-index: 60;
+    overflow-y: auto;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .cc-head { display: flex; align-items: center; gap: 10px; }
+  .cc-title { font-weight: 700; color: var(--text-dim); }
+  .cc-meta { color: var(--text-muted); font-size: 11px; }
+  .cc-stale {
+    color: #f59e0b; font-size: 11px;
+    border: 1px solid #f59e0b55; border-radius: 8px; padding: 1px 8px;
+  }
+  .cc-close {
+    margin-left: auto; background: transparent;
+    border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 8px; cursor: pointer; font-size: 14px; padding: 2px 10px;
+  }
+  .cc-columns { display: flex; gap: 10px; align-items: flex-start; }
+  .ccard {
+    flex: 1 1 0; min-width: 0;
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px;
+    background: var(--surface2);
+  }
+  .ccard-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+  .ccard-side { color: var(--text-dim); font-weight: 700; }
+  .ccard-id { color: #38bdf8; word-break: break-all; }
+  .ccard-badge { color: #f59e0b; font-size: 10px; border: 1px solid #f59e0b55; border-radius: 6px; padding: 0 6px; }
+  .ccard-name { font-size: 13px; margin-bottom: 4px; }
+  .ccard-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .ccard-row { display: flex; gap: 8px; align-items: flex-start; margin: 4px 0; font-size: 11px; flex-wrap: wrap; }
+  .cc-label { color: var(--text-muted); min-width: 130px; flex-shrink: 0; }
+  .cc-text { white-space: pre-wrap; word-break: break-word; }
+  .cc-error { color: #ef4444; }
+  .cc-warn { color: #f59e0b; }
+  .cc-hint { color: var(--text-muted); }
+  .cc-ok { color: #4ade80; }
+  .cc-survivor { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .cc-choice {
+    cursor: pointer; background: var(--bg);
+    border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 4px 10px; font-family: inherit; font-size: 11px;
+  }
+  .cc-choice.chosen { border-color: #4ade80; color: #4ade80; }
+  .cc-choice:disabled { opacity: 0.5; cursor: default; }
+  .cc-effects { border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11px; }
+  .cc-effects-title { color: var(--text-dim); margin-bottom: 6px; }
+  .cc-effect { display: flex; gap: 8px; margin: 3px 0; }
+  .cc-value { word-break: break-word; }
+  .cc-edge { color: #38bdf8; }
+  .cc-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .cc-btn {
+    cursor: pointer; background: #1e2333;
+    border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 8px; padding: 4px 12px; font-family: inherit;
+  }
+  .cc-btn:disabled { opacity: 0.45; cursor: default; }
+  .cc-merge { border-color: #22c55e55; color: #4ade80; }
+  .cc-danger { border-color: #ef444455; color: #ef4444; }
+  .cc-confirm {
+    border: 1px solid #ef444455; border-radius: 10px; padding: 10px;
+    font-size: 11px; display: flex; flex-direction: column; gap: 8px;
+  }
+
+  @media (max-width: 900px) {
+    .cc-columns { flex-direction: column; }
+    .cc-label { min-width: 90px; }
+  }
+
   .search-shell {
     flex: 1;
     max-width: 520px;
@@ -621,10 +701,18 @@ function connectSSE() {
 
   evtSource.onopen = () => {
     sseConnected = true;
+    // UX-01 (план 07): reconnect во время открытого preview помечает его
+    // устаревшим — во время разрыва граф мог измениться; merge сам не
+    // выполняется, пользователю предлагается перечитать.
+    if (ccState && ccState.sawSseError) {
+      ccState.sawSseError = false;
+      markConsolidateStale();
+    }
   };
 
   evtSource.onerror = () => {
     sseConnected = false;
+    if (ccState) ccState.sawSseError = true;
   };
 }
 
@@ -639,9 +727,11 @@ function handleSSE(msg) {
       handleNodeAdded(msg.data);
       break;
     case 'node_updated':
+      ccNoteNodeChange(msg.data && msg.data.id);
       handleNodeUpdated(msg.data);
       break;
     case 'node_removed':
+      ccNoteNodeChange(msg.data && msg.data.id);
       handleNodeRemoved(msg.data);
       break;
     case 'edge_added':
@@ -1065,10 +1155,12 @@ async function openConsolidate() {
       `<div class="stat" style="display:flex;gap:8px;align-items:center;border:1px solid #64748b44;border-radius:10px;padding:4px 8px">` +
       `<span style="color:#38bdf8">${esc(c.a)}</span> ≈ <span style="color:#38bdf8">${esc(c.b)}</span>` +
       `<span style="color:#4ade80">${(c.similarity * 100).toFixed(1)}%</span>` +
-      // W-01 (plan 05): ids ride in data attributes (HTML-escaped, decoded by
-      // the parser), never inside an inline handler string.
-      `<button data-action="consolidate" data-survivor="${esc(c.older)}" data-other="${esc(c.older === c.a ? c.b : c.a)}" ` +
-      `style="cursor:pointer;background:#22c55e22;border:1px solid #22c55e55;color:#4ade80;border-radius:8px;padding:2px 8px">merge into ${esc(c.older)}</button></div>`
+      // UX-01 (план 07): действие у пары — «Сравнить», POST делает только
+      // финальное подтверждение в preview. W-01: ids ride in data attributes,
+      // never inside an inline handler string.
+      `<button data-action="consolidate-compare" data-a="${esc(c.a)}" data-b="${esc(c.b)}" data-older="${esc(c.older)}" data-sim="${esc(String(c.similarity))}" ` +
+      `style="cursor:pointer;background:#3b82f622;border:1px solid #3b82f655;color:#38bdf8;border-radius:8px;padding:2px 8px">compare</button>` +
+      `<span style="color:#64748b">recommendation: older ${esc(c.older)}</span></div>`
     ).join('');
     el.innerHTML = `<div style="display:flex;flex-direction:column;gap:4px;width:100%">` +
       `<span class="stat">${candidates.length} duplicate candidate(s)</span>${rows}` +
@@ -1078,22 +1170,423 @@ async function openConsolidate() {
   }
 }
 
-async function applyConsolidate(survivor, other) {
+// ---- UX-01 (план 07): сравнение двух нод перед Consolidate ----
+// Список кандидатов открывает preview; POST выполняет единственное
+// финальное подтверждение. Отмена/закрытие/просмотр/смена survivor/ошибка
+// GET — ноль POST и ноль мутаций. Все данные едут в data-атрибутах (W-01).
+
+let ccState = null;
+
+function ccSurivorIds(state) {
+  const survivorId = state.survivor === 'A' ? state.a : state.b;
+  const otherId = state.survivor === 'A' ? state.b : state.a;
+  return { survivorId, otherId };
+}
+
+// SSE-событие об изменении одной из нод пары помечает открытый preview
+// устаревшим. merged/busy защищают от пометки событиями самого слияния.
+function ccNoteNodeChange(id) {
+  if (!ccState || ccState.merged || ccState.busy) return;
+  if (id && (id === ccState.a || id === ccState.b)) markConsolidateStale();
+}
+
+function closeConsolidatePreview() {
+  ccState = null;
+  const panel = document.getElementById('consolidate-preview');
+  if (panel) panel.remove();
+}
+
+function markConsolidateStale() {
+  if (!ccState || ccState.merged || ccState.busy) return;
+  ccState.stale = true;
+  ccState.confirmOpen = false;
+  renderConsolidatePreview();
+}
+
+// Открытие preview: обе карточки и последствия грузятся GET-ами; merge
+// остаётся disabled, пока не загружены обе карточки, план выбранной
+// ориентации и не выбран survivor.
+function openConsolidatePreview(a, b, meta) {
+  closeConsolidatePreview();
+  ccState = {
+    a, b,
+    older: (meta && meta.older) || '',
+    similarity: meta && meta.similarity !== undefined ? meta.similarity : null,
+    survivor: null,            // нет скрытого автовыбора: выбор явный
+    cards: { A: null, B: null },
+    plan: null,                // { ok, data } для ориентации (survivorId → otherId)
+    planLoading: false,
+    stale: false,
+    sawSseError: false,
+    conflict: false,
+    busy: false,
+    confirmOpen: false,
+    postError: null,
+    merged: null,
+    loadError: null,
+    gen: 0,
+  };
+  const panel = document.createElement('div');
+  panel.id = 'consolidate-preview';
+  // Делегирование на корне панели (W-01): данные — в data-атрибутах,
+  // ни одного inline-обработчика с интерполяцией id.
+  panel.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const actionEl = target.closest('[data-action]');
+    const action = actionEl ? actionEl.getAttribute('data-action') : null;
+    if (action === 'consolidate-close') { closeConsolidatePreview(); return; }
+    if (action === 'consolidate-survivor') {
+      chooseConsolidateSurvivor(actionEl.getAttribute('data-side') ?? '');
+      return;
+    }
+    if (action === 'consolidate-retry') { void loadConsolidatePreview(); return; }
+    if (action === 'consolidate-merge') {
+      if (!ccState || ccState.busy || ccState.merged) return;
+      ccState.confirmOpen = true;
+      renderConsolidatePreview();
+      return;
+    }
+    if (action === 'consolidate-confirm') { void submitConsolidateMerge(); return; }
+    if (action === 'consolidate-cancel-confirm') {
+      if (!ccState) return;
+      ccState.confirmOpen = false;
+      renderConsolidatePreview();
+      return;
+    }
+    const nav = target.closest('[data-navigate-id]');
+    if (nav) navigateTo(nav.getAttribute('data-navigate-id') ?? '');
+  });
+  document.body.appendChild(panel);
+  renderConsolidatePreview();
+  loadConsolidatePreview();
+}
+
+// (Пере)загрузка карточек и последствий. Всё — GET.
+async function loadConsolidatePreview() {
+  const state = ccState;
+  if (!state) return;
+  const gen = ++state.gen;
+  state.loadError = null;
+  state.cards = { A: null, B: null };
+  state.plan = null;
+  state.planLoading = Boolean(state.survivor);
+  renderConsolidatePreview();
+
+  const loadCard = async (side, id) => {
+    try {
+      const res = await fetch('/api/node/' + encodeURIComponent(id));
+      const data = await res.json();
+      if (!state || state.gen !== gen) return;
+      state.cards[side] = res.ok ? { ok: true, data } : { ok: false, error: (data && data.error) || ('HTTP ' + res.status) };
+    } catch (err) {
+      if (!state || state.gen !== gen) return;
+      state.cards[side] = { ok: false, error: String(err) };
+    }
+    renderConsolidatePreview();
+  };
+
+  await Promise.all([loadCard('A', state.a), loadCard('B', state.b)]);
+  await loadConsolidatePlan(gen);
+}
+
+// Последствия считаются серверным планировщиком (planConsolidation) для
+// текущей ориентации survivor. Смена survivor перезагружает план (GET).
+async function loadConsolidatePlan(gen) {
+  const state = ccState;
+  if (!state || state.gen !== gen || !state.survivor) return;
+  const { survivorId, otherId } = ccSurivorIds(state);
+  state.planLoading = true;
+  renderConsolidatePreview();
+  try {
+    const url = '/api/consolidate/preview?survivor=' + encodeURIComponent(survivorId) +
+      '&other=' + encodeURIComponent(otherId);
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!ccState || ccState !== state || state.gen !== gen) return;
+    state.plan = res.ok ? { ok: true, data } : { ok: false, error: (data && data.error) || ('HTTP ' + res.status) };
+  } catch (err) {
+    if (!ccState || ccState !== state || state.gen !== gen) return;
+    state.plan = { ok: false, error: String(err) };
+  }
+  state.planLoading = false;
+  renderConsolidatePreview();
+}
+
+function chooseConsolidateSurvivor(side) {
+  const state = ccState;
+  if (!state || state.merged || state.busy) return;
+  if (state.survivor === side) return;
+  state.survivor = side;
+  state.confirmOpen = false;
+  state.plan = null;
+  // План перечитывается для новой ориентации — чтение, не мутация.
+  void loadConsolidatePlan(state.gen);
+}
+
+// Финальное подтверждение — единственный POST. Повторный клик блокируется
+// флагом busy; ошибка не теряется: панель остаётся открыта с текстом.
+async function submitConsolidateMerge() {
+  const state = ccState;
+  if (!state || state.busy || state.merged) return;
+  const { survivorId, otherId } = ccSurivorIds(state);
+  const planOk = state.plan && state.plan.ok && !state.plan.data.rejection &&
+    state.plan.data.survivor === survivorId;
+  if (!planOk || !state.survivor) return;
+  state.busy = true;
+  state.confirmOpen = false;
+  state.postError = null;
+  renderConsolidatePreview();
+  const base = state.plan.data.base || {};
   try {
     const res = await fetch('/api/consolidate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ survivor, other }),
+      body: JSON.stringify({
+        survivor: survivorId,
+        other: otherId,
+        base: {
+          ...(base.digest ? { digest: base.digest } : {}),
+          survivor_updated_at: base.survivor_updated_at ?? null,
+          other_updated_at: base.other_updated_at ?? null,
+        },
+      }),
     });
-    const data = await res.json();
-    if (data.error) {
-      alert('merge failed: ' + data.error);
+    let data = {};
+    try { data = await res.json(); } catch { /* пустое тело — обработается ниже */ }
+    if (!ccState || ccState !== state) return;
+    if (res.status === 409 || data.error === 'version_conflict') {
+      // Stale preview: нода изменилась/удалена — перечитываем и просим
+      // подтвердить заново; merge сам не выполняется.
+      state.busy = false;
+      state.conflict = true;
+      await loadConsolidatePreview();
       return;
     }
-    location.reload();
+    if (!res.ok || data.error) {
+      state.busy = false;
+      state.postError = data.error || ('HTTP ' + res.status);
+      renderConsolidatePreview();
+      return;
+    }
+    state.busy = false;
+    state.merged = { survivor: survivorId, removed: otherId };
+    renderConsolidatePreview();
+    await refreshExplorerAfterMerge();
   } catch (err) {
-    alert('merge failed: ' + String(err));
+    if (!ccState || ccState !== state) return;
+    state.busy = false;
+    state.postError = String(err);
+    renderConsolidatePreview();
   }
+}
+
+// После успеха: настоящий survivor виден в панели, граф и кандидаты
+// обновляются перечитыванием (GET), поглощённая нода уходит из графа.
+async function refreshExplorerAfterMerge() {
+  try {
+    const [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()]);
+    if (graphData && Array.isArray(graphData.nodes)) {
+      handleSseInit({ nodes: graphData.nodes, edges: graphData.edges });
+    }
+    renderStats(stats);
+    updateVisibleCounter();
+    await openConsolidate();
+  } catch (err) {
+    // Слияние уже применено; сбой перечитывания показываем, не роняя панель.
+    if (ccState) {
+      ccState.postError = 'merged, but refresh failed: ' + String(err);
+      renderConsolidatePreview();
+    }
+  }
+}
+
+function ccCardHtml(side, id, card, olderId) {
+  const head = `<div class="ccard-head">` +
+    `<span class="ccard-side">${side}</span> <span class="ccard-id">${esc(id)}</span>` +
+    (olderId === id ? ' <span class="ccard-badge">recommended · older</span>' : '') +
+    `</div>`;
+  if (!card) return `<section class="ccard">${head}<div class="ccard-body">loading…</div></section>`;
+  if (!card.ok) {
+    return `<section class="ccard">${head}<div class="ccard-body cc-error">card failed: ${esc(card.error)}</div></section>`;
+  }
+  const d = card.data;
+  const badge = (label, color) =>
+    `<span class="kind-badge" style="background:${color}22;color:${color};border:1px solid ${color}44">${esc(label)}</span>`;
+  const status = d.status || 'active';
+  const statusColor = status === 'active' ? '#4ade80' : status === 'superseded' ? '#f59e0b' : '#ef4444';
+  let h = `<section class="ccard">${head}<div class="ccard-body">`;
+  h += `<div class="ccard-name">${esc(d.name)}</div>`;
+  h += `<div class="ccard-badges">${badge(d.kind, KIND_COLORS[d.kind] || '#888')}${badge(status, statusColor)}`;
+  if (d.epistemic_status) h += badge(d.epistemic_status, '#a855f7');
+  if (d.expired) h += badge('expired', '#f59e0b');
+  if (d.weak_support) h += badge('weak support', '#f59e0b');
+  h += `</div>`;
+  if (d.parent) h += `<div class="ccard-row"><span class="cc-label">parent</span><span class="link-row" data-navigate-id="${esc(d.parent.id)}">${esc(d.parent.name)}</span></div>`;
+  if (d.children && d.children.length) {
+    h += `<div class="ccard-row"><span class="cc-label">children (${d.children.length})</span>` +
+      d.children.map(c => `<span class="child-link" data-navigate-id="${esc(c.id)}">${esc(c.name)}</span>`).join('') + `</div>`;
+  }
+  // Полный текст без обрезания: white-space:pre-wrap, ничего не отрезается.
+  h += `<div class="ccard-row"><span class="cc-label">summary</span><div class="cc-text">${esc(d.summary || '')}</div></div>`;
+  h += `<div class="ccard-row"><span class="cc-label">why</span><div class="cc-text">${esc(d.why || '—')}</div></div>`;
+  if (d.refuted_reason) h += `<div class="ccard-row"><span class="cc-label">refuted reason</span><div class="cc-text">${esc(d.refuted_reason)}</div></div>`;
+  if (d.valid_until) h += `<div class="ccard-row"><span class="cc-label">valid until</span>${esc(String(d.valid_until))}${d.expired ? ' — expired' : ''}</div>`;
+  if (d.status_scope) h += `<div class="ccard-row"><span class="cc-label">scope</span><div class="cc-text">${esc(JSON.stringify(d.status_scope))}</div></div>`;
+  if (d.file_refs && d.file_refs.length) {
+    h += `<div class="ccard-row"><span class="cc-label">files</span>` +
+      d.file_refs.map(f => `<span class="file-ref">${esc(f)}</span>`).join('') + `</div>`;
+  }
+  if (d.informed_by && d.informed_by.length) {
+    h += `<div class="ccard-row"><span class="cc-label">supports (informed_by)</span>` +
+      d.informed_by.map(e =>
+        `<span class="link-row" data-navigate-id="${esc(e.to)}"><span class="rel">informed_by</span> <span class="name">${esc(e.to_name)}</span>` +
+        (e.rationale ? `<span class="desc">${esc(e.rationale)}</span>` : '') +
+        (e.weak ? ' <span style="color:#f59e0b">weak</span>' : '') + `</span>`).join('') + `</div>`;
+  }
+  if (d.informed_by_incoming && d.informed_by_incoming.length) {
+    h += `<div class="ccard-row"><span class="cc-label">relied on by</span>` +
+      d.informed_by_incoming.map(e =>
+        `<span class="link-row" data-navigate-id="${esc(e.from)}"><span class="rel">informed_by</span> <span class="name">${esc(e.from_name)}</span>` +
+        (e.rationale ? `<span class="desc">${esc(e.rationale)}</span>` : '') + `</span>`).join('') + `</div>`;
+  }
+  if (d.edges && d.edges.length) {
+    h += `<div class="ccard-row"><span class="cc-label">outgoing (${d.edges.length})</span>` +
+      d.edges.map(e =>
+        `<span class="link-row" data-navigate-id="${esc(e.to)}"><span class="rel">${esc(e.relation)}</span> <span class="name">${esc(e.to_name)}</span>` +
+        (e.description ? `<span class="desc">${esc(e.description)}</span>` : '') + `</span>`).join('') + `</div>`;
+  }
+  if (d.incoming_edges && d.incoming_edges.length) {
+    h += `<div class="ccard-row"><span class="cc-label">incoming (${d.incoming_edges.length})</span>` +
+      d.incoming_edges.map(e =>
+        `<span class="link-row" data-navigate-id="${esc(e.from)}"><span class="rel">${esc(e.relation)}</span> <span class="name">${esc(e.from_name)}</span>` +
+        (e.description ? `<span class="desc">${esc(e.description)}</span>` : '') + `</span>`).join('') + `</div>`;
+  }
+  if (d.trails && d.trails.length) {
+    h += `<div class="ccard-row"><span class="cc-label">trails</span>` +
+      d.trails.map(t => `<span class="file-ref">${esc(t.id)} · ${esc(t.state)}</span>`).join('') + `</div>`;
+  }
+  if (d.slots && d.slots.length) {
+    h += `<div class="ccard-row"><span class="cc-label">slots</span>` +
+      d.slots.map(s => `<span class="file-ref">${esc(s.project)} / ${esc(s.role)}</span>`).join('') + `</div>`;
+  }
+  if (d.task_state || d.due_at) {
+    h += `<div class="ccard-row"><span class="cc-label">task</span>${esc(d.task_state || '')}${d.due_at ? ' · due ' + esc(String(d.due_at)) : ''}</div>`;
+  }
+  const origin = d.created_via ? d.created_via : 'unknown';
+  h += `<div class="ccard-row"><span class="cc-label">origin</span>${esc(origin)}</div>`;
+  if (d.current_digests && d.current_digests.confirmed_claim) {
+    h += `<div class="ccard-row"><span class="cc-label">confirmed claim</span>yes${d.current_digests.confirmed_claim !== d.current_digests.claim ? ' — wording changed since confirmation' : ''}</div>`;
+  }
+  h += `<div class="ccard-row"><span class="cc-label">timestamps</span>created ${esc(String(d.created_at || '?'))} · updated ${esc(String(d.updated_at || '?'))}</div>`;
+  h += `</div></section>`;
+  return h;
+}
+
+function ccEffectsHtml(state, survivorId, otherId) {
+  if (!state.survivor) {
+    return `<div class="cc-effects"><span class="cc-hint">choose the survivor to compute the consequences — nothing happens until the final confirmation</span></div>`;
+  }
+  if (state.planLoading) return `<div class="cc-effects"><span class="cc-hint">computing consequences…</span></div>`;
+  if (!state.plan) return `<div class="cc-effects"><span class="cc-hint">consequences not loaded</span></div>`;
+  if (!state.plan.ok) {
+    return `<div class="cc-effects"><span class="cc-error">consequences failed: ${esc(state.plan.error)}</span></div>`;
+  }
+  const plan = state.plan.data;
+  if (plan.rejection) {
+    return `<div class="cc-effects"><span class="cc-error">merge is rejected: ${esc(plan.rejection)}</span></div>`;
+  }
+  const row = (label, value) => `<div class="cc-effect"><span class="cc-label">${esc(label)}</span><span class="cc-value">${value}</span></div>`;
+  let h = `<div class="cc-effects">`;
+  h += `<div class="cc-effects-title">Consequences (server planner — the same code apply executes)</div>`;
+  h += row('survivor', `<span style="color:#4ade80">${esc(survivorId)}</span> — сохраняется`);
+  h += row('absorbed', `<span style="color:#ef4444">${esc(otherId)}</span> — удаляется безвозвратно`);
+  h += row('summary', plan.summaryCombines ? 'объединится — текст дубля добавится в конец выжившего' : 'останется без изменений');
+  h += row('why', plan.whySource === 'survivor' ? 'остаётся у выжившего' :
+    plan.whySource === 'other' ? 'возьмётся из дубля' : 'нет ни у одной из нод');
+  h += row('file_refs', plan.refsAdded.length
+    ? `+${plan.refsAdded.length}: ${plan.refsAdded.map(r => esc(r)).join(', ')}` : 'новых ссылок нет');
+  const movedList = plan.edgesToMove.map(e =>
+    `<span class="cc-edge">${esc(e.relation)}: ${esc(e.from_id)} → ${esc(e.to_id)}</span>`).join('');
+  h += row('edges', `${plan.edgesToMove.length} переедут${movedList ? ' — ' + movedList : ''}; ` +
+    `${plan.edgesDropped} не переедут (самопетля или дубль — исчезнут вместе с узлом)`);
+  h += row('children', plan.children.length
+    ? `переедут под выжившего: ${plan.children.map(c => esc(c.id)).join(', ')}` : 'нет детей');
+  h += row('slots', plan.slots.length
+    ? `переедут: ${plan.slots.map(s => esc(`${s.project} / ${s.role}`)).join(', ')}` : 'нет слотов');
+  h += row('trails/artifacts', `${plan.trailMembers} участник(ов) цепочек, ${plan.artifacts} артефакт(ов) переедут`);
+  h += row('confirmations', plan.baselines > 0
+    ? `${plan.baselines} подтверждени(й) переедут` +
+      (plan.confirmationsAffected ? ' и покажут claim_changed — формулировка объединена' : ' без изменения формулировки')
+    : 'подтверждений у дубля нет');
+  h += row('task', plan.taskCarries
+    ? `состояние ${esc(plan.taskState || '')}${plan.dueAt ? ' (due ' + esc(String(plan.dueAt)) + ')' : ''} переедет` : 'не переезжает');
+  h += row('status', plan.statusDiverges
+    ? 'статус дубля НЕ переносится — у выжившего останется его собственный'
+    : 'статусы совпадают');
+  h += `</div>`;
+  return h;
+}
+
+function renderConsolidatePreview() {
+  const panel = document.getElementById('consolidate-preview');
+  if (!panel || !ccState) return;
+  const state = ccState;
+  const { survivorId, otherId } = ccSurivorIds(state);
+
+  let h = `<div class="cc-head"><span class="cc-title">consolidate preview</span>`;
+  h += `<span class="cc-meta">similarity ${state.similarity !== null ? (Number(state.similarity) * 100).toFixed(1) + '%' : '?'} · recommendation: older ${esc(state.older || '?')}</span>`;
+  if (state.stale) h += `<span class="cc-stale">preview stale — graph changed, re-read before merging</span>`;
+  h += `<button class="cc-close" data-action="consolidate-close" title="close (Escape)">×</button></div>`;
+
+  h += `<div class="cc-columns">` +
+    ccCardHtml('A', state.a, state.cards.A, state.older) +
+    ccCardHtml('B', state.b, state.cards.B, state.older) +
+    `</div>`;
+
+  // Явный выбор survivor: рекомендация видна, автовыбора нет.
+  h += `<div class="cc-survivor"><span class="cc-label">survivor</span>` +
+    `<button class="cc-choice${state.survivor === 'A' ? ' chosen' : ''}" data-action="consolidate-survivor" data-side="A" ${state.merged || state.busy ? 'disabled' : ''}>` +
+    `A — ${esc(state.a)}${state.older === state.a ? ' · recommended (older)' : ''}${state.survivor === 'A' ? ' · ✓ chosen' : ''}</button>` +
+    `<button class="cc-choice${state.survivor === 'B' ? ' chosen' : ''}" data-action="consolidate-survivor" data-side="B" ${state.merged || state.busy ? 'disabled' : ''}>` +
+    `B — ${esc(state.b)}${state.older === state.b ? ' · recommended (older)' : ''}${state.survivor === 'B' ? ' · ✓ chosen' : ''}</button></div>`;
+
+  h += ccEffectsHtml(state, survivorId, otherId);
+
+  const bothCards = state.cards.A && state.cards.A.ok && state.cards.B && state.cards.B.ok;
+  const planReady = state.plan && state.plan.ok && !state.plan.data.rejection &&
+    state.plan.data.survivor === survivorId && state.plan.data.other === otherId;
+  const mergeReady = !state.merged && !state.stale && !state.busy && bothCards && planReady && Boolean(state.survivor);
+
+  h += `<div class="cc-status">`;
+  if (state.loadError) h += `<span class="cc-error">${esc(state.loadError)}</span>`;
+  if (state.postError) h += `<span class="cc-error">merge failed: ${esc(state.postError)}</span>`;
+  if (state.conflict && !state.stale) h += `<span class="cc-warn">preview was stale — data re-read, confirm again</span>`;
+  if (state.busy) h += `<span class="cc-hint">merging…</span>`;
+  h += `</div>`;
+
+  h += `<div class="cc-actions">`;
+  const needsRetry = (!bothCards) || (state.plan && !state.plan.ok);
+  if (needsRetry && !state.busy && !state.merged) {
+    h += `<button class="cc-btn" data-action="consolidate-retry">retry load</button>`;
+  }
+  if (state.merged) {
+    h += `<span class="cc-ok">merged: survivor <b>${esc(state.merged.survivor)}</b>, absorbed <b>${esc(state.merged.removed)}</b>` +
+      ` — moved edges are recreated with origin "unknown" (server re-creation, plan 4 v8 §1.3)</span>`;
+    h += `<button class="cc-btn" data-action="consolidate-close">close</button>`;
+  } else {
+    h += `<button class="cc-btn cc-merge" data-action="consolidate-merge" ${mergeReady ? '' : 'disabled'}>Объединить…</button>`;
+  }
+  h += `</div>`;
+
+  if (state.confirmOpen && !state.merged) {
+    h += `<div class="cc-confirm"><div>Final confirmation: merge <b>${esc(otherId)}</b> into <b>${esc(survivorId)}</b>? ` +
+      `The absorbed node is deleted irreversibly; versions are bound to the preview (stale preview → 409, nothing is written).</div>` +
+      `<button class="cc-btn cc-danger" data-action="consolidate-confirm">Объединить ${esc(survivorId)} + ${esc(otherId)}</button>` +
+      `<button class="cc-btn" data-action="consolidate-cancel-confirm">Отмена</button></div>`;
+  }
+
+  panel.innerHTML = h;
 }
 
 // ---- Data model + simulation ----
@@ -2456,9 +2949,16 @@ function setupDelegatedActions() {
     stats.addEventListener('click', (event) => {
       const target = event.target;
       if (!(target instanceof Element)) return;
-      const consolidate = target.closest('button[data-action="consolidate"]');
-      if (consolidate) {
-        void applyConsolidate(consolidate.getAttribute('data-survivor') ?? '', consolidate.getAttribute('data-other') ?? '');
+      // UX-01 (план 07): действие у пары — «Сравнить», POST делает только
+      // финальное подтверждение внутри preview.
+      const compare = target.closest('button[data-action="consolidate-compare"]');
+      if (compare) {
+        const sim = Number(compare.getAttribute('data-sim'));
+        void openConsolidatePreview(
+          compare.getAttribute('data-a') ?? '',
+          compare.getAttribute('data-b') ?? '',
+          { older: compare.getAttribute('data-older') ?? '', similarity: Number.isFinite(sim) ? sim : null }
+        );
         return;
       }
       if (target.closest('#consolidate-btn')) { void openConsolidate(); return; }
@@ -2490,6 +2990,11 @@ function setupDelegatedActions() {
       if (nav) navigateTo(nav.getAttribute('data-navigate-id') ?? '');
     });
   }
+
+  // Escape закрывает preview (ноль POST и ноль мутаций).
+  document.addEventListener('keydown', (event) => {
+    if (event && event.key === 'Escape' && ccState) closeConsolidatePreview();
+  });
 }
 
 // ---- Init ----

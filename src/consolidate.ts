@@ -1,5 +1,6 @@
+import { createHash } from "crypto";
 import type { KnowledgeDB } from "./db.js";
-import type { NodeRow } from "./types.js";
+import type { EdgeRow, NodeRow } from "./types.js";
 
 /**
  * Duplicate consolidation (plan T5): find near-identical active nodes by
@@ -292,38 +293,393 @@ export function moveNodeEdges(
   return moved;
 }
 
-export interface ConsolidationPreview {
+/**
+ * UX-01 (план 07), шаг 0: планировщик последствий слияния — чистая функция
+ * от списков узлов и рёбер. Её вызывают и preview (describeConsolidation),
+ * и apply (mergeNodes): пока preview и apply считают разными путями,
+ * интерфейс обещает одно, а merge делает другое. Всё, что применит
+ * applyConsolidationPlan, уже решено здесь — включая порядок переносов
+ * рёбер и предсказуемые отказы informed_by.
+ */
+export interface ConsolidationPlanBase {
+  /**
+   * Дайджест входа планировщика — авторитетная привязка apply к preview:
+   * POST возвращает его, и merge отказывает version_conflict, если вход
+   * (карточки, рёбра, дети, workflow-счётчики) изменился. updated_at имеет
+   * секундное разрешение, поэтому токены ниже — только диагностика.
+   */
+  digest?: string;
+  /** Версии карточек (updated_at), против которых посчитан план. */
+  survivor_updated_at: string | null;
+  other_updated_at: string | null;
+}
+
+export interface PlannedEdgeMove {
+  from_id: string;
+  to_id: string;
+  relation: string;
+  description: string | null;
+}
+
+export interface ConsolidationPlan {
   survivor: string;
   other: string;
+  base: ConsolidationPlanBase;
   /** Контент дубля войдёт в саммари выжившего. */
   summaryCombines: boolean;
-  /** Сколько file_refs дубля добавится к выжившему. */
-  refsAdded: number;
-  /** Сколько рёбер переедет на выжившего (живые и надгробия, минус дедуп). */
-  edgesToMove: number;
-  children: number;
+  /** Полный текст summary выжившего после слияния. */
+  finalSummary: string;
+  /** Откуда берётся why выжившего (та же семантика `??`, что в apply). */
+  whySource: "survivor" | "other" | "none";
+  finalWhy: string | null;
+  /** Итоговый объединённый список file_refs выжившего. */
+  fileRefs: string[];
+  /** Ссылки дубля, которые добавятся к выжившему. */
+  refsAdded: string[];
+  /** Рёбра дубля, которые переедут (концы уже перемаплены на выжившего). */
+  edgesToMove: PlannedEdgeMove[];
+  /** Живые рёбра дубля, которые НЕ переедут (самопетля/дубль у выжившего). */
+  edgesDropped: number;
+  /** Дети дубля, которые переедут под выжившего. */
+  children: Array<{ id: string; name: string }>;
   slots: Array<{ project: string; role: string }>;
   trailMembers: number;
   artifacts: number;
   baselines: number;
   /** Состояние задачи дубля переедет (у выжившего пусто). */
   taskCarries: boolean;
+  taskState: string | null;
+  dueAt: string | null;
+  /** Lifecycle/epistemic статус дубля расходится — он НЕ переносится. */
+  statusDiverges: boolean;
+  /** Перенесённые подтверждения покажут claim_changed: формулировки разные. */
+  confirmationsAffected: boolean;
   /** Отказ и его причина — до транзакции, ничего не пишется. */
   rejection?: string;
 }
 
+export interface ConsolidationPlanInput {
+  survivor: NodeRow;
+  other: NodeRow;
+  /** Все строки узлов базы (живые и надгробия) — живость концов и дети. */
+  nodes: NodeRow[];
+  /** Все строки рёбер базы (живые и надгробия). */
+  edges: EdgeRow[];
+  workflow: {
+    slots: Array<{ project: string; role: string }>;
+    trailMembers: number;
+    artifacts: number;
+    baselines: number;
+  };
+}
+
+function parseRefsJson(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Итеративная достижимость по живому слою informed_by (как informedByReaches). */
+function informedByReaches(
+  adj: Map<string, string[]>,
+  start: string,
+  target: string
+): boolean {
+  if (start === target) return true;
+  const visited = new Set<string>([start]);
+  const stack = [start];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const next of adj.get(current) ?? []) {
+      if (next === target) return true;
+      if (!visited.has(next)) {
+        visited.add(next);
+        stack.push(next);
+      }
+    }
+  }
+  return false;
+}
+
+/** node лежит на живом цикле informed_by ⟺ член нетривиальной SCC. */
+function onInformedByCycle(adj: Map<string, string[]>, node: string): boolean {
+  const visited = new Set<string>();
+  const stack = [...(adj.get(node) ?? [])];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (current === node) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    stack.push(...(adj.get(current) ?? []));
+  }
+  return false;
+}
+
 /**
- * F-03.6 (план 03): read-only описание последствий слияния для preview
- * плана 07. Валидация — та же, что в apply (assertConsolidatable + та же
- * проверка цикла по поддереву), подсчёты — теми же запросами, которыми
- * apply переносит строки. Ни граф, ни снимки, ни история не пишутся.
+ * Дайджест входа планировщика: всё, что потребляет planConsolidation и
+ * применяет applyConsolidationPlan. Канонический JSON (ключи отсортированы,
+ * embedding исключён — план его не читает), sha256. Совпадение дайджеста
+ * между preview и confirm гарантирует: применяется ровно тот план, что
+ * был показан. K-10: это дайджест ВХОДА, а не current_digests.claim
+ * старого снимка — «подтверждённая формулировка» тут ни при чём.
  */
-export function describeConsolidation(
+function consolidationStateDigest(input: ConsolidationPlanInput): string {
+  const canonical = (value: unknown): unknown => {
+    if (value === null || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value instanceof Buffer || value instanceof ArrayBuffer) return undefined;
+    const record = value as Record<string, unknown>;
+    if (ArrayBuffer.isView(record)) return undefined; // TypedArray (embedding)
+    return Object.fromEntries(
+      Object.keys(record)
+        .sort()
+        .map((key) => [key, canonical(record[key])])
+        .filter(([, v]) => v !== undefined)
+    );
+  };
+  const shape = {
+    survivor: canonical({ ...input.survivor, embedding: null }),
+    other: canonical({ ...input.other, embedding: null }),
+    nodes: input.nodes
+      .map((n) => ({ id: n.id, removed_at: n.removed_at ?? null, parent_id: n.parent_id ?? null }))
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    edges: input.edges
+      .map((e) => ({
+        id: e.id,
+        from_id: e.from_id,
+        to_id: e.to_id,
+        relation: e.relation,
+        description: e.description ?? null,
+        removed_at: e.removed_at ?? null,
+      }))
+      .sort((a, b) => a.id - b.id),
+    workflow: input.workflow,
+  };
+  return createHash("sha256").update(JSON.stringify(shape), "utf8").digest("hex");
+}
+
+export function planConsolidation(input: ConsolidationPlanInput): ConsolidationPlan {
+  const { survivor, other, nodes, edges, workflow } = input;
+  const base: ConsolidationPlanBase = {
+    digest: consolidationStateDigest(input),
+    survivor_updated_at: survivor.updated_at ?? null,
+    other_updated_at: other.updated_at ?? null,
+  };
+
+  const summaryCombines =
+    !!other.summary &&
+    !survivor.summary.includes(other.summary) &&
+    other.summary !== survivor.summary;
+  const finalSummary = summaryCombines
+    ? `${survivor.summary}\n\n${other.summary}`
+    : survivor.summary;
+  // Та же семантика `??`, что в apply: пустая строка — это значение survivor.
+  const finalWhy = survivor.why ?? other.why;
+  const whySource =
+    survivor.why != null ? "survivor" : other.why != null ? "other" : "none";
+
+  const survivorRefs = parseRefsJson(survivor.file_refs);
+  const otherRefs = parseRefsJson(other.file_refs);
+  const fileRefs = [...new Set([...survivorRefs, ...otherRefs])];
+  const survivorRefSet = new Set(survivorRefs);
+  const refsAdded = [...new Set(otherRefs)].filter((r) => !survivorRefSet.has(r));
+
+  // Живые узлы — фильтр концов тот же, что в getOutgoingEdges/getIncomingEdges:
+  // живое ребро с живым дальним концом. Надгробия не переезжают (apply их
+  // никогда не переносил — preview раньше считал их и обещал лишнее).
+  const liveNodes = new Set(
+    nodes.filter((n) => n.removed_at === null).map((n) => n.id)
+  );
+
+  const existingKeys = new Set(
+    edges
+      .filter(
+        (e) =>
+          e.removed_at === null &&
+          (e.from_id === survivor.id || e.to_id === survivor.id) &&
+          liveNodes.has(e.from_id) &&
+          liveNodes.has(e.to_id)
+      )
+      .map((e) => `${e.from_id}|${e.to_id}|${e.relation}`)
+  );
+
+  const liveTouched = edges
+    .filter(
+      (e) =>
+        e.removed_at === null &&
+        (e.from_id === other.id || e.to_id === other.id) &&
+        liveNodes.has(e.from_id === other.id ? e.to_id : e.from_id)
+    )
+    .sort((a, b) => a.id - b.id);
+
+  const edgesToMove: PlannedEdgeMove[] = [];
+  const movedKeys = new Set<string>();
+  let edgesDropped = 0;
+  for (const e of liveTouched) {
+    const from = e.from_id === other.id ? survivor.id : e.from_id;
+    const to = e.to_id === other.id ? survivor.id : e.to_id;
+    if (from === to) {
+      edgesDropped++;
+      continue;
+    }
+    const key = `${from}|${to}|${e.relation}`;
+    if (existingKeys.has(key) || movedKeys.has(key)) {
+      edgesDropped++;
+      continue;
+    }
+    movedKeys.add(key);
+    edgesToMove.push({
+      from_id: from,
+      to_id: to,
+      relation: e.relation,
+      description: e.description,
+    });
+  }
+
+  // Дети — из списка узлов, тем же условием, которым transferNodeIdentity
+  // делает UPDATE: parent_id = дубль AND id != выживший.
+  const children = nodes
+    .filter((n) => n.parent_id === other.id && n.id !== survivor.id)
+    .map((n) => ({ id: n.id, name: n.name }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+  const taskCarries =
+    (survivor.task_state ?? null) === null && (other.task_state ?? null) !== null;
+
+  const plan: ConsolidationPlan = {
+    survivor: survivor.id,
+    other: other.id,
+    base,
+    summaryCombines,
+    finalSummary,
+    whySource,
+    finalWhy,
+    fileRefs,
+    refsAdded,
+    edgesToMove,
+    edgesDropped,
+    children,
+    slots: workflow.slots,
+    trailMembers: workflow.trailMembers,
+    artifacts: workflow.artifacts,
+    baselines: workflow.baselines,
+    taskCarries,
+    taskState: taskCarries ? other.task_state ?? null : null,
+    dueAt: taskCarries ? other.due_at ?? null : null,
+    statusDiverges:
+      (survivor.status ?? "active") !== (other.status ?? "active") ||
+      (survivor.epistemic_status ?? null) !== (other.epistemic_status ?? null),
+    confirmationsAffected:
+      workflow.baselines > 0 && (other.summary ?? "") !== survivor.summary,
+  };
+
+  // Предсказуемые отказы переносов informed_by: apply вставляет рёбра в
+  // состоянии ПОСЛЕ слияния (рёбра дубля уже удалены, выживший жив), и
+  // insertEdge прогоняет assertInformedByWritable против этого состояния.
+  // Планировщик проверяет те же инварианты над тем же состоянием, чтобы
+  // preview не обещал merge, который атомарно откатится.
+  const ibAdj = new Map<string, string[]>();
+  for (const e of edges) {
+    if (
+      e.relation !== "informed_by" ||
+      e.removed_at !== null ||
+      e.from_id === other.id ||
+      e.to_id === other.id ||
+      !liveNodes.has(e.from_id) ||
+      !liveNodes.has(e.to_id)
+    ) {
+      continue;
+    }
+    const list = ibAdj.get(e.from_id) ?? [];
+    list.push(e.to_id);
+    ibAdj.set(e.from_id, list);
+  }
+  for (const move of plan.edgesToMove) {
+    if (move.relation !== "informed_by") continue;
+    const rejection = informedByMoveRejection(ibAdj, move);
+    if (rejection) {
+      return rejectedPlan(survivor.id, other.id, base, rejection);
+    }
+    const list = ibAdj.get(move.from_id) ?? [];
+    list.push(move.to_id);
+    ibAdj.set(move.from_id, list);
+  }
+
+  return plan;
+}
+
+/** Те же проверки, что assertInformedByWritable делает на вставке переноса. */
+function informedByMoveRejection(
+  ibAdj: Map<string, string[]>,
+  move: PlannedEdgeMove
+): string | undefined {
+  if (!move.description || move.description.trim().length === 0) {
+    return (
+      `informed_by: рационал обязателен — что именно в узле-to поддерживает from. ` +
+      `Перенос "${move.from_id}" -> "${move.to_id}" отклонён, слияние не выполнено.`
+    );
+  }
+  if (informedByReaches(ibAdj, move.to_id, move.from_id)) {
+    return (
+      `informed_by cycle rejected: "${move.to_id}" already reaches "${move.from_id}" over live ` +
+      `informed_by edges — adding "${move.from_id} -> ${move.to_id}" would close a cycle.`
+    );
+  }
+  if (onInformedByCycle(ibAdj, move.to_id)) {
+    return (
+      `informed_by write rejected: "${move.to_id}" sits inside an unresolved ` +
+      `informed_by cycle (needs_merge). Resolve the merge conflict first, then retry.`
+    );
+  }
+  return undefined;
+}
+
+function rejectedPlan(
+  survivorId: string,
+  otherId: string,
+  base: ConsolidationPlanBase,
+  rejection: string
+): ConsolidationPlan {
+  return {
+    survivor: survivorId,
+    other: otherId,
+    base,
+    summaryCombines: false,
+    finalSummary: "",
+    whySource: "none",
+    finalWhy: null,
+    fileRefs: [],
+    refsAdded: [],
+    edgesToMove: [],
+    edgesDropped: 0,
+    children: [],
+    slots: [],
+    trailMembers: 0,
+    artifacts: 0,
+    baselines: 0,
+    taskCarries: false,
+    taskState: null,
+    dueAt: null,
+    statusDiverges: false,
+    confirmationsAffected: false,
+    rejection,
+  };
+}
+
+/**
+ * Валидация, одинаковая для preview и apply: самослияние, мёртвые участники,
+ * цикл по поддереву. Возвращает текст отказа или undefined. Тексты — те же,
+ * что бросали assertConsolidatable и transferNodeIdentity (S-08, план 03).
+ */
+function consolidationRejection(
   db: KnowledgeDB,
   survivorId: string,
   otherId: string
-): ConsolidationPreview {
-  let rejection: string | undefined;
+): string | undefined {
   try {
     assertConsolidatable(db, survivorId, otherId);
     // Цикл по поддереву — та же проверка, что в transferNodeIdentity.
@@ -331,189 +687,242 @@ export function describeConsolidation(
     const seen = new Set<string>();
     while (cursor?.parent_id) {
       if (cursor.parent_id === otherId || seen.has(cursor.parent_id)) {
-        throw new Error(
-          `Cannot merge "${otherId}" into "${survivorId}": the survivor lies inside the removed node's subtree — the hierarchy would become a cycle.`
-        );
+        return `Cannot merge "${otherId}" into "${survivorId}": the survivor lies inside the removed node's subtree — the hierarchy would become a cycle.`;
       }
       seen.add(cursor.parent_id);
       cursor = db.getNodeIncludingRemoved(cursor.parent_id);
     }
   } catch (err) {
-    rejection = err instanceof Error ? err.message : String(err);
-    return {
-      survivor: survivorId,
-      other: otherId,
-      summaryCombines: false,
-      refsAdded: 0,
-      edgesToMove: 0,
-      children: 0,
-      slots: [],
-      trailMembers: 0,
-      artifacts: 0,
-      baselines: 0,
-      taskCarries: false,
-      rejection,
-    };
+    return err instanceof Error ? err.message : String(err);
+  }
+  return undefined;
+}
+
+/**
+ * Workflow-счётчики для планировщика — теми же запросами, которыми
+ * transferNodeIdentity переносит строки. И preview, и apply собирают их
+ * одинаково.
+ */
+function collectWorkflowCounts(
+  db: KnowledgeDB,
+  otherId: string
+): ConsolidationPlanInput["workflow"] {
+  return {
+    slots: (
+      db.execSqlAll(
+        "SELECT project, role FROM slots WHERE node_id = ?",
+        otherId
+      ) as Array<{ project: string; role: string }>
+    ).map((s) => ({ ...s })),
+    trailMembers: (
+      db.execSqlFirst(
+        "SELECT COUNT(*) AS n FROM trail_members WHERE node_id = ?",
+        otherId
+      ) as { n: number }
+    ).n,
+    artifacts: (
+      db.execSqlFirst(
+        "SELECT COUNT(*) AS n FROM node_artifacts WHERE node_id = ?",
+        otherId
+      ) as { n: number }
+    ).n,
+    baselines: (
+      db.execSqlFirst(
+        "SELECT COUNT(*) AS n FROM support_baselines WHERE decision_id = ? OR support_id = ?",
+        otherId,
+        otherId
+      ) as { n: number }
+    ).n,
+  };
+}
+
+/**
+ * F-03.6 (план 03), UX-01 (план 07): read-only описание последствий слияния
+ * для preview. Валидация — та же, что в apply; последствия считает
+ * planConsolidation — та же чистая функция, которой применяет mergeNodes.
+ * Ни граф, ни снимки, ни история не пишутся.
+ */
+export function describeConsolidation(
+  db: KnowledgeDB,
+  survivorId: string,
+  otherId: string
+): ConsolidationPlan {
+  const rejection = consolidationRejection(db, survivorId, otherId);
+  const survivor = db.getNodeIncludingRemoved(survivorId);
+  const other = db.getNodeIncludingRemoved(otherId);
+  const base: ConsolidationPlanBase = {
+    survivor_updated_at: survivor?.updated_at ?? null,
+    other_updated_at: other?.updated_at ?? null,
+  };
+  if (rejection || !survivor || !other) {
+    return rejectedPlan(
+      survivorId,
+      otherId,
+      base,
+      rejection ?? `Cannot merge: node not found (${survivorId} / ${otherId}).`
+    );
   }
 
-  const survivor = db.getNode(survivorId)!;
-  const other = db.getNodeIncludingRemoved(otherId)!;
-  const summaryCombines =
-    !!other.summary &&
-    !survivor.summary.includes(other.summary) &&
-    other.summary !== survivor.summary;
+  return planConsolidation({
+    survivor,
+    other,
+    nodes: db.getAllNodesRaw(),
+    edges: db.getAllEdgesRaw(),
+    workflow: collectWorkflowCounts(db, otherId),
+  });
+}
 
-  const parseRefs = (raw: string | null): string[] => {
-    if (!raw) return [];
-    try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.map(String) : [];
-    } catch {
-      return [];
-    }
-  };
-  const survivorRefs = new Set(parseRefs(survivor.file_refs));
-  const refsAdded = parseRefs(other.file_refs).filter((r) => !survivorRefs.has(r)).length;
+/**
+ * UX-01 (план 07): нода изменилась или удалена между preview и confirm.
+ * Атомарный отказ до первой записи — POST несёт версии карточек/плана
+ * (updated_at), и merge отказывает 409, а не применяет устаревший план.
+ */
+export class VersionConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VersionConflictError";
+  }
+}
 
-  const existingEdges = new Set(
-    [...db.getOutgoingEdges(survivorId), ...db.getIncomingEdges(survivorId)].map(
-      (e) => `${e.from_id}|${e.to_id}|${e.relation}`
-    )
-  );
-  const rawEdges = db
-    .getAllEdgesRaw()
-    .filter((e) => e.from_id === otherId || e.to_id === otherId);
-  const edgesToMove = rawEdges.filter((e) => {
-    const from = e.from_id === otherId ? survivorId : e.from_id;
-    const to = e.to_id === otherId ? survivorId : e.to_id;
-    return from !== to && !existingEdges.has(`${from}|${to}|${e.relation}`);
-  }).length;
+export interface MergeNodesExpect {
+  /**
+   * Авторитетная привязка к версии плана (plan.base.digest): вход
+   * планировщика должен быть байт-в-байт тем же, что на preview.
+   */
+  digest?: string;
+  /**
+   * Запасные токены для вызовов без дайджеста. updated_at пишется с
+   * секундным разрешением — изменение в ту же секунду токен не меняет,
+   * поэтому при наличии digest токены не проверяются.
+   */
+  survivor_updated_at?: string | null;
+  other_updated_at?: string | null;
+}
 
-  const childrenRow = db.execSqlFirst(
-    "SELECT COUNT(*) AS n FROM nodes WHERE parent_id = ? AND id != ?",
-    otherId,
-    survivorId
-  ) as { n: number };
-  const slots = (
-    db.execSqlAll("SELECT project, role FROM slots WHERE node_id = ?", otherId) as Array<{
-      project: string;
-      role: string;
-    }>
-  ).map((s) => ({ ...s }));
-  const trailMembersRow = db.execSqlFirst(
-    "SELECT COUNT(*) AS n FROM trail_members WHERE node_id = ?",
-    otherId
-  ) as { n: number };
-  const artifactsRow = db.execSqlFirst(
-    "SELECT COUNT(*) AS n FROM node_artifacts WHERE node_id = ?",
-    otherId
-  ) as { n: number };
-  const baselinesRow = db.execSqlFirst(
-    "SELECT COUNT(*) AS n FROM support_baselines WHERE decision_id = ? OR support_id = ?",
-    otherId,
-    otherId
-  ) as { n: number };
+export interface MergeNodesOptions {
+  /**
+   * Версии, на которых пользователь подтверждал preview (plan.base).
+   * Отсутствие — CLI-вызов без preview, проверка не проводится.
+   */
+  expect?: MergeNodesExpect;
+}
 
-  return {
-    survivor: survivorId,
-    other: otherId,
-    summaryCombines,
-    refsAdded,
-    edgesToMove,
-    children: childrenRow.n,
-    slots,
-    trailMembers: trailMembersRow.n,
-    artifacts: artifactsRow.n,
-    baselines: baselinesRow.n,
-    taskCarries:
-      (survivor.task_state ?? null) === null && (other.task_state ?? null) !== null,
-  };
+/**
+ * Применяет готовый план. Вызывается ТОЛЬКО внутри транзакции mergeNodes;
+ * порядок переносов — как решил planConsolidation, чтобы проверка
+ * informed_by в insertEdge шла против того же состояния, против которого
+ * планировщик считал достижимость (рёбра дубля уже удалены).
+ */
+function applyConsolidationPlan(db: KnowledgeDB, plan: ConsolidationPlan): void {
+  db.updateNode(plan.survivor, {
+    summary: plan.finalSummary,
+    why: plan.finalWhy ?? undefined,
+    file_refs: plan.fileRefs.length > 0 ? plan.fileRefs : undefined,
+  });
+
+  // F-03: дети, слоты, цепочки, артефакты, снимки и алиасы следуют за
+  // выжившим — участники не теряются молча вместе с дублем.
+  transferNodeIdentity(db, plan.other, plan.survivor);
+
+  // hardDeleteNode removes remaining edges of the other node — рёбра дубля
+  // уходят ДО переносов, чтобы informed_by-проверки видели итоговый граф.
+  db.hardDeleteNode(plan.other);
+
+  for (const edge of plan.edgesToMove) {
+    db.insertEdge({
+      from_id: edge.from_id,
+      to_id: edge.to_id,
+      relation: edge.relation,
+      description: edge.description,
+      // Plan 4 v8 §1.3: a server-side re-creation during consolidation —
+      // the original row's origin is gone with it, so the new row is
+      // honestly 'unknown', not laundered into 'agent'.
+      via: "unknown",
+    });
+  }
 }
 
 /**
  * Merge node `other` into `survivor`: combine summary/why/file_refs, move
  * edges, hard-delete the other node. Caller decides which one survives —
  * findDuplicates marks the older one.
+ *
+ * UX-01 (план 07): последствия считает planConsolidation — та же чистая
+ * функция, что и у preview; apply исполняет готовый план, ничего не
+ * пересчитывая. С opts.expect отказ version_conflict атомарен: проверка
+ * версий — первое действие внутри BEGIN IMMEDIATE, до любой записи.
  */
 export function mergeNodes(
   db: KnowledgeDB,
   survivorId: string,
-  otherId: string
+  otherId: string,
+  options?: MergeNodesOptions
 ): MergeNodesResult {
-  // S-08: до транзакции — самослияние и мёртвые участники отвергаются без
-  // единой записи; повторный запрос по уже удалённому узлу тоже сюда попадает.
-  assertConsolidatable(db, survivorId, otherId);
-  const survivor = db.getNode(survivorId)!;
-  const other = db.getNodeIncludingRemoved(otherId)!;
-
   db.runInTransaction(() => {
-    // Combine summary (skip when identical or already contained).
-    let summary = survivor.summary;
-    if (
-      other.summary &&
-      !summary.includes(other.summary) &&
-      other.summary !== survivor.summary
-    ) {
-      summary = `${summary}\n\n${other.summary}`;
-    }
-
-    // Union of file_refs, order-preserving.
-    const parse = (raw: string | null): string[] => {
-      if (!raw) return [];
-      try {
-        const v = JSON.parse(raw);
-        return Array.isArray(v) ? v.map(String) : [];
-      } catch {
-        return [];
+    // Stale preview: привязка к версии плана проверяется до валидации
+    // слияния — изменённая/удалённая нода отвечает version_conflict, а не
+    // общим 400, и ни одна запись не делается.
+    if (options?.expect) {
+      const conflict = (reason: string): VersionConflictError =>
+        new VersionConflictError(
+          `version_conflict: ${reason} Nothing was written — re-read the cards and confirm again.`
+        );
+      const survivorNow = db.getNodeIncludingRemoved(survivorId);
+      const otherNow = db.getNodeIncludingRemoved(otherId);
+      if (!survivorNow) throw conflict(`node "${survivorId}" no longer exists.`);
+      if (!otherNow) throw conflict(`node "${otherId}" no longer exists.`);
+      const inputNow = {
+        survivor: survivorNow,
+        other: otherNow,
+        nodes: db.getAllNodesRaw(),
+        edges: db.getAllEdgesRaw(),
+        workflow: collectWorkflowCounts(db, otherId),
+      };
+      if (
+        options.expect.digest !== undefined &&
+        consolidationStateDigest(inputNow) !== options.expect.digest
+      ) {
+        throw conflict(
+          `the merge inputs changed since the preview (survivor "${survivorId}", other "${otherId}").`
+        );
       }
-    };
-    const refs = [...new Set([...parse(survivor.file_refs), ...parse(other.file_refs)])];
-
-    const why = survivor.why ?? other.why;
-
-    db.updateNode(survivorId, {
-      summary,
-      why: why ?? undefined,
-      file_refs: refs.length > 0 ? refs : undefined,
-    });
-
-    // Move edges from the other node to the survivor. Skip self-loops and
-    // edges that would duplicate an existing survivor edge.
-    const existing = new Set(
-      [...db.getOutgoingEdges(survivorId), ...db.getIncomingEdges(survivorId)].map(
-        (e) => `${e.from_id}|${e.to_id}|${e.relation}`
-      )
-    );
-    const otherEdges = [
-      ...db.getOutgoingEdges(otherId).map((e) => ({ from: otherId, to: e.to_id, relation: e.relation, description: e.description })),
-      ...db.getIncomingEdges(otherId).map((e) => ({ from: e.from_id, to: otherId, relation: e.relation, description: e.description })),
-    ];
-    const movedKeys = new Set<string>();
-    for (const edge of otherEdges) {
-      const from = edge.from === otherId ? survivorId : edge.from;
-      const to = edge.to === otherId ? survivorId : edge.to;
-      if (from === to) continue; // self-loop
-      const key = `${from}|${to}|${edge.relation}`;
-      if (existing.has(key) || movedKeys.has(key)) continue;
-      movedKeys.add(key);
-      db.insertEdge({
-        from_id: from,
-        to_id: to,
-        relation: edge.relation,
-        description: edge.description,
-        // Plan 4 v8 §1.3: a server-side re-creation during consolidation —
-        // the original row's origin is gone with it, so the new row is
-        // honestly 'unknown', not laundered into 'agent'.
-        via: "unknown",
-      });
+      // Запасные токены — только когда дайджеста нет (клиент без preview-плана).
+      if (options.expect.digest === undefined) {
+        if (
+          options.expect.survivor_updated_at !== undefined &&
+          (survivorNow.updated_at ?? null) !== options.expect.survivor_updated_at
+        ) {
+          throw conflict(`node "${survivorId}" changed since the preview.`);
+        }
+        if (
+          options.expect.other_updated_at !== undefined &&
+          (otherNow.updated_at ?? null) !== options.expect.other_updated_at
+        ) {
+          throw conflict(`node "${otherId}" changed since the preview.`);
+        }
+      }
     }
-
-    // F-03: дети, слоты, цепочки, артефакты, снимки и алиасы следуют за
-    // выжившим — участники не теряются молча вместе с дублем.
-    transferNodeIdentity(db, otherId, survivorId);
-
-    // hardDeleteNode removes remaining edges of the other node.
-    db.hardDeleteNode(otherId);
+    // S-08: самослияние и мёртвые участники отвергаются без единой записи;
+    // повторный запрос по уже удалённому узлу тоже сюда попадает.
+    const rejection = consolidationRejection(db, survivorId, otherId);
+    if (rejection) {
+      throw new Error(rejection);
+    }
+    const survivor = db.getNode(survivorId)!;
+    const other = db.getNodeIncludingRemoved(otherId)!;
+    const plan = planConsolidation({
+      survivor,
+      other,
+      nodes: db.getAllNodesRaw(),
+      edges: db.getAllEdgesRaw(),
+      workflow: collectWorkflowCounts(db, otherId),
+    });
+    if (plan.rejection) {
+      // Предсказанный отказ переносов informed_by — тот же атомарный отказ,
+      // который раньше случился бы на вставке внутри этой же транзакции.
+      throw new Error(plan.rejection);
+    }
+    applyConsolidationPlan(db, plan);
   });
 
   return { survivor: survivorId, removed: otherId };
