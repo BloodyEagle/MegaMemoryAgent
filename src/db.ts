@@ -849,15 +849,21 @@ export class KnowledgeDB {
   }
 
   getNode(id: string): NodeRow | undefined {
-    return this.db
-      .prepare("SELECT * FROM nodes WHERE id = ? AND removed_at IS NULL")
-      .get(id) as NodeRow | undefined;
+    // F-02 (план 03) / план 04: _metadata libsql вырезается у источника —
+    // профилировочный шум не попадает в дайджесты, сравнения состояния и ответы.
+    return this.cleanRow(
+      this.db
+        .prepare("SELECT * FROM nodes WHERE id = ? AND removed_at IS NULL")
+        .get(id) as NodeRow | undefined
+    );
   }
 
   getNodeIncludingRemoved(id: string): NodeRow | undefined {
-    return this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as
-      | NodeRow
-      | undefined;
+    return this.cleanRow(
+      this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as
+        | NodeRow
+        | undefined
+    );
   }
 
   updateNode(
@@ -1626,13 +1632,15 @@ export class KnowledgeDB {
   ): Array<EdgeRow & { other_id: string }> {
     const column = direction === "ancestry" ? "from_id" : "to_id";
     const other = direction === "ancestry" ? "to_id" : "from_id";
-    return this.db
-      .prepare(
-        `SELECT e.*, e.${other} AS other_id FROM edges e
-         WHERE e.${column} = ? AND e.relation = 'informed_by'
-           ${retrospective ? "" : "AND e.removed_at IS NULL"}`
-      )
-      .all(id) as Array<EdgeRow & { other_id: string }>;
+    return (
+      this.db
+        .prepare(
+          `SELECT e.*, e.${other} AS other_id FROM edges e
+           WHERE e.${column} = ? AND e.relation = 'informed_by'
+             ${retrospective ? "" : "AND e.removed_at IS NULL"}`
+        )
+        .all(id) as Array<EdgeRow & { other_id: string }>
+    ).map((r) => this.cleanRow(r)!);
   }
 
   private provenanceAuditReady = false;
@@ -1741,29 +1749,33 @@ export class KnowledgeDB {
 
   getSupportBaselines(decisionId: string): SupportBaselineRow[] {
     if (!this.hasSupportBaselinesTable()) return [];
-    return this.db
-      .prepare(
-        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                artifacts_digest
-         FROM support_baselines WHERE decision_id = ?
-         ORDER BY support_id, confirmed_at, edge_key`
-      )
-      .all(decisionId) as SupportBaselineRow[];
+    return (
+      this.db
+        .prepare(
+          `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                  edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                  artifacts_digest
+           FROM support_baselines WHERE decision_id = ?
+           ORDER BY support_id, confirmed_at, edge_key`
+        )
+        .all(decisionId) as SupportBaselineRow[]
+    ).map((r) => this.cleanRow(r)!);
   }
 
   /** Active (not superseded) rows only — the ones a check compares against. */
   getActiveSupportBaselines(decisionId: string): SupportBaselineRow[] {
     if (!this.hasSupportBaselinesTable()) return [];
-    return this.db
-      .prepare(
-        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                artifacts_digest
-         FROM support_baselines WHERE decision_id = ? AND superseded_at IS NULL
-         ORDER BY support_id, confirmed_at, edge_key`
-      )
-      .all(decisionId) as SupportBaselineRow[];
+    return (
+      this.db
+        .prepare(
+          `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                  edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                  artifacts_digest
+           FROM support_baselines WHERE decision_id = ? AND superseded_at IS NULL
+           ORDER BY support_id, confirmed_at, edge_key`
+        )
+        .all(decisionId) as SupportBaselineRow[]
+    ).map((r) => this.cleanRow(r)!);
   }
 
   /**
@@ -1778,15 +1790,17 @@ export class KnowledgeDB {
     edgeKey: string
   ): SupportBaselineRow | undefined {
     if (!this.hasSupportBaselinesTable()) return undefined;
-    return this.db
-      .prepare(
-        `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                artifacts_digest
-         FROM support_baselines
-         WHERE decision_id = ? AND support_id = ? AND edge_key = ? AND superseded_at IS NULL`
-      )
-      .get(decisionId, supportId, edgeKey) as SupportBaselineRow | undefined;
+    return this.cleanRow(
+      this.db
+        .prepare(
+          `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
+                  edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
+                  artifacts_digest
+           FROM support_baselines
+           WHERE decision_id = ? AND support_id = ? AND edge_key = ? AND superseded_at IS NULL`
+        )
+        .get(decisionId, supportId, edgeKey) as SupportBaselineRow | undefined
+    );
   }
 
   getAllSupportBaselines(): SupportBaselineRow[] {
@@ -2036,14 +2050,16 @@ export class KnowledgeDB {
   /** All observed artifacts of one node, deterministic (kind, ref) order. */
   getNodeArtifacts(nodeId: string): NodeArtifactRow[] {
     if (!this.hasNodeArtifactsTable()) return [];
-    return this.db
-      .prepare(
-        `SELECT node_id, kind, ref, digest, prev_digest, size_bytes,
-                checked_at, changed_at, checked_by, repo_path
-         FROM node_artifacts WHERE node_id = ?
-         ORDER BY kind, ref`
-      )
-      .all(nodeId) as NodeArtifactRow[];
+    return (
+      this.db
+        .prepare(
+          `SELECT node_id, kind, ref, digest, prev_digest, size_bytes,
+                  checked_at, changed_at, checked_by, repo_path
+           FROM node_artifacts WHERE node_id = ?
+           ORDER BY kind, ref`
+        )
+        .all(nodeId) as NodeArtifactRow[]
+    ).map((r) => this.cleanRow(r)!);
   }
 
   /** Insert or replace one observation row. The caller computes digest /
@@ -2152,14 +2168,16 @@ export class KnowledgeDB {
     afterToId: string,
     limit: number
   ): Array<EdgeRow & { other_id: string }> {
-    return this.db
-      .prepare(
-        `SELECT e.*, e.to_id AS other_id FROM edges e
-         WHERE e.from_id = ? AND e.relation = 'informed_by' AND e.removed_at IS NULL
-           AND e.to_id > ?
-         ORDER BY e.to_id LIMIT ?`
-      )
-      .all(decisionId, afterToId, limit) as Array<EdgeRow & { other_id: string }>;
+    return (
+      this.db
+        .prepare(
+          `SELECT e.*, e.to_id AS other_id FROM edges e
+           WHERE e.from_id = ? AND e.relation = 'informed_by' AND e.removed_at IS NULL
+             AND e.to_id > ?
+           ORDER BY e.to_id LIMIT ?`
+        )
+        .all(decisionId, afterToId, limit) as Array<EdgeRow & { other_id: string }>
+    ).map((r) => this.cleanRow(r)!);
   }
 
   /**
@@ -2248,11 +2266,13 @@ export class KnowledgeDB {
   // ---- Query methods ----
 
   getChildren(parentId: string): NodeRow[] {
-    return this.db
-      .prepare(
-        "SELECT * FROM nodes WHERE parent_id = ? AND removed_at IS NULL"
-      )
-      .all(parentId) as NodeRow[];
+    return (
+      this.db
+        .prepare(
+          "SELECT * FROM nodes WHERE parent_id = ? AND removed_at IS NULL"
+        )
+        .all(parentId) as NodeRow[]
+    ).map((r) => this.cleanRow(r)!);
   }
 
   getOutgoingEdges(
