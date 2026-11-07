@@ -827,7 +827,13 @@ describe("megamemory bench 2.1.6 — честные цифры", () => {
     const coldReport = { ...report, cold_start: true };
     expect(questionNotes(coldReport.questions[0], coldReport)).toContain("cold-start");
     expect(questionNotes(coldReport.questions[1], coldReport)).not.toContain("cold-start");
-    expect(questionNotes(report.questions[0], report)).not.toContain("cold-start");
+    // Явно тёплый отчёт: флаг cold_start в сыром report зависит от машины
+    // (на холодном FS CI первый запрос пересекает порог 5× median — это
+    // честный вердикт detectColdStart, а не поведение questionNotes).
+    const warmReport = { ...report, cold_start: false };
+    expect(questionNotes(warmReport.questions[0], warmReport)).not.toContain(
+      "cold-start"
+    );
     // формат списка id: до 10 целиком, дальше +N
     expect(formatIdList(["a", "b"])).toBe(" (ids: a, b)");
     expect(formatIdList(Array.from({ length: 12 }, (_, i) => `n${i}`))).toContain("+2");
