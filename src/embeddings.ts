@@ -55,6 +55,8 @@ const PIPELINE_OPTIONS = {
 };
 
 let extractor: FeatureExtractionPipeline | null = null;
+// R-03a (plan 08): shared in-flight load slot — see getExtractor below.
+let extractorInFlight: Promise<FeatureExtractionPipeline> | null = null;
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
 let activeEmbeds = 0;
 
@@ -66,17 +68,35 @@ function scheduleIdleUnload(): void {
     // Do not unload while inference is running.
     if (!extractor || activeEmbeds > 0) return;
     const disposing = extractor as unknown as { dispose?: () => unknown };
-    const result = disposing.dispose?.();
-    void Promise.resolve(result).finally(() => {
-      extractor = null;
-    });
+    // R-03b (plan 08): null the slot synchronously — an async dispose must
+    // never be handed to a new caller mid-disposal. The next getExtractor
+    // load repopulates the slot; this dispose does not touch it again.
+    extractor = null;
+    void Promise.resolve(disposing.dispose?.());
   }, IDLE_MS);
   idleTimer.unref?.(); // the timer must not keep the process alive
 }
 
 async function getExtractor(): Promise<FeatureExtractionPipeline> {
   if (!extractor) {
-    extractor = await pipeline("feature-extraction", MODEL_NAME, PIPELINE_OPTIONS);
+    // R-03a (plan 08): share the in-flight load — concurrent first embeds
+    // must not each start their own pipeline (double download, double
+    // memory, last write wins). A rejected load is not cached: the finally
+    // clears the slot so the next embed retries.
+    if (!extractorInFlight) {
+      extractorInFlight = pipeline("feature-extraction", MODEL_NAME, PIPELINE_OPTIONS)
+        .then((loaded) => {
+          extractor = loaded;
+          return loaded;
+        })
+        .finally(() => {
+          extractorInFlight = null;
+          scheduleIdleUnload();
+        });
+    }
+    const loaded = await extractorInFlight;
+    scheduleIdleUnload();
+    return loaded;
   }
   scheduleIdleUnload();
   return extractor;
@@ -109,6 +129,7 @@ export function resetEmbeddingsForTests(): void {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = null;
   extractor = null;
+  extractorInFlight = null;
   activeEmbeds = 0;
 }
 
