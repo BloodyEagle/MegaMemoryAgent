@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import Database from "libsql";
 import { KnowledgeDB } from "./db.js";
 import { makeId } from "./tools.js";
 
@@ -146,31 +147,148 @@ export function applyIdRepair(
 }
 
 /**
+ * S-01: coherent SQLite snapshot of a live (possibly WAL) database.
+ *
+ * The old backupDb() copyFile()'d only the main file: in WAL mode a committed
+ * transaction can live in `-wal`, so a "backup" silently lost every write
+ * since the last checkpoint. The replacement snapshots through SQLite itself:
+ * `VACUUM INTO` runs inside a read transaction against the source, so
+ * committed WAL frames are included, a concurrent uncommitted transaction is
+ * invisible, and the output is a self-contained file needing no `-wal`/`-shm`
+ * siblings. libsql (SQLite >= 3.27) supports the parameterized form; the
+ * source is opened readonly and is never written by this call.
+ */
+export function snapshotDb(sourcePath: string, destinationPath: string): void {
+  const source = new Database(sourcePath, {
+    readonly: true,
+    fileMustExist: true,
+  });
+  try {
+    source.pragma("busy_timeout = 5000");
+    // exec, not prepare().run(): a retained Statement object keeps the
+    // Windows file handle alive until GC, which a short-lived CLI never
+    // runs. Parameter-less exec leaves no such object behind.
+    source.exec(`VACUUM INTO '${destinationPath.replaceAll("'", "''")}'`);
+  } finally {
+    source.close();
+  }
+}
+
+const BACKUP_SUFFIX = ".bak-";
+/** Backups kept by default retention (three newest by mtime). */
+const BACKUPS_TO_KEEP = 3;
+
+/** Strict own backup naming: `<db>.bak-YYYYMMDD-HHMMSS-mmm[-N]`; the older
+ * second-precision `YYYYMMDD-HHMMSS` form matches too, so pre-2.1.14 backups
+ * still age out. Retention never touches anything else. */
+function ownBackupPattern(base: string): RegExp {
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `^${escaped}\\.bak-\\d{8}-\\d{6}(?:-\\d{3})?(?:-\\d+)?$`
+  );
+}
+
+/** UTC `YYYYMMDD-HHMMSS-mmm`: millisecond precision keeps same-second calls apart. */
+function backupStamp(d: Date): string {
+  const pad = (n: number, width: number) => String(n).padStart(width, "0");
+  return (
+    `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1, 2)}${pad(d.getUTCDate(), 2)}` +
+    `-${pad(d.getUTCHours(), 2)}${pad(d.getUTCMinutes(), 2)}${pad(d.getUTCSeconds(), 2)}` +
+    `-${pad(d.getUTCMilliseconds(), 3)}`
+  );
+}
+
+/** Inspect a retention candidate before deleting: a file that is not a
+ * SQLite database (whatever its name) is never ours. */
+function looksLikeSqliteFile(p: string): boolean {
+  try {
+    const fd = fs.openSync(p, "r");
+    try {
+      const header = Buffer.alloc(16);
+      const read = fs.readSync(fd, header, 0, 16, 0);
+      return (
+        read === 16 &&
+        header.toString("latin1") === "SQLite format 3\u0000"
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+/** Delete own verified backups beyond the `keep` newest. Candidates are
+ * filtered by the strict naming pattern and the SQLite magic header, sorted
+ * by mtime; unreadable files and foreign lookalikes are left alone. */
+function pruneBackups(dbPath: string, keep: number): void {
+  const dir = path.dirname(dbPath);
+  const base = path.basename(dbPath);
+  const pattern = ownBackupPattern(base);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  const candidates: Array<{ file: string; mtime: number }> = [];
+  for (const name of names) {
+    if (!pattern.test(name)) continue;
+    const file = path.join(dir, name);
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile() || !looksLikeSqliteFile(file)) continue;
+      candidates.push({ file, mtime: st.mtimeMs });
+    } catch {
+      continue; // an unreadable candidate is never deleted
+    }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  for (const old of candidates.slice(keep)) {
+    try {
+      fs.unlinkSync(old.file);
+    } catch {
+      // A competing pruner or an open handle: pruning is best-effort.
+    }
+  }
+}
+
+/**
  * Backup the database file before a destructive operation.
- * Keeps the 3 most recent backups, never overwrites an existing one.
- * Returns the backup path, or null when there was nothing to back up.
+ * S-01: the backup is a coherent SQLite snapshot (committed WAL included,
+ * in-flight transactions excluded), each call writes a distinct file even
+ * twice within the same second, and retention deletes only own verified
+ * files. Returns the backup path, or null when there was nothing to back up.
  */
 export function backupDb(dbPath: string): string | null {
   if (!fs.existsSync(dbPath)) return null;
-  const stamp = new Date()
-    .toISOString()
-    .replace(/[-:]/g, "")
-    .replace("T", "-")
-    .slice(0, 15); // YYYYMMDD-HHMMSS
-  const backupPath = `${dbPath}.bak-${stamp}`;
-  if (fs.existsSync(backupPath)) return backupPath;
-  fs.copyFileSync(dbPath, backupPath);
-
-  // Prune old backups, keep 3 most recent.
   const dir = path.dirname(dbPath);
   const base = path.basename(dbPath);
-  const backups = fs
-    .readdirSync(dir)
-    .filter((f) => f.startsWith(`${base}.bak-`))
-    .sort()
-    .reverse();
-  for (const old of backups.slice(3)) {
-    fs.unlinkSync(path.join(dir, old));
+  const stamp = backupStamp(new Date());
+
+  // Millisecond stamp + collision suffix; a competing process racing for the
+  // same name is settled by VACUUM INTO's own "output file already exists".
+  let backupPath: string | null = null;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const name =
+      attempt === 0
+        ? `${base}${BACKUP_SUFFIX}${stamp}`
+        : `${base}${BACKUP_SUFFIX}${stamp}-${attempt}`;
+    const candidate = path.join(dir, name);
+    if (fs.existsSync(candidate)) continue;
+    try {
+      snapshotDb(dbPath, candidate);
+      backupPath = candidate;
+      break;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes("already exists")) throw err;
+    }
   }
+  if (backupPath === null) {
+    throw new Error(`backupDb: could not reserve a unique backup name for ${dbPath}`);
+  }
+
+  pruneBackups(dbPath, BACKUPS_TO_KEEP);
   return backupPath;
 }

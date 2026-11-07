@@ -334,10 +334,10 @@ export async function runMigration(
     return report;
   }
 
-  // Step 0: backup (apply only). Checkpoint WAL first so the copied file
-  // contains everything written since the last checkpoint.
+  // Step 0: backup (apply only). snapshotDb() takes a coherent SQLite
+  // snapshot — committed WAL frames included — so no checkpoint is needed
+  // here (S-01): a checkpoint could be busy and does not freeze the copy.
   if (opts.backup && opts.dbPath) {
-    db.pragma("wal_checkpoint(TRUNCATE)");
     const backupPath = opts.backup(opts.dbPath);
     if (backupPath) {
       report.applied.push(`backup: ${backupPath}`);

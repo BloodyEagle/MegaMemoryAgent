@@ -141,9 +141,9 @@ export async function autoMigrateIfNeeded(
     return result;
   }
 
-  // F14.2: backup before conversion (always). wal_checkpoint makes the file
-  // copy self-contained.
-  db.pragma("wal_checkpoint(TRUNCATE)");
+  // F14.2: backup before conversion (always). backupDb() snapshots through
+  // SQLite (VACUUM INTO): committed WAL frames are included, so no checkpoint
+  // runs here — a "TRUNCATE for form's sake" could be busy and proves nothing.
   result.backup = backupDb(dbPath);
 
   const report = emptyReport();
