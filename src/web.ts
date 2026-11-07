@@ -915,11 +915,12 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
 
     if (pathname === "/api/consolidate" && req.method === "GET") {
       // T5 DoD: explorer tab lists duplicate candidates without mutating.
+      // R-06b (план 09): усечение по пределу на узел отдаётся честным счётчиком.
       const threshold = Number.parseFloat(url.searchParams.get("threshold") ?? "0.95");
-      const candidates = findDuplicates(db, {
+      const { candidates, candidates_truncated } = findDuplicates(db, {
         threshold: Number.isFinite(threshold) ? threshold : 0.95,
       });
-      json(res, { candidates });
+      json(res, { candidates, candidates_truncated });
       return;
     }
 

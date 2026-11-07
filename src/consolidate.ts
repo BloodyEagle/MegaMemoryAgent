@@ -75,11 +75,46 @@ export function nameSimilarity(a: string, b: string): number {
   return (2 * hits) / (sa.length - 1 + sb.length - 1);
 }
 
+/**
+ * План 09 (R-06b): ключ блока — нормализованное имя (нижний регистр, без
+ * пунктуации, схлопнутые пробелы). Внутри большой группы попарно сравниваются
+ * только узлы одного блока; разные блоки не сравниваются вовсе. На bench-данных
+ * плана 08 префиксные/токенные ключи схлопывались в один гигантский блок
+ * (все имена «Module …»), возвращая квадратицу — поэтому берётся полное
+ * нормализованное имя: размер блока ограничен реальными совпадениями имён.
+ */
+function nameBlockKey(name: string): string {
+  return name
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Порог размера группы: меньше — дешевле прежний квадратичный проход. */
+const BLOCK_GROUP_SIZE = 200;
+/** Предел пар-кандидатов на узел в большом блоке (план 09: «50 ближайших»). */
+const MAX_CANDIDATES_PER_NODE = 50;
+/** Окно сравнения в астрономически больших блоках: узел сравнивается со
+ * следующими WINDOW членами блока в порядке вставки, а не со всеми. Окно ≥
+ * размеров приёмочных групп (500 одинаковых имён сравниваются целиком). */
+const BLOCK_WINDOW = 2000;
+
+export interface FindDuplicatesResult {
+  candidates: DuplicateCandidate[];
+  /**
+   * Пары-кандидаты (sim ≥ threshold), не попавшие в выдачу из-за предела
+   * на узел. Честный счётчик: усечение видно в отчёте, а не молчит.
+   */
+  candidates_truncated: number;
+}
+
 /** Near-duplicate candidates among active nodes, grouped by parent. */
 export function findDuplicates(
   db: KnowledgeDB,
   opts: FindDuplicatesOptions = {}
-): DuplicateCandidate[] {
+): FindDuplicatesResult {
   const threshold = opts.threshold ?? 0.95;
   const limit = opts.limit ?? 100;
 
@@ -97,33 +132,134 @@ export function findDuplicates(
   }
 
   const candidates: DuplicateCandidate[] = [];
+  let truncated = 0;
+
+  const buildCandidate = (i: NodeRow, j: NodeRow, sim: number): DuplicateCandidate => ({
+    a: i.id,
+    b: j.id,
+    similarity: sim,
+    name_similarity: nameSimilarity(i.name, j.name),
+    same_parent: i.parent_id === j.parent_id,
+    older: (i.created_at ?? "") <= (j.created_at ?? "") ? i.id : j.id,
+  });
+
   for (const group of groups.values()) {
-    for (let i = 0; i < group.length; i++) {
-      for (let j = i + 1; j < group.length; j++) {
+    if (group.length < BLOCK_GROUP_SIZE) {
+      // Маленькая группа: прежний квадратичный проход — блокинг тут дороже,
+      // а выдача обязана совпадать байт в байт (фикстуры качества).
+      for (let i = 0; i < group.length; i++) {
+        for (let j = i + 1; j < group.length; j++) {
+          const va = toVector(group[i].embedding);
+          const vb = toVector(group[j].embedding);
+          if (!va || !vb) continue; // consolidation needs vectors on both sides
+          const sim = cosine(va, vb);
+          if (sim < threshold) continue;
+          candidates.push(buildCandidate(group[i], group[j], sim));
+          if (candidates.length >= limit) {
+            return { candidates, candidates_truncated: truncated };
+          }
+        }
+      }
+      continue;
+    }
+
+    // Большая группа: блоки по нормализованному имени. Пары ищутся только
+    // внутри блока — 10 000 корней с разными именами больше не квадрат.
+    const blocks = new Map<string, number[]>();
+    for (let idx = 0; idx < group.length; idx++) {
+      const key = nameBlockKey(group[idx].name);
+      const block = blocks.get(key) ?? [];
+      block.push(idx);
+      blocks.set(key, block);
+    }
+
+    // Предел на узел: у каждого узла свой топ-50 пар по убыванию схожести
+    // (при равенстве — найденная раньше). Пара выбывает из выдачи, как только
+    // вытеснена хотя бы у одного конца; первое вытеснение увеличивает
+    // candidates_truncated, повторное — нет.
+    type Kept = { key: string; sim: number; i: number; j: number };
+    const kept = new Map<number, Kept[]>();
+    const keptKeys = new Map<number, Set<string>>();
+    const dead = new Set<string>();
+    const countTruncated = (key: string): void => {
+      if (!dead.has(key)) {
+        dead.add(key);
+        truncated += 1;
+      }
+    };
+    const keepFor = (node: number, pair: Kept): boolean => {
+      const arr = kept.get(node) ?? [];
+      if (arr.length >= MAX_CANDIDATES_PER_NODE) {
+        let worst = 0;
+        for (let k = 1; k < arr.length; k++) {
+          // худшая — минимальная схожесть, при равенстве более поздняя
+          if (arr[k].sim < arr[worst].sim || (arr[k].sim === arr[worst].sim && k > worst)) {
+            worst = k;
+          }
+        }
+        const min = arr[worst];
+        if (pair.sim <= min.sim) {
+          // новому месту нет: пара не лучше худшей из топа
+          countTruncated(pair.key);
+          return false;
+        }
+        arr.splice(worst, 1);
+        keptKeys.get(node)!.delete(min.key);
+        countTruncated(min.key);
+      }
+      arr.push(pair);
+      kept.set(node, arr);
+      if (!keptKeys.has(node)) keptKeys.set(node, new Set());
+      keptKeys.get(node)!.add(pair.key);
+      return true;
+    };
+
+    for (const block of blocks.values()) {
+      for (let p = 0; p < block.length; p++) {
+        const i = block[p];
         const va = toVector(group[i].embedding);
-        const vb = toVector(group[j].embedding);
-        if (!va || !vb) continue; // consolidation needs vectors on both sides
-        const sim = cosine(va, vb);
-        if (sim < threshold) continue;
-        const older =
-          (group[i].created_at ?? "") <= (group[j].created_at ?? "")
-            ? group[i].id
-            : group[j].id;
-        candidates.push({
-          a: group[i].id,
-          b: group[j].id,
-          similarity: sim,
-          name_similarity: nameSimilarity(group[i].name, group[j].name),
-          same_parent: group[i].parent_id === group[j].parent_id,
-          older,
-        });
-        if (candidates.length >= limit) {
-          return candidates;
+        if (!va) continue;
+        const windowEnd = Math.min(block.length, p + 1 + BLOCK_WINDOW);
+        for (let q = p + 1; q < windowEnd; q++) {
+          const j = block[q];
+          const vb = toVector(group[j].embedding);
+          if (!vb) continue;
+          const sim = cosine(va, vb);
+          if (sim < threshold) continue;
+          const key = `${i}|${j}`;
+          const accepted =
+            keepFor(i, { key, sim, i, j }) && keepFor(j, { key, sim, i, j });
+          // Второй keepFor при отвержении первым уже не зовётся — пара мертва
+          // в любом случае (нужна оба конца), счётчик не задвоен dead-набором.
+          if (!accepted) continue;
         }
       }
     }
+
+    // Финал: пара выдаётся, если осталась в топе ОБОИХ концов. Порядок
+    // детерминирован обходом kept (владелец пары — меньший индекс).
+    const blockCandidates: DuplicateCandidate[] = [];
+    for (const [node, arr] of kept) {
+      for (const pair of arr) {
+        if (pair.i !== node) continue; // хозяин пары — меньший индекс
+        if (keptKeys.get(pair.j)?.has(pair.key)) {
+          blockCandidates.push(buildCandidate(group[pair.i], group[pair.j], pair.sim));
+        }
+      }
+    }
+    for (const cand of blockCandidates) {
+      if (candidates.length >= limit) {
+        // Пара найдена, но глобальный limit исчерпан — тоже честно считаем.
+        truncated += 1;
+        continue;
+      }
+      candidates.push(cand);
+    }
+    if (candidates.length >= limit) {
+      return { candidates, candidates_truncated: truncated };
+    }
   }
-  return candidates;
+  return { candidates, candidates_truncated: truncated };
 }
 
 export interface MergeNodesResult {

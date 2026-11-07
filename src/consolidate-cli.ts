@@ -30,11 +30,18 @@ export async function runConsolidate(args: string[]): Promise<void> {
 
   const db = new KnowledgeDB(p);
   try {
-    const candidates = findDuplicates(db, { threshold, limit });
+    // R-06b (план 09): усечение кандидатов по пределу на узел видно в отчёте.
+    const { candidates, candidates_truncated } = findDuplicates(db, { threshold, limit });
 
     heading(
       `  ${candidates.length} duplicate candidate(s) at threshold ${threshold}`
     );
+    if (candidates_truncated > 0) {
+      info(
+        `candidates_truncated: ${candidates_truncated} pair(s) above threshold ` +
+          `not shown — per-node candidate limit in a large group`
+      );
+    }
     for (const c of candidates) {
       console.log(
         `  ${pc.cyan(c.a)} ${pc.dim("≈")} ${pc.cyan(c.b)} ` +
