@@ -677,8 +677,18 @@ function refreshSimulation(alphaFloor) {
 
 function handleSseInit(data) {
   if (!data || !Array.isArray(data.nodes) || !Array.isArray(data.edges)) return;
-  if (nodes.length > 0) return;
+  // План 06 (W-06): reconnect заменяет состояние ЦЕЛИКОМ — раньше init
+  // игнорировался при непустом графе, и клиент жил на устаревшем снимке.
+  // Сохраняются только координаты выживших узлов, содержимое и рёбра свежие.
+  const savedCoords = new Map(nodes.map((node) => [node.id, { x: node.x, y: node.y }]));
   buildGraphData({ nodes: data.nodes, edges: data.edges });
+  for (const node of nodes) {
+    const saved = savedCoords.get(node.id);
+    if (saved) {
+      node.x = saved.x;
+      node.y = saved.y;
+    }
+  }
   initSimulation();
 
   if (data.stats || data.kinds) {
@@ -757,10 +767,49 @@ function handleNodeUpdated(data) {
   const node = nodeMap.get(data.id);
   if (!node) return;
 
-  node.name = data.name || node.name;
-  node.kind = data.kind || node.kind;
-  node.summary = data.summary || node.summary;
-  node.color = KIND_COLORS[node.kind] || '#888';
+  // План 06 (W-06): событие применяет ПОЛНУЮ модель, а не удерживает
+  // устаревшие поля: undefined означает «поле не прислоно», а не «оставить
+  // старое значение» — иначе status и parent_id молчали бы вечно.
+  if (data.name !== undefined) node.name = data.name;
+  if (data.kind !== undefined) {
+    node.kind = data.kind;
+    node.color = KIND_COLORS[node.kind] || '#888';
+  }
+  if (data.summary !== undefined) node.summary = data.summary;
+  if (data.status !== undefined) {
+    node.status = data.status || 'active';
+    node.muted = node.status !== 'active';
+  }
+  if (data.edge_count !== undefined) {
+    node.edge_count = data.edge_count;
+    node.radius = Math.max(7, 7 + node.edge_count * 1.5);
+  }
+  if (data.parent_id !== undefined && (data.parent_id || null) !== (node.parent_id || null)) {
+    const oldParentId = node.parent_id;
+    node.parent_id = data.parent_id || null;
+    // Parent-ребро обслуживается здесь же: старое снимается, новое ставится,
+    // счётчик детей у старого родителя пересчитывается.
+    edges = edges.filter((edge) => !(edge.isParentEdge && edgeEndpointId(edge.target) === node.id));
+    const parent = node.parent_id ? nodeMap.get(node.parent_id) : null;
+    if (parent) {
+      parent._hasChildren = true;
+      edges.push({
+        source: parent.id,
+        target: node.id,
+        relation: 'child',
+        description: '',
+        isParentEdge: true,
+        birthTime: performance.now(),
+        drawProgress: 0,
+        pulseTime: null,
+        dimmed: false,
+      });
+    }
+    const oldParent = oldParentId ? nodeMap.get(oldParentId) : null;
+    if (oldParent) {
+      oldParent._hasChildren = nodes.some((n) => n.parent_id === oldParent.id);
+    }
+  }
 
   const now = performance.now();
   node.pulseTime = now;
@@ -772,6 +821,7 @@ function handleNodeUpdated(data) {
     }
   }
 
+  refreshSimulation(0.3);
   spawnFloatingLabel('updated', node, node.color);
 }
 
@@ -1896,8 +1946,10 @@ function renderSearchResults(query, matches, mode, meta) {
     `;
   });
 
-  const metaLine = data.meta
-    ? `<div class="search-budget">${esc(String(data.meta.returned))} nodes, ~${esc(String(data.meta.tokens_estimated))} tokens, dropped ${esc(String(data.meta.dropped))}</div>`
+  // План 06 (W-03): meta — аргумент renderer, а не глобальная переменная
+  // data (ReferenceError ломал отрисовку каждого живого поиска).
+  const metaLine = meta
+    ? `<div class="search-budget">${esc(String(meta.returned))} nodes, ~${esc(String(meta.tokens_estimated))} tokens, dropped ${esc(String(meta.dropped))}</div>`
     : '';
   resultsEl.innerHTML = metaLine + rows.join('');
   resultsEl.classList.add('open');

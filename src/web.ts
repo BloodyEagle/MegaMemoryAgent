@@ -151,16 +151,18 @@ function printBanner(actualAddress: string, port: number, dbPath: string): void 
 
 /**
  * Attempt to listen on the given host+port. If EADDRINUSE, prompt the user
- * for an alternative port and retry. Returns a promise that resolves
- * once the server is listening. F1 2.1.13: host обязателен (127.0.0.1 или
- * явный ::1) — wildcard-слушатель больше не существует.
+ * for an alternative port and retry. Resolves with the ACTUAL bound port —
+ * после retry он отличается от аргумента, и Host-gate обязан сверяться
+ * с ним (план 06, W-05), иначе правильный новый адрес получал 403.
+ * F1 2.1.13: host обязателен (127.0.0.1 или явный ::1) — wildcard-слушатель
+ * больше не существует.
  */
 function listenWithRetry(
   server: http.Server,
   port: number,
   host: string,
   dbPath: string,
-): Promise<void> {
+): Promise<number> {
   return new Promise((resolve, reject) => {
     const onError = async (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
@@ -188,12 +190,13 @@ function listenWithRetry(
 
     server.listen(port, host, () => {
       server.removeListener("error", onError);
-      // Фактический адрес из socket-а, а не из аргумента: слушаем то, что
-      // написали. Для 127.0.0.1 это и есть "127.0.0.1".
+      // Фактический адрес и порт из socket-а, а не из аргумента: слушаем то,
+      // что написали. Для 127.0.0.1 адрес — "127.0.0.1".
       const addr = server.address();
       const actual = typeof addr === "object" && addr !== null ? addr.address : host;
-      printBanner(actual, port, dbPath);
-      resolve();
+      const actualPort = typeof addr === "object" && addr !== null ? addr.port : port;
+      printBanner(actual, actualPort, dbPath);
+      resolve(actualPort);
     });
   });
 }
@@ -480,6 +483,34 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     return sampled;
   }
 
+  /**
+   * План 06 (W-07): статусные переходы едут в ТОЙ ЖЕ typed-форме, что и
+   * остальные события оси (TimelineEntryView) — UI ждёт tool/timestamp/
+   * result_summary, а DB отдаёт {node_id, from_status, to_status, reason, at}.
+   * Дата нормализуется (непарсабельная остаётся как есть, но не становится
+   * undefined), порядок хронологический (DB отдаёт DESC).
+   */
+  function statusTimelineEntries(limit: number): TimelineEntryView[] {
+    const rows = db.getAllStatusHistory(limit);
+    const normalized = rows.map((row, idx) => {
+      const at = typeof row.at === "string" && row.at.trim() !== "" ? row.at : "";
+      const transition = `${row.from_status ?? "∅"} → ${row.to_status}`;
+      return {
+        seq: idx + 1,
+        timestamp: at,
+        tool: "status",
+        params: { node_id: row.node_id, from_status: row.from_status, to_status: row.to_status },
+        result_summary: `${row.node_id}: ${transition}${row.reason ? ` — ${row.reason}` : ""}`,
+        is_write: true,
+        is_error: false,
+        affected_ids: [row.node_id],
+      };
+    });
+    // Хронологический порядок оси: DB отдаёт свежие первыми (ORDER BY id DESC).
+    normalized.reverse();
+    return normalized.map((entry, idx) => ({ ...entry, seq: idx + 1 }));
+  }
+
   function initializeSseSnapshot(): void {
     const nodes = db.getAllActiveNodes();
     const edges = db.getAllEdges();
@@ -533,6 +564,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
               kind: node.kind,
               summary: node.summary,
               parent_id: node.parent_id,
+              status: (node as { status?: string }).status ?? "active",
               edge_count: edgeCounts.get(node.id) ?? 0,
             },
           });
@@ -545,6 +577,9 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
         if ((lastKnownNodeUpdates.get(id) ?? "") !== updatedAt) {
           const node = nodeById.get(id);
           if (!node) continue;
+          // План 06 (W-06): update несёт ВСЕ поля модели — без status и
+          // parent_id клиент после reconnect применял событие к устаревшему
+          // состоянию (статус и родитель оставались прежними).
           broadcast({
             type: "node_updated",
             data: {
@@ -552,6 +587,9 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
               name: node.name,
               kind: node.kind,
               summary: node.summary,
+              parent_id: node.parent_id,
+              status: (node as { status?: string }).status ?? "active",
+              edge_count: edgeCounts.get(node.id) ?? 0,
             },
           });
           hasChanges = true;
@@ -904,32 +942,45 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       req.on("error", () => {
         respondOnce(400, { error: "Request stream failed; nothing was written" });
       });
+      // План 06 (W-02): единый try/catch на весь callback — ни один исход
+      // разбора тела не завершает процесс. JSON.parse, вернувший null/массив/
+      // скаляр, отбраковывается объектной схемой до чтения полей (раньше
+      // `body.survivor` на null бросал TypeError и ронял сервер).
       req.on("end", () => {
-        if (tooLarge) {
-          respondOnce(413, { error: `Request body exceeds the ${MAX_BODY}-byte limit` });
-          return;
-        }
-        let body: { survivor?: unknown; other?: unknown };
         try {
-          body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        } catch {
-          respondOnce(400, { error: "Invalid JSON body" });
-          return;
-        }
-        const survivor = typeof body.survivor === "string" ? body.survivor.trim() : "";
-        const other = typeof body.other === "string" ? body.other.trim() : "";
-        if (!survivor || !other) {
-          respondOnce(400, { error: "survivor and other are required" });
-          return;
-        }
-        let result: MergeNodesResult;
-        try {
-          result = mergeNodes(db, survivor, other);
+          if (tooLarge) {
+            respondOnce(413, { error: `Request body exceeds the ${MAX_BODY}-byte limit` });
+            return;
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          } catch {
+            respondOnce(400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            respondOnce(400, { error: "A JSON object with survivor and other is required" });
+            return;
+          }
+          const body = parsed as { survivor?: unknown; other?: unknown };
+          const survivor = typeof body.survivor === "string" ? body.survivor.trim() : "";
+          const other = typeof body.other === "string" ? body.other.trim() : "";
+          if (!survivor || !other) {
+            respondOnce(400, { error: "survivor and other are required" });
+            return;
+          }
+          let result: MergeNodesResult;
+          try {
+            result = mergeNodes(db, survivor, other);
+          } catch (err) {
+            respondOnce(400, { error: err instanceof Error ? err.message : String(err) });
+            return;
+          }
+          respondOnce(200, { ok: true, ...result });
         } catch (err) {
-          respondOnce(400, { error: err instanceof Error ? err.message : String(err) });
-          return;
+          respondOnce(500, { error: err instanceof Error ? err.message : String(err) });
         }
-        respondOnce(200, { ok: true, ...result });
       });
       return;
     }
@@ -1025,42 +1076,51 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     }
 
     // U5: status lifecycle history — kind=status, tools, or all (default).
+    // План 06 (W-08): фильтры разбираются ДО kind-ветвления и применяются
+    // последовательно; kind без явного параметра не отрывает запрос от
+    // фильтрового обработчика (раньше дефолт "all" съедал writes_only/tool/
+    // since/until молча).
     if (pathname === "/api/timeline" && req.method === "GET") {
-      const kind = (url.searchParams.get("kind") ?? "all").trim();
-      if (kind === "status") {
-        const limit = clampInt(url.searchParams.get("limit"), 200, 1, 50000);
-        json(res, { kind: "status", entries: db.getAllStatusHistory(limit) });
+      const kindParam = url.searchParams.get("kind");
+      const kind = (kindParam ?? "all").trim();
+      if (kind !== "all" && kind !== "status" && kind !== "tools") {
+        json(res, { error: `Unknown timeline kind: ${kind}` }, 400);
         return;
       }
-      if (kind === "all") {
-        const limit = clampInt(url.searchParams.get("limit"), 200, 1, 50000);
-        const merged = buildMergedTimelineEntries({ limit });
-        json(res, {
-          kind: "all",
-          entries: merged.entries,
-          status_changes: db.getAllStatusHistory(limit),
-          source: merged.source,
-        });
-        return;
-      }
-      // kind === "tools" falls through to the legacy handler below.
-    }
-
-    if (pathname === "/api/timeline" && req.method === "GET") {
       const writesOnly = parseBooleanParam(url.searchParams.get("writes_only"));
       const tool = (url.searchParams.get("tool") ?? "").trim();
       const since = (url.searchParams.get("since") ?? "").trim();
       const until = (url.searchParams.get("until") ?? "").trim();
-      const limit = clampInt(url.searchParams.get("limit"), 1000, 1, 50000);
-      const { entries, source } = buildMergedTimelineEntries({
+      const limit = clampInt(url.searchParams.get("limit"), kind === "status" ? 200 : 1000, 1, 50000);
+
+      if (kind === "status") {
+        // Статусная ось фильтров tool/writes_only/since/until не имеет —
+        // неподдержанное сочетание честный 400, а не молчаливое игнорирование.
+        if (tool || since || until || writesOnly) {
+          json(res, { error: "kind=status supports only the limit parameter" }, 400);
+          return;
+        }
+        json(res, { kind: "status", entries: statusTimelineEntries(limit) });
+        return;
+      }
+
+      const merged = buildMergedTimelineEntries({
         writesOnly,
         tool: tool || undefined,
         since: since || undefined,
         until: until || undefined,
         limit,
       });
-
-      json(res, { entries, source });
+      if (kind === "all") {
+        json(res, {
+          kind: "all",
+          entries: merged.entries,
+          status_changes: statusTimelineEntries(limit),
+          source: merged.source,
+        });
+        return;
+      }
+      json(res, { entries: merged.entries, source: merged.source });
       return;
     }
 
@@ -1121,7 +1181,10 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     });
   }, 30000);
 
-  await listenWithRetry(server, port, host, dbPath);
+  // План 06 (W-05): gate и URL сверяются с ФАКТИЧЕСКИМ bound-портом — после
+  // retry он отличается от запрошенного. Запросы приходят только после
+  // listen, так как переприсваивание до первого запроса гарантировано.
+  port = await listenWithRetry(server, port, host, dbPath);
 
   // Graceful shutdown
   process.on("SIGINT", () => {
