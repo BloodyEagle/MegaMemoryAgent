@@ -58,18 +58,19 @@ describe("supersedes lifecycle", () => {
     expect(old?.status).toBe("superseded");
   });
 
-  it("supersedes unknown id fails after creating the node, reports missing", async () => {
+  it("supersedes unknown id is rejected before anything is written (plan 04 K-05)", async () => {
     const db = freshDb();
     await expect(
       createConcept(db, {
         name: "Ghost Replacer",
         kind: "decision",
-        summary: "заменитель хранит ссылку на несуществующий узел — supersedes падает после создания",
+        summary: "заменитель хранит ссылку на несуществующий узел — supersedes проверяется до записи",
         supersedes: ["does-not-exist"],
       })
     ).rejects.toThrow(/does-not-exist/);
-    // Node itself was created before the failure — still present.
-    expect(db.nodeExists("ghost-replacer")).toBe(true);
+    // K-05: the creation is atomic — the node itself is NOT created when a
+    // supersedes target is missing, so a retry of the call is safe.
+    expect(db.nodeExists("ghost-replacer")).toBe(false);
   });
 
   it("removeConcept deprecates status", async () => {
