@@ -5,7 +5,7 @@
 
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
-  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square" />
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.9-brightgreen?style=flat-square" />
   <img alt="version" src="https://img.shields.io/badge/version-2.1.13-orange?style=flat-square" />
 </p>
 
@@ -269,7 +269,7 @@ megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline bo
 
 ## Установка
 
-Нужен Node.js >= 18. Для чисто русских проектов подойдёт значительно меньшая модель (`cointegrated/rubert-tiny2`, 312-мерная) после конвертации в ONNX; модель выгружается после 5 минут простоя (`MEGAMEMORY_EMBED_IDLE_MS=0` отключает выгрузку), а `MEGAMEMORY_SEARCH=fts` не загружает её вовсе. Модель эмбеддингов (~120 МБ, мультиязычная) скачивается при первом
+Нужен Node.js >= 20.9 (поднят с 18: sharp 0.35 из цепочки эмбеддингов требует >= 20.9; dev-инструментарий — vite/vitest — требует >= 20.19). Для чисто русских проектов подойдёт значительно меньшая модель (`cointegrated/rubert-tiny2`, 312-мерная) после конвертации в ONNX; модель выгружается после 5 минут простоя (`MEGAMEMORY_EMBED_IDLE_MS=0` отключает выгрузку), а `MEGAMEMORY_SEARCH=fts` не загружает её вовсе. Модель эмбеддингов (~120 МБ, мультиязычная) скачивается при первом
 запуске и кешируется в `~/.cache/huggingface`.
 
 Установка глобально из npm:
