@@ -564,6 +564,11 @@
 </head>
 <body>
 
+<div id="transport-error" style="display:none;position:fixed;top:0;left:0;right:0;z-index:10000;background:#7f1d1d;color:#fecaca;font:12px/1.4 ui-monospace,monospace;padding:8px 12px;border-bottom:1px solid #b91c1c;">
+  <span class="te-msg">Server unreachable</span>
+  <button type="button" class="te-retry" style="margin-left:12px;background:#b91c1c;border:0;color:#fff;padding:3px 10px;cursor:pointer;border-radius:4px;">Reload</button>
+</div>
+
 <header>
   <span class="logo">MegaMemory</span>
   <div class="search-shell" id="search-shell">
@@ -682,6 +687,18 @@ function setEmptyStateVisible(visible) {
   const el = document.getElementById('empty-state');
   if (!el) return;
   el.classList.toggle('visible', Boolean(visible));
+}
+
+// R-08 (plan 08): transport failures must not stay silent — a dead startup
+// or a dead timeline previously died with an unhandled rejection and no
+// visible cue. The banner states where it happened; Reload re-runs init.
+function showTransportError(where, err) {
+  if (typeof console !== 'undefined' && console.error) console.error('Transport error (' + where + '):', err);
+  const el = document.getElementById('transport-error');
+  if (!el) return;
+  const msg = el.querySelector('.te-msg');
+  if (msg) msg.textContent = 'Server unreachable (' + where + ')' + (err && err.message ? ': ' + err.message : '');
+  el.style.display = 'block';
 }
 
 function connectSSE() {
@@ -2337,7 +2354,7 @@ function navigateTo(id) {
       showPanel(d);
       spawnFloatingLabel(node.kind, node, node.color);
     }
-  });
+  }).catch(err => showTransportError('node panel', err));
 }
 
 // ---- Search ----
@@ -2689,10 +2706,15 @@ async function scrubToStep(stepIndex) {
   );
 
   let data;
-  if (stepIndex >= timelineSteps.length) {
-    data = await fetchGraph();
-  } else {
-    data = await fetchGraphAt(timelineSteps[stepIndex].timestamp);
+  try {
+    if (stepIndex >= timelineSteps.length) {
+      data = await fetchGraph();
+    } else {
+      data = await fetchGraphAt(timelineSteps[stepIndex].timestamp);
+    }
+  } catch (err) {
+    showTransportError('timeline scrub', err);
+    return;
   }
 
   if (!timelineMode || requestId !== timelineFetchId) return;
@@ -2774,14 +2796,20 @@ async function enterTimelineMode() {
   const kind = document.getElementById('timeline-kind')?.value || 'all';
   let steps = [];
   let source = 'none';
-  if (kind === 'status') {
-    const sj = await (await fetch('/api/timeline?kind=status&limit=50000')).json();
-    steps = Array.isArray(sj.entries) ? sj.entries : [];
-    source = 'status_history';
-  } else {
-    const payload = await fetchTimelineSteps();
-    steps = Array.isArray(payload.entries) ? payload.entries : [];
-    source = payload.source || 'none';
+  try {
+    if (kind === 'status') {
+      const sj = await (await fetch('/api/timeline?kind=status&limit=50000')).json();
+      steps = Array.isArray(sj.entries) ? sj.entries : [];
+      source = 'status_history';
+    } else {
+      const payload = await fetchTimelineSteps();
+      steps = Array.isArray(payload.entries) ? payload.entries : [];
+      source = payload.source || 'none';
+    }
+  } catch (err) {
+    timelineMode = false;
+    showTransportError('timeline', err);
+    return;
   }
   if (steps.length === 0) {
     timelineMode = false;
@@ -2851,7 +2879,9 @@ async function exitTimelineMode() {
       return [`${sid}|${tid}|${edge.relation}`, edge.birthTime];
     })
   );
-  const [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()]);
+  const [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()])
+    .catch(err => { showTransportError('live reload', err); return null; });
+  if (!graphData) return;
   buildGraphData(graphData);
   const now = performance.now();
   for (const node of nodes) {
@@ -3000,6 +3030,13 @@ function setupDelegatedActions() {
 // ---- Init ----
 
 async function init() {
+  // R-08: scripts run in order, so at this point d3 is either loaded or its
+  // tag failed (vendor file missing AND CDN unreachable). Without this the
+  // page dies in setupCanvas with a bare ReferenceError and no cue.
+  if (typeof d3 === 'undefined') {
+    showTransportError('d3', new Error('graph library failed to load — check the serve banner for the d3 source (vendored file or CDN fallback)'));
+    return;
+  }
   setupCanvas();
   setupCanvasInteraction();
   setupDelegatedActions();
@@ -3012,7 +3049,13 @@ async function init() {
     }
   });
 
-  const [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()]);
+  let graphData, stats;
+  try {
+    [graphData, stats] = await Promise.all([fetchGraph(), fetchStats()]);
+  } catch (err) {
+    showTransportError('startup', err);
+    return;
+  }
   renderStats(stats);
 
   buildGraphData(graphData);
@@ -3030,6 +3073,17 @@ async function init() {
   connectSSE();
   setupTimeline();
 }
+
+// R-08: wire the transport banner's Reload button once, guarded — the inert
+// audit DOM has no location.
+(function setupTransportBanner() {
+  const el = document.getElementById('transport-error');
+  const btn = el && el.querySelector('.te-retry');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (typeof location !== 'undefined' && typeof location.reload === 'function') location.reload();
+  });
+})();
 
 init();
 </script>

@@ -162,6 +162,37 @@ describe("serve security (F1 2.1.13)", () => {
     expect(ok.status).toBe(200);
   });
 
+  it("rejects malformed Host forms: bare IPv6 and a portless Host on a non-80 port", { timeout: 45000 }, async () => {
+    const db = makeDb(os.tmpdir(), "hostform");
+    tmpDir = db.dir;
+    await startServe(db.file);
+
+    // R-08: `::1` без скобок — не валидная форма Host (браузеры шлют
+    // `[::1]:port`). Раньше проходила через whitelist-запись "::1".
+    const bare6 = await request({ host: "127.0.0.1", port }, "/api/stats", {
+      headers: { host: `::1:${port}` },
+    });
+    expect(bare6.status).toBe(403);
+
+    // Host без порта допустим только для дефолтного 80 — на любом другом
+    // порту это не браузерная форма (браузер всегда шлёт порт).
+    const portless = await request({ host: "127.0.0.1", port }, "/api/stats", {
+      headers: { host: "localhost" },
+    });
+    expect(portless.status).toBe(403);
+
+    // Легитимные формы не задеты: скобочный IPv6 и localhost с портом.
+    const bracketed = await request({ host: "127.0.0.1", port }, "/api/stats", {
+      headers: { host: `[::1]:${port}` },
+    });
+    expect(bracketed.status).toBe(200);
+
+    const withPort = await request({ host: "127.0.0.1", port }, "/api/stats", {
+      headers: { host: `localhost:${port}` },
+    });
+    expect(withPort.status).toBe(200);
+  });
+
   it("rejects a foreign Origin with 403 and no CORS header", { timeout: 45000 }, async () => {
     const db = makeDb(os.tmpdir(), "origin");
     tmpDir = db.dir;

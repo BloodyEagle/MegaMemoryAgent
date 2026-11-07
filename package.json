@@ -48,7 +48,7 @@
     "url": "https://github.com/BloodyEagle/MegaMemoryAgent/issues"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.9.0"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.2",
