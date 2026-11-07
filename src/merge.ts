@@ -257,26 +257,15 @@ export class MergeEngine {
       accepted_at: string | null;
     };
     const deferredEdges: DeferredEdge[] = [];
-    const seenPreexistingEdgeKeys = new Set<string>();
 
+    // S-05: pre-existing копии едут в общий список вербатим — выбор
+    // live/tombstone и версии rationale делает единая группировка при
+    // вставке, «первый встретился» в дедуп-ключе больше не решает исход
+    // (старый ключ без removed_at оживлял удалённое ребро).
     const deferPreexistingEdge = (
       e: EdgeRow,
       originSide: "left" | "right"
     ): void => {
-      // JSON array, not pipe-joined — ids containing "|" must not collide (F11).
-      const key = JSON.stringify([
-        e.from_id,
-        e.to_id,
-        e.relation,
-        e.description ?? "",
-        e.merge_group ?? "",
-        e.needs_merge,
-        e.source_branch ?? "",
-        e.merge_timestamp ?? "",
-      ]);
-      if (seenPreexistingEdgeKeys.has(key)) return;
-      seenPreexistingEdgeKeys.add(key);
-
       deferredEdges.push({
         from_id: e.from_id,
         to_id: e.to_id,
@@ -494,42 +483,41 @@ export class MergeEngine {
 
     // ---- PASS 2: Insert all edges ----
 
-    // First, collect non-conflict edges
+    // Collect the edges of non-conflict nodes verbatim — копии с обеих сторон
+    // идут в общий список, политика выбора применяется в проходе вставки
+    // (единая для обычных, конфликтных и pre-existing веток).
     for (const id of allIds) {
       if (conflictIds.has(id)) continue; // handled via deferred edges
 
       const leftNode = leftNodeMap.get(id);
       const rightNode = rightNodeMap.get(id);
 
-      // Skip pre-existing conflicts
-      if (leftNode && leftNode.needs_merge && leftNode.merge_group) continue;
-
       if (!leftNode && rightNode) {
         this.deferEdgesForNode(deferredEdges, rightEdgeMap, rightNode.id, idRemapping, "right");
       } else if (leftNode && !rightNode) {
         this.deferEdgesForNode(deferredEdges, leftEdgeMap, leftNode.id, idRemapping, "left");
       } else if (leftNode && rightNode) {
-        // Identical nodes — union of edges from both sides
-        this.deferEdgesClean(
-          deferredEdges,
-          leftEdgeMap,
-          rightEdgeMap,
-          leftNode.id,
-          idRemapping,
-          result,
-          now,
-          leftLabel,
-          rightLabel
-        );
+        // Identical nodes — edges of both sides travel; the unified grouping
+        // below merges the copies by their final ends.
+        this.deferEdgesForNode(deferredEdges, leftEdgeMap, leftNode.id, idRemapping, "left");
+        this.deferEdgesForNode(deferredEdges, rightEdgeMap, rightNode.id, idRemapping, "right");
       }
     }
 
-    // Now insert all deferred edges, remapping target IDs where needed.
+    // Now insert all deferred edges. S-05/F20: копии одного логического ребра
+    // группируются ПО КОНЕЧНЫМ точкам уже после ремапа — «первый встретился»
+    // больше не политика ни в одной ветке:
+    //   - надгробие всегда бьёт живую копию, независимо от порядка входов
+    //     (удалённая ссылка не воскрешается повторным merge);
+    //   - расхождение копий (removed_at или rationale) — конфликт на
+    //     выжившей строке (needs_merge), а не тихое замещение;
+    //   - при одинаковом состоянии остаётся первая копия (левые входы
+    //     раньше правых — детерминировано, содержимое совпадает).
     // F5: every source rowid maps to the output rowid it became — by
     // identity, never by ends — so the snapshot carry (§7) re-anchors each
     // baseline to ITS edge.
-    const outEdgeIdByEnds = new Map<string, number>();
-    const edgeIdRemapping = new Map<string, number>(); // "side:srcEdgeId" → output rowid
+    type EdgeGroup = { copies: DeferredEdge[]; remappedToId: string };
+    const edgeGroups = new Map<string, EdgeGroup>();
     for (const edge of deferredEdges) {
       // Remap to_id if the target was conflicted — use _originSide to determine
       // which suffixed version to point at (not from_id suffix, which may be absent
@@ -554,39 +542,82 @@ export class MergeEngine {
         }
       }
 
-      const res = outputDb.insertEdgeRaw({
-        from_id: edge.from_id,
-        to_id: remappedToId,
-        relation: edge.relation,
-        description: edge.description,
-        created_at: edge.created_at,
-        merge_group: edge.merge_group,
-        needs_merge: edge.needs_merge,
-        source_branch: edge.source_branch,
-        merge_timestamp: edge.merge_timestamp,
-        removed_at: edge.removed_at,
-        created_via: edge.created_via,
-        accepted_at: edge.accepted_at,
-      });
       const endsKey = JSON.stringify([edge.from_id, remappedToId, edge.relation]);
-      // INSERT OR IGNORE: same ends were inserted earlier in this pass (e.g.
-      // two rationales for one pair) — the surviving row anchors every copy.
-      // A source rowid dropped above (dead live edge) maps to nothing: its
-      // snapshot keeps the source edge_key and honestly reports "removed".
+      let group = edgeGroups.get(endsKey);
+      if (!group) {
+        group = { copies: [], remappedToId };
+        edgeGroups.set(endsKey, group);
+      }
+      group.copies.push(edge);
+    }
+
+    const outEdgeIdByEnds = new Map<string, number>();
+    const edgeIdRemapping = new Map<string, number>(); // "side:srcEdgeId" → output rowid
+    for (const [endsKey, group] of edgeGroups) {
+      const isRemoved = (e: DeferredEdge) => e.removed_at !== null;
+      let winner = group.copies[0];
+      for (const copy of group.copies) {
+        if (winner.removed_at === null && copy.removed_at !== null) {
+          winner = copy;
+          break;
+        }
+      }
+      let diverged = false;
+      const firstRemoved = isRemoved(group.copies[0]);
+      const firstDescription = group.copies[0].description ?? "";
+      for (const copy of group.copies) {
+        if (isRemoved(copy) !== firstRemoved || (copy.description ?? "") !== firstDescription) {
+          diverged = true;
+          break;
+        }
+      }
+
+      let mergeGroup = winner.merge_group;
+      let needsMerge = winner.needs_merge;
+      let sourceBranch = winner.source_branch;
+      let mergeTimestamp = winner.merge_timestamp;
+      if (diverged) {
+        result.edgeConflicts++;
+        mergeGroup = randomUUID();
+        needsMerge = 1;
+        sourceBranch = winner._originSide === "left" ? leftLabel : rightLabel;
+        mergeTimestamp = now;
+      }
+
+      const res = outputDb.insertEdgeRaw({
+        from_id: winner.from_id,
+        to_id: group.remappedToId,
+        relation: winner.relation,
+        description: winner.description,
+        created_at: winner.created_at,
+        merge_group: mergeGroup,
+        needs_merge: needsMerge,
+        source_branch: sourceBranch,
+        merge_timestamp: mergeTimestamp,
+        removed_at: winner.removed_at,
+        created_via: winner.created_via,
+        accepted_at: winner.accepted_at,
+      });
+      // INSERT OR IGNORE: единственная вставка на группу; срабатывает только
+      // когда пара уже была в существующем --into output. Source rowid,
+      // отброшенный выше (мёртвое живое ребро), не мапится никуда: его
+      // снимок честно остаётся со своим source edge_key («removed»).
       let outId = res.id;
       if (!res.inserted) {
         const existing = outEdgeIdByEnds.get(endsKey);
         if (existing === undefined) {
           throw new Error(
-            `Merge error: ignored insert of ${edge.from_id} -> ${remappedToId} ` +
-              `(${edge.relation}) has no earlier output row.`
+            `Merge error: ignored insert of ${winner.from_id} -> ${group.remappedToId} ` +
+              `(${winner.relation}) has no earlier output row.`
           );
         }
         outId = existing;
       }
       outEdgeIdByEnds.set(endsKey, outId);
-      for (const src of edge._srcEdgeIds) {
-        edgeIdRemapping.set(`${src.side}:${src.id}`, outId);
+      for (const copy of group.copies) {
+        for (const src of copy._srcEdgeIds) {
+          edgeIdRemapping.set(`${src.side}:${src.id}`, outId);
+        }
       }
     }
 
@@ -856,104 +887,6 @@ export class MergeEngine {
         _srcEdgeIds: [{ side, id: e.id }],
         created_via: e.created_via ?? "unknown",
         accepted_at: e.accepted_at ?? null,
-      });
-    }
-  }
-
-  /**
-   * For identical nodes, defer the union of edges from both sides
-   * (deduplicated). F20: when the same edge pair is tombstoned in one input
-   * and live in the other, the TOMBSTONE wins — a removed link must not
-   * resurrect just because the other branch still has it; restoring it is an
-   * explicit `link` call.
-   *
-   * 2.1.2 F2: the dedup key is the SAME one the unique index enforces —
-   * (from_id, to_id, relation), no description. With the old content key a
-   * live copy and a tombstone of one pair looked like two different edges:
-   * the second INSERT OR IGNORE was silently dropped and the surviving side
-   * depended on the input order (live on the left -> live wins, live on the
-   * right -> tombstone wins). Now the divergence between copies (removed_at
-   * or description) is registered as a needs_merge conflict instead of being
-   * settled by order; the tombstone rule applies within the single key.
-   */
-  private deferEdgesClean(
-    deferred: Array<{
-      from_id: string; to_id: string; relation: string;
-      description: string | null; created_at: string | null;
-      merge_group: string | null; needs_merge: number;
-      source_branch: string | null; merge_timestamp: string | null;
-      removed_at: string | null;
-      _originSide: "left" | "right";
-      _srcEdgeIds: Array<{ side: "left" | "right"; id: number }>;
-      created_via: string | null;
-      accepted_at: string | null;
-    }>,
-    leftEdgeMap: Map<string, EdgeRow[]>,
-    rightEdgeMap: Map<string, EdgeRow[]>,
-    nodeId: string,
-    _idRemapping: Map<string, string>,
-    result: MergeResult,
-    now: string,
-    leftLabel: string,
-    rightLabel: string
-  ): void {
-    const leftEdges = leftEdgeMap.get(nodeId) ?? [];
-    const rightEdges = rightEdgeMap.get(nodeId) ?? [];
-
-    const byEnds = new Map<
-      string,
-      {
-        edge: EdgeRow;
-        side: "left" | "right";
-        sources: Array<{ side: "left" | "right"; id: number }>;
-        diverged: boolean;
-      }
-    >();
-    const put = (e: EdgeRow, side: "left" | "right"): void => {
-      const key = JSON.stringify([e.from_id, e.to_id, e.relation]);
-      const prev = byEnds.get(key);
-      if (!prev) {
-        byEnds.set(key, { edge: e, side, sources: [{ side, id: e.id }], diverged: false });
-        return;
-      }
-      // F5: the losing copy still maps to the winning output row — its
-      // snapshot (if any) must follow the same edge, not dangle on a raw
-      // source rowid.
-      prev.sources.push({ side, id: e.id });
-      // 2.1.2 F2: copies of one pair that disagree in removal state or
-      // rationale are a conflict — flagged on the surviving row, counted in
-      // the merge report, never settled by the order of the inputs.
-      const removedDiffers = (prev.edge.removed_at === null) !== (e.removed_at === null);
-      const descriptionDiffers = (prev.edge.description ?? "") !== (e.description ?? "");
-      if (removedDiffers || descriptionDiffers) prev.diverged = true;
-      // Left first, then right; a colliding live copy never overrides a tombstone.
-      if (prev.edge.removed_at === null && e.removed_at !== null) {
-        prev.edge = e;
-        prev.side = side;
-      }
-    };
-    for (const e of leftEdges) put(e, "left");
-    for (const e of rightEdges) put(e, "right");
-
-    for (const { edge, side, sources, diverged } of byEnds.values()) {
-      if (diverged) {
-        result.edgeConflicts++;
-      }
-      deferred.push({
-        from_id: edge.from_id,
-        to_id: edge.to_id,
-        relation: edge.relation,
-        description: edge.description,
-        created_at: edge.created_at,
-        merge_group: diverged ? randomUUID() : null,
-        needs_merge: diverged ? 1 : 0,
-        source_branch: diverged ? (side === "left" ? leftLabel : rightLabel) : null,
-        merge_timestamp: diverged ? now : null,
-        removed_at: edge.removed_at ?? null,
-        _originSide: side,
-        _srcEdgeIds: sources,
-        created_via: edge.created_via ?? "unknown",
-        accepted_at: edge.accepted_at ?? null,
       });
     }
   }
