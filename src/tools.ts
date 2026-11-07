@@ -33,7 +33,8 @@ import type {
   NodeRow,
   RelationType,
 } from "./types.js";
-import { stripMergeSuffix } from "./merge.js";
+import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
+import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
 import {
   readProvenanceConfig,
   REQUIRE_SUPPORT_MESSAGE,
@@ -1772,8 +1773,19 @@ export async function resolveConflict(
   }
 
   // Prefer an active (non-removed) node as the base so the resolved concept
-  // stays active for removal conflicts. Fall back to first node.
-  const base = nodes.find((n) => n.removed_at === null) ?? nodes[0];
+  // stays active for removal conflicts. Fall back to first node. CLI
+  // «keep left/right» задаёт prefer — та же доменная операция, не вторая
+  // реализация (F-03.1).
+  const base =
+    (input.prefer
+      ? nodes.find(
+          (n) =>
+            n.removed_at === null &&
+            n.id.endsWith(input.prefer === "left" ? MERGE_SUFFIX_LEFT : MERGE_SUFFIX_RIGHT)
+        )
+      : undefined) ??
+    nodes.find((n) => n.removed_at === null) ??
+    nodes[0];
   const originalId = stripMergeSuffix(base.id);
 
   const text = embeddingText(base.name, base.kind, input.resolved.summary);
@@ -1786,14 +1798,8 @@ export async function resolveConflict(
   if (input.resolved.file_refs !== undefined) changes.file_refs = input.resolved.file_refs;
 
   db.runInTransaction(() => {
-    // Delete all conflict copies except the base
-    for (const node of nodes) {
-      if (node.id !== base.id) {
-        db.hardDeleteNode(node.id);
-      }
-    }
-
-    // Rename the base back to the original clean ID
+    // Rename the base back to the original clean ID first — переименование
+    // тянет за собой рёбра, parent_id детей и id в снимках опор.
     if (base.id !== originalId) {
       const renamed = db.renameNodeId(base.id, originalId);
       if (!renamed) {
@@ -1816,9 +1822,6 @@ export async function resolveConflict(
     // Б10: lifecycle merge rule — superseded/deprecated beats active,
     // skipped on legacy dbs without the status column.
     // valid_until is the later of the versions in the group.
-    // Б10: lifecycle merge rule — superseded/deprecated beats active,
-    // valid_until is the later of the versions. Skipped on legacy dbs
-    // without the status column (merge flags below are cleared regardless).
     if (db.hasStatusColumn) {
       const lifecycle = KnowledgeDB.mergeLifecycleStatus(
         { status: base.status, valid_until: base.valid_until },
@@ -1830,6 +1833,32 @@ export async function resolveConflict(
           )
       );
       db.setNodeStatus(originalId, lifecycle.status, lifecycle.valid_until ?? undefined);
+    }
+
+    // S-06: проигравший вариант не стирается вместе со своими рёбрами.
+    // Рёбра переезжают на выживший identity вербатим (живые и надгробия),
+    // дети/слоты/участники цепочек/артефакты/снимки/алиасы — через
+    // transferNodeIdentity; цикл, возникший от ремапа, отвергается
+    // атомарно. Исчезновение истории не превращается в «complete».
+    const componentsKey = (components: string[][]): string =>
+      JSON.stringify(
+        components.map((c) => [...c].sort()).sort((a, b) => a.join("\u0000").localeCompare(b.join("\u0000")))
+      );
+    const cyclesBefore = db.informedByCycleComponents();
+
+    for (const node of nodes) {
+      if (node.id === base.id) continue;
+      moveNodeEdges(db, node.id, originalId);
+      transferNodeIdentity(db, node.id, originalId);
+      db.hardDeleteNode(node.id);
+    }
+
+    const cyclesAfter = db.informedByCycleComponents();
+    if (componentsKey(cyclesAfter) !== componentsKey(cyclesBefore)) {
+      throw new Error(
+        `Resolution rejected: remapping the losing variant onto "${originalId}" closes an informed_by cycle ` +
+          `(${cyclesAfter.map((c) => c.join(" -> ")).join("; ")}) — nothing was written.`
+      );
     }
 
     // Clear merge flags on the resolved node and any associated edges

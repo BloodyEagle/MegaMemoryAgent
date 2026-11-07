@@ -2473,13 +2473,15 @@ export class KnowledgeDB {
   }
 
   getSlot(project: string, role: string): { node_id: string; node_name: string; updated_at: string } | undefined {
-    return this.db
-      .prepare(
-        `SELECT s.node_id, n.name AS node_name, s.updated_at
-         FROM slots s JOIN nodes n ON n.id = s.node_id AND n.removed_at IS NULL
-         WHERE s.project = ? AND s.role = ?`
-      )
-      .get(project, role) as { node_id: string; node_name: string; updated_at: string } | undefined;
+    return this.cleanRow(
+      this.db
+        .prepare(
+          `SELECT s.node_id, n.name AS node_name, s.updated_at
+           FROM slots s JOIN nodes n ON n.id = s.node_id AND n.removed_at IS NULL
+           WHERE s.project = ? AND s.role = ?`
+        )
+        .get(project, role) as { node_id: string; node_name: string; updated_at: string } | undefined
+    );
   }
 
   /** Release the role without touching the node itself (plan 2 §2 rule 4). */
@@ -2617,17 +2619,33 @@ export class KnowledgeDB {
   }
 
   getTrail(id: string): { id: string; name: string; summary: string; stale: number; created_at: string; updated_at: string | null } | undefined {
-    return this.db
-      .prepare("SELECT * FROM trails WHERE id = ?")
-      .get(id) as never;
+    return this.cleanRow(
+      this.db
+        .prepare("SELECT * FROM trails WHERE id = ?")
+        .get(id) as { id: string; name: string; summary: string; stale: number; created_at: string; updated_at: string | null } | undefined
+    );
   }
 
   getTrailMembers(trailId: string): Array<{ position: number; node_id: string; fingerprint: string }> {
-    return this.db
-      .prepare(
-        "SELECT position, node_id, fingerprint FROM trail_members WHERE trail_id = ? ORDER BY position"
-      )
-      .all(trailId) as Array<{ position: number; node_id: string; fingerprint: string }>;
+    return (
+      this.db
+        .prepare(
+          "SELECT position, node_id, fingerprint FROM trail_members WHERE trail_id = ? ORDER BY position"
+        )
+        .all(trailId) as Array<{ position: number; node_id: string; fingerprint: string }>
+    ).map((m) => this.cleanRow(m)!);
+  }
+
+  /**
+   * libsql вешает на каждую строку `_metadata: { duration }` — шум
+   * профилировщика statement'а, а не данные. В JSON-ответах он выглядит как
+   * поле записи и ломает сравнение сохранённого и прочитанного состояния
+   * (F-02, S-03: перенос цепочек/слотов вербатим).
+   */
+  private cleanRow<T>(row: T | undefined | null): T | undefined {
+    if (row === undefined || row === null) return undefined;
+    const { _metadata, ...rest } = row as T & { _metadata?: unknown };
+    return rest as T;
   }
 
   /** Trails that reference a node — used by removal notes and node cards. */
@@ -2861,6 +2879,18 @@ export class KnowledgeDB {
     return this._hasCreatedViaColumn;
   }
 
+  /** Plan 2 (v6): task board columns — merge carries them with the row (F-02, S-03). */
+  private _hasTaskColumns: boolean | undefined;
+
+  private get hasTaskColumns(): boolean {
+    if (this._hasTaskColumns === undefined) {
+      const cols = this.db.pragma("table_info(nodes)") as Array<{ name: string }>;
+      this._hasTaskColumns =
+        cols.some((c) => c.name === "task_state") && cols.some((c) => c.name === "due_at");
+    }
+    return this._hasTaskColumns;
+  }
+
   insertNodeRaw(node: {
     id: string;
     name: string;
@@ -2892,6 +2922,10 @@ export class KnowledgeDB {
     claim_digest_at?: string | null;
     // 2.1.10 (v12): node origin travels with the row (MergeEngine carry).
     created_via?: string | null;
+    // F-02 (S-03): task board state travels with the row — merge непустой
+    // базы с пустой больше не превращает задачу с дедлайном в ноду с NULL.
+    task_state?: string | null;
+    due_at?: string | null;
   }): void {
     // Б10: fork columns exist only on migrated dbs — compose the column
     // list conditionally so upstream dbs keep working.
@@ -2911,13 +2945,15 @@ export class KnowledgeDB {
     const claimParams = this.hasClaimColumns ? ", @claim_digest, @claim_digest_at" : "";
     const viaCols = this.hasCreatedViaColumn ? ", created_via" : "";
     const viaParams = this.hasCreatedViaColumn ? ", @created_via" : "";
+    const taskCols = this.hasTaskColumns ? ", task_state, due_at" : "";
+    const taskParams = this.hasTaskColumns ? ", @task_state, @due_at" : "";
     const stmt = this.db.prepare(`
       INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task,
         created_at, updated_at, removed_at, removed_reason, embedding,
-        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols}${viaCols})
+        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols}${viaCols}${taskCols})
       VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task,
         @created_at, @updated_at, @removed_at, @removed_reason, @embedding,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams}${viaParams})
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams}${viaParams}${taskParams})
     `);
     const values: Record<string, unknown> = {
       id: node.id,
@@ -2953,6 +2989,10 @@ export class KnowledgeDB {
     }
     if (this.hasCreatedViaColumn) {
       values.created_via = (node as { created_via?: string | null }).created_via ?? null;
+    }
+    if (this.hasTaskColumns) {
+      values.task_state = (node as { task_state?: string | null }).task_state ?? null;
+      values.due_at = (node as { due_at?: string | null }).due_at ?? null;
     }
     stmt.run(values);
     this.syncNameNorm(node.id, node.name);

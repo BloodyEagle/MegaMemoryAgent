@@ -3,6 +3,7 @@ import path from "path";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { MergeEngine, stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
+import { resolveConflict } from "./tools.js";
 import { errorBold, success, info, error } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 import type { NodeRow } from "./types.js";
@@ -262,7 +263,10 @@ export async function runResolve(args: string[]): Promise<void> {
       db.clearEdgeMergeFlagsByGroup(mergeGroup);
       success(`Kept both versions of "${originalId}" as separate concepts.`);
     } else {
-      // keep left or right
+      // keep left or right: та же доменная операция, что и MCP
+      // resolve_conflict (F-03.1) — проигравший вариант не стирается вместе
+      // со своими рёбрами и workflow-состоянием, а переезжает на выживший
+      // identity с сохранением свидетельств.
       const winner = keep === "left" ? leftNode : rightNode;
       const loser = keep === "left" ? rightNode : leftNode;
 
@@ -271,21 +275,32 @@ export async function runResolve(args: string[]): Promise<void> {
         process.exit(1);
       }
 
-      // Remove loser first (before renaming winner to avoid ID collision)
-      if (loser) {
-        db.hardDeleteNode(loser.id);
-      }
+      const parseRefs = (raw: string | null): string[] | undefined => {
+        if (!raw) return undefined;
+        try {
+          const parsed = JSON.parse(raw);
+          return Array.isArray(parsed) ? parsed.map(String) : undefined;
+        } catch {
+          return undefined;
+        }
+      };
 
-      // Rename winner to original ID
-      db.renameNodeId(winner.id, originalId);
-      db.clearNodeMergeFlags(originalId);
-      db.clearEdgeMergeFlagsByGroup(mergeGroup);
+      await resolveConflict(db, {
+        merge_group: mergeGroup,
+        resolved: {
+          summary: winner.summary,
+          ...(winner.why !== null && winner.why !== undefined ? { why: winner.why } : {}),
+          ...(parseRefs(winner.file_refs) ?? {}),
+        },
+        reason: `keep ${keep}: CLI resolution keeping the ${winner.source_branch ?? keep} version`,
+        prefer: keep,
+      });
 
       const keptBranch = winner.source_branch ?? keep;
       success(`Resolved "${originalId}" — kept ${pc.cyan(keptBranch)} version.`);
 
       if (loser) {
-        info(`Removed ${pc.dim(loser.source_branch ?? (keep === "left" ? "right" : "left"))} version.`);
+        info(`Removed ${pc.dim(loser.source_branch ?? (keep === "left" ? "right" : "left"))} version; its edges and workflow state moved to the kept identity.`);
       }
     }
   } finally {
