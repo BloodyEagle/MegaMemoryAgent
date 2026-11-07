@@ -565,6 +565,11 @@ export interface ResolveConflictInput {
     file_refs?: string[];
   };
   reason: string;
+  /**
+   * F-03.1 (план 03): какой вариант выживает при «keep left/right» из CLI.
+   * MCP-вызов не задаёт его — базой становится первая живая копия группы.
+   */
+  prefer?: "left" | "right";
 }
 
 export interface MergeResult {

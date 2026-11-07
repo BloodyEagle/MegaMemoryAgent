@@ -251,6 +251,48 @@ export function transferNodeIdentity(
 }
 
 /**
+ * F-03 (план 03, S-06): перенос рёбер удаляемого варианта на выжившего
+ * identity — живые и надгробия, вербатим (created_via/accepted_at/removed_at),
+ * чтобы утраченная опора не исчезала из провенанса и «связей нет» не
+ * превращалось в ложный complete. Дедуп полагается на уникальный индекс
+ * (from_id, to_id, relation): пара, уже стоящая у выжившего, не создаётся
+ * второй раз — копия варианта уходит вместе с ним; надгробие выжившего при
+ * этом не воскрешается (та же политика, что и в merge, F20).
+ * Возвращает число фактически перенесённых строк.
+ */
+export function moveNodeEdges(
+  db: KnowledgeDB,
+  fromId: string,
+  toId: string
+): number {
+  const edges = db
+    .getAllEdgesRaw()
+    .filter((e) => e.from_id === fromId || e.to_id === fromId);
+  let moved = 0;
+  for (const e of edges) {
+    const from = e.from_id === fromId ? toId : e.from_id;
+    const to = e.to_id === fromId ? toId : e.to_id;
+    if (from === to) continue; // самопетля после ремапа — не свидетельство
+    const res = db.insertEdgeRaw({
+      from_id: from,
+      to_id: to,
+      relation: e.relation,
+      description: e.description,
+      created_at: e.created_at,
+      merge_group: e.merge_group,
+      needs_merge: e.needs_merge,
+      source_branch: e.source_branch,
+      merge_timestamp: e.merge_timestamp,
+      removed_at: e.removed_at,
+      created_via: e.created_via ?? "unknown",
+      accepted_at: e.accepted_at ?? null,
+    });
+    if (res.inserted) moved++;
+  }
+  return moved;
+}
+
+/**
  * Merge node `other` into `survivor`: combine summary/why/file_refs, move
  * edges, hard-delete the other node. Caller decides which one survives —
  * findDuplicates marks the older one.
