@@ -2748,6 +2748,32 @@ async function scrubToStep(stepIndex) {
 
   refreshSimulation(0.15);
   setEmptyStateVisible(nodes.length === 0);
+
+  // План 09 (камера timeline): после navigateTo к далёкому узлу новая эпоха
+  // может целиком лечь вне вьюпорта. Если возле центра вьюпорта нет ни одного
+  // узла текущего шага — центрируем камеру на медиане координат узлов (без
+  // анимации: камера должна быть на месте сразу после скраба). Узлы рядом —
+  // камеру не трогаем: не дёргаем её без причины.
+  if (nodes.length > 0) {
+    const centerX = (width / 2 - panX) / zoom;
+    const centerY = (height / 2 - panY) / zoom;
+    const radius = (0.25 * Math.min(width, height)) / zoom;
+    const hasNearbyNode = nodes.some((n) => {
+      const dx = n.x - centerX;
+      const dy = n.y - centerY;
+      return dx * dx + dy * dy <= radius * radius;
+    });
+    if (!hasNearbyNode) {
+      const xs = nodes.map((n) => n.x).sort((a, b) => a - b);
+      const ys = nodes.map((n) => n.y).sort((a, b) => a - b);
+      const mid = xs.length >> 1;
+      const medianX = xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
+      const medianY = ys.length % 2 ? ys[mid] : (ys[mid - 1] + ys[mid]) / 2;
+      cameraAnimation = null;
+      panX = width / 2 - medianX * zoom;
+      panY = height / 2 - medianY * zoom;
+    }
+  }
 }
 
 function startTimelinePlayback() {
