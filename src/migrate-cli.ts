@@ -3,11 +3,29 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import pc from "picocolors";
-import { KnowledgeDB } from "./db.js";
+import { KnowledgeDB, UpstreamSchemaError } from "./db.js";
 import { planIdRepair, applyIdRepair, backupDb, snapshotDb } from "./migrate.js";
 import { runMigration } from "./migrate-schema.js";
 import { success, info, heading, skip, warn } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
+
+/**
+ * 08-N1 (план 09): сырая upstream-база (user_version = 0) не открывается
+ * конструктором с авто-миграцией — тот падал на индексе по ещё не существующей
+ * колонке. Для migrate это штатный вход: открываем базу без авто-миграции,
+ * поднимаем схему шагами конструктора (runPendingMigrations), форк-колонки
+ * (status, name_norm), FTS и метки добавит runMigration.
+ */
+function openForMigration(dbPath: string): KnowledgeDB {
+  try {
+    return new KnowledgeDB(dbPath);
+  } catch (err) {
+    if (!(err instanceof UpstreamSchemaError)) throw err;
+    const db = new KnowledgeDB(dbPath, { autoMigrate: false });
+    db.runPendingMigrations();
+    return db;
+  }
+}
 
 function printReport(
   report: Awaited<ReturnType<typeof runMigration>>,
@@ -172,7 +190,7 @@ export async function runMigrate(args: string[], deps: DryRunDeps = {}): Promise
   if (dryRun) {
     const before = fingerprint(p);
     await withDryRunCopy(p, async (copyPath) => {
-      const db = new KnowledgeDB(copyPath);
+      const db = openForMigration(copyPath);
       try {
         const report = await runMigration(db, {
           apply: true,
@@ -196,7 +214,7 @@ export async function runMigrate(args: string[], deps: DryRunDeps = {}): Promise
     return;
   }
 
-  const db = new KnowledgeDB(p);
+  const db = openForMigration(p);
   try {
     const report = await runMigration(db, {
       apply: true,

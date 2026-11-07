@@ -340,9 +340,13 @@ export async function auditDom(options: {
   }
   return {
     element, dispatch, invoke, settle, handlerErrors, sse, requests, errors, alerts, location,
-    graphState: () => JSON.parse(run("JSON.stringify({nodes, edges})")) as {
+    /** Выполнить выражение в контексте обозревателя — для проверки/подготовки
+     * состояния, до которого нет DOM-доступа (камера: zoom/panX/panY). */
+    evaluate: <T>(expression: string): T => run(expression) as T,
+    graphState: () => JSON.parse(run("JSON.stringify({nodes, edges, camera: {zoom, panX, panY, width, height}})")) as {
       nodes: Array<AuditGraphNode & { x: number; y: number; selected: boolean }>;
       edges: Array<{ source: string | { id: string }; target: string | { id: string }; relation: string; isParentEdge: boolean }>;
+      camera: { zoom: number; panX: number; panY: number; width: number; height: number };
     },
     close: () => { eventSources.forEach((source) => source.close()); timers.clear(); },
   };

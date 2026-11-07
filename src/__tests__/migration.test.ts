@@ -4,15 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import Database from "libsql";
-import { KnowledgeDB } from "../db.js";
+import { KnowledgeDB, UpstreamSchemaError } from "../db.js";
 import { runMigration, ensureEmbedMeta, emptyReport } from "../migrate-schema.js";
+import { runMigrate } from "../migrate-cli.js";
 import { vectorSearchEnabled, MODEL_NAME } from "../embeddings.js";
 import { runDoctor } from "../doctor.js";
 import { cleanupDir } from "./helpers/cleanup.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
 // Upstream v1.6.2-shaped fixture: exact upstream schema, no fork columns.
-function buildUpstreamFixture(dbPath: string): void {
+// userVersion: 4 — каноничная репо-фикстура; null — сырая upstream-база,
+// как в реальном 1.6.2: user_version не проставлялась, остаётся 0 (08-N1).
+function buildUpstreamFixture(dbPath: string, userVersion: number | null = 4): void {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   db.exec(`
@@ -81,7 +84,15 @@ function buildUpstreamFixture(dbPath: string): void {
 
   // Fully-migrated upstream db: constructor's own migrate() must be a no-op,
   // otherwise the dry-run hash comparison would see a user_version write.
-  db.pragma("user_version = 4");
+  // null (сырая upstream) оставляет user_version = 0.
+  if (userVersion !== null) {
+    db.pragma(`user_version = ${userVersion}`);
+  }
+  // libsql освобождает нативный хендл закрытого соединения только при GC
+  // (Windows): отложенное закрытие чекпоинтит -wal в main уже ПОСЛЕ снятия
+  // хеша, и «ничего не изменено» превращается в лотерею. TRUNCATE при
+  // сборке фиксирует весь контент в main — поздний чекпоинт ничего не меняет.
+  db.pragma("wal_checkpoint(TRUNCATE)");
   db.close();
 }
 
@@ -377,6 +388,84 @@ describe("embedding meta on migration (F10)", () => {
       const embedCheck = checks.find((c) => c.name === "embedding model");
       expect(embedCheck?.detail).toContain("unknown");
       expect(problems).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("08-N1 (план 09): сырая upstream-база с user_version = 0", () => {
+  function freshRawDir(): { dir: string; dbPath: string } {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-migration-raw-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    buildUpstreamFixture(dbPath, null);
+    return { dir: tmpDir, dbPath };
+  }
+
+  it("конструктор даёт понятную ошибку с кодом и путём починки, а не «no such column: status»", () => {
+    const { dbPath } = freshRawDir();
+    let caught: unknown;
+    try {
+      new KnowledgeDB(dbPath);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(UpstreamSchemaError);
+    const err = caught as UpstreamSchemaError;
+    expect(err.code).toBe("UPSTREAM_SCHEMA_V0");
+    expect(err.message).toContain("migrate --apply");
+    expect(err.message).not.toContain("no such column");
+  });
+
+  it("migrate --apply на той же базе проходит и поднимает схему до v13", async () => {
+    const { dbPath } = freshRawDir();
+    await runMigrate(["--db", dbPath, "--apply"]);
+
+    // База открывается штатно: миграция завершена, версия проставлена.
+    const db = new KnowledgeDB(dbPath);
+    try {
+      expect(db.getUserVersion()).toBe(13);
+      const raw = db.getAllNodesRaw();
+      expect(raw).toHaveLength(20);
+      expect(raw.every((n) => (n as { status?: string }).status === "active")).toBe(true);
+      expect(db.nodeExists("книга")).toBe(true); // id repair прошёл
+      expect(db.getMetaValue("schema_version")).toBe("3");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("migrate --dry-run на сырой базе считает план и не пишет в оригинал", async () => {
+    const { dbPath } = freshRawDir();
+    const before = sha256(dbPath);
+    await runMigrate(["--db", dbPath, "--dry-run"]);
+    expect(sha256(dbPath)).toBe(before);
+  });
+
+  it("повреждённая база даёт ошибку целостности, а не совет выполнить migrate", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-migration-corrupt-"));
+    tmpDir = dir;
+    const dbPath = path.join(dir, "corrupt.db");
+    fs.writeFileSync(dbPath, Buffer.from("это точно не заголовок SQLite..........."));
+    let caught: unknown;
+    try {
+      new KnowledgeDB(dbPath);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(UpstreamSchemaError);
+    expect((caught as Error).message).not.toContain("migrate --apply");
+  });
+
+  it("новая пустая база (user_version = 0 без таблиц) создаётся штатно", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-migration-fresh-"));
+    tmpDir = dir;
+    const dbPath = path.join(dir, "fresh.db");
+    const db = new KnowledgeDB(dbPath);
+    try {
+      expect(db.getUserVersion()).toBe(13);
+      expect(db.getAllNodesRaw()).toHaveLength(0);
     } finally {
       db.close();
     }
