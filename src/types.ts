@@ -196,10 +196,20 @@ export interface NodeWithContext {
   status?: string;
   valid_until?: string | null;
   /**
-   * 2.1.12 F1: факт просрочен (valid_until в прошлом). Ставится только при
-   * include_stale: true — по умолчанию такие узлы из выдачи исключены.
+   * 2.1.12 F1: факт просрочен (valid_until в прошлом). В выдаче поиска
+   * ставится только при include_stale: true — по умолчанию такие узлы
+   * исключены; на карточке узла считается всегда.
    */
   expired?: boolean;
+  /**
+   * UX-01 (план 07): происхождение записи (v12), задача и роли узла —
+   * сравнение перед слиянием показывает то, что переедет или потеряется
+   * вместе с дублем.
+   */
+  created_via?: string | null;
+  task_state?: string | null;
+  due_at?: string | null;
+  slots?: Array<{ project: string; role: string }>;
   /** Plan 1: epistemic axis + the scope of a `validated` (JSON). */
   epistemic_status?: string | null;
   status_scope?: Record<string, unknown> | null;

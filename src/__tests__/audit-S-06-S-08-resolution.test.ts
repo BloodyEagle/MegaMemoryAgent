@@ -148,17 +148,31 @@ describe("S-08 consolidation validates distinct live identities", () => {
     const preview = describeConsolidation(db, "survivor", "other");
     expect(preview.rejection).toBeUndefined();
     expect(sqlState(db)).toEqual(before);
+    // UX-01 (план 07): последствия — списки, а не счётчики: preview
+    // показывает, ЧТО именно переедет. Планировщик один для preview и apply.
     expect(preview).toMatchObject({
       survivor: "survivor",
       other: "other",
       summaryCombines: true,
-      refsAdded: 1,
-      edgesToMove: 1,
-      children: 1,
+      refsAdded: ["src/shared.ts"],
+      edgesToMove: [
+        { from_id: "survivor", to_id: "peer", relation: "connects_to", description: "Outgoing link" },
+      ],
+      children: [{ id: "child", name: "child" }],
       trailMembers: 1,
       taskCarries: true,
+      taskState: "open",
+      dueAt: "2030-06-01",
+      // kind различается, но lifecycle/epistemic статусы одинаковы —
+      // расхождения статусов нет, поэтому «статус дубля не переносится»
+      // предупреждением не становится.
+      statusDiverges: false,
     });
     expect(preview.slots).toEqual([{ project: "project", role: "handoff" }]);
+    expect(preview.finalSummary).toContain("First wording");
+    expect(preview.finalSummary).toContain("Second wording");
+    // why нет ни у одной из нод — честный источник «none».
+    expect(preview.whySource).toBe("none");
 
     const rejected = describeConsolidation(db, "child", "other");
     expect(rejected.rejection).toMatch(/cycle/i);

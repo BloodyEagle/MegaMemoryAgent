@@ -4,8 +4,14 @@ import path from "path";
 import { fileURLToPath } from "url";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
-import { buildNodeWithContext, understand } from "./tools.js";
-import { findDuplicates, mergeNodes, type MergeNodesResult } from "./consolidate.js";
+import { buildNodeWithContext, currentDigestsOf, understand } from "./tools.js";
+import {
+  describeConsolidation,
+  findDuplicates,
+  mergeNodes,
+  VersionConflictError,
+  type MergeNodesResult,
+} from "./consolidate.js";
 import { renderAllMarkdown, renderNodeMarkdown } from "./export.js";
 import { digestSourceChildren } from "./digest.js";
 import { errorBold, askPort } from "./cli-utils.js";
@@ -885,6 +891,10 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
         updated_at: node.updated_at,
         created_by_task: node.created_by_task,
       };
+      // UX-01 (план 07): карточка explorer несёт дайджесты формулировки, как
+      // get_concept, — подтверждённая версия видна при сравнении перед
+      // слиянием (те же поля планов 04, не своя структура).
+      result.current_digests = currentDigestsOf(node);
       json(res, result);
       return;
     }
@@ -902,6 +912,19 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
         threshold: Number.isFinite(threshold) ? threshold : 0.95,
       });
       json(res, { candidates });
+      return;
+    }
+
+    if (pathname === "/api/consolidate/preview" && req.method === "GET") {
+      // UX-01 (план 07): read-only описание последствий слияния — тот же
+      // планировщик (planConsolidation), что исполняет apply. Ни одной записи.
+      const survivor = (url.searchParams.get("survivor") ?? "").trim();
+      const other = (url.searchParams.get("other") ?? "").trim();
+      if (!survivor || !other) {
+        json(res, { error: "survivor and other query params are required" }, 400);
+        return;
+      }
+      json(res, describeConsolidation(db, survivor, other));
       return;
     }
 
@@ -963,17 +986,48 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
             respondOnce(400, { error: "A JSON object with survivor and other is required" });
             return;
           }
-          const body = parsed as { survivor?: unknown; other?: unknown };
+          const body = parsed as { survivor?: unknown; other?: unknown; base?: unknown };
           const survivor = typeof body.survivor === "string" ? body.survivor.trim() : "";
           const other = typeof body.other === "string" ? body.other.trim() : "";
           if (!survivor || !other) {
             respondOnce(400, { error: "survivor and other are required" });
             return;
           }
+          // UX-01 (план 07): версии карточек/плана, на которых пользователь
+          // подтверждал preview. Необязательное поле (CLI-совместимость);
+          // допустимые значения — строка или null, всё остальное отбраковка.
+          let versionExpect: { survivor_updated_at?: string | null; other_updated_at?: string | null } | undefined;
+          if (body.base !== undefined) {
+            if (typeof body.base !== "object" || body.base === null || Array.isArray(body.base)) {
+              respondOnce(400, { error: "base must be an object with updated_at tokens" });
+              return;
+            }
+            const rawBase = body.base as { survivor_updated_at?: unknown; other_updated_at?: unknown };
+            const token = (value: unknown): string | null | undefined => {
+              if (value === undefined) return undefined;
+              if (value === null) return null;
+              return typeof value === "string" ? value : undefined;
+            };
+            const survivorToken = token(rawBase.survivor_updated_at);
+            const otherToken = token(rawBase.other_updated_at);
+            if (survivorToken === undefined || otherToken === undefined) {
+              respondOnce(400, { error: "base tokens must be strings or null" });
+              return;
+            }
+            versionExpect = {};
+            if (survivorToken !== undefined) versionExpect.survivor_updated_at = survivorToken;
+            if (otherToken !== undefined) versionExpect.other_updated_at = otherToken;
+          }
           let result: MergeNodesResult;
           try {
-            result = mergeNodes(db, survivor, other);
+            result = mergeNodes(db, survivor, other, versionExpect ? { expect: versionExpect } : undefined);
           } catch (err) {
+            // Stale preview: нода изменилась/удалена между preview и confirm —
+            // атомарный отказ, ни одной записи; UI перечитывает карточки.
+            if (err instanceof VersionConflictError) {
+              respondOnce(409, { error: "version_conflict", detail: err.message });
+              return;
+            }
             respondOnce(400, { error: err instanceof Error ? err.message : String(err) });
             return;
           }

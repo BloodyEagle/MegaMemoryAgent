@@ -291,6 +291,15 @@ export function buildNodeWithContext(
     // T4: lifecycle status surfaces in the node card.
     status: node.status ?? "active",
     valid_until: node.valid_until ?? null,
+    // 2.1.12 F1: факт просрочен — на карточке это видно без вычислений.
+    expired: isNodeExpired(node),
+    // UX-01 (план 07): происхождение, задача и слоты на карточке — сравнение
+    // перед слиянием показывает то, что влияет на последствия (создатель,
+    // дедлайн и роли переезжают или теряются вместе с дублем).
+    created_via: node.created_via ?? null,
+    task_state: node.task_state ?? null,
+    due_at: node.due_at ?? null,
+    slots: db.getSlotsForNode(node.id),
     // Plan 1 §5.3: both axes on the card, plus the scope of a `validated`.
     epistemic_status: node.epistemic_status ?? null,
     status_scope: parseStatusScope(node.status_scope),
@@ -941,8 +950,12 @@ export function getConcept(
  * the confirmation was made on (the snapshot pins it; a divergence against
  * it is the support_check signal, not a confirmable value). status has no
  * node-level snapshot — always current.
+ *
+ * UX-01 (план 07): экспортирован — HTTP-карточка узла в explorer несёт те
+ * же дайджесты, что и get_concept (подтверждённая формулировка видна при
+ * сравнении перед слиянием).
  */
-function currentDigestsOf(node: NodeRow): CurrentDigestsView {
+export function currentDigestsOf(node: NodeRow): CurrentDigestsView {
   const snapshotClaim = node.claim_digest ?? null;
   return {
     claim: claimDigestOf(node.summary),
