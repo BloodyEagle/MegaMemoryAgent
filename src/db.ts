@@ -2321,6 +2321,82 @@ export class KnowledgeDB {
       .all() as NodeRow[];
   }
 
+  /**
+   * План 09 (R-06a): сколько живых корней всего — счётчик без чтения их строк.
+   * list_roots отчитывается meta.dropped/truncated от полного числа, даже когда
+   * сами корни читает страницами.
+   */
+  countRootNodes(): number {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM nodes WHERE parent_id IS NULL AND removed_at IS NULL"
+      )
+      .get() as { count: number };
+    return row.count;
+  }
+
+  /**
+   * План 09 (R-06a): страница корней только с колонками стартового дайджеста.
+   * SELECT * тянет embedding и служебные колонки, которые list_roots не
+   * читает, — на большой граф это лишние сотни мегабайт в RSS. Кейсет
+   * (name, id): на уникальных именах порядок тот же, что у getRootNodes()
+   * (ORDER BY name), на совпадающих — детерминированный.
+   */
+  getRootOverviewPage(
+    after: { name: string; id: string } | null,
+    limit: number
+  ): Array<{ id: string; name: string; kind: string; valid_until: string | null }> {
+    if (after === null) {
+      return this.db
+        .prepare(
+          `SELECT id, name, kind, valid_until FROM nodes
+           WHERE parent_id IS NULL AND removed_at IS NULL
+           ORDER BY name, id LIMIT ?`
+        )
+        .all(limit) as Array<{
+        id: string;
+        name: string;
+        kind: string;
+        valid_until: string | null;
+      }>;
+    }
+    return this.db
+      .prepare(
+        `SELECT id, name, kind, valid_until FROM nodes
+         WHERE parent_id IS NULL AND removed_at IS NULL
+           AND (name > ? OR (name = ? AND id > ?))
+         ORDER BY name, id LIMIT ?`
+      )
+      .all(after.name, after.name, after.id, limit) as Array<{
+      id: string;
+      name: string;
+      kind: string;
+      valid_until: string | null;
+    }>;
+  }
+
+  /**
+   * План 09 (R-06a): число живых детей для набора родителей — один запрос с
+   * GROUP BY на чанк вместо запроса на каждого ребёнка (классический N+1:
+   * 10k корней раньше стоили 10k prepare). parent_id индексирован, чанк
+   * выбирает все группы одним проходом по индексу.
+   */
+  getChildCounts(parentIds: string[], chunkSize = 500): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (let i = 0; i < parentIds.length; i += chunkSize) {
+      const chunk = parentIds.slice(i, i + chunkSize);
+      const rows = this.db
+        .prepare(
+          `SELECT parent_id, COUNT(*) AS cnt FROM nodes
+           WHERE removed_at IS NULL AND parent_id IN (${chunk.map(() => "?").join(",")})
+           GROUP BY parent_id`
+        )
+        .all(...chunk) as Array<{ parent_id: string; cnt: number }>;
+      for (const row of rows) counts.set(row.parent_id, row.cnt);
+    }
+    return counts;
+  }
+
   getAllActiveNodesWithEmbeddings(): Array<{
     id: string;
     name: string;

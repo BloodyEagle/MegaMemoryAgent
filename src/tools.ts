@@ -1803,13 +1803,50 @@ export function listRoots(
 ): ListRootsOutput & { hint?: string } {
   const maxTokens = input.max_tokens ?? 1500;
   const extra = input.extra_payload ?? {};
-  const rootRows = db.getRootNodes();
-
   const stats = db.getStats();
   const hint =
     stats.nodes === 0
       ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
       : undefined;
+
+  // План 09 (R-06a): корни читаются страницами под бюджет ответа, а не целиком
+  // с последней порезкой в памяти. Как только корневая секция перестаёт
+  // помещаться в бюджет, дальше страницу читать бессмысленно — бинарный поиск
+  // максимума не зайдёт за неё. meta.dropped/truncated считаются от полного
+  // числа корней (COUNT), так что выдача совпадает с прежним цельным чтением
+  // на любом бюджете.
+  const ROOT_PAGE = 500;
+  // Запас на цифры tokens_estimated в meta (после подстановки ответ чуть
+  // растёт) — порезка идёт с зазором, финальный замер честный.
+  const RESERVE = 32;
+  const target = maxTokens - RESERVE;
+  const totalRoots = db.countRootNodes();
+  const rootRows: Array<{
+    id: string;
+    name: string;
+    kind: string;
+    valid_until: string | null;
+  }> = [];
+  let after: { name: string; id: string } | null = null;
+  while (rootRows.length < totalRoots) {
+    const page = db.getRootOverviewPage(after, ROOT_PAGE);
+    if (page.length === 0) break;
+    rootRows.push(...page);
+    after = {
+      name: page[page.length - 1].name,
+      id: page[page.length - 1].id,
+    };
+    if (
+      estimateTokens(JSON.stringify(rootRows, null, 2)) > target ||
+      page.length < ROOT_PAGE
+    ) {
+      break;
+    }
+  }
+
+  // Child count — одним группированным запросом на чанк родителей, не по
+  // запросу на корень (N+1: 10k корней стоили 10k prepare и +200 МБ RSS).
+  const childCounts = db.getChildCounts(rootRows.map((r) => r.id));
 
   // Budgeted overview (plan T3): id/name/kind + child count, no summary.
   // 2.1.12 F1: valid_until на корне виден сразу — просроченный корень не
@@ -1818,7 +1855,7 @@ export function listRoots(
     id: root.id,
     name: root.name,
     kind: root.kind as NodeWithContext["kind"],
-    child_count: db.getChildren(root.id).length,
+    child_count: childCounts.get(root.id) ?? 0,
     valid_until: root.valid_until ?? null,
   }));
   // Plan 2 §2/§3: role slots go FIRST in the startup digest, then the top-5
@@ -1852,10 +1889,12 @@ export function listRoots(
     ...(hint ? { hint } : {}),
     meta: {
       returned: roots.length,
-      dropped: rootsCompact.length - roots.length,
+      // Полное число корней (COUNT), не прочитанное: страницы могут быть
+      // обрезаны бюджетом раньше конца таблицы.
+      dropped: totalRoots - roots.length,
       tokens_estimated: tokensEstimated,
       truncated:
-        roots.length < rootsCompact.length ||
+        roots.length < totalRoots ||
         slotsCut.length < slots.length ||
         boardCut.length < boardTop.length,
       dropped_slots: slots.length - slotsCut.length,
@@ -1874,11 +1913,6 @@ export function listRoots(
         `Подними max_tokens (по умолчанию 1500).`
     );
   }
-
-  // Запас на цифры tokens_estimated в meta (после подстановки ответ чуть
-  // растёт) — порезка идёт с зазором, финальный замер честный.
-  const RESERVE = 32;
-  const target = maxTokens - RESERVE;
 
   const fits = (nRoots: number, nSlots: number, nBoard: number): boolean =>
     measure({
