@@ -2076,6 +2076,12 @@ export function computeBoard(db: KnowledgeDB): BoardOutput {
  * Per-member state of a saved chain, evaluated at read time (plan 2 §1): a
  * member whose fingerprint no longer matches makes the chain `stale`; a
  * member that no longer exists at all makes it `broken` — nothing to refresh.
+ *
+ * Plan 04 K-09: freshness of the SNAPSHOT and fitness of the REASONING are
+ * separate — a member that can no longer back any reasoning (refuted,
+ * abandoned, expired) is stale however well its fingerprint matches. Expiry
+ * is computed on the fresh clock at read time; it is never hashed into the
+ * fingerprint, so natural expiry stales the chain without any write.
  */
 export function trailMemberStates(
   db: KnowledgeDB,
@@ -2100,6 +2106,21 @@ export function trailMemberStates(
     if (node.removed_at) {
       view.state = "stale";
       view.reason = `member "${m.node_id}" was removed (${node.removed_reason ?? "no reason recorded"})`;
+      return view;
+    }
+    if (node.epistemic_status === "refuted") {
+      view.state = "stale";
+      view.reason = `member "${m.node_id}" опровергнут — вывод на нём строить нельзя (причина в карточке узла)`;
+      return view;
+    }
+    if (node.epistemic_status === "abandoned") {
+      view.state = "stale";
+      view.reason = `member "${m.node_id}" заброшен — вывод может устареть`;
+      return view;
+    }
+    if (isNodeExpired(node)) {
+      view.state = "stale";
+      view.reason = `member "${m.node_id}" просрочен (valid_until ${node.valid_until}) — утверждение могло перестать быть верным`;
       return view;
     }
     const now = db.nodeFingerprint(m.node_id);

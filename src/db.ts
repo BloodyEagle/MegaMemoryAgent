@@ -2667,21 +2667,42 @@ export class KnowledgeDB {
       .run(stale ? 1 : 0, trailId);
   }
 
-  /** trail_refresh: overwrite all member fingerprints with the current ones. */
+  /**
+   * trail_refresh: overwrite member fingerprints with the current ones.
+   * Plan 04 K-09: a refresh re-snapshots ELIGIBLE members only and never
+   * launders reasoning — a member that is removed, refuted, abandoned or
+   * expired cannot be made fresh by re-hashing it: its saved fingerprint
+   * stays, and the chain keeps (or gains) its stale flag. A hard-deleted
+   * member is still an error — the chain is broken, only a rebuild helps.
+   */
   refreshTrailFingerprints(trailId: string): void {
     this.runInTransaction(() => {
       const members = this.getTrailMembers(trailId);
       const stmt = this.db.prepare(
         "UPDATE trail_members SET fingerprint = ? WHERE trail_id = ? AND position = ?"
       );
+      let ineligible = false;
       for (const m of members) {
+        const row = this.getNodeIncludingRemoved(m.node_id);
+        if (!row) {
+          throw new Error(`Member "${m.node_id}" no longer exists — chain is broken, refresh impossible.`);
+        }
+        if (
+          row.removed_at ||
+          row.epistemic_status === "refuted" ||
+          row.epistemic_status === "abandoned" ||
+          isNodeExpired(row)
+        ) {
+          ineligible = true;
+          continue;
+        }
         const fp = this.nodeFingerprint(m.node_id);
         if (fp === null) {
           throw new Error(`Member "${m.node_id}" no longer exists — chain is broken, refresh impossible.`);
         }
         stmt.run(fp, trailId, m.position);
       }
-      this.setTrailStale(trailId, false);
+      this.setTrailStale(trailId, ineligible);
     });
   }
 

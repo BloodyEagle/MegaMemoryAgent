@@ -1011,7 +1011,7 @@ async function startMcpServer() {
 
   server.tool(
     "trail_refresh",
-    "Re-snapshot the fingerprints of every chain member after you verified the chain still holds. Refuses on a broken chain (a member was hard-deleted) — rebuild it instead.",
+    "Re-snapshot the fingerprints of every chain member after you verified the chain still holds. Refuses on a broken chain (a member was hard-deleted) — rebuild it instead. Plan 04 K-09: refresh не оживляет непригодных участников — опровергнутый, заброшенный, просроченный или удалённый член цепочки не переснимается, и цепочка остаётся stale; refresh обновляет только снимок годных членов, пригодность рассуждения он не «чинит».",
     {
       id: z.string().describe("Trail id"),
     },
