@@ -37,8 +37,10 @@ const cmd = process.argv[2];
 switch (cmd) {
   case "install": {
     const { runInstall } = await import("./install.js");
-    await runInstall(process.argv.slice(3));
-    process.exit(0);
+    // План 06 (C-01): провал критического шага настройки — неуспех процесса,
+    // а не exit(0): CI и скрипты обязаны видеть, что установка не прошла.
+    const outcome = await runInstall(process.argv.slice(3));
+    process.exit(outcome.ok ? 0 : 1);
     break;
   }
 

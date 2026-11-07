@@ -25,6 +25,18 @@ interface StepResult {
   error?: string;
 }
 
+/**
+ * План 06 (C-01): структурированный итог установки — CLI ставит exit code
+ * по нему, а не делает exit(0) всегда. Пропущенные шаги (после провала
+ * критического) считаются отдельно: skipped — не успех.
+ */
+export interface InstallOutcome {
+  ok: boolean;
+  succeeded: number;
+  failed: Array<{ target: string; targetLabel: string; name: string; error?: string }>;
+  skipped: Array<{ target: string; targetLabel: string; name: string }>;
+}
+
 interface CommandRuntime {
   opencodeCommand: string[];
   stdioCommand: string;
@@ -752,7 +764,7 @@ async function chooseTargetsInteractively(): Promise<InstallTarget[]> {
   );
 }
 
-export async function runInstall(args: string[]): Promise<void> {
+export async function runInstall(args: string[]): Promise<InstallOutcome> {
   console.log();
   console.log(`  ${pc.bold(pc.cyan("megamemory"))} ${pc.dim("install")}`);
   console.log();
@@ -768,7 +780,6 @@ export async function runInstall(args: string[]): Promise<void> {
     console.log(pc.dim(`  Example: ${pc.cyan("megamemory install --target claudecode")}`));
     console.log();
     process.exit(1);
-    return;
   }
 
   if (targets.length === 0) {
@@ -778,10 +789,11 @@ export async function runInstall(args: string[]): Promise<void> {
   if (targets.length === 0) {
     warn("No targets selected. Nothing to do.");
     console.log();
-    return;
+    return { ok: true, succeeded: 0, failed: [], skipped: [] };
   }
 
   const steps: StepResult[] = [];
+  const skipped: Array<{ target: string; targetLabel: string; name: string }> = [];
 
   for (const target of targets) {
     const targetConfig = targetConfigs[target];
@@ -811,6 +823,16 @@ export async function runInstall(args: string[]): Promise<void> {
 
         if (step.critical) {
           warn(`Skipping remaining ${targetConfig.label} steps because ${step.name} failed.`);
+          // План 06 (C-01): пропущенные шаги фиксируются явно — оставшиеся
+          // шаги цели не были выполнены, и молча считать target настроенным
+          // нельзя.
+          for (const rest of targetConfig.steps.slice(i + 1)) {
+            skipped.push({
+              target,
+              targetLabel: targetConfig.label,
+              name: rest.name,
+            });
+          }
           break;
         }
       }
@@ -851,5 +873,29 @@ export async function runInstall(args: string[]): Promise<void> {
     console.log();
     console.log(pc.dim(`  Steps that succeeded will still work. Fix the issues above and re-run.`));
   }
+  if (skipped.length > 0) {
+    console.log(
+      `  ${pc.yellow(`${skipped.length} step(s) skipped:`)}`
+    );
+    for (const item of skipped) {
+      console.log(`    ${pc.dim("-")} ${item.targetLabel} — ${item.name}`);
+    }
+  }
   console.log();
+  const outcome: InstallOutcome = {
+    ok: failed.length === 0,
+    succeeded: steps.length - failed.length,
+    failed: failed.map((f) => ({
+      target: f.target,
+      targetLabel: f.targetLabel,
+      name: f.name,
+      error: f.error,
+    })),
+    skipped,
+  };
+  // План 06 (C-01): провал виден и прямому вызывающему runInstall —
+  // process.exitCode даёт ненулевой код завершения процесса без выброса
+  // exit-а в in-process вызывающих (те читают структурированный итог).
+  if (!outcome.ok) process.exitCode = 1;
+  return outcome;
 }
