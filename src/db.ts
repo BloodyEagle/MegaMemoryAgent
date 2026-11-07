@@ -70,6 +70,20 @@ function envInt(name: string, defaultValue: number): number {
   return Number.isFinite(n) ? Math.trunc(n) : defaultValue;
 }
 
+/**
+ * 08-N1 (план 09): сырая upstream-база (user_version = 0, схема v1.6.2 без
+ * форк-колонок) не открывается конструктором с авто-миграцией — молчаливое
+ * падение «no such column: status» выглядело как повреждение базы. Взамен —
+ * понятная ошибка с кодом и штатным путём починки.
+ */
+export class UpstreamSchemaError extends Error {
+  readonly code = "UPSTREAM_SCHEMA_V0";
+  constructor(message: string) {
+    super(message);
+    this.name = "UpstreamSchemaError";
+  }
+}
+
 export class KnowledgeDB {
   private db: Database.Database;
   private dbFile: string;
@@ -121,7 +135,7 @@ export class KnowledgeDB {
       .run(norm, id);
   }
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, opts: { autoMigrate?: boolean } = {}) {
     // Ensure directory exists
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
@@ -134,6 +148,41 @@ export class KnowledgeDB {
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("synchronous = NORMAL");
+    // 08-N1 (план 09): migrate --apply открывает сырую upstream-базу без
+    // авто-миграции и поднимает схему сам (runPendingMigrations + runMigration).
+    if (opts.autoMigrate === false) return;
+    this.assertMigratable();
+    this.migrate();
+    this.backfillCreatedViaV2();
+  }
+
+  /**
+   * 08-N1 (план 09): user_version = 0 — это либо новая пустая база, либо
+   * сырая upstream (v1.6.2 user_version не ставила). Пустая база создаётся
+   * штатно; на существующей таблице nodes молча мигрировать нельзя — шаг v1
+   * строит индексы по форк-колонкам, которых там нет, и конструктор падал
+   * «no such column: status», что выглядит как повреждение базы.
+   */
+  private assertMigratable(): void {
+    const version = this.getUserVersion();
+    if (version !== 0) return;
+    const hasNodes = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes'")
+      .get();
+    if (!hasNodes) return; // новая база — схема создаётся миграцией
+    throw new UpstreamSchemaError(
+      `База "${this.dbFile}" создана другой версией (user_version = 0 — сырая схема upstream без форк-колонок). ` +
+        `Выполните \`megamemory migrate --apply --db "${this.dbFile}"\` — она поднимет схему и проставит версию.`
+    );
+  }
+
+  /**
+   * 08-N1 (план 09): поднять схему штатными шагами миграции вручную — для
+   * баз, открытых с autoMigrate: false (путь migrate --apply для сырых
+   * upstream-баз). После неё runMigration/ensureSchema добавит форк-колонки
+   * (status, name_norm), FTS и метки.
+   */
+  runPendingMigrations(): void {
     this.migrate();
     this.backfillCreatedViaV2();
   }
@@ -237,15 +286,37 @@ export class KnowledgeDB {
           CREATE INDEX IF NOT EXISTS idx_nodes_removed ON nodes(removed_at);
           CREATE INDEX IF NOT EXISTS idx_nodes_merge_group ON nodes(merge_group);
           CREATE INDEX IF NOT EXISTS idx_nodes_needs_merge ON nodes(needs_merge);
-          CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
-          CREATE INDEX IF NOT EXISTS idx_nodes_name_norm ON nodes(name_norm);
           CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
           CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
           CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
           CREATE INDEX IF NOT EXISTS idx_edges_merge_group ON edges(merge_group);
           CREATE INDEX IF NOT EXISTS idx_edges_needs_merge ON edges(needs_merge);
-          CREATE INDEX IF NOT EXISTS idx_edges_removed ON edges(removed_at);
         `);
+        // 08-N1 (план 09): индексы по колонкам, которых может не быть на
+        // базе, уже имеющей таблицы (сырая upstream: nodes без status/name_norm,
+        // edges без removed_at), строятся только при наличии колонок. На
+        // upstream их добавят более поздние шаги и ensureSchema (migrate
+        // --apply) — раньше именно этот CREATE INDEX валил конструктор
+        // «no such column: status».
+        const v1nodes = new Set(
+          (this.db.prepare("PRAGMA table_info(nodes)").all() as Array<{ name: string }>).map(
+            (c) => c.name
+          )
+        );
+        if (v1nodes.has("status")) {
+          this.db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);");
+        }
+        if (v1nodes.has("name_norm")) {
+          this.db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_norm ON nodes(name_norm);");
+        }
+        const v1edges = new Set(
+          (this.db.prepare("PRAGMA table_info(edges)").all() as Array<{ name: string }>).map(
+            (c) => c.name
+          )
+        );
+        if (v1edges.has("removed_at")) {
+          this.db.exec("CREATE INDEX IF NOT EXISTS idx_edges_removed ON edges(removed_at);");
+        }
       }
 
       if (currentVersion < 2) {
