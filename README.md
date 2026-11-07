@@ -336,6 +336,13 @@ megamemory doctor               # health check, exit code 1 on problems
 The migration never drops or renames a column, so upstream v1.6.2 still opens a migrated database.
 Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports them explicitly.
 
+Dry-run boundaries (R-05): a `--dry-run` command never writes graph data, but **opening a legacy
+database converts it on open** — backup, one transaction (schema, id repair, FTS rebuild,
+`name_norm`/embed meta backfill), report next to the file. This is deliberate and separate from
+the dry-run promise: the conversion touches schema and hygiene fields, not your claims. The
+exporter owns only the files it renders: `export --check` reports extra `.md` files in the
+directory and never deletes them — prune manually, the exporter has no ownership of the folder.
+
 ---
 
 ## MCP tools
