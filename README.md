@@ -389,6 +389,16 @@ directory and never deletes them — prune manually, the exporter has no ownersh
 | `megamemory expire --ids a,b --until D[\|--past]` | Set `valid_until` on journal/state-claim nodes (dry-run by default, `--apply` to write) |
 | `megamemory merge`, `conflicts`, `resolve` | Two-way merge of graphs across branches |
 
+Read-only script accesses (`stats --funnel --json`, `migrate --dry-run`)
+never migrate the database in place: on a schema mismatch the command fails
+with a ready-made fix — `megamemory migrate --apply --db "<path>"` for an
+older database, an upgrade-the-package hint (with the file's `user_version`)
+for a newer one. The other read commands (`stats`, `export`, `eval`,
+`doctor`) open the database for writing and auto-migrate in place. `serve`
+and the MCP server write to the database themselves (usage and timeline) —
+that is why the reference demo database `fixtures/demo.db` opens read-only;
+make a copy to work with it.
+
 ---
 
 ## Environment

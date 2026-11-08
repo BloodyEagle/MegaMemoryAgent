@@ -214,11 +214,16 @@ export class KnowledgeDB {
 
     this.db = new Database(dbPath);
     if (readonly) {
-      // libsql 0.5.x игнорирует опцию конструктора readonly: true (проверено
-      // планом 11: INSERT через такое соединение проходит) — единственная
-      // работающая гарантия на уровне соединения в этом биндинге:
-      // все записи отклоняются SQLITE_READONLY «attempt to write a readonly
-      // database». journal_mode не трогаем: переключение пишет заголовок.
+      // libsql 0.5.x игнорирует И опцию конструктора readonly: true, И
+      // fileMustExist (план 11: INSERT через «readonly»-соединение проходит,
+      // несуществующий путь открывается как пустая база). Единственная
+      // работающая гарантия на уровне соединения в этом биндинге —
+      // PRAGMA query_only = ON: все записи отклоняются SQLITE_READONLY
+      // «attempt to write a readonly database». Проверено зондом плана 11,
+      // поведение покрыто тестами (fixtures-readonly.test.ts). Не
+      // «упрощать» обратно на opts конструктора — молчаливая запись в
+      // эталонные фикстуры. journal_mode не трогаем: переключение пишет
+      // заголовок.
       this.db.pragma("query_only = ON");
     }
     this.dbFile = path.resolve(dbPath);
