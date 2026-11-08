@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "url";
-import { KnowledgeDB, ReadonlyDbError } from "../db.js";
+import { KnowledgeDB, ReadonlyDbError, SCHEMA_VERSION } from "../db.js";
 import { auditFixture } from "./helpers/audit.js";
 
 /**
@@ -57,7 +57,9 @@ describe("план 11: фикстуры только для чтения", () =>
     try {
       const nodes = db.getAllNodesRaw();
       expect(nodes.length).toBeGreaterThan(0);
-      expect(db.getUserVersion()).toBe(13);
+      // План 13.1 (F2) страж: фикстура обязана быть на текущей схеме —
+      // v4 (до перегенерации) не возвращается.
+      expect(db.getUserVersion()).toBe(SCHEMA_VERSION);
     } finally {
       db.close();
     }

@@ -67,6 +67,12 @@ export interface NextHintsInput {
   refuted?: NextHintsRefuted[];
   /** Текущий момент — для возраста снимков подтверждения. */
   now?: Date;
+  /**
+   * План 13.1 (F6): бюджет проверки support_check при сборе followups.
+   * Дефолт — боевые DEFAULT_MAX_CHECK_*; тесты inject'ят малый лимит,
+   * чтобы воспроизвести support_check: incomplete без 5000 рёбер.
+   */
+  checkBudget?: { edges: number; bytes: number };
 }
 
 /** file_ref с диапазоном строк покрывает участок, а не целый файл. */
@@ -319,7 +325,10 @@ export function buildNextHints(input: NextHintsInput): NextHints {
     const view = computeSupportCheck(
       db,
       card.id,
-      new CheckBudget(DEFAULT_MAX_CHECK_EDGES, DEFAULT_MAX_CHECK_BYTES)
+      new CheckBudget(
+        input.checkBudget?.edges ?? DEFAULT_MAX_CHECK_EDGES,
+        input.checkBudget?.bytes ?? DEFAULT_MAX_CHECK_BYTES
+      )
     );
     if (!view || (view.state !== "unknown" && view.state !== "incomplete")) continue;
     followupNode.add(card.id);
