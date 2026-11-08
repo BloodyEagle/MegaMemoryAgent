@@ -40,7 +40,7 @@ You have access to a project knowledge graph via the \`megamemory\` MCP server a
 **Workflow: understand → work → update**
 
 1. **Session start:** You must call \`megamemory\` with action \`overview\` (or \`megamemory:list_roots\` directly) before you begin work.
-2. **Before each task:** You must call \`megamemory\` with action \`query\` (or \`megamemory:understand\` directly) before reading source files for project understanding.
+2. **Before each task:** You must call \`megamemory\` with action \`query\` (or \`megamemory:understand\` directly) before reading source files for project understanding. The answer ends with a \`next\` block — follow it: read \`must_read\` refs before editing, don't read \`skip\` files whole (already covered by cards), run \`followups\` as written (args are ready), record per \`record\` after the change.
 3. **After each task:** You must call \`megamemory\` with action \`record\` to create/update/link concepts for what you built.
 
 Be specific in summaries: parameter names, defaults, file locations, rationale. One idea — one node; update an existing node instead of creating a near-duplicate; when a decision dies, mark it superseded — do not delete. Keep concepts max 3 levels deep.
@@ -49,7 +49,7 @@ Good node: \`auth-token-refresh\` (decision) — "Silent refresh 30 s before tok
 Bad node: \`auth\` — "Everything about auth." — a vague label no query can retrieve.
 
 4. **Budget:** \`understand\` is compact by default and bounded by \`max_tokens\` (1500).
-   Use \`mode:"full"\` only when you need \`why\` and full children/edges.
+   Use \`mode:"full"\` only when you need \`why\` and full children/edges; \`mode:"brief"\` gives a ≤8-line orientation plus \`next\`, no cards.
 5. **Freshness:** when a decision replaces an older one, pass \`supersedes: [old_id]\` to
    \`create_concept\` instead of deleting. If a search finds nothing, retry with
    \`include_inactive: true\` — the concept may be marked superseded.
