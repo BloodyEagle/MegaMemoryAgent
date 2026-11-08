@@ -224,12 +224,15 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
 
   // F14: convert a legacy database on first open (same as the MCP path).
   try {
-    const { autoMigrateIfNeeded, describeAutoMigration } = await import(
-      "./auto-migrate.js"
-    );
+    const { autoMigrateIfNeeded, describeAutoMigration, describeSchemaRepair } =
+      await import("./auto-migrate.js");
     const result = await autoMigrateIfNeeded(db, dbPath);
     const line = describeAutoMigration(result);
     if (line) console.log(pc.dim(`  ${line}`));
+    // 2.3.2 (plan 16): incomplete schema on a non-legacy db (the 2.3.1
+    // regression) is repaired on open — say so, in its own wording.
+    const repairLine = describeSchemaRepair(result);
+    if (repairLine) console.log(pc.dim(`  ${repairLine}`));
     for (const w of result.warnings) console.log(pc.yellow(`  ${w}`));
   } catch (err) {
     errorBold(`Auto-migration failed: ${err instanceof Error ? err.message : String(err)}`);

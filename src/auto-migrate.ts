@@ -6,6 +6,7 @@ import {
   ensureSchema,
   ensureEmbedMeta,
   emptyReport,
+  type MigrationReport,
 } from "./migrate-schema.js";
 import { planIdRepair, applyIdRepair, backupDb } from "./migrate.js";
 
@@ -36,6 +37,69 @@ export interface PreflightReport {
   fts_rows: number | null;
   has_vectors: number;
   legacy: boolean;
+  /**
+   * 2.3.2 (plan 16): schema-completeness signals. The 2.3.1 fresh-db marker
+   * removed the only startup caller of ensureSchema along with the spurious
+   * legacy conversion, and new dbs were created without FTS, trigram and
+   * embed meta (search silently degraded to LIKE). These fields make the
+   * gap visible and repairable on open.
+   */
+  fts_tri: boolean;
+  fts_triggers: number;
+  embed_model: string | null;
+  schema_complete: boolean;
+}
+
+/**
+ * Cheap completeness probe: one sqlite_master read for every FTS-related
+ * object plus one count inside the index. Read-only — safe on any
+ * connection, no locks. Shared by preflight() and the repair transaction
+ * (re-check under the write lock: a second process may have repaired first).
+ *
+ * Deliberate deviation from plan 16 §2.1's sketch formula (see the report):
+ * - embed_model is REPORTED but does not gate completeness — healthy dbs
+ *   without it (the demo fixture, dbs converted before 2.3.1 without a
+ *   first embedding) must not be written to on open; it self-heals lazily
+ *   on first embedding and is stamped eagerly whenever a repair runs.
+ * - nodes_fts_tri is required only when MEGAMEMORY_FTS_TOKENIZER=trigram
+ *   requests it (ensureTrigramFts is env-gated); but a trigram table that
+ *   exists must have its three triggers — it stops being maintained
+ *   otherwise.
+ */
+function readSchemaCompleteness(db: KnowledgeDB): {
+  fts: boolean;
+  tri: boolean;
+  triggers: number;
+  triTriggers: number;
+  complete: boolean;
+} {
+  const rows = db.execSqlAll(
+    `SELECT type, name FROM sqlite_master
+     WHERE name IN ('nodes_fts','nodes_fts_tri',
+                    'nodes_ai','nodes_ad','nodes_au',
+                    'nodes_tri_ai','nodes_tri_ad','nodes_tri_au')`
+  ) as Array<{ type: string; name: string }>;
+  const has = (type: string, name: string): boolean =>
+    rows.some((r) => r.type === type && r.name === name);
+  const triggerCount = (names: string[]): number =>
+    rows.filter((r) => r.type === "trigger" && names.includes(r.name)).length;
+
+  const fts = has("table", "nodes_fts");
+  const tri = has("table", "nodes_fts_tri");
+  const triggers = triggerCount(["nodes_ai", "nodes_ad", "nodes_au"]);
+  const triTriggers = triggerCount([
+    "nodes_tri_ai",
+    "nodes_tri_ad",
+    "nodes_tri_au",
+  ]);
+  const trigramRequested =
+    (process.env.MEGAMEMORY_FTS_TOKENIZER ?? "").toLowerCase() === "trigram";
+  const complete =
+    fts &&
+    triggers === 3 &&
+    (!trigramRequested || tri) &&
+    (!tri || triTriggers === 3);
+  return { fts, tri, triggers, triTriggers, complete };
 }
 
 export function preflight(db: KnowledgeDB): PreflightReport {
@@ -62,11 +126,8 @@ export function preflight(db: KnowledgeDB): PreflightReport {
   );
   const schemaVersion = db.getMetaValue("schema_version") ?? null;
 
-  const hasFts =
-    db.execSqlFirst(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
-    ) !== undefined;
-  const ftsRows = hasFts
+  const completeness = readSchemaCompleteness(db);
+  const ftsRows = completeness.fts
     ? (db.execSqlFirst("SELECT count(*) AS n FROM nodes_fts") as { n: number }).n
     : null;
 
@@ -90,6 +151,10 @@ export function preflight(db: KnowledgeDB): PreflightReport {
     fts_rows: ftsRows,
     has_vectors: hasVectors,
     legacy,
+    fts_tri: completeness.tri,
+    fts_triggers: completeness.triggers,
+    embed_model: db.getMetaValue("embed_model") ?? null,
+    schema_complete: completeness.complete,
   };
 }
 
@@ -103,6 +168,14 @@ export interface AutoMigrationResult {
   reembed_required: boolean;
   warnings: string[];
   report_file: string | null;
+  /**
+   * 2.3.2 (plan 16): true when a schema-completeness repair ran (FTS
+   * objects missing on a non-legacy db — the 2.3.1 regression). This is
+   * NOT a legacy conversion: `performed` stays false, no backup, no
+   * migration report.
+   */
+  repaired: boolean;
+  repair_steps: string[];
 }
 
 /**
@@ -127,7 +200,17 @@ export async function autoMigrateIfNeeded(
     reembed_required: false,
     warnings: [],
     report_file: null,
+    repaired: false,
+    repair_steps: [],
   };
+
+  // 2.3.2 (plan 16): a non-legacy db with an incomplete schema (no FTS
+  // table/triggers — every db created by 2.3.1) is repaired in place before
+  // serving. Additive objects only: no backup, no migration report, no
+  // legacy conversion semantics.
+  if (!before.legacy && !before.schema_complete) {
+    repairSchemaCompleteness(db, before, result);
+  }
 
   if (!before.legacy) return result; // idempotent: nothing to do
 
@@ -283,6 +366,191 @@ export async function autoMigrateIfNeeded(
   }
 
   return result;
+}
+
+/**
+ * 2.3.2 (plan 16): repair an incomplete schema on a non-legacy db.
+ *
+ * ensureFts() creates the sync triggers only together with the table, so a
+ * db whose FTS objects were lost (every db created by 2.3.1) gets them all
+ * back here: ensureSchema for the missing tables/meta, explicit trigger
+ * restoration for the gap case (table present, triggers gone — ensureSchema
+ * alone would report alreadyOk and leave the index unmaintained, and the
+ * completeness check would re-trigger repair on every start), a rebuild
+ * when the index could have gone stale, and ensureEmbedMeta so a repaired
+ * db records its embedding model eagerly.
+ *
+ * Failure policy (plan 16 §2.2): a repair exception is swallowed with a
+ * warning — startup continues in the degraded LIKE-search mode. Unlike the
+ * legacy conversion this branch touches no data objects, so it must never
+ * be fatal: an MCP server dying because FTS could not be created is worse
+ * than an MCP server without ranking.
+ */
+function repairSchemaCompleteness(
+  db: KnowledgeDB,
+  before: PreflightReport,
+  result: AutoMigrationResult
+): void {
+  if (before.integrity !== "ok") {
+    // Same policy as the legacy path (F14.1): never write to a corrupt file.
+    result.warnings.push(
+      `integrity_check failed (${before.integrity}) — schema repair skipped`
+    );
+    return;
+  }
+  // The repair lives in RW paths only (plan 16 §2.4): auto-migration is not
+  // even called on readonly connections today, but a future caller must not
+  // get SQLITE_READONLY out of a repair attempt.
+  const queryOnly = db.pragma("query_only") as Array<{ query_only: number }>;
+  if (queryOnly.length > 0 && queryOnly[0].query_only === 1) return;
+
+  const report = emptyReport();
+  let repairedHere = false;
+  try {
+    db.runInTransaction(() => {
+      // Another process may have repaired the base between preflight and
+      // the write lock: re-read the cheap signals and exit silently.
+      const now = readSchemaCompleteness(db);
+      if (now.complete) return;
+      const { fts: ftsBefore, tri: triBefore } = now;
+
+      ensureSchema(db, report);
+      ensureMissingFtsTriggers(db, report);
+
+      // ensureFts rebuilds the index when it creates the table; a table that
+      // lost its triggers has been missing updates for that window — rebuild.
+      if (ftsBefore && now.triggers < 3 && hasRealTable(db, "nodes_fts")) {
+        db.execSql("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')");
+        report.applied.push("rebuilt nodes_fts (restored triggers)");
+      }
+      if (triBefore && now.triTriggers < 3 && hasRealTable(db, "nodes_fts_tri")) {
+        db.execSql("INSERT INTO nodes_fts_tri(nodes_fts_tri) VALUES('rebuild')");
+        report.applied.push("rebuilt nodes_fts_tri (restored triggers)");
+      }
+
+      ensureEmbedMeta(db, report);
+
+      // Verify before COMMIT: repair touches schema objects, never data.
+      // A failed verification rolls everything back.
+      const nodesNow = (
+        db.execSqlFirst("SELECT count(*) AS n FROM nodes") as { n: number }
+      ).n;
+      if (nodesNow !== before.nodes) {
+        throw new Error(
+          `schema repair changed the node count (${before.nodes} -> ${nodesNow})`
+        );
+      }
+      if (!hasRealTable(db, "nodes_fts")) {
+        throw new Error("nodes_fts still missing after repair");
+      }
+      repairedHere = true;
+    });
+  } catch (err) {
+    result.warnings.push(
+      `schema repair failed: ${
+        err instanceof Error ? err.message : String(err)
+      } — search falls back to LIKE until 'megamemory migrate --apply'`
+    );
+    return;
+  }
+  if (!repairedHere) return; // another process repaired first — stay silent
+  result.repaired = true;
+  result.repair_steps = report.applied;
+  result.warnings.push(...report.warnings);
+}
+
+/**
+ * ensureFts()/ensureTrigramFts() only create their sync triggers together
+ * with the table (migrate-schema.ts, untouched by plan 16). A db that lost
+ * the triggers but kept the table would never regain them through
+ * ensureSchema — recreate the missing ones explicitly. IF NOT EXISTS, so a
+ * freshly created table is a no-op here. Mirror of the trigger DDL in
+ * migrate-schema.ts — keep in sync.
+ */
+function ensureMissingFtsTriggers(
+  db: KnowledgeDB,
+  report: MigrationReport
+): void {
+  const existing = new Set(
+    (
+      db.execSqlAll(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN " +
+          "('nodes_ai','nodes_ad','nodes_au','nodes_tri_ai','nodes_tri_ad','nodes_tri_au')"
+      ) as Array<{ name: string }>
+    ).map((r) => r.name)
+  );
+  if (hasRealTable(db, "nodes_fts") && !existing.has("nodes_ai")) {
+    db.execSql(`
+      CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
+        INSERT INTO nodes_fts(rowid, name, summary, why)
+        VALUES (new.rowid, new.name, new.summary, new.why);
+      END;
+      CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
+        INSERT INTO nodes_fts(nodes_fts, rowid, name, summary, why)
+        VALUES ('delete', old.rowid, old.name, old.summary, old.why);
+      END;
+      CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+        INSERT INTO nodes_fts(nodes_fts, rowid, name, summary, why)
+        VALUES ('delete', old.rowid, old.name, old.summary, old.why);
+        INSERT INTO nodes_fts(rowid, name, summary, why)
+        VALUES (new.rowid, new.name, new.summary, new.why);
+      END;
+    `);
+    report.applied.push("restored nodes_ai/ad/au triggers");
+  }
+  if (hasRealTable(db, "nodes_fts_tri") && !existing.has("nodes_tri_ai")) {
+    db.execSql(`
+      CREATE TRIGGER IF NOT EXISTS nodes_tri_ai AFTER INSERT ON nodes BEGIN
+        INSERT INTO nodes_fts_tri(rowid, name, summary, why)
+        VALUES (new.rowid, new.name, new.summary, new.why);
+      END;
+      CREATE TRIGGER IF NOT EXISTS nodes_tri_ad AFTER DELETE ON nodes BEGIN
+        INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
+        VALUES ('delete', old.rowid, old.name, old.summary, old.why);
+      END;
+      CREATE TRIGGER IF NOT EXISTS nodes_tri_au AFTER UPDATE ON nodes BEGIN
+        INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
+        VALUES ('delete', old.rowid, old.name, old.summary, old.why);
+        INSERT INTO nodes_fts_tri(rowid, name, summary, why)
+        VALUES (new.rowid, new.name, new.summary, new.why);
+      END;
+    `);
+    report.applied.push("restored nodes_tri_ai/ad/au triggers");
+  }
+}
+
+/** Real FTS table (a view with the same name must not count — plan 16 R9). */
+function hasRealTable(db: KnowledgeDB, name: string): boolean {
+  return (
+    db.execSqlFirst(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+      name
+    ) !== undefined
+  );
+}
+
+/**
+ * One-line stderr summary for the schema repair (plan 16 §2.3). Never
+ * reuses the `migrated:` wording — that line means an upstream conversion.
+ */
+export function describeSchemaRepair(r: AutoMigrationResult): string | null {
+  if (!r.repaired) return null;
+  const parts: string[] = [];
+  for (const step of r.repair_steps) {
+    if (step.startsWith("created nodes_fts + triggers")) {
+      // nodes_fts mirrors the nodes table (external content): the rebuilt
+      // index holds exactly as many rows as the verified node count.
+      parts.push(`created nodes_fts + triggers (${r.before.nodes} rows)`);
+    } else if (step.startsWith("created nodes_fts_tri")) {
+      parts.push("created nodes_fts_tri (+triggers)");
+    } else if (step.startsWith("set meta.embed_model")) {
+      parts.push("embed meta");
+    } else {
+      parts.push(step);
+    }
+  }
+  if (parts.length === 0) parts.push("schema objects restored");
+  return `schema repair: ${parts.join(", ")}`;
 }
 
 /** One-line stderr summary for startup (F14.4). */

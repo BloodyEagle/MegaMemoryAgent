@@ -249,9 +249,8 @@ async function startMcpServer() {
   // verified before serving. MEGAMEMORY_AUTO_MIGRATE=0 opts out — then
   // only the additive schema steps run and id repair stays manual.
   try {
-    const { autoMigrateIfNeeded, describeAutoMigration } = await import(
-      "./auto-migrate.js"
-    );
+    const { autoMigrateIfNeeded, describeAutoMigration, describeSchemaRepair } =
+      await import("./auto-migrate.js");
     if (process.env.MEGAMEMORY_AUTO_MIGRATE === "0") {
       const { ensureSchema, emptyReport } = await import("./migrate-schema.js");
       ensureSchema(db, emptyReport());
@@ -259,6 +258,10 @@ async function startMcpServer() {
       const result = await autoMigrateIfNeeded(db, DB_PATH);
       const line = describeAutoMigration(result);
       if (line) console.error(`megamemory: ${line}`);
+      // 2.3.2 (plan 16): incomplete schema on a non-legacy db (the 2.3.1
+      // regression) is repaired on open — say so, in its own wording.
+      const repairLine = describeSchemaRepair(result);
+      if (repairLine) console.error(`megamemory: ${repairLine}`);
       if (result.report_file) {
         console.error(`megamemory: migration report ${result.report_file}`);
       }
