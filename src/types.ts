@@ -292,7 +292,7 @@ export interface UnderstandInput {
    * compact (default): trimmed per-node payload under the token budget;
    * full: legacy verbose output (why, children/edges for every node).
    */
-  mode?: "compact" | "full";
+  mode?: "compact" | "full" | "brief";
   /** Include superseded/deprecated nodes (T4). Default false. */
   include_inactive?: boolean;
   /**
