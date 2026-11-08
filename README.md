@@ -36,12 +36,12 @@ database at `.megamemory/knowledge.db`.
 | Node IDs | slug strips everything outside `[a-z0-9-]`; Cyrillic, CJK, Greek, emoji names collapse to `""` and the second such node is lost | Unicode-safe slug: letters of any script, diacritics stripped only after Latin/Cyrillic/Greek/Hebrew bases (katakana dakuten and Hangul jamo are preserved), `/` becomes `-`, NFC output, hash fallback for emoji-only names, `-<hash8>` on collisions |
 | Embeddings | `all-MiniLM-L6-v2`, English-only, dimension hardcoded | `Xenova/multilingual-e5-small` by default (`MEGAMEMORY_EMBED_MODEL`), e5 `passage:`/`query:` prefixes, dimension read from the model, vector search disabled on model mismatch until `megamemory reembed` |
 | Search | cosine similarity only | hybrid: FTS5 + vector fused with RRF, per-hit `via: vector \| fts \| both`, query sanitization for `MATCH`, short-CJK routing, optional trigram index, `name_norm` LIKE fallback |
-| Context | `understand` returns everything it found | `mode: "compact"` by default, bounded by `max_tokens` (1500), summaries trimmed to 240 chars, edges between returned nodes only, `meta.returned / dropped / tokens_estimated` |
+| Context | `understand` returns everything it found | `mode: "compact"` by default, bounded by `max_tokens` (1500), summaries trimmed to 240 chars, edges between returned nodes only, `meta.returned / dropped / tokens_estimated`; the answer ends with a `next` action block (`must_read` / `skip` / `followups` / `record`) |
 | Freshness | delete or nothing | node `status` (`active`/`superseded`/`deprecated`), `supersedes` and `contradicts` edges, outdated nodes hidden from answers but visible in the graph; facts expire: `valid_until` drops state claims out of answers after their date |
 | Duplicates | manual merge | `megamemory consolidate` finds embedding-similar pairs (≥ 0.95) and merges them with edge transfer |
 | Long modules | every child read separately | `digest` nodes: one per module, rebuilt after the 5th child, lower search weight |
 | Portability | DB only | `megamemory export --md <dir>` writes one markdown file per node (frontmatter + wiki-links), `--check` for CI |
-| Cost visibility | none | every `understand` / `list_roots` / `get_concept` is measured; 7-day aggregates in `megamemory stats`, `/api/stats` and the explorer's **Tokens** panel |
+| Cost visibility | none | every `understand` / `list_roots` / `get_concept` is measured; 7-day aggregates in `megamemory stats`, `/api/stats` and the explorer's **Tokens** panel; `megamemory stats --funnel` measures the understand → follow-up → record funnel over the `timeline` journal (`--json` for scripts) |
 | Migration | — | `megamemory migrate --dry-run/--apply` upgrades an upstream database in place, additively, with backups and a downgrade-safe schema |
 
 ---
@@ -52,7 +52,8 @@ database at `.megamemory/knowledge.db`.
 
 1. **Session start** — the agent calls `list_roots` (budgeted) to orient itself.
 2. **Before a task** — `understand` with a natural-language query, or `get_concept` for an exact ID.
-3. **After a task** — `create_concept` / `update_concept`, then `link` for relationships.
+3. **Follow the `next` block** in the answer — read the `must_read` refs, don't read `skip` files whole (already covered), run the ready-made `followups`, and record per `record` after the change (`mode: "brief"` gives the same contract in ≤8 lines, no cards).
+4. **After a task** — `create_concept` / `update_concept`, then `link` for relationships.
 
 ---
 
@@ -349,7 +350,7 @@ directory and never deletes them — prune manually, the exporter has no ownersh
 
 | Tool | Description |
 |---|---|
-| `understand` | Hybrid search over the graph. `top_k`, `max_tokens`, `mode: "compact" \| "full"`, `include_inactive`, `include_stale` (expired facts). |
+| `understand` | Hybrid search over the graph. `top_k`, `max_tokens`, `mode: "compact" \| "full" \| "brief"`, `include_inactive`, `include_stale` (expired facts). Every answer ends with the `next` block: `must_read` refs to read, `skip` files already covered, ready-to-run `followups`, and the `record` line. |
 | `get_concept` | Exact-ID lookup with children, edges, incoming edges, parent. |
 | `create_concept` | Add a concept with edges, file refs and `supersedes`; `valid_until` sets the fact's expiry. |
 | `update_concept` | Update fields; embeddings are regenerated. `valid_until: null` clears the expiry. |
