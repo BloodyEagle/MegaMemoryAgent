@@ -150,13 +150,36 @@ next to \`hit_rate\` (anywhere in the top-10): a rank-6 hit is a much weaker ans
 `;
 
 /**
+ * План 18 (2.4.0): which commands open the database read-only and what they
+ * print on an outdated schema. Mirrors the "Which commands never write to
+ * the database" section of both READMEs — same facts, guide wording is its
+ * own single source here (README ×2 are kept in sync by hand).
+ */
+const READONLY_SECTION = `
+## Read-only commands
+
+\`megamemory export\`, \`eval\` and \`conflicts\` open the database READ-ONLY: they never
+write, never migrate, and leave the file byte-identical (so does the scripted
+\`stats --funnel --json\` snapshot and \`migrate --dry-run\`). On an outdated schema
+they fail with a ready-made fix — \`megamemory migrate --apply --db "<path>"\` —
+instead of migrating silently. \`MEGAMEMORY_ALLOW_AUTO_MIGRATE=1\` restores the old
+in-place migration for one invocation.
+
+\`stats\`, \`bench\` and \`doctor\` still open the database for writing, on purpose:
+the read paths of \`stats\`/\`bench\` record usage telemetry, \`stats --prune\` writes
+by design, and \`doctor\` migrates in place. \`serve\` and the MCP server write too.
+`;
+
+/**
  * F2: the full `megamemory guide` text — exactly the snippet that install
- * writes (one source), plus the session example and the measuring section.
+ * writes (one source), plus the session example, the measuring section and
+ * the read-only commands note.
  */
 export function buildGuideText(): string {
   return [
     AGENTS_MD_SNIPPET.trimStart(),
     SESSION_EXAMPLE.trimStart(),
     MEASURING_SECTION.trimStart(),
+    READONLY_SECTION.trimStart(),
   ].join("\n");
 }
