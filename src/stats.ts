@@ -5,6 +5,7 @@ import { errorBold } from "./cli-utils.js";
 import { listRoots } from "./tools.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 import { supportQualityBreakdown } from "./stub.js";
+import { computeFunnel, formatFunnel } from "./funnel.js";
 
 const KIND_ORDER = ["feature", "module", "component", "pattern", "config", "decision"];
 
@@ -60,12 +61,30 @@ export async function runStats(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // План 13 §2.3: `stats --funnel` — воронка «understand → follow-up →
+  // запись» по журналу timeline. `--json` печатает ТОЛЬКО JSON-объект:
+  // его парсит скрипт снятия метрик, остальной вывод stats мешал бы.
+  // Скриптовый снимок не должен мутировать базу — открываем readonly,
+  // если это единственное, что попросили (--prune требует записи).
+  const funnelMode = args.includes("--funnel");
+  const jsonMode = args.includes("--json");
+  const pruneRequested = getFlag(args, "--prune") !== undefined;
+  if (funnelMode && jsonMode && !pruneRequested) {
+    const readonlyDb = new KnowledgeDB(dbPath, { readonly: true });
+    try {
+      console.log(JSON.stringify(computeFunnel(readonlyDb), null, 2));
+    } finally {
+      readonlyDb.close();
+    }
+    return;
+  }
+
   const db = new KnowledgeDB(dbPath);
   try {
     // F5 (2.1.1): manual journal cleanup — runs the same retention rules the
     // automatic write-time prune uses, regardless of the write counter, and
     // reports exactly what it deleted.
-    if (getFlag(args, "--prune") !== undefined) {
+    if (pruneRequested) {
       const { byAge, byCount } = db.pruneTimeline();
       const total = byAge + byCount;
       console.log(
@@ -241,6 +260,14 @@ export async function runStats(args: string[]): Promise<void> {
     );
     if (prov.metrics_truncated) {
       printRow("Note", "metrics truncated by budget — counts are lower estimates");
+    }
+
+    // План 13 §2.3: секция воронки в конце вывода — остальной stats не ломает.
+    if (funnelMode) {
+      console.log();
+      for (const line of formatFunnel(computeFunnel(db))) {
+        console.log(line);
+      }
     }
   } finally {
     db.close();
