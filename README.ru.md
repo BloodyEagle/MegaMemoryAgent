@@ -430,8 +430,9 @@ npx vitest run src/__tests__/id-generation.test.ts --reporter=dot     # целе
 npx vitest run                                                       # всё (долго: скачивание модели)
 ```
 
-`fixtures/demo.db` — готовый граф (ru/en/zh/эмодзи, один `superseded`, один `digest`, пара дублей)
-для ручной проверки в обозревателе.
+`fixtures/demo.db` — готовый граф (ru/en/zh/эмодзи, один `superseded`, один `digest`, пара дублей).
+Перед открытием в обозревателе сними копию: `serve` пишет журнал обращений в обслуживаемую базу,
+а страж репозитория (`fixtures/sha256sums.txt`) требует неизменности фикстур байт-в-байт.
 
 ---
 

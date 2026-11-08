@@ -38,6 +38,10 @@ export default defineConfig({
         test: {
           name: "unit",
           include: UNIT_FILES.map((f) => `src/__tests__/${f}.test.ts`),
+          // План 11 (2.2.1): страж фикстур — RW-открытие fixtures/* падает с
+          // ReadonlyDbError. Задаётся в каждом проекте: корневой setupFiles
+          // при projects не выполняется (проверено планом 11).
+          setupFiles: ["./src/__tests__/fixtures-guard.setup.ts"],
         },
       },
       {
@@ -47,6 +51,8 @@ export default defineConfig({
           include: ["src/__tests__/**/*.test.ts"],
           exclude: UNIT_FILES.map((f) => `src/__tests__/${f}.test.ts`),
           testTimeout: 15_000,
+          // Env наследуют spawned dist-CLI интеграционных тестов.
+          setupFiles: ["./src/__tests__/fixtures-guard.setup.ts"],
         },
       },
       {
@@ -55,6 +61,7 @@ export default defineConfig({
           execArgv: ["--expose-gc"],
           include: ["tests/integration/**/*.test.ts"],
           testTimeout: 15_000,
+          setupFiles: ["./src/__tests__/fixtures-guard.setup.ts"],
         },
       },
     ],
