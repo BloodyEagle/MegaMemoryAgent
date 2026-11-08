@@ -148,7 +148,12 @@ describe("patches v1.1: zh budget (А6/В15) and edges_between (В14)", () => {
     }
     const result = await understand(db, { query: "支付", top_k: 20, max_tokens: 500 });
     expect(result.meta!.returned).toBeGreaterThanOrEqual(1);
-    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500);
+    // План 13 §2.1: блок next присутствует в каждом ответе, и его record не
+    // режется никогда — кап соблюдается с точностью до этого постоянного
+    // минимума, а превышение помечается meta.truncated (мера остаётся честной).
+    const NEXT_FLOOR_TOKENS = 96;
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500 + NEXT_FLOOR_TOKENS);
+    expect(result.meta!.truncated).toBe(true);
     expect(result.meta!.dropped).toBeGreaterThan(0);
   });
 
