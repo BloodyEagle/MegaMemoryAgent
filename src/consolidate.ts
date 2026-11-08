@@ -126,6 +126,27 @@ function nameTrigrams(name: string): string[] {
   return out;
 }
 
+// Ступень C (план 12): LSH по эмбеддингам для пар, которых не видят ни
+// точное имя, ни триграммы (синонимы, у которых < K общих триграмм).
+
+/** Число случайных гиперплоскостей: 8 бит сигнатуры → 256 корзин. */
+const LSH_PLANES = 8;
+/** Фиксированный seed гиперплоскостей: одинаковые корзины между прогонами —
+ * повторный вызов на тех же данных даёт тот же набор кандидатов. */
+const LSH_SEED = 0x9e3779b9;
+
+/** Детерминированный PRNG (mulberry32) — считается достаточно случайным для
+ * гиперплоскостей и воспроизводимым при фиксированном seed. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 export interface FindDuplicatesResult {
   candidates: DuplicateCandidate[];
   /**
@@ -308,6 +329,71 @@ export function findDuplicates(
           else {
             postings.delete(g);
             banned.add(g);
+          }
+        }
+      }
+    }
+
+    // Ступень C: LSH по эмбеддингам. 8 детерминированных гиперплоскостей
+    // (±1 по каждой размерности, фиксированный seed) → 256 корзин; пары
+    // сравниваются внутри корзины и между соседними по одному биту —
+    // близкие векторы (косинус ≥ порога ≈ угол < ~18°) почти всегда попадают
+    // в одну корзину или соседнюю, при O(n) на построение вместо O(n²)
+    // попарных косинусов. Ступень A/B пары здесь дедуплицируются в feedPair.
+    if (groupHasVectors) {
+      const lshNodes: number[] = [];
+      let dim = -1;
+      for (let i = 0; i < group.length; i++) {
+        const v = toVector(group[i].embedding);
+        if (!v) continue;
+        if (dim < 0) dim = v.length;
+        if (v.length !== dim) continue; // разная размерность — косинус всё равно 0
+        lshNodes.push(i);
+      }
+      if (lshNodes.length >= 2 && dim > 0) {
+        const rnd = mulberry32(LSH_SEED);
+        const planes: Int8Array[] = [];
+        for (let p = 0; p < LSH_PLANES; p++) {
+          const plane = new Int8Array(dim);
+          for (let d = 0; d < dim; d++) plane[d] = rnd() < 0.5 ? -1 : 1;
+          planes.push(plane);
+        }
+        const buckets = new Map<number, number[]>();
+        const acc = new Float64Array(LSH_PLANES);
+        for (const i of lshNodes) {
+          const v = toVector(group[i].embedding)!;
+          acc.fill(0);
+          for (let d = 0; d < dim; d++) {
+            const val = v[d];
+            if (val === 0) continue;
+            for (let p = 0; p < LSH_PLANES; p++) acc[p] += planes[p][d] * val;
+          }
+          let sig = 0;
+          for (let p = 0; p < LSH_PLANES; p++) if (acc[p] >= 0) sig |= 1 << p;
+          const bucket = buckets.get(sig);
+          if (bucket) bucket.push(i);
+          else buckets.set(sig, [i]);
+        }
+        for (const [sig, members] of buckets) {
+          // внутри корзины — окном, как в блоках ступени A
+          for (let p = 0; p < members.length; p++) {
+            const end = Math.min(members.length, p + 1 + BLOCK_WINDOW);
+            for (let q = p + 1; q < end; q++) feedPair(members[p], members[q]);
+          }
+          // соседние корзины (отличие в одном бите); пара корзин обрабатывается
+          // один раз — из старшей, чтобы не сравнивать каждую пару дважды
+          for (let k = 0; k < LSH_PLANES; k++) {
+            const nb = sig ^ (1 << k);
+            if (nb < sig) continue;
+            const neighbors = buckets.get(nb);
+            if (!neighbors) continue;
+            const end = Math.min(neighbors.length, BLOCK_WINDOW);
+            for (const a of members) {
+              for (let x = 0; x < end; x++) {
+                const b = neighbors[x];
+                feedPair(a < b ? a : b, a < b ? b : a);
+              }
+            }
           }
         }
       }

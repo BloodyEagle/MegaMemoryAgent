@@ -133,6 +133,30 @@ describe("findDuplicates blocking (R-06b, план 09)", () => {
     expect(candidates_truncated).toBe(0); // давления на предел не было
   });
 
+  it("большая группа: имена без общих триграмм с одинаковым вектором находятся через LSH (ступень C)", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      // «склад восток» / «очередь запад»: ни одной общей триграммы — ступень
+      // B слепа, блоки ступени A разные. Пару приносит только векторная
+      // корзина (план 12: «вектор близок, имя нет»).
+      db.insertNode({ id: "lex-a", name: "Склад Восток", kind: "module", summary: "a" });
+      db.insertNode({ id: "lex-b", name: "Очередь Запад", kind: "module", summary: "b" });
+      for (let i = 0; i < 250; i++) {
+        db.insertNode({ id: `pad-${i}`, name: `Filler Node ${i}`, kind: "module", summary: `p ${i}` });
+      }
+    });
+    setEmbedding(db, "lex-a", [0, 0, 1, 0]);
+    setEmbedding(db, "lex-b", [0, 0, 1, 0]);
+    for (let i = 0; i < 250; i++) {
+      setEmbedding(db, `pad-${i}`, randomUnitEmbedding(3000 + i));
+    }
+
+    const { candidates, candidates_truncated } = findDuplicates(db, { threshold: 0.95 });
+    const pairs = candidates.map((c) => [c.a, c.b].sort().join("|"));
+    expect(pairs).toContain("lex-a|lex-b");
+    expect(candidates_truncated).toBe(0);
+  });
+
   it("имена отличаются только регистром и пунктуацией — один блок, пара находится", () => {
     const db = freshDb();
     db.runInTransaction(() => {
