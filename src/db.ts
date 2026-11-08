@@ -20,6 +20,16 @@ import { looksLikeFileRefAnchor } from "./stub.js";
 export const SCHEMA_VERSION = 13;
 
 /**
+ * 2.3.1: значение маркера конверсии для meta.schema_version, а не версия
+ * схемы — её несёт PRAGMA user_version. Семантика маркера (см.
+ * migrate-schema.ts): "1" — upstream-схема, "3" — «наша конверсия
+ * прогонялась». Локальная копия, а не импорт: migrate-schema.ts импортирует
+ * db.ts, обратный импорт даст цикл; расхождение значений ловит страж
+ * fresh-db-marker.test.ts (T1).
+ */
+const FORK_SCHEMA_MARKER = "3";
+
+/**
  * 2.1.12 F1: просрочен ли факт. Просрочен = жив, активен, valid_until в
  * прошлом. Superseded/deprecated узлы не «просрочены» — их старость уже
  * выражена собственным статусом; удалённые не считаются вовсе. Неразбираемая
@@ -357,6 +367,17 @@ export class KnowledgeDB {
   private migrate(): void {
     const version = this.getUserVersion();
     if (version >= SCHEMA_VERSION) return;
+
+    // 2.3.1: свежая база — та же проверка, что в assertMigratable(), но
+    // ДО создания таблиц: после них `nodes` уже существует и предикат всегда
+    // ложен. Только на свежей базе ставим маркер конверсии — иначе первое
+    // RW-открытие считает её legacy и гоняет пустую «конверсию» с бэкапом
+    // и migration-report (план 15).
+    const isFreshDb =
+      version === 0 &&
+      this.db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes'")
+        .get() === undefined;
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -851,6 +872,10 @@ export class KnowledgeDB {
       }
 
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      // 2.3.1: маркер конверсии ставится при создании — внутри транзакции,
+      // при ROLLBACK уходит вместе со схемой (setMetaValue создаёт meta
+      // лениво и безопасен в транзакции).
+      if (isFreshDb) this.setMetaValue("schema_version", FORK_SCHEMA_MARKER);
       this.db.exec("COMMIT");
     } catch (err) {
       this.db.exec("ROLLBACK");
