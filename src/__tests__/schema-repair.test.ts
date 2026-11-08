@@ -355,4 +355,111 @@ describe("schema repair on open (plan 16)", () => {
     ).toBe(1);
     expect(describeSchemaRepair(result)).toBeNull();
   });
+
+  // 2.4.0 (plan 18, часть A): решение о ремонте триггеров — по КОЛИЧЕСТВУ
+  // триггеров набора (< 3), а не по одному имени-стражу: база с 1-2 из 3
+  // триггеров обязана ремонтироваться, иначе она навсегда остаётся неполной
+  // и ремонт (с записью в файл) срабатывает на каждом старте.
+  it("A1: a base that lost ONE of three triggers is repaired, set fully restored", async () => {
+    makeTmp();
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    // 1st open: full repair of a fresh base (default env: unicode61 only)
+    const db1 = track(new KnowledgeDB(dbPath));
+    expect((await autoMigrateIfNeeded(db1, dbPath)).repaired).toBe(true);
+    db1.close();
+    openDbs.length = 0;
+    await waitUntilGone(dbPath + "-wal");
+
+    // damage: exactly one trigger of the set of three
+    const raw = new Database(dbPath);
+    raw.exec("DROP TRIGGER nodes_au");
+    raw.close();
+
+    const db2 = track(new KnowledgeDB(dbPath));
+    const result = await autoMigrateIfNeeded(db2, dbPath);
+    expect(result.repaired).toBe(true);
+    expect(result.performed).toBe(false);
+    for (const t of ["nodes_ai", "nodes_ad", "nodes_au"]) {
+      expect(
+        db2.execSqlFirst(
+          "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+          t
+        )
+      ).toBeTruthy();
+    }
+    expect(result.repair_steps).toContain("restored nodes_ai/ad/au triggers");
+    expect(describeSchemaRepair(result)).toContain(
+      "restored nodes_ai/ad/au triggers"
+    );
+  });
+
+  it("A2: the run after the trigger repair is silent and writes nothing", async () => {
+    makeTmp();
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    // 1st open: full repair of a fresh base
+    const db1 = track(new KnowledgeDB(dbPath));
+    expect((await autoMigrateIfNeeded(db1, dbPath)).repaired).toBe(true);
+    db1.close();
+    openDbs.length = 0;
+    await waitUntilGone(dbPath + "-wal");
+
+    // 2nd open: one trigger of three was lost — repaired again
+    const raw = new Database(dbPath);
+    raw.exec("DROP TRIGGER nodes_au");
+    raw.close();
+    const db2 = track(new KnowledgeDB(dbPath));
+    expect((await autoMigrateIfNeeded(db2, dbPath)).repaired).toBe(true);
+    db2.close();
+    openDbs.length = 0;
+    await waitUntilGone(dbPath + "-wal");
+    await waitUntilGone(dbPath + "-shm");
+    const hashBefore = hashDb(dbPath);
+
+    // 3rd open: the base is complete — nothing to repair, no file write
+    const db3 = track(new KnowledgeDB(dbPath));
+    const third = await autoMigrateIfNeeded(db3, dbPath);
+    expect(third.repaired).toBe(false);
+    expect(third.performed).toBe(false);
+    expect(describeSchemaRepair(third)).toBeNull();
+    db3.close();
+    openDbs.length = 0;
+
+    await waitUntilGone(dbPath + "-wal");
+    await waitUntilGone(dbPath + "-shm");
+    expect(hashDb(dbPath)).toBe(hashBefore);
+    expectNoArtifacts(tmpDir);
+  });
+
+  it("A3: trigram env — a partial trigram trigger set is restored in full", async () => {
+    // afterEach restores the captured value — other tests must not see trigram
+    process.env.MEGAMEMORY_FTS_TOKENIZER = "trigram";
+    makeTmp();
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    // 1st open: full repair with BOTH indexes and all six triggers
+    const db1 = track(new KnowledgeDB(dbPath));
+    expect((await autoMigrateIfNeeded(db1, dbPath)).repaired).toBe(true);
+    db1.close();
+    openDbs.length = 0;
+    await waitUntilGone(dbPath + "-wal");
+
+    // damage: exactly one trigram trigger of the set of three
+    const raw = new Database(dbPath);
+    raw.exec("DROP TRIGGER nodes_tri_au");
+    raw.close();
+
+    const db2 = track(new KnowledgeDB(dbPath));
+    const result = await autoMigrateIfNeeded(db2, dbPath);
+    expect(result.repaired).toBe(true);
+    for (const t of ["nodes_tri_ai", "nodes_tri_ad", "nodes_tri_au"]) {
+      expect(
+        db2.execSqlFirst(
+          "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+          t
+        )
+      ).toBeTruthy();
+    }
+    expect(result.repair_steps).toContain(
+      "restored nodes_tri_ai/ad/au triggers"
+    );
+  });
 });
