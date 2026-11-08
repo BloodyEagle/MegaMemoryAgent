@@ -31,9 +31,15 @@ import type {
   NestedSupportView,
   UnderstandMeta,
   CurrentDigestsView,
+  NextHints,
   NodeRow,
   RelationType,
 } from "./types.js";
+import {
+  buildNextHints,
+  emptyNextHints,
+  type NextHintsCard,
+} from "./next-hints.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
 import {
@@ -516,7 +522,13 @@ export async function understand(
   } else if (mode === "vector" && vectorSearchEnabled(db)) {
     const candidates = db.getAllActiveNodesWithEmbeddings();
     if (candidates.length === 0) {
-      return { matches: [], compact: [], meta: { returned: 0, dropped: 0, tokens_estimated: 0 } };
+      // План 13 §2.1: пустой ответ тоже заканчивается блоком next.
+      return {
+        matches: [],
+        compact: [],
+        meta: { returned: 0, dropped: 0, tokens_estimated: 0 },
+        next: emptyNextHints(),
+      };
     }
     const queryEmbedding = await embed(queryText(input.query));
     topMatches = findTopK(queryEmbedding, candidates, searchPool);
@@ -578,7 +590,20 @@ export async function understand(
       if (via) ctx.via = via;
       return ctx;
     });
-    const payload = JSON.stringify({ matches, refuted });
+    // План 13 §2.1: full-режим тоже заканчивается блоком next. Опор на
+    // карточке full-режима видно все (informed_by-рёбра с rationale), поэтому
+    // get_concept-подсказка для них не нужна; бюджета в full-режиме нет —
+    // next не режется.
+    const fullNext = buildNextHints({
+      db,
+      cards: matches.map((m) => ({
+        id: m.id,
+        kind: m.kind,
+        visibleSupports: m.edges.filter((e) => e.relation === "informed_by").length,
+      })),
+      refuted: refuted.map((r) => ({ name: r.name, reason: r.refuted_reason ?? null })),
+    });
+    const payload = JSON.stringify({ matches, refuted, next: fullNext });
     db.insertUsage({
       tool: "understand",
       query: input.query,
@@ -598,6 +623,7 @@ export async function understand(
         stale_excluded: staleExcluded,
         inactive_excluded: inactiveExcluded,
       },
+      next: fullNext,
     };
   }
 
@@ -705,17 +731,19 @@ export async function understand(
     truncated,
   });
 
-  /** Тот объект, который уйдёт по проводу (со всеми секциями и extra). */
+  /** Тот объект, который уйдёт по проводу (со всеми секциями, extra и next). */
   const buildPayload = (
     compactList: CompactMatch[],
     refutedList: CompactMatch[],
-    meta: UnderstandMeta
+    meta: UnderstandMeta,
+    next?: NextHints
   ) => ({
     matches: [],
     compact: compactList,
     refuted: refutedList,
     edges_between: edgesFor(compactList),
     meta,
+    ...(next ? { next } : {}),
     ...extra,
   });
 
@@ -865,6 +893,42 @@ export async function understand(
   const dropped = eligible.length - top.length + refutedCut;
   const supportsInlined = foldedIds.size;
 
+  // ---- План 13 (§2.1): блок next — контракт действия из размещённых карточек ----
+  //
+  // Строится ПОСЛЕ размещения (placeLoop/refuted-цикл не меняются — next не
+  // влияет на размещение) из того, что реально попало в ответ: верхний уровень
+  // в ранговом порядке, затем вложенные опоры. Блок входит в ту же wire-меру
+  // (K-03), поэтому единственное законно меняющееся старое значение —
+  // meta.tokens_estimated: оно растёт по сравнению с версией без next.
+  const nextCards: NextHintsCard[] = [];
+  for (const m of compact) {
+    nextCards.push({ id: m.id, kind: m.kind, visibleSupports: m.supports?.length ?? 0 });
+    for (const s of m.supports ?? []) {
+      // Вложенная опора видна в ответе без собственных опор.
+      nextCards.push({ id: s.id });
+    }
+  }
+  const refutedForNext = refutedShown.map((r) => ({
+    name: r.name,
+    reason: r.refuted_reason ?? null,
+  }));
+  let next: NextHints = buildNextHints({ db, cards: nextCards, refuted: refutedForNext });
+
+  // Обрезка по бюджету: сначала skip, затем followups — по одному элементу с
+  // перемериванием после каждого. must_read и record не режутся никогда; если
+  // выше цели и после порезок — так и остаётся, усечение помечается в meta.
+  let nextCut = false;
+  const measureWithNext = (tokens: number): number =>
+    measure(buildPayload(compact, refutedShown, metaFor(tokens, dropped, false), next));
+  while (next.skip.length > 0 && measureWithNext(0) > target) {
+    next.skip.pop();
+    nextCut = true;
+  }
+  while (next.followups.length > 0 && measureWithNext(0) > target) {
+    next.followups.pop();
+    nextCut = true;
+  }
+
   // Финальная честная мера: число токенов само едет в meta, поэтому замер
   // повторяется до стабильности разрядов (число в payload == число в мере).
   const edgesBetween = edgesFor(compact);
@@ -875,17 +939,20 @@ export async function understand(
       refuted: refutedShown,
       edges_between: edgesBetween,
       meta: metaFor(tokens, dropped, false),
+      next,
       ...extra,
     });
   tokensEstimated = measureFinal(0);
   for (let i = 0; i < 3; i++) {
-    const next = measureFinal(tokensEstimated);
-    if (next === tokensEstimated) break;
-    tokensEstimated = next;
+    const again = measureFinal(tokensEstimated);
+    if (again === tokensEstimated) break;
+    tokensEstimated = again;
   }
   // Первая нода может игнорировать лимит («always return at least one») —
   // тогда метка усечения обязательна: не утверждаем, что ответ уложился.
   // (truncated: true короче false — замер с false остаётся верхней оценкой.)
+  // План 13: порезанный next — тоже усечение, даже если мера влезла в бюджет.
+  if (nextCut) truncated = true;
   if (tokensEstimated > maxTokens) truncated = true;
   const payloadMeta = metaFor(tokensEstimated, dropped, truncated);
   const payload = JSON.stringify({
@@ -894,6 +961,7 @@ export async function understand(
     refuted: refutedShown,
     edges_between: edgesBetween,
     meta: payloadMeta,
+    next,
   });
 
   db.insertUsage({
@@ -911,6 +979,7 @@ export async function understand(
     refuted: refutedShown,
     edges_between: edgesBetween,
     meta: payloadMeta,
+    next,
   };
 }
 

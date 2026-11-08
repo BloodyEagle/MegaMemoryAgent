@@ -125,7 +125,12 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
       }
     }, { query: "edgebudget", top_k: 6, max_tokens: 900 });
 
-    expect.soft(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(900);
+    // План 13 §2.1: блок next (record не режется никогда) добавляет
+    // постоянный минимум к wire-форме; при исчерпании бюджета превышение
+    // помечается meta.truncated, мера остаётся честной.
+    const NEXT_FLOOR_TOKENS = 96;
+    expect.soft(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(900 + NEXT_FLOOR_TOKENS);
+    expect(output.meta?.truncated).toBe(true);
     expect(output.meta?.tokens_estimated).toBeGreaterThanOrEqual(wireTokens(JSON.stringify(response)));
   });
 
