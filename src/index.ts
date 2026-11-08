@@ -313,12 +313,12 @@ async function startMcpServer() {
 
   server.tool(
     "understand",
-    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node.",
+    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node. Ответ несёт блок next — исполняй его дословно: must_read (до 3 ссылок) прочитай перед правками, файлы из skip целиком не читай (уже покрыты карточками), followups выполни как написаны (аргументы готовые), после правки запиши знание по строке record. mode:'brief' — до 8 строк текста плюс next, без карточек, для быстрой ориентации.",
     {
       query: z.string().describe("Natural language query describing what you want to understand about the project"),
       top_k: z.number().int().min(1).max(50).optional().describe("Number of top results to return (default: 10)"),
       max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the answer (default: 1500)"),
-      mode: z.enum(["compact", "full"]).optional().describe("compact (default) trims each node to essentials under the budget; full returns legacy verbose output"),
+      mode: z.enum(["compact", "full", "brief"]).optional().describe("compact (default) trims each node to essentials under the budget; full returns legacy verbose output; brief returns up to 8 lines of text plus the next block, no cards"),
       include_inactive: z.boolean().optional().describe("Include superseded/deprecated nodes (default: false)"),
       include_stale: z.boolean().optional().describe("Вернуть и просроченные факты (valid_until в прошлом) — с пометкой expired: true (по умолчанию исключены, meta.stale_excluded считает исключённых)"),
     },
@@ -338,12 +338,27 @@ async function startMcpServer() {
           extra_payload: { ...instructions },
         });
         const returned = result.meta?.returned ?? result.matches.length;
+        // План 13: must_read едет в timeline — воронка (stats --funnel) считает
+        // «выдано/открыто» по этим полям. refs — для чтения человеком, node_ids —
+        // для сверки с последующими get_concept.
+        const mustRead = result.next?.must_read ?? [];
         const ids = result.compact
           ? result.compact.map((m) => m.id)
-          : result.matches.map((match) => match.id);
+          : result.matches.length > 0
+            ? result.matches.map((match) => match.id)
+            : mustRead.map((m) => m.node_id);
         timeline.log({
           tool: "understand",
-          params: { query: params.query, top_k: params.top_k },
+          params: {
+            query: params.query,
+            top_k: params.top_k,
+            ...(mustRead.length > 0
+              ? {
+                  must_read: mustRead.map((m) => m.ref),
+                  must_read_ids: mustRead.map((m) => m.node_id),
+                }
+              : {}),
+          },
           result_summary: `${returned} matches`,
           is_write: false,
           is_error: false,
