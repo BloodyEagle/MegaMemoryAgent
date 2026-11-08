@@ -230,3 +230,31 @@ describe("документация 2.1.13 (F7)", () => {
     expect(lines).toBeLessThanOrEqual(60);
   });
 });
+
+describe("readonly-команды в документации (план 18, 2.4.0)", () => {
+  it("guide объясняет читающие команды: список, migrate --apply, env-выход", () => {
+    const guide = buildGuideText();
+    expect(guide).toContain("## Read-only commands");
+    expect(guide).toContain("`megamemory export`, `eval` and `conflicts`");
+    expect(guide).toContain("megamemory migrate --apply --db");
+    expect(guide).toContain("MEGAMEMORY_ALLOW_AUTO_MIGRATE=1");
+    // вычеркнутые из конверсии названы честно, со причиной
+    expect(guide).toContain("`stats`, `bench` and `doctor` still open the database for writing");
+  });
+
+  it("раздел «Какие команды не пишут в базу» есть в обоих README — по смыслу идентичен", () => {
+    const en = fs.readFileSync(path.join(PROJECT_ROOT, "README.md"), "utf-8");
+    const ru = fs.readFileSync(path.join(PROJECT_ROOT, "README.ru.md"), "utf-8");
+    for (const [name, doc] of [["en", en], ["ru", ru]] as const) {
+      // список команд совпадает с guide
+      expect(doc, name).toMatch(/`export`, `eval` и `conflicts`|`export`, `eval` and `conflicts`/);
+      expect(doc, name).toContain("stats --funnel --json");
+      expect(doc, name).toContain("migrate --apply --db");
+      expect(doc, name).toContain("MEGAMEMORY_ALLOW_AUTO_MIGRATE=1");
+      // осознанные исключения названы в обоих
+      expect(doc, name).toMatch(/`stats`, `bench` и `doctor`|`stats`, `bench` and `doctor`/);
+    }
+    expect(en).toContain("### Which commands never write to the database");
+    expect(ru).toContain("### Какие команды не пишут в базу");
+  });
+});
