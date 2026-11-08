@@ -84,6 +84,48 @@ export class UpstreamSchemaError extends Error {
   }
 }
 
+/**
+ * План 11 (2.2.1): доступ к фикстурам. Фикстуры — эталонные файлы репозитория:
+ * их байты защищает fixtures/sha256sums.txt, а RW-открытие мутирует их даже
+ * без единого запроса (авто-миграция прячет запись в -wal, отложенный
+ * GC-чекпоинт переносит её в main на выходе процесса). Ошибки делятся на три
+ * кода: запрещённая RW-открытие фикстуры, устаревшая/слишком новая схема под
+ * readonly — починить на месте нельзя, работай на копии.
+ */
+export type ReadonlyDbErrorCode =
+  | "FIXTURE_WRITE_FORBIDDEN"
+  | "SCHEMA_TOO_OLD_READONLY"
+  | "SCHEMA_TOO_NEW_READONLY";
+
+export class ReadonlyDbError extends Error {
+  readonly code: ReadonlyDbErrorCode;
+  constructor(code: ReadonlyDbErrorCode, message: string) {
+    super(message);
+    this.name = "ReadonlyDbError";
+    this.code = code;
+  }
+}
+
+/**
+ * Каталог фикстур задаёт окружение (vitest setupFile ставит его на fixtures/
+ * репозитория; spawned dist-CLI наследует env). Не задан — стража нет:
+ * продакшн и ручные команды (включая make-demo-db.cjs) работают как раньше.
+ */
+function fixtureGuardDir(): string | null {
+  const raw = process.env.MEGAMEMORY_FIXTURES_DIR;
+  if (raw === undefined || raw.trim() === "") return null;
+  return path.resolve(raw);
+}
+
+/** План 11: путь лежит под каталогом фикстур (строгий префикс с сепаратором). */
+export function isUnderFixturesDir(dbPath: string): boolean {
+  const guardDir = fixtureGuardDir();
+  if (!guardDir) return false;
+  const abs = path.resolve(dbPath);
+  const rel = path.relative(guardDir, abs);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
 export class KnowledgeDB {
   private db: Database.Database;
   private dbFile: string;
@@ -135,22 +177,83 @@ export class KnowledgeDB {
       .run(norm, id);
   }
 
-  constructor(dbPath: string, opts: { autoMigrate?: boolean } = {}) {
-    // Ensure directory exists
+  constructor(
+    dbPath: string,
+    opts: { autoMigrate?: boolean; readonly?: boolean } = {}
+  ) {
+    // План 11: фикстуры открываются только readonly — запись в эталонные
+    // файлы невозможна на уровне соединения, а не дисциплины. Страж
+    // окружения (MEGAMEMORY_FIXTURES_DIR от vitest setupFile) ловит RW-путь
+    // ДО открытия, readonly-соединение — гарантию даже без стража.
+    const readonly = opts.readonly === true;
+    if (!readonly && isUnderFixturesDir(dbPath)) {
+      throw new ReadonlyDbError(
+        "FIXTURE_WRITE_FORBIDDEN",
+        `Фикстуры только для чтения: "${path.resolve(dbPath)}" лежит в каталоге фикстур, ` +
+          `а это открытие дало бы соединению право записи (RW-открытие мутирует файл ` +
+          `даже без запросов — авто-миграция и отложенный чекпоинт). ` +
+          `Открой с { readonly: true } или работай на копии во временном каталоге.`
+      );
+    }
+
     const dir = path.dirname(dbPath);
-    if (!fs.existsSync(dir)) {
+    if (!readonly && !fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
+    }
+    // libsql 0.5.x игнорирует и fileMustExist (открывает несуществующий путь
+    // как новую пустую базу) — для readonly существование проверяем сами,
+    // до открытия: опечатка в пути не должна выглядеть пустым графом.
+    if (readonly && !fs.existsSync(dbPath)) {
+      throw new ReadonlyDbError(
+        "SCHEMA_TOO_OLD_READONLY",
+        `База не найдена: ${path.resolve(dbPath)}.`
+      );
     }
 
     this.db = new Database(dbPath);
+    if (readonly) {
+      // libsql 0.5.x игнорирует опцию конструктора readonly: true (проверено
+      // планом 11: INSERT через такое соединение проходит) — единственная
+      // работающая гарантия на уровне соединения в этом биндинге:
+      // все записи отклоняются SQLITE_READONLY «attempt to write a readonly
+      // database». journal_mode не трогаем: переключение пишет заголовок.
+      this.db.pragma("query_only = ON");
+    }
     this.dbFile = path.resolve(dbPath);
-    this.db.pragma("journal_mode = WAL");
+    if (!readonly) {
+      this.db.pragma("journal_mode = WAL");
+    }
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
-    this.db.pragma("synchronous = NORMAL");
+    if (!readonly) {
+      this.db.pragma("synchronous = NORMAL");
+    }
     // 08-N1 (план 09): migrate --apply открывает сырую upstream-базу без
     // авто-миграции и поднимает схему сам (runPendingMigrations + runMigration).
     if (opts.autoMigrate === false) return;
+    if (readonly) {
+      // План 11: readonly-соединение мигрировать не может — молчаливый пропуск
+      // «схема помоложе» означал бы чтение чужими запросами. Явная ошибка
+      // отправляет на копию + migrate --apply (или перегенерацию фикстуры).
+      const version = this.getUserVersion();
+      if (version < SCHEMA_VERSION) {
+        throw new ReadonlyDbError(
+          "SCHEMA_TOO_OLD_READONLY",
+          `База "${this.dbFile}" устарела: схема v${version} < v${SCHEMA_VERSION}, ` +
+            `а readonly-соединение не мигрирует. Сними копию и выполни ` +
+            `\`megamemory migrate --apply --db <копия>\`; фикстуры — перегенерируй ` +
+            `scripts/make-demo-db.cjs.`
+        );
+      }
+      if (version > SCHEMA_VERSION) {
+        throw new ReadonlyDbError(
+          "SCHEMA_TOO_NEW_READONLY",
+          `База "${this.dbFile}" новее этого билда: схема v${version} > v${SCHEMA_VERSION}. ` +
+            `Обнови megamemory.`
+        );
+      }
+      return;
+    }
     this.assertMigratable();
     this.migrate();
     this.backfillCreatedViaV2();

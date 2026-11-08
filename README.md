@@ -432,7 +432,9 @@ npx vitest run                                                       # full suit
 ```
 
 `fixtures/demo.db` is a ready-made graph (ru/en/zh/emoji, one `superseded`, one `digest`, one
-duplicate pair) for manual checks in the explorer.
+duplicate pair). Copy it before opening in the explorer: `serve` records the call journal into
+the database it serves, and the repository guard (`fixtures/sha256sums.txt`) requires fixtures
+to stay byte-identical.
 
 ---
 
