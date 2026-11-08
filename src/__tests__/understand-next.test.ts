@@ -8,9 +8,11 @@ import { estimateTokens, link, understand } from "../tools.js";
 import {
   BASELINE_FORMAT_VERSION,
   claimDigestOf,
+  confirmSupports,
   edgeDigestOf,
   statusDigestOf,
 } from "../support-baselines.js";
+import { buildNextHints } from "../next-hints.js";
 import type { UnderstandOutput } from "../types.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
@@ -313,6 +315,41 @@ describe("План 13 §2.1: блок next в understand", () => {
     // Все 3 опоры сложены в карточку — невидимых нет, get_concept не предлагается.
     expect(out.compact![0].supports).toHaveLength(3);
     expect(follow.some((f) => f.tool === "get_concept")).toBe(false);
+  });
+
+  it("followups: нечистый support_check (incomplete) — provenance_trace; бюджет — инъекция малого лимита (план 13.1 F6)", () => {
+    seedMerge();
+    // Подтверждённый снимок решения: без него support_check — unknown.
+    const decision = db.getNode("merge-plan")!;
+    const edges = db.getInformedByEdges("merge-plan", "ancestry", false);
+    confirmSupports(db, {
+      decision_id: "merge-plan",
+      expected_claim_digest: claimDigestOf(decision.summary),
+      items: edges.map((e) => {
+        const support = db.getNode(e.other_id)!;
+        return {
+          support_id: e.other_id,
+          expected_claim_digest: claimDigestOf(support.summary),
+          expected_status_digest: statusDigestOf(support.status, support.epistemic_status),
+          expected_edge_digest: edgeDigestOf(e.description),
+        };
+      }),
+    });
+    // Боевой бюджет (5000 рёбер) на такой базе даёт unchanged; ветку incomplete
+    // воспроизводит инъекция малого лимита — 3 опоры не влезают в 1 ребро.
+    const hints = buildNextHints({
+      db,
+      cards: [{ id: "merge-plan", kind: "decision", visibleSupports: 3 }],
+      checkBudget: { edges: 1, bytes: 1_000_000 },
+    });
+    const follow = hints.followups;
+    expect(follow).toHaveLength(1);
+    expect(follow[0].tool).toBe("provenance_trace");
+    expect(follow[0].args).toEqual({ node_id: "merge-plan" });
+    expect(follow[0].why).toContain("support_check: incomplete");
+    // Снимок на месте — без инъекции бюджет а недостижим: боевой вызов
+    // (understand, тест выше) остаётся unknown-веткой.
+    expect(db.lastActiveBaselineAt("merge-plan")).not.toBeNull();
   });
 
   it("followups не больше 3, каждый с дословно исполнимыми аргументами", async () => {
