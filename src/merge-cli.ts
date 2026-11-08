@@ -4,7 +4,7 @@ import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { MergeEngine, stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
 import { resolveConflict } from "./tools.js";
-import { errorBold, success, info, error } from "./cli-utils.js";
+import { errorBold, success, info, error, openReadonlyOrExplain } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 import type { NodeRow } from "./types.js";
 
@@ -129,7 +129,9 @@ export async function runConflicts(args: string[]): Promise<void> {
   const dbPath = resolveDbPathOrExit(args);
   const json = hasFlag(args, "--json");
 
-  const db = new KnowledgeDB(dbPath);
+  // План 18 (2.4.0): conflicts только читает узлы с needs_merge — база
+  // открывается readonly. MEGAMEMORY_ALLOW_AUTO_MIGRATE=1 возвращает RW.
+  const db = openReadonlyOrExplain(dbPath, "conflicts");
   try {
     const conflictNodes = db.getConflictNodes();
 

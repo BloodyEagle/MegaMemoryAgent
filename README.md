@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.9-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.3.3-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.4.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -389,15 +389,22 @@ directory and never deletes them — prune manually, the exporter has no ownersh
 | `megamemory expire --ids a,b --until D[\|--past]` | Set `valid_until` on journal/state-claim nodes (dry-run by default, `--apply` to write) |
 | `megamemory merge`, `conflicts`, `resolve` | Two-way merge of graphs across branches |
 
-Read-only script accesses (`stats --funnel --json`, `migrate --dry-run`)
-never migrate the database in place: on a schema mismatch the command fails
-with a ready-made fix — `megamemory migrate --apply --db "<path>"` for an
-older database, an upgrade-the-package hint (with the file's `user_version`)
-for a newer one. The other read commands (`stats`, `export`, `eval`,
-`doctor`) open the database for writing and auto-migrate in place. `serve`
-and the MCP server write to the database themselves (usage and timeline) —
-that is why the reference demo database `fixtures/demo.db` opens read-only;
-make a copy to work with it.
+### Which commands never write to the database
+
+`export`, `eval` and `conflicts` — plus the scripted `stats --funnel --json`
+snapshot and `migrate --dry-run` — open the database READ-ONLY: no WAL, no
+in-place migration, the file's bytes stay untouched. On a schema mismatch the
+command fails with a ready-made fix — `megamemory migrate --apply --db "<path>"`
+for an older database, an upgrade-the-package hint (with the file's
+`user_version`) for a newer one. `MEGAMEMORY_ALLOW_AUTO_MIGRATE=1` restores
+the old behavior for one invocation: a read-write open with auto-migration.
+
+`stats`, `bench` and `doctor` still open the database for writing —
+deliberately: the read paths of `stats`/`bench` record usage telemetry
+(`list_roots`/`understand` bookkeeping), `stats --prune` writes by design,
+and `doctor` migrates in place. `serve` and the MCP server write usage and
+timeline too. That is why the reference demo database `fixtures/demo.db`
+opens read-only; make a copy to work with it.
 
 ---
 

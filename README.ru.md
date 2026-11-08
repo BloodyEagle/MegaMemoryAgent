@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.9-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.3.3-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.4.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -388,15 +388,23 @@ megamemory doctor               # проверка здоровья, код вы
 | `megamemory expire --ids a,b --until D[\|--past]` | Проставить `valid_until` журнальным узлам и утверждениям о состоянии (dry-run по умолчанию, запись — `--apply`) |
 | `megamemory merge`, `conflicts`, `resolve` | Двусторонний merge графов между ветками |
 
-Скриптовые чтения, открываемые readonly (`stats --funnel --json`,
-`migrate --dry-run`), базу на месте не мигрируют: при несовпадении схемы
-команда падает с готовой командой починки — `megamemory migrate --apply
---db "<путь>"` для устаревшей базы, совет обновить пакет — для базы более
-нового билда. Остальные читающие команды (`stats`, `export`, `eval`,
-`doctor`) открывают базу на запись и авто-мигрируют на месте. `serve` и
-MCP-сервер пишут в базу сами (usage и timeline) — поэтому эталонная
-демо-база `fixtures/demo.db` открывается только на чтение; для работы с
-ней снимите копию.
+### Какие команды не пишут в базу
+
+`export`, `eval` и `conflicts` — а также скриптовый снимок
+`stats --funnel --json` и `migrate --dry-run` — открывают базу ТОЛЬКО НА
+ЧТЕНИЕ: ни WAL, ни миграции на месте, байты файла базы не меняются. При
+несовпадении схемы команда падает с готовой починкой —
+`megamemory migrate --apply --db "<путь>"` для устаревшей базы, совет
+обновить пакет (с `user_version` файла) — для базы более нового билда.
+`MEGAMEMORY_ALLOW_AUTO_MIGRATE=1` возвращает прежнее поведение на один
+запуск: RW-открытие с авто-миграцией.
+
+`stats`, `bench` и `doctor` по-прежнему открывают базу на запись —
+осознанно: пути чтения `stats`/`bench` пишут телеметрию usage (учёт
+`list_roots`/`understand`), `stats --prune` пишет по замыслу, `doctor`
+мигрирует на месте. `serve` и MCP-сервер тоже пишут usage и timeline.
+Поэтому эталонная демо-база `fixtures/demo.db` открывается только на
+чтение; для работы с ней снимите копию.
 
 ---
 

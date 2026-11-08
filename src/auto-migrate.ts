@@ -445,7 +445,13 @@ function repairSchemaCompleteness(
       if (!hasRealTable(db, "nodes_fts")) {
         throw new Error("nodes_fts still missing after repair");
       }
-      repairedHere = true;
+      // Flag the commit only when something was actually applied: a repair
+      // that changed nothing must stay silent (repair_steps empty, repaired
+      // false) — the clean-db-must-not-log invariant, enforced mechanically
+      // instead of by the happy path of the steps above.
+      if (report.applied.length > 0) {
+        repairedHere = true;
+      }
     });
   } catch (err) {
     result.warnings.push(
@@ -481,11 +487,22 @@ function ensureMissingFtsTriggers(
       ) as Array<{ name: string }>
     ).map((r) => r.name)
   );
-  if (hasRealTable(db, "nodes_fts") && !existing.has("nodes_ai")) {
+  // Decide by the SIZE of the surviving set, not by one sentinel name:
+  // readSchemaCompleteness requires 3 of 3 per set, so a db with 1-2 of 3
+  // triggers must be repaired too — otherwise the repair commits, the base
+  // stays incomplete and the repair (and its file write) re-runs on every
+  // start forever. ensureFtsTriggers/ensureTrigramTriggers are idempotent
+  // (IF NOT EXISTS) and always create the whole set — a redundant call for
+  // a set that lost only some of its triggers is a deliberate no-op.
+  const mainSet = ["nodes_ai", "nodes_ad", "nodes_au"];
+  const triSet = ["nodes_tri_ai", "nodes_tri_ad", "nodes_tri_au"];
+  const countPresent = (names: string[]): number =>
+    names.filter((n) => existing.has(n)).length;
+  if (hasRealTable(db, "nodes_fts") && countPresent(mainSet) < 3) {
     ensureFtsTriggers(db);
     report.applied.push("restored nodes_ai/ad/au triggers");
   }
-  if (hasRealTable(db, "nodes_fts_tri") && !existing.has("nodes_tri_ai")) {
+  if (hasRealTable(db, "nodes_fts_tri") && countPresent(triSet) < 3) {
     ensureTrigramTriggers(db);
     report.applied.push("restored nodes_tri_ai/ad/au triggers");
   }
@@ -521,7 +538,6 @@ export function describeSchemaRepair(r: AutoMigrationResult): string | null {
       parts.push(step);
     }
   }
-  if (parts.length === 0) parts.push("schema objects restored");
   return `schema repair: ${parts.join(", ")}`;
 }
 
