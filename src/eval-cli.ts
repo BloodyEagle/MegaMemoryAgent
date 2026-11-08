@@ -1,9 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
-import { KnowledgeDB } from "./db.js";
 import { loadEvalPairs, runEval } from "./eval.js";
-import { errorBold, success, info, heading, warn } from "./cli-utils.js";
+import { errorBold, success, info, heading, warn, openReadonlyOrExplain } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 
 /**
@@ -87,7 +86,9 @@ export async function runEvalCli(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const db = new KnowledgeDB(p);
+  // План 18 (2.4.0): eval только измеряет recall на живом поиске — база
+  // открывается readonly. MEGAMEMORY_ALLOW_AUTO_MIGRATE=1 возвращает RW.
+  const db = openReadonlyOrExplain(p, "eval");
   try {
     const result = await runEval(db, pairs, { k });
 

@@ -1,5 +1,6 @@
 import pc from "picocolors";
 import { createInterface } from "readline";
+import { KnowledgeDB, ReadonlyDbError } from "./db.js";
 
 // ---- Styled output helpers ----
 
@@ -200,4 +201,46 @@ export function validatePort(value: unknown, rawInput?: string): string | null {
   }
   const display = rawInput ?? String(value);
   return `Invalid port '${display}'. Port must be a number between 1 and 65535.`;
+}
+
+// ---- Readonly opening for read-only commands ----
+
+/**
+ * План 18 (2.4.0): читающие команды не пишут в базу. Открывает базу
+ * ТОЛЬКО НА ЧТЕНИЕ и объясняет отказ, если схема не годится для чтения:
+ * миграция таким соединением невозможна (и молчаливо не выполняется), а
+ * читающий вызов обязан либо увидеть данные, либо понять, почему нет.
+ *
+ * - По умолчанию: `new KnowledgeDB(dbPath, { readonly: true })` — соединение
+ *   не ставит WAL и не мигрирует; на устаревшей схеме конструктор бросает
+ *   ReadonlyDbError с готовой командой `megamemory migrate --apply --db "<путь>"`.
+ * - `MEGAMEMORY_ALLOW_AUTO_MIGRATE=1` возвращает прежнее поведение — обычное
+ *   RW-открытие с авто-миграцией (для скриптов, которым нужен и побочный
+ *   эффект, и ответ).
+ *
+ * Отказ печатается в stderr (текст ошибки из db.ts самодостаточен: путь и
+ * команда migrate уже в сообщении) и процесс выходит с кодом 2. Дополнительная
+ * строка про env-выход добавляется ТОЛЬКО для SCHEMA_TOO_OLD_READONLY:
+ * для SCHEMA_TOO_NEW_READONLY переменная ничего не меняет (обновляй пакет),
+ * а для отсутствующей/повреждённой базы сообщение db.ts само объясняет выход.
+ */
+export function openReadonlyOrExplain(dbPath: string, command: string): KnowledgeDB {
+  if (process.env.MEGAMEMORY_ALLOW_AUTO_MIGRATE === "1") {
+    return new KnowledgeDB(dbPath);
+  }
+  try {
+    return new KnowledgeDB(dbPath, { readonly: true });
+  } catch (err) {
+    if (err instanceof ReadonlyDbError) {
+      errorBold(err.message);
+      if (err.code === "SCHEMA_TOO_OLD_READONLY") {
+        errorBold(
+          `Читающие команды «${command}» больше не мигрируют базу молча. ` +
+            `Либо разреши авто-миграцию для этой команды: MEGAMEMORY_ALLOW_AUTO_MIGRATE=1`
+        );
+      }
+      process.exit(2);
+    }
+    throw err;
+  }
 }

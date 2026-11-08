@@ -1,9 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
-import { KnowledgeDB } from "./db.js";
 import { exportMarkdown, checkMarkdown } from "./export.js";
-import { errorBold, success, info, heading, warn } from "./cli-utils.js";
+import { errorBold, success, info, heading, warn, openReadonlyOrExplain } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 
 /**
@@ -25,7 +24,10 @@ export async function runExport(args: string[]): Promise<void> {
 
   const p = resolveDbPathOrExit(args);
 
-  const db = new KnowledgeDB(p);
+  // План 18 (2.4.0): export только читает граф — база открывается readonly,
+  // файл базы не мутирует (ни WAL, ни авто-миграция). MEGAMEMORY_ALLOW_AUTO_MIGRATE=1
+  // возвращает прежнее RW-открытие.
+  const db = openReadonlyOrExplain(p, "export");
   try {
     if (check) {
       const diff = checkMarkdown(db, dir);
