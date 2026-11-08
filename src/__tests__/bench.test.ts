@@ -107,8 +107,10 @@ describe("megamemory bench (2.1.5 F3)", () => {
     const q = report.questions[0];
     // План 06 (K-03): оценка честная — пустой ответ стоит конверт+meta
     // (~130 токенов), нулём он больше не притворяется.
+    // План 13: в ответе всегда есть блок next (record не режется никогда) —
+    // пустой ответ стоит конверт+meta+record (~205 в этой фикстуре), кап поднят до 220.
     expect(q.graph_tokens).toBeGreaterThan(0);
-    expect(q.graph_tokens).toBeLessThanOrEqual(200);
+    expect(q.graph_tokens).toBeLessThanOrEqual(220);
     expect(q.ratio_files).toBeNull();
     expect(q.hit).toBe(false);
     expect(report.hit_rate).toBe(0);
