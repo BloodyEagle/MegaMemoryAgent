@@ -29,6 +29,33 @@ function setEmbedding(db: KnowledgeDB, id: string, vec: number[]): void {
   );
 }
 
+// План 12: наполнителям больших групп нужны различающиеся векторы — при
+// триграммной ступени кандидатов одинаковые векторы наполнителей честно
+// становятся парами-дубликатами и затаптывают предел на узел. 24-мерные
+// случайные направления не поднимаются над порогом попарно.
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function randomUnitEmbedding(seed: number): number[] {
+  const rnd = mulberry32(seed);
+  const v = new Float32Array(24);
+  let norm = 0;
+  for (let i = 0; i < v.length; i++) {
+    v[i] = rnd() * 2 - 1;
+    norm += v[i] * v[i];
+  }
+  norm = Math.sqrt(norm) || 1;
+  for (let i = 0; i < v.length; i++) v[i] /= norm;
+  return Array.from(v);
+}
+
 describe("findDuplicates", () => {
   it("finds near-identical pairs, skips dissimilar nodes", () => {
     const db = freshDb();
@@ -78,32 +105,56 @@ describe("findDuplicates blocking (R-06b, план 09)", () => {
     for (const c of candidates) expect(c.similarity).toBeGreaterThanOrEqual(0.9);
   });
 
-  it("большая группа: одинаковые имена находятся, разные имена с одинаковым вектором — нет (документированный компромисс)", () => {
+  it("большая группа: одинаковые имена и близкие имена с одинаковым вектором находятся (план 12: компромисс 09 снят ступенью B)", () => {
     const db = freshDb();
     db.runInTransaction(() => {
-      // Пара с одинаковыми именами — попадает в один блок.
+      // Пара с одинаковыми именами — попадает в один блок (ступень A).
       db.insertNode({ id: "twin-a", name: "Twin Alpha", kind: "module", summary: "first" });
       db.insertNode({ id: "twin-b", name: "Twin Alpha", kind: "module", summary: "second" });
-      // Пара с разными именами и одинаковым вектором — блоки разные.
-      db.insertNode({ id: "solo-one", name: "Solo One", kind: "module", summary: "one" });
-      db.insertNode({ id: "solo-two", name: "Solo Two", kind: "module", summary: "two" });
+      // Пара с разными именами и одинаковым вектором — блоки разные, но
+      // триграммы общие («solo», «module») — ступень B доводит до сравнения.
+      db.insertNode({ id: "solo-one", name: "Solo Module One", kind: "module", summary: "one" });
+      db.insertNode({ id: "solo-two", name: "Solo Module Two", kind: "module", summary: "two" });
       // Наполнители с уникальными именами до большой группы (порог блокинга 200).
       for (let i = 0; i < 250; i++) {
         db.insertNode({ id: `filler-${i}`, name: `Unique Filler ${i}`, kind: "module", summary: `f ${i}` });
       }
     });
-    for (const id of ["twin-a", "twin-b", "solo-one", "solo-two"]) {
-      setEmbedding(db, id, [1, 0, 0, 0]);
-    }
+    for (const id of ["twin-a", "twin-b"]) setEmbedding(db, id, [1, 0, 0, 0]);
+    for (const id of ["solo-one", "solo-two"]) setEmbedding(db, id, [0, 1, 0, 0]);
     for (let i = 0; i < 250; i++) {
-      setEmbedding(db, `filler-${i}`, [0, 1, 0, 0]);
+      setEmbedding(db, `filler-${i}`, randomUnitEmbedding(1000 + i));
     }
 
     const { candidates, candidates_truncated } = findDuplicates(db, { threshold: 0.95 });
     const pairs = candidates.map((c) => [c.a, c.b].sort().join("|"));
     expect(pairs).toContain("twin-a|twin-b");
-    expect(pairs).not.toContain("solo-one|solo-two");
+    expect(pairs).toContain("solo-one|solo-two");
     expect(candidates_truncated).toBe(0); // давления на предел не было
+  });
+
+  it("большая группа: имена без общих триграмм с одинаковым вектором находятся через LSH (ступень C)", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      // «склад восток» / «очередь запад»: ни одной общей триграммы — ступень
+      // B слепа, блоки ступени A разные. Пару приносит только векторная
+      // корзина (план 12: «вектор близок, имя нет»).
+      db.insertNode({ id: "lex-a", name: "Склад Восток", kind: "module", summary: "a" });
+      db.insertNode({ id: "lex-b", name: "Очередь Запад", kind: "module", summary: "b" });
+      for (let i = 0; i < 250; i++) {
+        db.insertNode({ id: `pad-${i}`, name: `Filler Node ${i}`, kind: "module", summary: `p ${i}` });
+      }
+    });
+    setEmbedding(db, "lex-a", [0, 0, 1, 0]);
+    setEmbedding(db, "lex-b", [0, 0, 1, 0]);
+    for (let i = 0; i < 250; i++) {
+      setEmbedding(db, `pad-${i}`, randomUnitEmbedding(3000 + i));
+    }
+
+    const { candidates, candidates_truncated } = findDuplicates(db, { threshold: 0.95 });
+    const pairs = candidates.map((c) => [c.a, c.b].sort().join("|"));
+    expect(pairs).toContain("lex-a|lex-b");
+    expect(candidates_truncated).toBe(0);
   });
 
   it("имена отличаются только регистром и пунктуацией — один блок, пара находится", () => {
@@ -117,11 +168,72 @@ describe("findDuplicates blocking (R-06b, план 09)", () => {
     });
     setEmbedding(db, "case-a", [1, 0, 0, 0]);
     setEmbedding(db, "case-b", [1, 0, 0, 0]);
-    for (let i = 0; i < 250; i++) setEmbedding(db, `pad-${i}`, [0, 1, 0, 0]);
+    for (let i = 0; i < 250; i++) {
+      setEmbedding(db, `pad-${i}`, randomUnitEmbedding(2000 + i));
+    }
 
     const { candidates } = findDuplicates(db, { threshold: 0.95 });
     const pairs = candidates.map((c) => [c.a, c.b].sort().join("|"));
     expect(pairs).toContain("case-a|case-b");
+  });
+});
+
+describe("findDuplicates крайние режимы и инвариант усечения (план 12)", () => {
+  it("пустой граф — ноль кандидатов", () => {
+    const db = freshDb();
+    expect(findDuplicates(db, { threshold: 0.95 })).toEqual({
+      candidates: [],
+      candidates_truncated: 0,
+    });
+  });
+
+  it("граф без эмбеддингов — ноль кандидатов: сравнение требует векторы с обеих сторон", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      db.insertNode({ id: "a", name: "Same", kind: "module", summary: "a" });
+      db.insertNode({ id: "b", name: "Same", kind: "module", summary: "b" });
+    });
+    expect(findDuplicates(db, { threshold: 0.95 })).toEqual({
+      candidates: [],
+      candidates_truncated: 0,
+    });
+  });
+
+  it("граф только с эмбеддингами — пара находится по векторам", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      db.insertNode({ id: "v1", name: "Alpha", kind: "module", summary: "a" });
+      db.insertNode({ id: "v2", name: "Beta", kind: "module", summary: "b" });
+      db.insertNode({ id: "v3", name: "Gamma", kind: "module", summary: "c" });
+    });
+    setEmbedding(db, "v1", [1, 0, 0, 0]);
+    setEmbedding(db, "v2", [1, 0, 0, 0]);
+    setEmbedding(db, "v3", [0, 1, 0, 0]);
+    const { candidates } = findDuplicates(db, { threshold: 0.95 });
+    expect(candidates).toHaveLength(1);
+    expect([candidates[0].a, candidates[0].b].sort()).toEqual(["v1", "v2"]);
+  });
+
+  it("инвариант усечения: выданные + candidates_truncated = все пары выше порога в обработанных корзинах", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      for (let i = 0; i < 210; i++) {
+        db.insertNode({ id: `same-${i}`, name: "Same", kind: "module", summary: `s ${i}` });
+      }
+    });
+    for (let i = 0; i < 210; i++) setEmbedding(db, `same-${i}`, [1, 0, 0, 0]);
+
+    // Одна корзина/блок на все 210 узлов: все C(210,2) = 21 945 пар выше
+    // порога перечислены ровно один раз, каждая либо выдана, либо ровно
+    // один раз учтена в candidates_truncated (отвержение, вытеснение из
+    // топа-50 или глобальный предел).
+    const { candidates, candidates_truncated } = findDuplicates(db, { threshold: 0.9 });
+    expect(candidates.length + candidates_truncated).toBe((210 * 209) / 2);
+    expect(candidates.length).toBeLessThanOrEqual(100);
+    expect(candidates_truncated).toBeGreaterThan(0);
+    // Дедупликация ступеней: пара не задвоена в выдаче.
+    const keys = candidates.map((c) => [c.a, c.b].sort().join("|"));
+    expect(new Set(keys).size).toBe(keys.length);
   });
 });
 

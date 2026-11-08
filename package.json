@@ -1,6 +1,6 @@
 {
   "name": "@bloodyeagle/megamemory",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "MCP server that gives coding agents persistent project understanding via a knowledge graph",
   "type": "module",
   "main": "dist/index.js",
@@ -24,7 +24,8 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "posttest": "node scripts/check-fixtures.mjs"
   },
   "keywords": [
     "mcp",

@@ -292,7 +292,7 @@ export interface UnderstandInput {
    * compact (default): trimmed per-node payload under the token budget;
    * full: legacy verbose output (why, children/edges for every node).
    */
-  mode?: "compact" | "full";
+  mode?: "compact" | "full" | "brief";
   /** Include superseded/deprecated nodes (T4). Default false. */
   include_inactive?: boolean;
   /**
@@ -422,6 +422,73 @@ export interface UnderstandOutput {
    */
   edges_between?: Array<{ from: string; to: string; relation: string }>;
   meta?: UnderstandMeta;
+  /**
+   * План 13 §2.1: машинно-исполнимый контракт действия, завершающий каждый
+   * ответ understand (что читать, что пропускать, какие вызовы сделать, что
+   * записать). Присутствует в compact- и full-режимах; при пустом ответе блок
+   * остаётся с пустыми списками и формой записи в record. В бюджет ответа
+   * входит на общих основаниях: tokens_estimated считается по той же
+   * wire-форме, что уходит по проводу (K-03), поэтому по сравнению с
+   * версией 2.2.0 число выросло — это единственное законно меняющееся старое
+   * значение.
+   */
+  next?: NextHints;
+}
+
+/** План 13 §2.1: одна ссылка must_read — дословный file_ref узла из ответа. */
+export interface NextHintRead {
+  /** Дословно из file_refs узла (может содержать ":строки"). */
+  ref: string;
+  /** Почему читать: узел-источник (имя, суть). */
+  why: string;
+  /** Узел, чей file_ref породил ссылку. */
+  node_id: string;
+}
+
+/**
+ * План 13 §2.1: файл, целиком покрытый карточкой ответа, — читать его целиком
+ * не нужно. Даётся только при честном покрытии: у узла непустые file_refs,
+ * summary не заглушка (см. src/stub.ts), узел не слабый (refuted/abandoned/
+ * ungrounded), и файл не попал в must_read.
+ */
+export interface NextHintSkip {
+  /** Целый файл — file_ref БЕЗ диапазона строк. */
+  ref: string;
+  /** Какой узел покрывает файл. */
+  why: string;
+}
+
+/** План 13 §2.1: follow-up вызов с готовыми аргументами — исполняется дословно. */
+export interface NextHintFollowup {
+  tool: "check_artifacts" | "get_concept" | "provenance_trace";
+  /** Готовые аргументы вызова. */
+  args: Record<string, unknown>;
+  why: string;
+}
+
+/**
+ * План 13 §2.1: контракт действия в конце ответа understand. must_read — до 3
+ * ссылок из file_refs узлов ответа; skip — целые файлы, покрытые карточками;
+ * followups — до 3 вызовов с готовыми аргументами (приоритет: check_artifacts
+ * для устаревших снимков, get_concept для решений с невидимыми опорами,
+ * provenance_trace для нечистого support_check); record — форма записи,
+ * присутствует всегда, даже при пустом ответе.
+ */
+export interface NextHints {
+  must_read: NextHintRead[];
+  skip: NextHintSkip[];
+  followups: NextHintFollowup[];
+  record: string;
+}
+
+/**
+ * План 13 §2.2 (режим brief, группа B): до 8 строк текста вместо карточек
+ * плюс тот же блок next. compact остаётся режимом по умолчанию.
+ */
+export interface BriefOutput {
+  brief: string;
+  next: NextHints;
+  meta: UnderstandMeta;
 }
 
 export interface GetConceptInput {

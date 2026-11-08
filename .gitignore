@@ -16,6 +16,7 @@ npm-ci.log
 graph-deps.json
 .graph-deps-cache.json
 .kilo-edit-body.txt
+kilo.json
 *.db-shm
 *.db-wal
 tmp-upstream-acc/

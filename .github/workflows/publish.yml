@@ -76,7 +76,11 @@ jobs:
           npm install "$GITHUB_WORKSPACE/$TARBALL" >/dev/null
           ./node_modules/.bin/megamemory --version
           ./node_modules/.bin/megamemory --help >/dev/null
-          ./node_modules/.bin/megamemory stats --db ./node_modules/@bloodyeagle/megamemory/fixtures/demo.db >/dev/null
+          # План 11 (2.2.1): фикстуры только для чтения — stats работает на
+          # копии; прямое --db в fixtures/ установленный пакет мутировал бы
+          # (авто-миграция + отложенный чекпоинт на выходе процесса).
+          cp ./node_modules/@bloodyeagle/megamemory/fixtures/demo.db /tmp/mm-smoke/demo-copy.db
+          ./node_modules/.bin/megamemory stats --db /tmp/mm-smoke/demo-copy.db >/dev/null
 
       - run: npm publish --provenance --access public
         env:

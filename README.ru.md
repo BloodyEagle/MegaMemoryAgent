@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.9-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.2.0-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.3.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -36,12 +36,12 @@
 | Идентификаторы | slug вырезает всё вне `[a-z0-9-]`: кириллица, CJK, греческий, эмодзи схлопываются в `""`, второй такой узел теряется | Unicode-слаг: буквы любого алфавита, диакритика снимается только после латиницы/кириллицы/греческого/иврита (дакутэн катаканы и хангыль сохраняются), `/` → `-`, вывод в NFC, hash-фолбэк для имён из эмодзи, суффикс `-<hash8>` при коллизии |
 | Эмбеддинги | `all-MiniLM-L6-v2`, только английский, размерность зашита | по умолчанию `Xenova/multilingual-e5-small` (`MEGAMEMORY_EMBED_MODEL`), префиксы e5 `passage:`/`query:`, размерность берётся из модели, при смене модели векторный поиск отключается до `megamemory reembed` |
 | Поиск | только косинус | гибрид: FTS5 + вектор через RRF, у каждого попадания `via: vector \| fts \| both`, санитизация запросов для `MATCH`, маршрутизация коротких CJK-запросов, опциональный trigram-индекс, LIKE-фолбэк по `name_norm` |
-| Контекст | `understand` отдаёт всё найденное | по умолчанию `mode: "compact"` с лимитом `max_tokens` (1500), summary обрезается до 240 символов, рёбра — только между возвращёнными узлами, `meta.returned / dropped / tokens_estimated` |
+| Контекст | `understand` отдаёт всё найденное | по умолчанию `mode: "compact"` с лимитом `max_tokens` (1500), summary обрезается до 240 символов, рёбра — только между возвращёнными узлами, `meta.returned / dropped / tokens_estimated`; ответ заканчивается блоком действий `next` (`must_read` / `skip` / `followups` / `record`) |
 | Актуальность | либо удалить, либо никак | `status` (`active`/`superseded`/`deprecated`), рёбра `supersedes` и `contradicts`, устаревшее скрыто из ответов, но видно в графе; факты стареют: `valid_until` после своей даты убирает утверждение о состоянии из ответов |
 | Дубли | только ручной merge | `megamemory consolidate` находит пары с близостью эмбеддингов ≥ 0.95 и сливает их с переносом рёбер |
 | Большие модули | каждый ребёнок читается отдельно | `digest`-узлы: один на модуль, пересобирается после 5-го ребёнка, пониженный вес в поиске |
 | Переносимость | только БД | `megamemory export --md <dir>` — по файлу на узел (frontmatter + wiki-ссылки), `--check` для CI |
-| Видимость цены | нет | каждый `understand` / `list_roots` / `get_concept` измеряется; агрегаты за 7 дней в `megamemory stats`, `/api/stats` и панели **Tokens** в explorer |
+| Видимость цены | нет | каждый `understand` / `list_roots` / `get_concept` измеряется; агрегаты за 7 дней в `megamemory stats`, `/api/stats` и панели **Tokens** в explorer; `megamemory stats --funnel` считает воронку «understand → follow-up → запись» по журналу `timeline` (`--json` для скриптов) |
 | Миграция | — | `megamemory migrate --dry-run/--apply` обновляет базу upstream на месте, аддитивно, с бэкапами и совместимостью вниз |
 
 ---
@@ -52,7 +52,8 @@
 
 1. **Начало сессии** — агент вызывает `list_roots` (с бюджетом), чтобы сориентироваться.
 2. **Перед задачей** — `understand` с запросом на естественном языке или `get_concept` по точному id.
-3. **После задачи** — `create_concept` / `update_concept`, затем `link` для связей.
+3. **Исполни блок `next`** из ответа — прочитай ссылки `must_read`, файлы из `skip` целиком не читай (уже покрыты карточками), выполни готовые `followups`, после правки запиши по строке `record` (`mode: "brief"` даёт тот же контракт в ≤8 строках, без карточек).
+4. **После задачи** — `create_concept` / `update_concept`, затем `link` для связей.
 
 ---
 
@@ -348,7 +349,7 @@ megamemory doctor               # проверка здоровья, код вы
 
 | Инструмент | Что делает |
 |---|---|
-| `understand` | Гибридный поиск по графу. `top_k`, `max_tokens`, `mode: "compact" \| "full"`, `include_inactive`, `include_stale` (просроченные факты). |
+| `understand` | Гибридный поиск по графу. `top_k`, `max_tokens`, `mode: "compact" \| "full" \| "brief"`, `include_inactive`, `include_stale` (просроченные факты). Каждый ответ заканчивается блоком `next`: ссылки `must_read` прочитать, файлы `skip` уже покрыты, готовые `followups` выполнить, запись по строке `record`. |
 | `get_concept` | Точный поиск по id: дети, рёбра, входящие рёбра, родитель. |
 | `create_concept` | Новая концепция с рёбрами, ссылками на файлы и `supersedes`; `valid_until` задаёт срок годности. |
 | `update_concept` | Обновление полей; эмбеддинг пересчитывается. `valid_until: null` снимает срок. |
@@ -386,6 +387,16 @@ megamemory doctor               # проверка здоровья, код вы
 | `megamemory export --md <dir> [--check]` | Markdown-экспорт и проверка расхождений для CI |
 | `megamemory expire --ids a,b --until D[\|--past]` | Проставить `valid_until` журнальным узлам и утверждениям о состоянии (dry-run по умолчанию, запись — `--apply`) |
 | `megamemory merge`, `conflicts`, `resolve` | Двусторонний merge графов между ветками |
+
+Скриптовые чтения, открываемые readonly (`stats --funnel --json`,
+`migrate --dry-run`), базу на месте не мигрируют: при несовпадении схемы
+команда падает с готовой командой починки — `megamemory migrate --apply
+--db "<путь>"` для устаревшей базы, совет обновить пакет — для базы более
+нового билда. Остальные читающие команды (`stats`, `export`, `eval`,
+`doctor`) открывают базу на запись и авто-мигрируют на месте. `serve` и
+MCP-сервер пишут в базу сами (usage и timeline) — поэтому эталонная
+демо-база `fixtures/demo.db` открывается только на чтение; для работы с
+ней снимите копию.
 
 ---
 
@@ -430,8 +441,9 @@ npx vitest run src/__tests__/id-generation.test.ts --reporter=dot     # целе
 npx vitest run                                                       # всё (долго: скачивание модели)
 ```
 
-`fixtures/demo.db` — готовый граф (ru/en/zh/эмодзи, один `superseded`, один `digest`, пара дублей)
-для ручной проверки в обозревателе.
+`fixtures/demo.db` — готовый граф (ru/en/zh/эмодзи, один `superseded`, один `digest`, пара дублей).
+Перед открытием в обозревателе сними копию: `serve` пишет журнал обращений в обслуживаемую базу,
+а страж репозитория (`fixtures/sha256sums.txt`) требует неизменности фикстур байт-в-байт.
 
 ---
 

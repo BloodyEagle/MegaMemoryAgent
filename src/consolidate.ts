@@ -82,6 +82,10 @@ export function nameSimilarity(a: string, b: string): number {
  * плана 08 префиксные/токенные ключи схлопывались в один гигантский блок
  * (все имена «Module …»), возвращая квадратицу — поэтому берётся полное
  * нормализованное имя: размер блока ограничен реальными совпадениями имён.
+ *
+ * План 12 (R-06b) вернул полноту: пары из разных блоков снова доходят до
+ * сравнения через ступень B (триграммы) и ступень C (LSH по векторам) —
+ * см. комментарии в findDuplicates.
  */
 function nameBlockKey(name: string): string {
   return name
@@ -100,6 +104,48 @@ const MAX_CANDIDATES_PER_NODE = 50;
  * следующими WINDOW членами блока в порядке вставки, а не со всеми. Окно ≥
  * размеров приёмочных групп (500 одинаковых имён сравниваются целиком). */
 const BLOCK_WINDOW = 2000;
+
+// План 12 (R-06b): блокинг по точному имени пропускал пары с разными
+// блоками («Модуль авторизации» / «Модуль аутентификации», опечатки).
+// Ступень B возвращает их: кандидаты по триграммам нормализованного имени.
+
+/** Минимум общих триграмм нормализованного имени у пары-кандидата. */
+const TRIGRAM_MIN_SHARED = 3;
+/** Триграммы с документной частотой выше лимита не индексируются: в
+ * однородном корпусе («Module …» у каждого имени) они не выбирают пару, а
+ * без лимита проход по postings вырождается в квадрат на общем префиксе.
+ * Пары, у которых все общие триграммы сверхчастые, ловит ступень C. */
+const TRIGRAM_MAX_DF = 256;
+
+/** Триграммы нормализованного имени (тот же nameBlockKey, что у блоков
+ * ступени A — нормализация не расходится между ступенями). */
+function nameTrigrams(name: string): string[] {
+  const norm = nameBlockKey(name);
+  const out: string[] = [];
+  for (let i = 0; i + 3 <= norm.length; i++) out.push(norm.slice(i, i + 3));
+  return out;
+}
+
+// Ступень C (план 12): LSH по эмбеддингам для пар, которых не видят ни
+// точное имя, ни триграммы (синонимы, у которых < K общих триграмм).
+
+/** Число случайных гиперплоскостей: 8 бит сигнатуры → 256 корзин. */
+const LSH_PLANES = 8;
+/** Фиксированный seed гиперплоскостей: одинаковые корзины между прогонами —
+ * повторный вызов на тех же данных даёт тот же набор кандидатов. */
+const LSH_SEED = 0x9e3779b9;
+
+/** Детерминированный PRNG (mulberry32) — считается достаточно случайным для
+ * гиперплоскостей и воспроизводимым при фиксированном seed. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 export interface FindDuplicatesResult {
   candidates: DuplicateCandidate[];
@@ -163,16 +209,10 @@ export function findDuplicates(
       continue;
     }
 
-    // Большая группа: блоки по нормализованному имени. Пары ищутся только
-    // внутри блока — 10 000 корней с разными именами больше не квадрат.
-    const blocks = new Map<string, number[]>();
-    for (let idx = 0; idx < group.length; idx++) {
-      const key = nameBlockKey(group[idx].name);
-      const block = blocks.get(key) ?? [];
-      block.push(idx);
-      blocks.set(key, block);
-    }
-
+    // Большая группа: три ступени кандидатов (план 12) вместо одной.
+    // Порог и функция сравнения не изменились — меняется только то, какие
+    // пары до сравнения доходят.
+    //
     // Предел на узел: у каждого узла свой топ-50 пар по убыванию схожести
     // (при равенстве — найденная раньше). Пара выбывает из выдачи, как только
     // вытеснена хотя бы у одного конца; первое вытеснение увеличивает
@@ -214,24 +254,147 @@ export function findDuplicates(
       return true;
     };
 
+    /**
+     * Единый путь пары из любой ступени: сравнение как раньше (косинус,
+     * векторы нужны с обеих сторон), дедупликация между ступенями (одна пара
+     * может найтись в нескольких) и поток в общий предел на узел. Вызывается
+     * с i < j — ключ пары и обход kept предполагают «хозяин — меньший индекс».
+     */
+    const feedPair = (i: number, j: number): void => {
+      const va = toVector(group[i].embedding);
+      const vb = toVector(group[j].embedding);
+      if (!va || !vb) return; // consolidation needs vectors on both sides
+      const sim = cosine(va, vb);
+      if (sim < threshold) return;
+      const key = `${i}|${j}`;
+      if (dead.has(key)) return;
+      if (keptKeys.get(i)?.has(key) || keptKeys.get(j)?.has(key)) return;
+      // Второй keepFor при отвержении первым уже не зовётся — пара мертва
+      // в любом случае (нужна оба конца), счётчик не задвоен dead-набором.
+      keepFor(i, { key, sim, i, j }) && keepFor(j, { key, sim, i, j });
+    };
+
+    // Есть ли в группе векторы: без них сравнение невозможно в принципе,
+    // ступени B/C пропускаются целиком (FTS-режим — не ошибка, а режим).
+    // Проверка через toVector: libsql отдаёт embedding то Buffer, то
+    // ArrayBuffer — у последнего нет .length, только .byteLength.
+    const groupHasVectors = group.some((r) => toVector(r.embedding) !== null);
+
+    // Ступень A: точное имя. Блоки по нормализованному имени, пары только
+    // внутри блока — 10 000 корней с разными именами не квадрат.
+    const blocks = new Map<string, number[]>();
+    for (let idx = 0; idx < group.length; idx++) {
+      const key = nameBlockKey(group[idx].name);
+      const block = blocks.get(key) ?? [];
+      block.push(idx);
+      blocks.set(key, block);
+    }
+
     for (const block of blocks.values()) {
       for (let p = 0; p < block.length; p++) {
         const i = block[p];
-        const va = toVector(group[i].embedding);
-        if (!va) continue;
         const windowEnd = Math.min(block.length, p + 1 + BLOCK_WINDOW);
         for (let q = p + 1; q < windowEnd; q++) {
-          const j = block[q];
-          const vb = toVector(group[j].embedding);
-          if (!vb) continue;
-          const sim = cosine(va, vb);
-          if (sim < threshold) continue;
-          const key = `${i}|${j}`;
-          const accepted =
-            keepFor(i, { key, sim, i, j }) && keepFor(j, { key, sim, i, j });
-          // Второй keepFor при отвержении первым уже не зовётся — пара мертва
-          // в любом случае (нужна оба конца), счётчик не задвоен dead-набором.
-          if (!accepted) continue;
+          feedPair(i, block[q]);
+        }
+      }
+    }
+
+    // Ступень B: триграммы. Инвертированный индекс «триграмма нормализо-
+    // ванного имени → список id» строится один раз на группу и живёт только
+    // в памяти вызова. Кандидаты для узла i — ранее обработанные узлы (j < i),
+    // у которых с ним не меньше K общих триграмм. Опечатки и перестановки
+    // слов сохраняют внутренние триграммы — такие пары дошли до сравнения.
+    if (groupHasVectors) {
+      const postings = new Map<string, number[]>();
+      const banned = new Set<string>();
+      for (let i = 0; i < group.length; i++) {
+        const grams = [...new Set(nameTrigrams(group[i].name))];
+        if (grams.length > 0) {
+          const counts = new Map<number, number>();
+          for (const g of grams) {
+            const post = postings.get(g);
+            if (!post) continue;
+            for (const j of post) counts.set(j, (counts.get(j) ?? 0) + 1);
+          }
+          for (const [j, c] of counts) {
+            if (c >= TRIGRAM_MIN_SHARED) feedPair(j, i);
+          }
+        }
+        for (const g of grams) {
+          if (banned.has(g)) continue;
+          const post = postings.get(g);
+          if (post === undefined) postings.set(g, [i]);
+          else if (post.length < TRIGRAM_MAX_DF) post.push(i);
+          else {
+            postings.delete(g);
+            banned.add(g);
+          }
+        }
+      }
+    }
+
+    // Ступень C: LSH по эмбеддингам. 8 детерминированных гиперплоскостей
+    // (±1 по каждой размерности, фиксированный seed) → 256 корзин; пары
+    // сравниваются внутри корзины и между соседними по одному биту —
+    // близкие векторы (косинус ≥ порога ≈ угол < ~18°) почти всегда попадают
+    // в одну корзину или соседнюю, при O(n) на построение вместо O(n²)
+    // попарных косинусов. Ступень A/B пары здесь дедуплицируются в feedPair.
+    if (groupHasVectors) {
+      const lshNodes: number[] = [];
+      let dim = -1;
+      for (let i = 0; i < group.length; i++) {
+        const v = toVector(group[i].embedding);
+        if (!v) continue;
+        if (dim < 0) dim = v.length;
+        if (v.length !== dim) continue; // разная размерность — косинус всё равно 0
+        lshNodes.push(i);
+      }
+      if (lshNodes.length >= 2 && dim > 0) {
+        const rnd = mulberry32(LSH_SEED);
+        const planes: Int8Array[] = [];
+        for (let p = 0; p < LSH_PLANES; p++) {
+          const plane = new Int8Array(dim);
+          for (let d = 0; d < dim; d++) plane[d] = rnd() < 0.5 ? -1 : 1;
+          planes.push(plane);
+        }
+        const buckets = new Map<number, number[]>();
+        const acc = new Float64Array(LSH_PLANES);
+        for (const i of lshNodes) {
+          const v = toVector(group[i].embedding)!;
+          acc.fill(0);
+          for (let d = 0; d < dim; d++) {
+            const val = v[d];
+            if (val === 0) continue;
+            for (let p = 0; p < LSH_PLANES; p++) acc[p] += planes[p][d] * val;
+          }
+          let sig = 0;
+          for (let p = 0; p < LSH_PLANES; p++) if (acc[p] >= 0) sig |= 1 << p;
+          const bucket = buckets.get(sig);
+          if (bucket) bucket.push(i);
+          else buckets.set(sig, [i]);
+        }
+        for (const [sig, members] of buckets) {
+          // внутри корзины — окном, как в блоках ступени A
+          for (let p = 0; p < members.length; p++) {
+            const end = Math.min(members.length, p + 1 + BLOCK_WINDOW);
+            for (let q = p + 1; q < end; q++) feedPair(members[p], members[q]);
+          }
+          // соседние корзины (отличие в одном бите); пара корзин обрабатывается
+          // один раз — из старшей, чтобы не сравнивать каждую пару дважды
+          for (let k = 0; k < LSH_PLANES; k++) {
+            const nb = sig ^ (1 << k);
+            if (nb < sig) continue;
+            const neighbors = buckets.get(nb);
+            if (!neighbors) continue;
+            const end = Math.min(neighbors.length, BLOCK_WINDOW);
+            for (const a of members) {
+              for (let x = 0; x < end; x++) {
+                const b = neighbors[x];
+                feedPair(a < b ? a : b, a < b ? b : a);
+              }
+            }
+          }
         }
       }
     }
