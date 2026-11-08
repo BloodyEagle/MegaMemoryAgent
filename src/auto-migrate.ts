@@ -5,6 +5,8 @@ import {
   MIGRATION_TARGET_SCHEMA_VERSION,
   ensureSchema,
   ensureEmbedMeta,
+  ensureFtsTriggers,
+  ensureTrigramTriggers,
   emptyReport,
   type MigrationReport,
 } from "./migrate-schema.js";
@@ -461,11 +463,11 @@ function repairSchemaCompleteness(
 
 /**
  * ensureFts()/ensureTrigramFts() only create their sync triggers together
- * with the table (migrate-schema.ts, untouched by plan 16). A db that lost
- * the triggers but kept the table would never regain them through
- * ensureSchema — recreate the missing ones explicitly. IF NOT EXISTS, so a
- * freshly created table is a no-op here. Mirror of the trigger DDL in
- * migrate-schema.ts — keep in sync.
+ * with the table. A db that lost the triggers but kept the table would
+ * never regain them through ensureSchema — recreate the missing sets
+ * explicitly. The DDL itself lives in the one shared source
+ * (migrate-schema.ts, plan 17); this wrapper only decides which sets were
+ * missing and words the report.
  */
 function ensureMissingFtsTriggers(
   db: KnowledgeDB,
@@ -480,41 +482,11 @@ function ensureMissingFtsTriggers(
     ).map((r) => r.name)
   );
   if (hasRealTable(db, "nodes_fts") && !existing.has("nodes_ai")) {
-    db.execSql(`
-      CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-        INSERT INTO nodes_fts(rowid, name, summary, why)
-        VALUES (new.rowid, new.name, new.summary, new.why);
-      END;
-      CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-        INSERT INTO nodes_fts(nodes_fts, rowid, name, summary, why)
-        VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-      END;
-      CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-        INSERT INTO nodes_fts(nodes_fts, rowid, name, summary, why)
-        VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-        INSERT INTO nodes_fts(rowid, name, summary, why)
-        VALUES (new.rowid, new.name, new.summary, new.why);
-      END;
-    `);
+    ensureFtsTriggers(db);
     report.applied.push("restored nodes_ai/ad/au triggers");
   }
   if (hasRealTable(db, "nodes_fts_tri") && !existing.has("nodes_tri_ai")) {
-    db.execSql(`
-      CREATE TRIGGER IF NOT EXISTS nodes_tri_ai AFTER INSERT ON nodes BEGIN
-        INSERT INTO nodes_fts_tri(rowid, name, summary, why)
-        VALUES (new.rowid, new.name, new.summary, new.why);
-      END;
-      CREATE TRIGGER IF NOT EXISTS nodes_tri_ad AFTER DELETE ON nodes BEGIN
-        INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
-        VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-      END;
-      CREATE TRIGGER IF NOT EXISTS nodes_tri_au AFTER UPDATE ON nodes BEGIN
-        INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
-        VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-        INSERT INTO nodes_fts_tri(rowid, name, summary, why)
-        VALUES (new.rowid, new.name, new.summary, new.why);
-      END;
-    `);
+    ensureTrigramTriggers(db);
     report.applied.push("restored nodes_tri_ai/ad/au triggers");
   }
 }

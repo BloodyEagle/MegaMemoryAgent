@@ -51,18 +51,18 @@ function tableExists(db: KnowledgeDB, name: string): boolean {
   return row !== undefined;
 }
 
-/** FTS index + sync triggers. Trigger-managed, so upstream INSERTs stay indexed. */
-function ensureFts(db: KnowledgeDB, report: MigrationReport): void {
-  if (tableExists(db, "nodes_fts")) {
-    report.alreadyOk.push("nodes_fts");
-    return;
-  }
+/**
+ * Plan 17 (2.3.3): the single source of the FTS sync-trigger DDL. Both the
+ * fresh creation path (ensureFts / ensureTrigramFts, right after the new
+ * table) and the schema repair (auto-migrate.ts, when a table lost its
+ * triggers) run exactly this DDL — there is no second copy to drift.
+ * Idempotent (IF NOT EXISTS): right after table creation they are a no-op
+ * guard, on a damaged base they restore the missing sets. Deliberately
+ * writes nothing to the migration report — the caller knows whether it
+ * "created" or "restored" and words its own report line.
+ */
+export function ensureFtsTriggers(db: KnowledgeDB): void {
   db.execSql(`
-    CREATE VIRTUAL TABLE nodes_fts USING fts5(
-      name, summary, why,
-      content='nodes', content_rowid='rowid',
-      tokenize="unicode61 remove_diacritics 2"
-    );
     CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
       INSERT INTO nodes_fts(rowid, name, summary, why)
       VALUES (new.rowid, new.name, new.summary, new.why);
@@ -78,6 +78,42 @@ function ensureFts(db: KnowledgeDB, report: MigrationReport): void {
       VALUES (new.rowid, new.name, new.summary, new.why);
     END;
   `);
+}
+
+/** Trigram twin of ensureFtsTriggers (same single-source rules). */
+export function ensureTrigramTriggers(db: KnowledgeDB): void {
+  db.execSql(`
+    CREATE TRIGGER IF NOT EXISTS nodes_tri_ai AFTER INSERT ON nodes BEGIN
+      INSERT INTO nodes_fts_tri(rowid, name, summary, why)
+      VALUES (new.rowid, new.name, new.summary, new.why);
+    END;
+    CREATE TRIGGER IF NOT EXISTS nodes_tri_ad AFTER DELETE ON nodes BEGIN
+      INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
+      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
+    END;
+    CREATE TRIGGER IF NOT EXISTS nodes_tri_au AFTER UPDATE ON nodes BEGIN
+      INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
+      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
+      INSERT INTO nodes_fts_tri(rowid, name, summary, why)
+      VALUES (new.rowid, new.name, new.summary, new.why);
+    END;
+  `);
+}
+
+/** FTS index + sync triggers. Trigger-managed, so upstream INSERTs stay indexed. */
+function ensureFts(db: KnowledgeDB, report: MigrationReport): void {
+  if (tableExists(db, "nodes_fts")) {
+    report.alreadyOk.push("nodes_fts");
+    return;
+  }
+  db.execSql(`
+    CREATE VIRTUAL TABLE nodes_fts USING fts5(
+      name, summary, why,
+      content='nodes', content_rowid='rowid',
+      tokenize="unicode61 remove_diacritics 2"
+    );
+  `);
+  ensureFtsTriggers(db);
   db.execSql("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')");
   report.applied.push("created nodes_fts + triggers, rebuilt index");
   // М2: remember the tokenizer the index was built with.
@@ -105,21 +141,8 @@ function ensureTrigramFts(db: KnowledgeDB, report: MigrationReport): void {
       content='nodes', content_rowid='rowid',
       tokenize="trigram"
     );
-    CREATE TRIGGER IF NOT EXISTS nodes_tri_ai AFTER INSERT ON nodes BEGIN
-      INSERT INTO nodes_fts_tri(rowid, name, summary, why)
-      VALUES (new.rowid, new.name, new.summary, new.why);
-    END;
-    CREATE TRIGGER IF NOT EXISTS nodes_tri_ad AFTER DELETE ON nodes BEGIN
-      INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
-      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-    END;
-    CREATE TRIGGER IF NOT EXISTS nodes_tri_au AFTER UPDATE ON nodes BEGIN
-      INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
-      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-      INSERT INTO nodes_fts_tri(rowid, name, summary, why)
-      VALUES (new.rowid, new.name, new.summary, new.why);
-    END;
   `);
+  ensureTrigramTriggers(db);
   db.execSql("INSERT INTO nodes_fts_tri(nodes_fts_tri) VALUES('rebuild')");
   report.applied.push("created nodes_fts_tri (trigram), rebuilt index");
 }
