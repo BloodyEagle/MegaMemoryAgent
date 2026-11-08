@@ -1,2 +1,2 @@
-c07719309b83e29de249e4d9be1d8907d87561eb79dc954b1c902423ac9216c8 *fixtures/demo.db
+bfbc6375b55ea18f39af9b5201383bccbbfaf505cf93a36bcf37d80e7a42c4bd *fixtures/demo.db
 03b0ac84509fd6fc2b2c96c2c4dc06e2b8d67bf314b646fbc2b04d81cceac032 *fixtures/eval.jsonl
