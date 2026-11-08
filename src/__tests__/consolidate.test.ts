@@ -178,6 +178,65 @@ describe("findDuplicates blocking (R-06b, план 09)", () => {
   });
 });
 
+describe("findDuplicates крайние режимы и инвариант усечения (план 12)", () => {
+  it("пустой граф — ноль кандидатов", () => {
+    const db = freshDb();
+    expect(findDuplicates(db, { threshold: 0.95 })).toEqual({
+      candidates: [],
+      candidates_truncated: 0,
+    });
+  });
+
+  it("граф без эмбеддингов — ноль кандидатов: сравнение требует векторы с обеих сторон", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      db.insertNode({ id: "a", name: "Same", kind: "module", summary: "a" });
+      db.insertNode({ id: "b", name: "Same", kind: "module", summary: "b" });
+    });
+    expect(findDuplicates(db, { threshold: 0.95 })).toEqual({
+      candidates: [],
+      candidates_truncated: 0,
+    });
+  });
+
+  it("граф только с эмбеддингами — пара находится по векторам", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      db.insertNode({ id: "v1", name: "Alpha", kind: "module", summary: "a" });
+      db.insertNode({ id: "v2", name: "Beta", kind: "module", summary: "b" });
+      db.insertNode({ id: "v3", name: "Gamma", kind: "module", summary: "c" });
+    });
+    setEmbedding(db, "v1", [1, 0, 0, 0]);
+    setEmbedding(db, "v2", [1, 0, 0, 0]);
+    setEmbedding(db, "v3", [0, 1, 0, 0]);
+    const { candidates } = findDuplicates(db, { threshold: 0.95 });
+    expect(candidates).toHaveLength(1);
+    expect([candidates[0].a, candidates[0].b].sort()).toEqual(["v1", "v2"]);
+  });
+
+  it("инвариант усечения: выданные + candidates_truncated = все пары выше порога в обработанных корзинах", () => {
+    const db = freshDb();
+    db.runInTransaction(() => {
+      for (let i = 0; i < 210; i++) {
+        db.insertNode({ id: `same-${i}`, name: "Same", kind: "module", summary: `s ${i}` });
+      }
+    });
+    for (let i = 0; i < 210; i++) setEmbedding(db, `same-${i}`, [1, 0, 0, 0]);
+
+    // Одна корзина/блок на все 210 узлов: все C(210,2) = 21 945 пар выше
+    // порога перечислены ровно один раз, каждая либо выдана, либо ровно
+    // один раз учтена в candidates_truncated (отвержение, вытеснение из
+    // топа-50 или глобальный предел).
+    const { candidates, candidates_truncated } = findDuplicates(db, { threshold: 0.9 });
+    expect(candidates.length + candidates_truncated).toBe((210 * 209) / 2);
+    expect(candidates.length).toBeLessThanOrEqual(100);
+    expect(candidates_truncated).toBeGreaterThan(0);
+    // Дедупликация ступеней: пара не задвоена в выдаче.
+    const keys = candidates.map((c) => [c.a, c.b].sort().join("|"));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
 describe("mergeNodes", () => {
   it("merges into the older node, combines summary, moves edges, removes twin", () => {
     const db = freshDb();
