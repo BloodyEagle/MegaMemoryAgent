@@ -94,6 +94,8 @@ export class UpstreamSchemaError extends Error {
  */
 export type ReadonlyDbErrorCode =
   | "FIXTURE_WRITE_FORBIDDEN"
+  | "DB_MISSING_READONLY"
+  | "DB_CORRUPT_READONLY"
   | "SCHEMA_TOO_OLD_READONLY"
   | "SCHEMA_TOO_NEW_READONLY";
 
@@ -205,7 +207,7 @@ export class KnowledgeDB {
     // до открытия: опечатка в пути не должна выглядеть пустым графом.
     if (readonly && !fs.existsSync(dbPath)) {
       throw new ReadonlyDbError(
-        "SCHEMA_TOO_OLD_READONLY",
+        "DB_MISSING_READONLY",
         `База не найдена: ${path.resolve(dbPath)}.`
       );
     }
@@ -233,24 +235,54 @@ export class KnowledgeDB {
     if (opts.autoMigrate === false) return;
     if (readonly) {
       // План 11: readonly-соединение мигрировать не может — молчаливый пропуск
-      // «схема помоложе» означал бы чтение чужими запросами. Явная ошибка
+      // «схема помоложе» означало бы чтение чужими запросами. Явная ошибка
       // отправляет на копию + migrate --apply (или перегенерацию фикстуры).
-      const version = this.getUserVersion();
-      if (version < SCHEMA_VERSION) {
-        throw new ReadonlyDbError(
-          "SCHEMA_TOO_OLD_READONLY",
-          `База "${this.dbFile}" устарела: схема v${version} < v${SCHEMA_VERSION}, ` +
-            `а readonly-соединение не мигрирует. Сними копию и выполни ` +
-            `\`megamemory migrate --apply --db <копия>\`; фикстуры — перегенерируй ` +
-            `scripts/make-demo-db.cjs.`
-        );
-      }
-      if (version > SCHEMA_VERSION) {
-        throw new ReadonlyDbError(
-          "SCHEMA_TOO_NEW_READONLY",
-          `База "${this.dbFile}" новее этого билда: схема v${version} > v${SCHEMA_VERSION}. ` +
-            `Обнови megamemory.`
-        );
+      // План 13.1 (F1): в тексте — готовая команда с путём; совет migrate
+      // не выдаётся повреждённой базе (quick_check идёт раньше совета —
+      // миграция не починит битый файл). Ошибка покидает конструктор вместе
+      // с закрытым соединением — иначе нативный хендл держит файл до GC.
+      try {
+        const version = this.getUserVersion();
+        if (version < SCHEMA_VERSION) {
+          const damaged = this.quickCheckDetail();
+          if (damaged !== null) {
+            throw new ReadonlyDbError(
+              "DB_CORRUPT_READONLY",
+              `База "${this.dbFile}" не читается (PRAGMA quick_check: ${damaged}). ` +
+                `Совет мигрировать не даётся — сначала восстанови базу из резервной копии.`
+            );
+          }
+          throw new ReadonlyDbError(
+            "SCHEMA_TOO_OLD_READONLY",
+            `База "${this.dbFile}" устарела: схема v${version} < v${SCHEMA_VERSION}, ` +
+              `а readonly-соединение не мигрирует. Сними копию и выполни ` +
+              `\`megamemory migrate --apply --db "${this.dbFile}"\` на копии; ` +
+              `фикстуры — перегенерируй scripts/make-demo-db.cjs.`
+          );
+        }
+        if (version > SCHEMA_VERSION) {
+          const damaged = this.quickCheckDetail();
+          if (damaged !== null) {
+            throw new ReadonlyDbError(
+              "DB_CORRUPT_READONLY",
+              `База "${this.dbFile}" не читается (PRAGMA quick_check: ${damaged}). ` +
+                `Совет обновить пакет не даётся — сначала восстанови базу из резервной копии.`
+            );
+          }
+          throw new ReadonlyDbError(
+            "SCHEMA_TOO_NEW_READONLY",
+            `База "${this.dbFile}" создана более новой версией megamemory: ` +
+              `user_version = ${version}, этот билд понимает v${SCHEMA_VERSION}. ` +
+              `Обнови пакет: npm install -g @bloodyeagle/megamemory@latest.`
+          );
+        }
+      } catch (err) {
+        try {
+          this.db.close();
+        } catch {
+          /* уже закрыта — не важнее ошибки, из-за которой закрываем */
+        }
+        throw err;
       }
       return;
     }
@@ -299,6 +331,22 @@ export class KnowledgeDB {
         ? (pragmaResult as Record<string, unknown>).user_version
         : pragmaResult
     ) as number;
+  }
+
+  /**
+   * План 13.1 (F1): null — база цела; строка — что именно ответил quick_check.
+   * Вызывается только в ветках несовпадения схемы (на нормальном пути дорого),
+   * чтобы совет «мигрируй» не доставался битому файлу.
+   */
+  private quickCheckDetail(): string | null {
+    try {
+      const rows = this.db.pragma("quick_check") as Array<Record<string, unknown>>;
+      const values = rows.map((r) => Object.values(r)[0]);
+      if (rows.length === 1 && values[0] === "ok") return null;
+      return values.join("; ") || "пустой ответ";
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
   }
 
   private migrate(): void {
