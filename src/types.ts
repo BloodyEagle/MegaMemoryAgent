@@ -19,15 +19,8 @@ export interface Node {
   merge_timestamp: string | null;
 }
 
-export type NodeKind =
-  | "feature"
-  | "module"
-  | "pattern"
-  | "config"
-  | "decision"
-  | "component"
-  /** T6: derived node compressing a module's children into one payload. */
-  | "digest";
+export const NODE_KINDS = ["feature", "module", "pattern", "config", "decision", "component", "digest"] as const;
+export type NodeKind = (typeof NODE_KINDS)[number];
 
 export interface Edge {
   id: number;
@@ -175,6 +168,12 @@ export interface NodeWithContext {
     name: string;
     kind: NodeKind;
     summary: string;
+    status?: string;
+    epistemic_status?: string | null;
+    status_scope?: Record<string, unknown> | null;
+    valid_until?: string | null;
+    expired?: boolean;
+    refuted_reason?: string | null;
   }>;
   edges: Array<{
     to: string;
@@ -324,6 +323,9 @@ export interface NestedSupportView {
   status: string;
   /** Epistemic axis (null = не оценивалось). */
   epistemic_status?: string | null;
+  status_scope?: Record<string, unknown> | null;
+  valid_until?: string | null;
+  refuted_reason?: string | null;
   file_refs?: string[] | null;
   /** past valid_until — при include_stale: true. */
   expired?: boolean;
@@ -339,6 +341,8 @@ export interface CompactMatch {
   status: string;
   /** Plan 1: epistemic axis, shown so refuted nodes are never mistaken for facts. */
   epistemic_status?: string | null;
+  status_scope?: Record<string, unknown> | null;
+  valid_until?: string | null;
   /**
    * План 06 (K-04): причина опровержения едет и в compact-выдаче —
    * «антизнание с причиной» не только в full-режиме.
@@ -351,8 +355,8 @@ export interface CompactMatch {
   /** Alias of score, kept for explorer UI compatibility. */
   similarity?: number;
   via?: "vector" | "fts" | "both";
-  /** Present only for the first 3 results (one level, names only). */
-  children?: Array<{ id: string; name: string; kind: NodeKind }>;
+  /** Present only for the first 3 results; historical children remain qualified. */
+  children?: Array<{ id: string; name: string; kind: NodeKind; status?: string; epistemic_status?: string | null; status_scope?: Record<string, unknown> | null; valid_until?: string | null; expired?: boolean; refuted_reason?: string | null }>;
   edges?: Array<{ to: string; to_name: string; relation: RelationType }>;
   /**
    * 2.1.7 F2: live informed_by supports of THIS node that the same query
@@ -445,12 +449,7 @@ export interface NextHintRead {
   node_id: string;
 }
 
-/**
- * План 13 §2.1: файл, целиком покрытый карточкой ответа, — читать его целиком
- * не нужно. Даётся только при честном покрытии: у узла непустые file_refs,
- * summary не заглушка (см. src/stub.ts), узел не слабый (refuted/abandoned/
- * ungrounded), и файл не попал в must_read.
- */
+/** Legacy shape for explicit coverage proofs; current next output keeps this list empty. */
 export interface NextHintSkip {
   /** Целый файл — file_ref БЕЗ диапазона строк. */
   ref: string;
@@ -649,6 +648,9 @@ export interface BoardColumn {
   name: string;
   terminal: boolean;
   count: number;
+  returned?: number;
+  has_more?: boolean;
+  next_cursor?: string | null;
   cards: Array<{ id: string; name: string; rot?: number; due_at?: string | null }>;
 }
 

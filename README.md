@@ -52,7 +52,7 @@ database at `.megamemory/knowledge.db`.
 
 1. **Session start** — the agent calls `list_roots` (budgeted) to orient itself.
 2. **Before a task** — `understand` with a natural-language query, or `get_concept` for an exact ID.
-3. **Follow the `next` block** in the answer — read the `must_read` refs, don't read `skip` files whole (already covered), run the ready-made `followups`, and record per `record` after the change (`mode: "brief"` gives the same contract in ≤8 lines, no cards).
+3. **Follow relevant `next` instructions** — read `must_read` refs, run ready-made `followups`, and record per `record` after the change. Refs and a brief without the claim do not prove whole-file coverage; `skip` does not replace checking current code. All modes use the actual MCP wire budget and refuse an impossible required envelope.
 4. **After a task** — `create_concept` / `update_concept`, then `link` for relationships.
 
 ---
@@ -93,8 +93,11 @@ binary — no network calls, GitHub API is never touched. `check_artifacts` on
 such an anchor reports the resolved sha; the tag moved or the branch advanced
 → `changed` with both shas in `weak_links`; the ref vanished → `missing`. Use
 `git:branch:` only for "has moved" checks, never as proof of "merged". The
-repository is `--repo PATH` at server start (default: the database directory);
-the path is pinned into `node_artifacts.repo_path` at the first resolution, so
+repository is `--repo PATH` at server start (default: the database directory).
+Start MCP without a subcommand: `megamemory --db PATH --repo REPO`;
+`--db=PATH` and `--repo=REPO` are equivalent, missing or repeated values fail
+before opening the database. CLI subcommands may follow these global flags.
+The path is pinned into `node_artifacts.repo_path` at the first resolution, so
 later checks do not depend on the server's cwd. Auto-deriving supports from
 `why` + `file_refs` exists
 but is **off by default** (`provenance.auto_ground` in `megamemory.config.json`
@@ -205,22 +208,33 @@ often it points at the right nodes. Three baselines, one flag:
 # vs reading the file_refs files of the found nodes (default)
 megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline files
 
-# vs an external structural tool (symbol graph, outline): {query} is substituted escaped
-megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline te \
-  --te-cmd "node ~/agent-skills/graph.js path {query}"
+# vs token-economy-ts 1.1.0 text search: run from the analyzed project's root
+# Replace the executable/script paths below with their absolute local paths.
+megamemory bench --db "<owned-copy.db>" --questions q.jsonl --baseline te \
+  --te-exec "C:/Program Files/nodejs/node.exe" \
+  --te-arg "C:/p/agent-skills/skills/token-economy-ts/scripts/code-searcher.js" \
+  --te-arg "query={query}" --te-arg "root=." --te-arg "ext=.ts,.tsx,.js,.jsx,.mjs,.cjs"
 
 # both ratios side by side: where memory wins, where the structural tool is the right call
 megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline both
 ```
 
-Mixed-language repositories: the right structural tool depends on the language of the
-module, so `te_cmd` and `lang` are set **per question**, and the report breaks the median
-ratio down per language:
+`lang` groups results; it does not dispatch a skill. `root`/`--ref-root` resolve
+file references and do not change runner cwd. Preset token counts bypass the runner;
+precedence is preset → structured runner → per-question shell → global shell.
+Shell templates are trusted advanced input, especially on Windows.
 
-```json
-{"id": "q7", "query": "where is apply_catalog called", "lang": "python",
- "te_cmd": "python ~/agent-skills/graph.py rdeps {query}"}
+Graph path requires two endpoints, not a natural-language query:
+
+```text
+node "C:/p/agent-skills/skills/token-economy-ts/scripts/graph-tool.js" op=path from=src/a.ts to=src/b.ts root=.
+python -I "C:/p/agent-skills/skills/token-economy-py/scripts/te.py" search "apply_catalog" --root "<project-root>"
 ```
+
+TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 use separate CLI/output contracts; use the
+script from the source/staging package or an explicitly updated installation.
+A complete expected no-match is valid; errors, absent payloads and truncation are
+not proof of quality or a measurable advantage.
 
 `ratio = baseline_tokens / graph_tokens` — but never read it without `hit_rate` (did the
 expected nodes surface in the top-10): a cheap but wrong answer is not savings.
@@ -350,7 +364,7 @@ directory and never deletes them — prune manually, the exporter has no ownersh
 
 | Tool | Description |
 |---|---|
-| `understand` | Hybrid search over the graph. `top_k`, `max_tokens`, `mode: "compact" \| "full" \| "brief"`, `include_inactive`, `include_stale` (expired facts). Every answer ends with the `next` block: `must_read` refs to read, `skip` files already covered, ready-to-run `followups`, and the `record` line. |
+| `understand` | Hybrid search over the graph. `top_k`, `max_tokens`, `mode: "compact" \| "full" \| "brief"`, `include_inactive`, `include_stale` (expired facts). Every answer ends with the `next` block: `must_read` refs to read, `skip` never substitutes for checking current sources, ready-to-run `followups`, and the `record` line. |
 | `get_concept` | Exact-ID lookup with children, edges, incoming edges, parent. |
 | `create_concept` | Add a concept with edges, file refs and `supersedes`; `valid_until` sets the fact's expiry. |
 | `update_concept` | Update fields; embeddings are regenerated. `valid_until: null` clears the expiry. |
@@ -362,6 +376,8 @@ directory and never deletes them — prune manually, the exporter has no ownersh
 | `provenance_trace` | Walk `informed_by` (`ancestry` / `impact`) with honest completeness and weak links first. |
 | `provenance_audit` | Graph-wide provenance audit: weak links, ungrounded decisions, retention of past audits. |
 | `check_artifacts` | Hash a node's file/git-blob artifacts (file refs may carry line locators — the whole file is hashed), resolve `git:tag/commit/branch` refs to a sha; divergences surface as `artifact_changed`. |
+| `board` | Task board; done has total `count`, `returned`, `has_more`, `next_cursor`. Continue with `done_cursor`, optionally `done_limit` (1–100, default 20). |
+| `trail_refresh` | Refresh fingerprints and return actual fresh/stale state and reasons; a broken chain is refused without writes. |
 
 **Kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest`
 

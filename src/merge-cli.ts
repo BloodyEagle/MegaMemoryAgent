@@ -7,13 +7,11 @@ import { resolveConflict } from "./tools.js";
 import { errorBold, success, info, error, openReadonlyOrExplain } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 import type { NodeRow } from "./types.js";
+import { valueFlag } from "./cli-flags.js";
 
 // ---- Flag parsing helpers ----
 
-function getFlag(args: string[], flag: string): string | undefined {
-  const idx = args.indexOf(flag);
-  return idx !== -1 && args[idx + 1] ? args[idx + 1] : undefined;
-}
+const getFlag = valueFlag;
 
 function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
@@ -27,7 +25,7 @@ function getPositionalArgs(args: string[]): string[] {
   let i = 0;
   while (i < args.length) {
     if (args[i].startsWith("--")) {
-      if (BOOLEAN_FLAGS.has(args[i])) {
+      if (BOOLEAN_FLAGS.has(args[i]) || args[i].includes("=")) {
         // Boolean flag — skip only the flag itself
         i += 1;
       } else {
@@ -251,18 +249,21 @@ export async function runResolve(args: string[]): Promise<void> {
     const originalId = stripMergeSuffix(nodes[0].id);
 
     if (keep === "both") {
-      // Keep both as separate concepts with new unique IDs
-      if (leftNode) {
-        const newId = `${originalId}-${leftNode.source_branch ?? "left"}`;
-        db.renameNodeId(leftNode.id, newId);
-        db.clearNodeMergeFlags(newId);
-      }
-      if (rightNode) {
-        const newId = `${originalId}-${rightNode.source_branch ?? "right"}`;
-        db.renameNodeId(rightNode.id, newId);
-        db.clearNodeMergeFlags(newId);
-      }
-      db.clearEdgeMergeFlagsByGroup(mergeGroup);
+      const remaps = [leftNode, rightNode].filter((node): node is NodeRow => node !== undefined)
+        .map(node => ({ oldId: node.id, newId: `${originalId}-${node.source_branch ?? (node.id.endsWith(MERGE_SUFFIX_LEFT) ? "left" : "right")}` }));
+      db.runInTransaction(() => {
+        if (new Set(remaps.map(remap => remap.newId)).size !== remaps.length) {
+          throw new Error("Both versions require distinct destination IDs.");
+        }
+        for (const remap of remaps) {
+          if (db.getNodeIncludingRemoved(remap.newId)) throw new Error(`Node "${remap.newId}" already exists.`);
+        }
+        for (const remap of remaps) {
+          if (!db.renameNodeId(remap.oldId, remap.newId)) throw new Error(`Failed to rename "${remap.oldId}".`);
+          db.clearNodeMergeFlags(remap.newId);
+        }
+        db.clearEdgeMergeFlagsByGroup(mergeGroup);
+      });
       success(`Kept both versions of "${originalId}" as separate concepts.`);
     } else {
       // keep left or right: та же доменная операция, что и MCP

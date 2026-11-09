@@ -496,42 +496,7 @@ export function transferNodeIdentity(
     fromId,
     toId
   );
-  db.execSqlRun(
-    "UPDATE slots SET node_id = ?, updated_at = datetime('now') WHERE node_id = ?",
-    toId,
-    fromId
-  );
-  // Fingerprints travel verbatim: the saved reasoning stays as saved; the
-  // staleness check is trail_refresh's explicit job, not a silent rewrite.
-  db.execSqlRun(
-    "UPDATE trail_members SET node_id = ? WHERE node_id = ?",
-    toId,
-    fromId
-  );
-  // OR IGNORE: a colliding observation (node_id, kind, ref) means the survivor
-  // already tracks that artifact — the duplicate row is the same observation,
-  // the leftover is removed with the node.
-  db.execSqlRun(
-    "UPDATE OR IGNORE node_artifacts SET node_id = ? WHERE node_id = ?",
-    toId,
-    fromId
-  );
-  db.execSqlRun("DELETE FROM node_artifacts WHERE node_id = ?", fromId);
-  db.execSqlRun(
-    "UPDATE OR IGNORE support_baselines SET decision_id = ? WHERE decision_id = ?",
-    toId,
-    fromId
-  );
-  db.execSqlRun(
-    "UPDATE OR IGNORE support_baselines SET support_id = ? WHERE support_id = ?",
-    toId,
-    fromId
-  );
-  db.execSqlRun(
-    "UPDATE aliases SET new_id = ? WHERE new_id = ?",
-    toId,
-    fromId
-  );
+  db.remapNodeReferences(fromId, toId, true);
 
   const survivor = db.getNode(toId);
   const from = db.getNodeIncludingRemoved(fromId);

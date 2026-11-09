@@ -1,9 +1,10 @@
 import http from "http";
 import fs from "fs";
 import path from "path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "url";
 import pc from "picocolors";
-import { KnowledgeDB } from "./db.js";
+import { KnowledgeDB, isNodeExpired } from "./db.js";
 import { buildNodeWithContext, currentDigestsOf, understand } from "./tools.js";
 import {
   describeConsolidation,
@@ -54,6 +55,17 @@ export function healthPayload(db: KnowledgeDB): HealthReport & { d3_source: D3So
 function resolveWebDir(): string {
   const thisDir = path.dirname(fileURLToPath(import.meta.url));
   return path.resolve(thisDir, "..", "web");
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("'", "&#39;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function webSecurityHeaders(res: http.ServerResponse, csp: string): void {
+  res.setHeader("Content-Security-Policy", csp);
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Content-Type-Options", "nosniff");
 }
 
 function json(res: http.ServerResponse, data: unknown, status = 200): void {
@@ -137,12 +149,12 @@ function sameOrigin(
   referer: string | undefined,
   host: string
 ): boolean {
-  const expected = `http://${host.toLowerCase()}`;
-  if (origin !== undefined) return origin.trim().toLowerCase() === expected;
+  const expected = new URL(`http://${host.toLowerCase()}`).origin;
+  if (origin !== undefined) return origin === expected;
   if (referer !== undefined) {
     try {
       const ref = new URL(referer);
-      return `http://${ref.host.toLowerCase()}` === expected;
+      return ref.origin === expected && !ref.username && !ref.password;
     } catch {
       return false;
     }
@@ -252,6 +264,9 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       parent_id: string | null;
       edge_count: number;
       status: string;
+      epistemic_status: string | null;
+      valid_until: string | null;
+      expired: boolean;
     }>;
     edges: Array<{
       from: string;
@@ -267,7 +282,10 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       summary: n.summary,
       parent_id: n.parent_id,
       edge_count: 0,
-      status: (n as { status?: string }).status ?? "active",
+      status: n.status ?? "active",
+      epistemic_status: n.epistemic_status ?? null,
+      valid_until: n.valid_until ?? null,
+      expired: isNodeExpired(n),
     }));
 
     const edges = db.getAllEdges().map((e) => ({
@@ -581,7 +599,10 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
               kind: node.kind,
               summary: node.summary,
               parent_id: node.parent_id,
-              status: (node as { status?: string }).status ?? "active",
+              status: node.status ?? "active",
+              epistemic_status: node.epistemic_status ?? null,
+              valid_until: node.valid_until ?? null,
+              expired: isNodeExpired(node),
               edge_count: edgeCounts.get(node.id) ?? 0,
             },
           });
@@ -605,7 +626,10 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
               kind: node.kind,
               summary: node.summary,
               parent_id: node.parent_id,
-              status: (node as { status?: string }).status ?? "active",
+              status: node.status ?? "active",
+              epistemic_status: node.epistemic_status ?? null,
+              valid_until: node.valid_until ?? null,
+              expired: isNodeExpired(node),
               edge_count: edgeCounts.get(node.id) ?? 0,
             },
           });
@@ -684,10 +708,22 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
   // never a silent 404 in the script tag.
   const d3 = resolveD3Src();
   if (d3.note) console.log(pc.yellow(`  ${d3.note}`));
+  // Only absolute-path local assets or credential-free HTTP(S) mirrors.
+  // Validation is not escaping: the URL remains inert in the HTML attribute.
+  const d3Url = new URL(d3.src, "http://localhost");
+  if ((!d3.src.startsWith("/") && !/^https?:\/\//i.test(d3.src)) || d3.src.startsWith("//") ||
+      !["http:", "https:"].includes(d3Url.protocol) || d3Url.username || d3Url.password || /[\u0000-\u0020\\]/.test(d3.src)) {
+    throw new Error("Invalid D3 URL: use a local absolute path or an HTTP(S) URL without credentials");
+  }
   const htmlContent = fs
     .readFileSync(htmlPath, "utf-8")
-    .replaceAll("{{VERSION}}", VERSION)
-    .replaceAll("{{D3_SRC}}", d3.src);
+    .replaceAll("{{VERSION}}", escapeHtmlAttribute(VERSION))
+    .replaceAll("{{D3_SRC}}", escapeHtmlAttribute(d3.src));
+  const inlineHashes = [...htmlContent.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)]
+    .filter(match => !/\bsrc\s*=/i.test(match[0].slice(0, match[0].indexOf(">"))))
+    .map(match => `'sha256-${createHash("sha256").update(match[1]).digest("base64")}'`);
+  const d3Policy = d3.src.startsWith("/") ? "" : d3Url.origin;
+  const csp = `default-src 'self'; script-src 'self' ${inlineHashes.join(" ")} ${d3Policy}; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`;
 
   let embeddingsReady = false;
   let embeddingInitError: string | null = null;
@@ -715,6 +751,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
 
   const server = http.createServer((req, res) => {
     void (async () => {
+    webSecurityHeaders(res, csp);
     const url = new URL(req.url ?? "/", `http://localhost:${port}`);
     const pathname = url.pathname;
 
@@ -732,6 +769,10 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       json(res, { error: "Forbidden: cross-origin request" }, 403);
       return;
     }
+
+    // Reject malformed encodings before routes; they are client errors.
+    try { decodeURI(req.url ?? "/"); }
+    catch { json(res, { error: "Malformed URL" }, 400); return; }
 
     // ---- Routes ----
 
@@ -752,7 +793,13 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       const types: Record<string, string> = { ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".map": "application/json" };
       const type = types[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
       res.writeHead(200, { "Content-Type": type, "Cache-Control": "public, max-age=86400" });
-      fs.createReadStream(filePath).pipe(res);
+      const stream = fs.createReadStream(filePath);
+      stream.on("error", () => {
+        if (res.headersSent) res.destroy();
+        else json(res, { error: "Static asset unavailable" }, 500);
+      });
+      res.on("close", () => stream.destroy());
+      stream.pipe(res);
       return;
     }
 
@@ -786,7 +833,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
         return;
       }
 
-      if (!embeddingsReady && !isTextOnlySearchMode()) {
+      if (!embeddingsReady && !isTextOnlySearchMode() && vectorSearchEnabled(db)) {
         try {
           await initializeEmbeddings();
           embeddingsReady = true;
@@ -814,7 +861,12 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
           id: m.id,
           name: m.name,
           kind: m.kind,
-          status: "active",
+          status: m.status,
+          epistemic_status: m.epistemic_status,
+          status_scope: m.status_scope,
+          valid_until: m.valid_until,
+          expired: m.expired,
+          refuted_reason: m.refuted_reason,
           summary: m.summary,
           file_refs: m.file_refs,
           similarity: m.similarity,
@@ -847,7 +899,11 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
         json(res, { error: `Concept "${id}" not found` }, 404);
         return;
       }
-      const outgoing = db.getOutgoingEdges(node.id).map((e) => ({ relation: e.relation, to_id: e.to_id }));
+      const outgoing = db.getOutgoingEdges(node.id).map((e) => ({
+        relation: e.relation,
+        to_id: e.to_id,
+        description: e.description,
+      }));
       const children = db.getChildren(node.id).filter((c) => c.kind !== "digest");
       const md = renderNodeMarkdown(node, outgoing, children);
       // HTTP headers must stay ASCII: provide a sanitized fallback name
@@ -1005,16 +1061,18 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
             respondOnce(400, { error: "survivor and other are required" });
             return;
           }
-          // UX-01 (план 07): версии карточек/плана, на которых пользователь
-          // подтверждал preview. Необязательное поле (CLI-совместимость);
-          // допустимые значения — строка или null, всё остальное отбраковка.
-          let versionExpect: { survivor_updated_at?: string | null; other_updated_at?: string | null } | undefined;
+          // Preview digest is authoritative; timestamp-only requests remain the legacy contract.
+          let versionExpect: { digest?: string; survivor_updated_at?: string | null; other_updated_at?: string | null } | undefined;
           if (body.base !== undefined) {
             if (typeof body.base !== "object" || body.base === null || Array.isArray(body.base)) {
               respondOnce(400, { error: "base must be an object with updated_at tokens" });
               return;
             }
-            const rawBase = body.base as { survivor_updated_at?: unknown; other_updated_at?: unknown };
+            const rawBase = body.base as { digest?: unknown; survivor_updated_at?: unknown; other_updated_at?: unknown };
+            if (rawBase.digest !== undefined && (typeof rawBase.digest !== "string" || !/^[0-9a-f]{64}$/.test(rawBase.digest))) {
+              respondOnce(400, { error: "base.digest must be a SHA-256 digest" });
+              return;
+            }
             const token = (value: unknown): string | null | undefined => {
               if (value === undefined) return undefined;
               if (value === null) return null;
@@ -1022,11 +1080,17 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
             };
             const survivorToken = token(rawBase.survivor_updated_at);
             const otherToken = token(rawBase.other_updated_at);
-            if (survivorToken === undefined || otherToken === undefined) {
+            if (rawBase.digest === undefined && (survivorToken === undefined || otherToken === undefined)) {
+              respondOnce(400, { error: "base tokens must be strings or null" });
+              return;
+            }
+            if ((rawBase.survivor_updated_at !== undefined && survivorToken === undefined) ||
+                (rawBase.other_updated_at !== undefined && otherToken === undefined)) {
               respondOnce(400, { error: "base tokens must be strings or null" });
               return;
             }
             versionExpect = {};
+            if (typeof rawBase.digest === "string") versionExpect.digest = rawBase.digest;
             if (survivorToken !== undefined) versionExpect.survivor_updated_at = survivorToken;
             if (otherToken !== undefined) versionExpect.other_updated_at = otherToken;
           }
@@ -1230,7 +1294,10 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     })().catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       console.error(pc.red(`  Web request failed: ${message}`));
-      json(res, { error: "Internal server error" }, 500);
+      if (res.destroyed || res.writableEnded) return;
+      if (res.headersSent) { res.destroy(); return; }
+      json(res, { error: err instanceof URIError || err instanceof TypeError ? "Malformed URL" : "Internal server error" },
+        err instanceof URIError || (err instanceof TypeError && (err as NodeJS.ErrnoException).code === "ERR_INVALID_URL") ? 400 : 500);
     });
   });
 

@@ -5,25 +5,22 @@
  * всем, что добавляет MCP-обработчик (extra_payload).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { auditFixture, type AuditFixture } from "./helpers/audit.js";
 import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { listRoots, estimateTokens } from "../tools.js";
-import { closeAndCleanup } from "./helpers/cleanup.js";
 
-let tmpDir: string;
+let fixture: AuditFixture;
 let db: KnowledgeDB;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-roots-budget-"));
-  db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
+  fixture = auditFixture();
+  db = fixture.db("knowledge.db");
   ensureSchema(db);
 });
 
 afterEach(async () => {
-  if (db) await closeAndCleanup(db, tmpDir);
+  await fixture.close();
   delete process.env.MEGAMEMORY_DB_PATH;
 });
 
@@ -56,7 +53,7 @@ describe("list_roots budget (F3 2.1.13)", () => {
     expect(result.meta!.truncated).toBe(true);
     expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(1500);
     // оценка не расходится с реальной сериализацией обработчика
-    const actual = estimateTokens(JSON.stringify({ ...result, ...extra }, null, 2));
+    const actual = estimateTokens(JSON.stringify({ content: [{ type: "text", text: JSON.stringify({ ...result, ...extra }, null, 2) }] }));
     expect(actual).toBeLessThanOrEqual(1500);
     expect(Math.abs(actual - result.meta!.tokens_estimated)).toBeLessThanOrEqual(5);
   });
@@ -68,7 +65,7 @@ describe("list_roots budget (F3 2.1.13)", () => {
     db.insertNode({ id: `r-${"a".repeat(200)}`, name: "latin ".repeat(30), kind: "module", summary: "s" });
     const extra = handlerExtra();
     const result = listRoots(db, { max_tokens: 600, extra_payload: extra });
-    const actual = estimateTokens(JSON.stringify({ ...result, ...extra }, null, 2));
+    const actual = estimateTokens(JSON.stringify({ content: [{ type: "text", text: JSON.stringify({ ...result, ...extra }, null, 2) }] }));
     expect(actual).toBeLessThanOrEqual(600);
     expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(actual);
   });
@@ -141,7 +138,7 @@ describe("list_roots budget (F3 2.1.13)", () => {
     db.setSlot("", "architect", "рол");
     const extra = handlerExtra({ nodes: 31, wide: "z".repeat(120) });
     const result = listRoots(db, { max_tokens: 900, extra_payload: extra });
-    const actual = estimateTokens(JSON.stringify({ ...result, ...extra }, null, 2));
+    const actual = estimateTokens(JSON.stringify({ content: [{ type: "text", text: JSON.stringify({ ...result, ...extra }, null, 2) }] }));
     // замер шёл по полной сериализации — расходится максимум на цифры meta
     expect(Math.abs(actual - result.meta!.tokens_estimated)).toBeLessThanOrEqual(5);
     expect(actual).toBeLessThanOrEqual(900);

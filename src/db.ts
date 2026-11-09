@@ -1900,7 +1900,7 @@ export class KnowledgeDB {
   /** Plan 3 §3 / §10 (decision 7): audit runs persist so a later re-run of a
    * shifted graph can be compared against what was actually found. The table
    * is created lazily like status_history/usage — no schema bump needed. */
-  private ensureProvenanceAuditTable(): void {
+  ensureProvenanceAuditTable(): void {
     if (this.provenanceAuditReady) return;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS provenance_audit_runs (
@@ -2683,7 +2683,7 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT id, name, kind, summary, why, file_refs, parent_id,
-                created_by_task, created_at, updated_at, removed_at, removed_reason${this.hasStatusColumn ? ", status" : ""}
+                created_by_task, created_at, updated_at, removed_at, removed_reason${this.hasStatusColumn ? ", status, valid_from, valid_until" : ""}${this.hasEpistemicColumns ? ", epistemic_status, status_scope" : ""}
          FROM nodes WHERE removed_at IS NULL ORDER BY name`
       )
       .all() as Array<Omit<NodeRow, "embedding">>;
@@ -2923,6 +2923,21 @@ export class KnowledgeDB {
       .all(limit) as Array<{ id: string; name: string; summary: string; updated_at: string }>;
   }
 
+  getDoneTaskPage(limit = 20, after?: { updated_at: string; id: string }): {
+    rows: Array<{ id: string; name: string; updated_at: string }>;
+    total: number;
+    has_more: boolean;
+  } {
+    const total = Number((this.db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE task_state='done' AND removed_at IS NULL").get() as { n: number }).n);
+    const rows = this.db.prepare(
+      `SELECT id, name, COALESCE(updated_at,'') AS updated_at FROM nodes
+       WHERE task_state='done' AND removed_at IS NULL
+       ${after ? "AND (COALESCE(updated_at,'') < @at OR (COALESCE(updated_at,'') = @at AND id < @id))" : ""}
+       ORDER BY COALESCE(updated_at,'') DESC, id DESC LIMIT @limit`
+    ).all(after ? { at: after.updated_at, id: after.id, limit: limit + 1 } : { limit: limit + 1 }) as Array<{ id: string; name: string; updated_at: string }>;
+    return { rows: rows.slice(0, limit), total, has_more: rows.length > limit };
+  }
+
   // ---- Trails (plan 2 §1) ----
 
   /**
@@ -3142,56 +3157,53 @@ export class KnowledgeDB {
   }
 
   renameNodeId(oldId: string, newId: string): boolean {
-    // FK checks are DEFERRED to COMMIT instead of pragma foreign_keys=OFF:
-    // the pragma is a no-op inside a transaction, and renameNodeId is also
-    // called from inside one (resolveConflict) — where the old approach
-    // left enforcement on and the rename of a node that edges still
-    // reference failed with "FOREIGN KEY constraint failed". All the
-    // updates below run in one transaction, so the graph is consistent
-    // again by the time the deferral is checked.
-    this.db.pragma("defer_foreign_keys = ON");
-    try {
-      let changed = false;
-      this.runInTransaction(() => {
-        const result = this.db
-          .prepare("UPDATE nodes SET id = @newId, updated_at = datetime('now') WHERE id = @oldId")
-          .run({ oldId, newId });
+    if (oldId === newId) return this.getNodeIncludingRemoved(oldId) !== undefined;
+    return this.runInTransaction(() => {
+      if (!this.getNodeIncludingRemoved(oldId)) return false;
+      if (this.getNodeIncludingRemoved(newId)) throw new Error(`Node "${newId}" already exists.`);
+      this.db.pragma("defer_foreign_keys = ON");
+      const params = { oldId, newId };
+      this.db.prepare("UPDATE nodes SET id = @newId, updated_at = datetime('now') WHERE id = @oldId").run(params);
+      this.db.prepare("UPDATE nodes SET parent_id = @newId WHERE parent_id = @oldId").run(params);
+      this.db.prepare("UPDATE edges SET from_id = @newId WHERE from_id = @oldId").run(params);
+      this.db.prepare("UPDATE edges SET to_id = @newId WHERE to_id = @oldId").run(params);
+      this.remapNodeReferences(oldId, newId);
+      return true;
+    });
+  }
 
-        if (result.changes > 0) {
-          changed = true;
-          // Update parent_id references in children
-          this.db
-            .prepare("UPDATE nodes SET parent_id = @newId WHERE parent_id = @oldId")
-            .run({ oldId, newId });
-          // Update edge references
-          this.db
-            .prepare("UPDATE edges SET from_id = @newId WHERE from_id = @oldId")
-            .run({ oldId, newId });
-          this.db
-            .prepare("UPDATE edges SET to_id = @newId WHERE to_id = @oldId")
-            .run({ oldId, newId });
-          // Plan 4 (v8) §7: a technical id remap carries the snapshot keys
-          // along — the snapshot content itself is not touched. OR IGNORE:
-          // a pathological pre-existing row under the new id must not break
-          // the rename.
-          if (this.hasSupportBaselinesTable()) {
-            this.db
-              .prepare(
-                "UPDATE OR IGNORE support_baselines SET decision_id = @newId WHERE decision_id = @oldId"
-              )
-              .run({ oldId, newId });
-            this.db
-              .prepare(
-                "UPDATE OR IGNORE support_baselines SET support_id = @newId WHERE support_id = @oldId"
-              )
-              .run({ oldId, newId });
-          }
+  remapNodeReferences(oldId: string, newId: string, merging = false): void {
+    this.runInTransaction(() => {
+      const params = { oldId, newId };
+      const references: Array<[string, string[]]> = [
+        ["slots", ["node_id"]], ["trail_members", ["node_id"]],
+        ["node_artifacts", ["node_id"]], ["status_history", ["node_id"]],
+        ["support_baselines", ["decision_id", "support_id"]],
+        ["support_revisions", ["decision_id", "support_id"]],
+        ["aliases", ["new_id"]], ["provenance_audit_runs", ["root_id"]],
+        ["digest_sources", ["digest_id"]], ["nodes_vec", ["id"]],
+      ];
+      for (const [table, columns] of references) {
+        if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) continue;
+        if (merging && table === "nodes_vec") {
+          this.db.prepare("DELETE FROM nodes_vec WHERE id = ?").run(oldId);
+          continue;
         }
-      });
-      return changed;
-    } finally {
-      this.db.pragma("defer_foreign_keys = OFF");
-    }
+        for (const column of columns) {
+          this.db.prepare(`UPDATE "${table}" SET "${column}" = @newId WHERE "${column}" = @oldId`).run(params);
+        }
+      }
+      if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='digest_sources'").get()) {
+        const rows = this.db.prepare("SELECT digest_id, sources FROM digest_sources").all() as Array<{ digest_id: string; sources: string }>;
+        for (const row of rows) {
+          const sources = JSON.parse(row.sources) as Array<{ node_id: string }>;
+          if (!sources.some(source => source.node_id === oldId)) continue;
+          for (const source of sources) if (source.node_id === oldId) source.node_id = newId;
+          this.db.prepare("UPDATE digest_sources SET sources = ? WHERE digest_id = ?").run(JSON.stringify(sources), row.digest_id);
+        }
+      }
+      return true;
+    });
   }
 
   getAllNodesRaw(): NodeRow[] {

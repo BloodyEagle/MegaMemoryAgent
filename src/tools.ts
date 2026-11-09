@@ -36,12 +36,8 @@ import type {
   NodeRow,
   RelationType,
 } from "./types.js";
-import {
-  buildNextHints,
-  emptyNextHints,
-  type NextHintsCard,
-} from "./next-hints.js";
-import { BRIEF_EMPTY_TEXT, renderBrief, type BriefNodeInfo } from "./brief.js";
+import { buildNextHints, type NextHintsCard } from "./next-hints.js";
+import { renderBrief, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
 import {
@@ -200,6 +196,18 @@ export function validateEpistemicTransition(
   }
 }
 
+/** Qualification shared by child cards and nested supports. */
+function nodeQualification(db: KnowledgeDB, node: NodeRow) {
+  return {
+    status: node.status ?? "active",
+    epistemic_status: node.epistemic_status ?? null,
+    status_scope: parseStatusScope(node.status_scope),
+    valid_until: node.valid_until ?? null,
+    expired: isNodeExpired(node),
+    ...(node.epistemic_status === "refuted" ? { refuted_reason: db.getLatestEpistemicReason(node.id, "refuted") } : {}),
+  };
+}
+
 /**
  * Build a NodeWithContext from a node row and DB lookups.
  */
@@ -214,6 +222,7 @@ export function buildNodeWithContext(
     name: c.name,
     kind: c.kind as NodeWithContext["kind"],
     summary: c.summary,
+    ...nodeQualification(db, c),
   }));
 
   const outgoing = db.getOutgoingEdges(node.id).map((e) => ({
@@ -354,6 +363,19 @@ export function estimateTokens(text: string): number {
   return Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 }
 
+/** Actual MCP content wrapper, including pretty JSON escaping and its own estimate. */
+function measureMcpPayload(payload: unknown): number {
+  const value = payload as { meta?: { tokens_estimated: number } };
+  let tokens = 0;
+  for (;;) {
+    const measured = estimateTokens(JSON.stringify({
+      content: [{ type: "text", text: JSON.stringify(value.meta ? { ...value, meta: { ...value.meta, tokens_estimated: tokens } } : value, null, 2) }],
+    }));
+    if (measured === tokens) return tokens;
+    tokens = measured;
+  }
+}
+
 /**
  * Truncate to maxChars at a word boundary with an ellipsis. Operates on
  * UTF-16 code units but never splits a surrogate pair.
@@ -456,13 +478,9 @@ function compactMatch(
     id: node.id,
     name: node.name,
     kind: node.kind as CompactMatch["kind"],
-    status: node.status ?? "active",
-    epistemic_status: node.epistemic_status ?? null,
+    ...nodeQualification(db, node),
     // План 06 (K-04): «антизнание с причиной» и в compact — причина была
     // только в full-режиме, в компактной выдаче опровержение теряло смысл.
-    ...(node.epistemic_status === "refuted"
-      ? { refuted_reason: db.getLatestEpistemicReason(node.id, "refuted") }
-      : {}),
     summary: trimSummary(node.summary),
     file_refs: fileRefs,
     // План 06 (K-03): RRF-score несёт 17 значащих цифр и дублируется в
@@ -483,6 +501,7 @@ function compactMatch(
         id: c.id,
         name: c.name,
         kind: c.kind as CompactMatch["kind"],
+        ...nodeQualification(db, c),
       }));
     match.edges = db
       .getOutgoingEdges(node.id)
@@ -524,38 +543,12 @@ export async function understand(
   } else if (mode === "vector" && vectorSearchEnabled(db)) {
     const candidates = db.getAllActiveNodesWithEmbeddings();
     if (candidates.length === 0) {
-      // План 13 §2.2: в brief-режиме пустой ответ — тоже brief-форма
-      // (строка «ничего не нашлось» + next с пустыми списками и record).
-      if (outputMode === "brief") {
-        const emptyBrief: BriefOutput & { matches: never[] } = {
-          matches: [],
-          brief: BRIEF_EMPTY_TEXT,
-          next: emptyNextHints(),
-          meta: { returned: 0, dropped: 0, tokens_estimated: 0 },
-        };
-        // Честная мера пустого ответа по той же wire-форме (K-03): число
-        // токенов само едет в meta — итерация до сходимости разрядов.
-        const emptyEnvelope = (payload: unknown): string =>
-          JSON.stringify({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
-        for (let i = 0; i < 3; i++) {
-          const tokens = estimateTokens(emptyEnvelope(emptyBrief));
-          if (tokens === emptyBrief.meta.tokens_estimated) break;
-          emptyBrief.meta.tokens_estimated = tokens;
-        }
-        // BriefOutput не входит в UnderstandOutput (matches обязателен);
-        // matches: [] держит обработчик MCP безопасным и карточек не несёт.
-        return emptyBrief as unknown as UnderstandOutput;
-      }
-      // План 13 §2.1: пустой ответ тоже заканчивается блоком next.
-      return {
-        matches: [],
-        compact: [],
-        meta: { returned: 0, dropped: 0, tokens_estimated: 0 },
-        next: emptyNextHints(),
-      };
+      // Empty vector results use the same budgeted envelope as every other path.
+      topMatches = [];
+    } else {
+      const queryEmbedding = await embed(queryText(input.query));
+      topMatches = findTopK(queryEmbedding, candidates, searchPool);
     }
-    const queryEmbedding = await embed(queryText(input.query));
-    topMatches = findTopK(queryEmbedding, candidates, searchPool);
   } else {
     topMatches = basicSearch(db, input.query, searchPool);
   }
@@ -611,23 +604,13 @@ export async function understand(
   // идут с visibleSupports: 0 — подсказка get_concept для решений с опорами
   // остаётся честной. Бюджет считается по ТОЙ ЖЕ wire-форме, что уйдёт по
   // проводу (K-03): pretty-JSON внутри MCP-конверта с extra_payload
-  // обработчика. При превышении цели режется только next (skip → followups;
-  // must_read и record не режутся никогда), текст брифа не режется — он
-  // ограничен 8 строками по построению. Перерасход и порезка помечаются в
-  // meta.truncated, tokens_estimated остаётся честным числом фактической
-  // выдачи.
+  // обработчика. При превышении режутся только optional followups; must_read
+  // и record сохраняются. Если обязательная форма не влезает, запрос отклоняется.
+  // meta.truncated отмечает реальную порезку, а не разрешение перерасхода.
   if (outputMode === "brief") {
     const extra = input.extra_payload ?? {};
 
-    /** Wire-ответ, как его соберёт MCP-обработчик (см. index.ts). */
-    const wireEnvelope = (payload: unknown): string =>
-      JSON.stringify({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
-
-    const measure = (payload: unknown): number => estimateTokens(wireEnvelope(payload));
-
-    // Тот же запас на рост чисел в meta, что в compact-ветке (см. ниже).
-    const RESERVE = 16;
-    const target = maxTokens - RESERVE;
+    // Brief keeps its text and mandatory instructions intact; only followups may be cut.
 
     // Основа брифа: верхний уровень выдачи в ранговом порядке (top_k).
     const nodes = eligible.slice(0, topK);
@@ -678,41 +661,17 @@ export async function understand(
       ...extra,
     });
 
-    // Порезка по бюджету: только next — сначала skip, затем followups, по
-    // одному элементу с перемериванием после каждого. Текст брифа строится
-    // ИЗ next, поэтому при каждом замере он перерисовывается сам и текст с
-    // блоком не расходятся.
+    // Remove optional followups only; mandatory references and record stay intact.
     let nextCut = false;
-    const measureWith = (tokens: number): number => measure(buildPayload(tokens, false));
-    while (next.skip.length > 0 && measureWith(0) > target) {
-      next.skip.pop();
-      nextCut = true;
-    }
-    while (next.followups.length > 0 && measureWith(0) > target) {
+    while (next.followups.length > 0 && measureMcpPayload(buildPayload(0, nextCut)) > maxTokens) {
       next.followups.pop();
       nextCut = true;
     }
-
-    // Финальная честная мера: число токенов само едет в meta, поэтому замер
-    // повторяется до стабильности разрядов (как в compact-ветке).
-    let tokensEstimated = measureWith(0);
-    for (let i = 0; i < 3; i++) {
-      const again = measureWith(tokensEstimated);
-      if (again === tokensEstimated) break;
-      tokensEstimated = again;
+    const truncated = nextCut;
+    const tokensEstimated = measureMcpPayload(buildPayload(0, truncated));
+    if (tokensEstimated > maxTokens) {
+      throw new Error(`understand: max_tokens=${maxTokens} cannot fit the brief instructions and required references (minimum ${tokensEstimated}); increase the budget.`);
     }
-
-    // Порезанный next и перерасход — усечение. Затем перемер с финальным
-    // флагом: "truncated": true короче false, а tokens_estimated обязан
-    // сходиться с реальной wire-формой байт-в-байт.
-    let truncated = nextCut || tokensEstimated > maxTokens;
-    const measureFinal = (tokens: number): number => measure(buildPayload(tokens, truncated));
-    for (let i = 0; i < 3; i++) {
-      const again = measureFinal(tokensEstimated);
-      if (again === tokensEstimated) break;
-      tokensEstimated = again;
-    }
-
     const output: BriefOutput & { matches: never[] } = {
       matches: [],
       brief: renderBrief(briefNodes, next),
@@ -749,10 +708,7 @@ export async function understand(
       if (via) ctx.via = via;
       return ctx;
     });
-    // План 13 §2.1: full-режим тоже заканчивается блоком next. Опор на
-    // карточке full-режима видно все (informed_by-рёбра с rationale), поэтому
-    // get_concept-подсказка для них не нужна; бюджета в full-режиме нет —
-    // next не режется.
+    // Full preserves every selected card and instruction, refusing budgets that cannot fit.
     const fullNext = buildNextHints({
       db,
       cards: matches.map((m) => ({
@@ -762,28 +718,34 @@ export async function understand(
       })),
       refuted: refuted.map((r) => ({ name: r.name, reason: r.refuted_reason ?? null })),
     });
-    const payload = JSON.stringify({ matches, refuted, next: fullNext });
-    db.insertUsage({
-      tool: "understand",
-      query: input.query,
-      nodes: matches.length,
-      returnedChars: payload.length,
-      returnedTokens: estimateTokens(payload),
-      estimatedFullTokens: estimateTokens(payload), // full mode IS the full cost
-    });
-    return {
+    const output: UnderstandOutput = {
       matches,
       compact: undefined,
       refuted,
       meta: {
         returned: matches.length,
         dropped: eligible.length - matches.length,
-        tokens_estimated: estimateTokens(payload),
+        tokens_estimated: 0,
         stale_excluded: staleExcluded,
         inactive_excluded: inactiveExcluded,
       },
       next: fullNext,
     };
+    const tokensEstimated = measureMcpPayload({ ...output, ...input.extra_payload });
+    if (tokensEstimated > maxTokens) {
+      throw new Error(`understand: max_tokens=${maxTokens} cannot fit the full response and required instructions (minimum ${tokensEstimated}); increase the budget or use compact mode.`);
+    }
+    output.meta!.tokens_estimated = tokensEstimated;
+    const payload = JSON.stringify(output);
+    db.insertUsage({
+      tool: "understand",
+      query: input.query,
+      nodes: matches.length,
+      returnedChars: payload.length,
+      returnedTokens: tokensEstimated,
+      estimatedFullTokens: tokensEstimated,
+    });
+    return output;
   }
 
   // ---- compact: единый сериализатор бюджета и MCP-ответа (план 06, K-03) ----
@@ -811,11 +773,7 @@ export async function understand(
         )
       : [];
 
-  /** Wire-ответ, как его соберёт MCP-обработчик (см. index.ts). */
-  const wireEnvelope = (payload: unknown): string =>
-    JSON.stringify({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
-
-  const measure = (payload: unknown): number => estimateTokens(wireEnvelope(payload));
+  const measure = measureMcpPayload;
 
   // План 06 (K-03, работа 5): полный граф ради оценки «сэкономленных
   // токенов» на каждом compact-запросе не строим — стоимость full-режима
@@ -902,13 +860,22 @@ export async function understand(
     refuted: refutedList,
     edges_between: edgesFor(compactList),
     meta,
-    ...(next ? { next } : {}),
+    next: next ?? buildNextHints({
+      db,
+      cards: compactList.flatMap(card => [{ id: card.id, kind: card.kind, visibleSupports: card.supports?.length ?? 0 }, ...(card.supports ?? []).map(support => ({ id: support.id }))]),
+      refuted: refutedList.map(card => ({ name: card.name, reason: card.refuted_reason ?? null })),
+    }),
     ...extra,
   });
 
   /** Мера текущей формы ответа с заданным списком refuted (числа-заглушки). */
-  const measureWith = (refutedList: CompactMatch[]): number =>
-    measure(buildPayload(withNested(displayList()), refutedList, metaFor(0, 0, false)));
+  const measureWith = (refutedList: CompactMatch[]): number => {
+    const payload = buildPayload(withNested(displayList()), refutedList, metaFor(0, 0, false));
+    while (payload.next.followups.length > 0 && measure(payload) > maxTokens) {
+      payload.next.followups.pop();
+    }
+    return measure(payload);
+  };
 
   // Ниже минимума — понятный отказ: пустой конверт (meta + instructions +
   // MCP-обёртка) сам стоит токенов.
@@ -921,10 +888,7 @@ export async function understand(
     );
   }
 
-  // Запас на рост чисел в meta (tokens_estimated и др. подставляются в
-  // последнюю очередь) — порезка идёт с зазором, финальный замер честный.
-  const RESERVE = 16;
-  const target = maxTokens - RESERVE;
+  const target = maxTokens;
 
   /**
    * Fold pass — recomputed from scratch, so repeated calls (after each
@@ -964,10 +928,8 @@ export async function understand(
             id: sup.id,
             name: sup.name,
             summary: trimSummary(row.summary),
-            status: sup.status,
-            epistemic_status: sup.epistemic_status ?? null,
+            ...nodeQualification(db, row),
             file_refs: parseFileRefs(row.file_refs),
-            ...(sup.expired ? { expired: true } : {}),
             ...(row.epistemic_status === "abandoned" ||
             row.epistemic_status === "refuted" ||
             isUngrounded(db, row)
@@ -1006,8 +968,8 @@ export async function understand(
         continue;
       }
       if (displayList().length >= topK) {
-        if (foldSupports() > 0) continue; // слот освобождён — добираем
-        break; // top_k заполнен верхним уровнем
+        foldSupports();
+        if (displayList().length >= topK) break;
       }
       const candidate = compactMatch(db, eligible[idx].node, {
         score: eligible[idx].score,
@@ -1045,20 +1007,15 @@ export async function understand(
   // Освободившиеся токены — ограниченный добор матчей.
   placeLoop();
 
-  const compact = withNested(displayList());
+  let compact = withNested(displayList());
   // План 06 (K-01): счётчики не смешиваются — dropped считает усечённых
   // (top_k/бюджет, включая порезанных refuted), фильтрованные живут в
   // stale_excluded/inactive_excluded.
-  const dropped = eligible.length - top.length + refutedCut;
+  let dropped = eligible.length - top.length + refutedCut;
   const supportsInlined = foldedIds.size;
 
-  // ---- План 13 (§2.1): блок next — контракт действия из размещённых карточек ----
-  //
-  // Строится ПОСЛЕ размещения (placeLoop/refuted-цикл не меняются — next не
-  // влияет на размещение) из того, что реально попало в ответ: верхний уровень
-  // в ранговом порядке, затем вложенные опоры. Блок входит в ту же wire-меру
-  // (K-03), поэтому единственное законно меняющееся старое значение —
-  // meta.tokens_estimated: оно растёт по сравнению с версией без next.
+  // Build final instructions from the placed top-level cards and nested supports.
+  // Placement measured this same next block before accepting each candidate.
   const nextCards: NextHintsCard[] = [];
   for (const m of compact) {
     nextCards.push({ id: m.id, kind: m.kind, visibleSupports: m.supports?.length ?? 0 });
@@ -1073,46 +1030,27 @@ export async function understand(
   }));
   let next: NextHints = buildNextHints({ db, cards: nextCards, refuted: refutedForNext });
 
-  // Обрезка по бюджету: сначала skip, затем followups — по одному элементу с
-  // перемериванием после каждого. must_read и record не режутся никогда; если
-  // выше цели и после порезок — так и остаётся, усечение помечается в meta.
-  let nextCut = false;
-  const measureWithNext = (tokens: number): number =>
-    measure(buildPayload(compact, refutedShown, metaFor(tokens, dropped, false), next));
-  while (next.skip.length > 0 && measureWithNext(0) > target) {
-    next.skip.pop();
-    nextCut = true;
-  }
-  while (next.followups.length > 0 && measureWithNext(0) > target) {
+  // Placement already includes next; only optional followups may be shortened.
+  const measureWithNext = (): number =>
+    measure(buildPayload(compact, refutedShown, metaFor(0, dropped, truncated), next));
+  while (next.followups.length > 0 && measureWithNext() > target) {
     next.followups.pop();
-    nextCut = true;
+    truncated = true;
   }
 
-  // Финальная честная мера: число токенов само едет в meta, поэтому замер
-  // повторяется до стабильности разрядов (число в payload == число в мере).
   const edgesBetween = edgesFor(compact);
-  const measureFinal = (tokens: number): number =>
-    measure({
-      matches: [],
-      compact,
-      refuted: refutedShown,
-      edges_between: edgesBetween,
-      meta: metaFor(tokens, dropped, false),
-      next,
-      ...extra,
-    });
-  tokensEstimated = measureFinal(0);
-  for (let i = 0; i < 3; i++) {
-    const again = measureFinal(tokensEstimated);
-    if (again === tokensEstimated) break;
-    tokensEstimated = again;
+  tokensEstimated = measure({
+    matches: [],
+    compact,
+    refuted: refutedShown,
+    edges_between: edgesBetween,
+    meta: metaFor(0, dropped, truncated),
+    next,
+    ...extra,
+  });
+  if (tokensEstimated > maxTokens) {
+    throw new Error(`understand: max_tokens=${maxTokens} cannot fit the instructions and required references (minimum ${tokensEstimated}); increase the budget.`);
   }
-  // Первая нода может игнорировать лимит («always return at least one») —
-  // тогда метка усечения обязательна: не утверждаем, что ответ уложился.
-  // (truncated: true короче false — замер с false остаётся верхней оценкой.)
-  // План 13: порезанный next — тоже усечение, даже если мера влезла в бюджет.
-  if (nextCut) truncated = true;
-  if (tokensEstimated > maxTokens) truncated = true;
   const payloadMeta = metaFor(tokensEstimated, dropped, truncated);
   const payload = JSON.stringify({
     matches: [],
@@ -2044,10 +1982,8 @@ export function listRoots(
   // числа корней (COUNT), так что выдача совпадает с прежним цельным чтением
   // на любом бюджете.
   const ROOT_PAGE = 500;
-  // Запас на цифры tokens_estimated в meta (после подстановки ответ чуть
-  // растёт) — порезка идёт с зазором, финальный замер честный.
-  const RESERVE = 32;
-  const target = maxTokens - RESERVE;
+  // Each fit check includes the final token field; no fixed reserve is needed.
+  const target = maxTokens;
   const totalRoots = db.countRootNodes();
   const rootRows: Array<{
     id: string;
@@ -2095,9 +2031,7 @@ export function listRoots(
   }));
   const boardTop = computeBoard(db).columns.find((c) => c.name === "open")!.cards.slice(0, 5);
 
-  /** Сериализованный размер ответа — байт/3, как его увидит модель. */
-  const measure = (payload: unknown): number =>
-    estimateTokens(JSON.stringify(payload, null, 2));
+  const measure = measureMcpPayload;
 
   type RootsCompact = (typeof rootsCompact)[number];
   type Slots = (typeof slots)[number];
@@ -2201,13 +2135,9 @@ export function listRoots(
   );
   const withExtra = { ...payload, ...extra };
 
-  // Фикспойнт: подставляем tokens_estimated и перемеряем, пока цифры
-  // не перестанут менять размер сериализации (2 итераций достаточно).
-  let tokens = measure(withExtra);
-  for (let i = 0; i < 2; i++) {
-    const next = measure({ ...withExtra, meta: { ...payload.meta, tokens_estimated: tokens } });
-    if (next === tokens) break;
-    tokens = next;
+  const tokens = measure(withExtra);
+  if (tokens > maxTokens) {
+    throw new Error(`list_roots: max_tokens=${maxTokens} cannot fit the response envelope (minimum ${tokens}); increase the budget.`);
   }
   const finalPayload: ListRootsOutput & { hint?: string } = {
     ...payload,
@@ -2447,17 +2377,29 @@ export function taskRot(task: {
 }
 
 /** Full board: the `open` column sorted by rot, the terminal `done` fresh-first. */
-export function computeBoard(db: KnowledgeDB): BoardOutput {
+export function computeBoard(db: KnowledgeDB, input: { done_cursor?: string; done_limit?: number } = {}): BoardOutput {
   const openTasks = db.getOpenTasks().map((t) => {
     const { rot, overdue } = taskRot(t);
     return { id: t.id, name: t.name, rot, due_at: t.due_at, overdue };
   });
   openTasks.sort((a, b) => b.rot - a.rot);
 
-  const doneTasks = db.getDoneTasks().map((t) => ({
-    id: t.id,
-    name: t.name,
-  }));
+  let after: { updated_at: string; id: string } | undefined;
+  if (input.done_cursor !== undefined) {
+    try {
+      if (typeof input.done_cursor !== "string" || !/^[A-Za-z0-9_-]+$/.test(input.done_cursor)) throw new Error();
+      const decoded = Buffer.from(input.done_cursor, "base64url");
+      if (decoded.toString("base64url") !== input.done_cursor) throw new Error();
+      const parsed = JSON.parse(decoded.toString("utf8"));
+      if (typeof parsed?.updated_at !== "string" || typeof parsed?.id !== "string" || parsed.id.length === 0) throw new Error();
+      after = { updated_at: parsed.updated_at, id: parsed.id };
+    } catch { throw new Error("board: invalid done_cursor."); }
+  }
+  const limit = input.done_limit ?? 20;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("board: done_limit must be between 1 and 100.");
+  const donePage = db.getDoneTaskPage(limit, after);
+  const doneTasks = donePage.rows.map(t => ({ id: t.id, name: t.name }));
+  const last = donePage.rows[donePage.rows.length - 1];
 
   const columns: BoardColumn[] = [
     {
@@ -2469,7 +2411,10 @@ export function computeBoard(db: KnowledgeDB): BoardOutput {
     {
       name: "done",
       terminal: true,
-      count: doneTasks.length,
+      count: donePage.total,
+      returned: doneTasks.length,
+      has_more: donePage.has_more,
+      next_cursor: donePage.has_more && last ? Buffer.from(JSON.stringify({ updated_at: last.updated_at, id: last.id }), "utf8").toString("base64url") : null,
       cards: doneTasks,
     },
   ];
@@ -2607,13 +2552,18 @@ export function trailGet(db: KnowledgeDB, id: string): TrailView {
   };
 }
 
-export function trailRefresh(db: KnowledgeDB, id: string): { message: string } {
+export function trailRefresh(db: KnowledgeDB, id: string): { message: string; state: TrailView["state"]; reasons: Array<string | null> } {
   const trail = db.getTrail(id);
   if (!trail) {
     throw new Error(`Trail "${id}" not found.`);
   }
   db.refreshTrailFingerprints(id);
-  return { message: `Trail "${id}" refreshed: fingerprints re-snapshotted, chain is fresh.` };
+  const actual = trailGet(db, id);
+  return {
+    message: `Trail "${id}" refreshed: fingerprints re-snapshotted, chain is ${actual.state}.`,
+    state: actual.state,
+    reasons: actual.members.filter(member => member.state !== "fresh").map(member => member.reason),
+  };
 }
 
 export function trailExtend(db: KnowledgeDB, id: string, nodeIds: string[]): { message: string } {
@@ -2718,8 +2668,8 @@ export function taskDone(db: KnowledgeDB, id: string): { message: string } {
   return { message: `Task "${id}" done${wasDue ? ` (was due ${wasDue})` : ""}.` };
 }
 
-export function board(db: KnowledgeDB): BoardOutput & { summary: string } {
-  const output = computeBoard(db);
+export function board(db: KnowledgeDB, input: { done_cursor?: string; done_limit?: number } = {}): BoardOutput & { summary: string } {
+  const output = computeBoard(db, input);
   const openCol = output.columns.find((c) => c.name === "open")!;
   return {
     ...output,
