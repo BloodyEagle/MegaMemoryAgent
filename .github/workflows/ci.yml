@@ -22,7 +22,7 @@ jobs:
 
       - run: npm ci
 
-      - name: Lint (bounded AST policy: syntax, debugger, duplicate keys, UTF-8; vendor excluded)
+      - name: "Lint (bounded AST policy: syntax, debugger, duplicate keys, UTF-8; vendor excluded)"
         run: node scripts/lint.mjs
 
       - name: Typecheck source
