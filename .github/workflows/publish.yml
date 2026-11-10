@@ -54,6 +54,10 @@ jobs:
       contents: write
       id-token: write
     steps:
+      # --provenance читает git-remote и commit: без checkout джоб падал
+      # «Could not read from remote repository» ещё до загрузки в реестр.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: megamemory-tarball
