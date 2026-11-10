@@ -101,7 +101,9 @@ jobs:
           ./node_modules/.bin/megamemory stats --db /tmp/mm-smoke/demo-copy.db >/dev/null
 
       - name: Publish the tested tarball
-        run: npm publish "staging/$TARBALL" --provenance --access public
+        # Абсолютный путь: относительный «staging/x.tgz» npm парсит как
+        # github-shorthand owner/repo и лезет в ssh вместо чтения файла.
+        run: npm publish "$GITHUB_WORKSPACE/staging/$TARBALL" --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
