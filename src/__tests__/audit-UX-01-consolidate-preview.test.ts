@@ -9,7 +9,7 @@ const LONG_TAIL = "ХВОСТ-ПОЛНОГО-ТЕКСТА";
 function planFixture(
   survivor: string,
   other: string,
-  overrides: Partial<ReturnType<typeof planBase>> = {}
+  overrides: Partial<ReturnType<typeof planBase> & { rejection?: string }> = {}
 ) {
   return { ...planBase(survivor, other), ...overrides };
 }

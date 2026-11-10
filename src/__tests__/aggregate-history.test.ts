@@ -4,19 +4,23 @@ import { ensureSchema } from "../migrate-schema.js";
 import { MergeEngine } from "../merge.js";
 
 describe("P-04 aggregate history carry", () => {
-  it.each([false, true])("lossless carry bypasses retention and preserves the original confirmation actor (reverse=%s)", async reverse => {
+  it.each([false, true])("lossless carry bypasses retention; the snapshot actor normalizes to import, the journal keeps the original (reverse=%s)", async reverse => {
     const fixture = auditFixture();
     try {
       const left = fixture.db("left.db"), right = fixture.db("right.db");
       for (const db of [left, right]) { ensureSchema(db); addNode(db, "decision"); addNode(db, "support"); }
       for (let i = 0; i < 50; i++) left.execSqlRun("INSERT INTO support_revisions(decision_id,support_id,edge_key,claim_digest,status_digest,edge_digest,format_version,confirmed_at,recorded_at,source,reason) VALUES ('decision','support','5',?,'status','edge',1,'2026-11-10','2026-11-10','agent',NULL)", `historic-${i}`);
       right.upsertSupportBaseline({ decision_id: "decision", support_id: "support", edge_key: "5", claim_digest: "current", status_digest: "status", edge_digest: "edge", format_version: 1, confirmed_at: "2026-11-10", confirmed_by: "original-agent", superseded_at: null, artifacts_digest: null });
+      right.execSqlRun("INSERT INTO support_revisions(decision_id,support_id,edge_key,claim_digest,status_digest,edge_digest,format_version,confirmed_at,recorded_at,source,reason) VALUES ('decision','support','5','current','status','edge',1,'2026-11-10','2026-11-10','agent','confirmed')");
       const inputs = reverse ? ["right.db", "left.db"] : ["left.db", "right.db"];
       new MergeEngine().merge(fixture.file(inputs[0]), fixture.file(inputs[1]), fixture.file("out.db"));
       const output = fixture.db("out.db");
-      const revisions = output.execSqlAll("SELECT claim_digest FROM support_revisions") as Array<{ claim_digest: string }>;
+      const revisions = output.execSqlAll("SELECT claim_digest, source FROM support_revisions") as Array<{ claim_digest: string; source: string }>;
       for (let i = 0; i < 50; i++) expect(revisions.some(row => row.claim_digest === `historic-${i}`)).toBe(true);
-      expect(output.getAllSupportBaselines()[0].confirmed_by).toBe("original-agent");
+      // §7: the import never confirms — the snapshot row is normalized, the
+      // original actor survives in the verbatim journal row.
+      expect(output.getAllSupportBaselines()[0].confirmed_by).toBe("import");
+      expect(revisions.some(row => row.claim_digest === "current" && row.source === "agent")).toBe(true);
     } finally { await fixture.close(); }
   });
 

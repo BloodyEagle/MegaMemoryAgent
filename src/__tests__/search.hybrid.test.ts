@@ -1,18 +1,20 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
 import { hybridSearch, rrfMerge, hasCjk } from "../search.js";
 import { ensureSchema } from "../migrate-schema.js";
-import { MODEL_NAME } from "../embeddings.js";
-import { closeAndCleanup } from "./helpers/cleanup.js";
+import { reembed } from "../reembed.js";
 
 let tmpDir: string;
-let db: KnowledgeDB;
+let db: KnowledgeDB | undefined;
+const profile = process.env.USERPROFILE ?? os.tmpdir();
+const managedCleanup = path.basename(profile).startsWith("mm-new6-owned-");
+const deferredCleanup = new Set<string>();
 
 function freshDb(withTrigram = false): KnowledgeDB {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-search-"));
+  tmpDir = fs.mkdtempSync(path.join(managedCleanup ? profile : os.tmpdir(), "mm-search-"));
   if (withTrigram) {
     process.env.MEGAMEMORY_FTS_TOKENIZER = "trigram";
   }
@@ -24,7 +26,26 @@ function freshDb(withTrigram = false): KnowledgeDB {
 
 afterEach(async () => {
   delete process.env.MEGAMEMORY_SEARCH;
-  if (db) await closeAndCleanup(db, tmpDir);
+  db?.close();
+  db = undefined;
+  if (!tmpDir) return;
+  for (let i = 0; i < 40; i++) {
+    (globalThis as { gc?: () => void }).gc?.();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); return; }
+    catch { await new Promise((resolve) => setTimeout(resolve, 100)); }
+  }
+  deferredCleanup.add(tmpDir);
+});
+
+afterAll(() => {
+  for (const ownedDir of deferredCleanup) {
+    (globalThis as { gc?: () => void }).gc?.();
+    try { fs.rmSync(ownedDir, { recursive: true, force: true }); deferredCleanup.delete(ownedDir); }
+    catch { /* The supervisor removes its isolated profile after worker exit. */ }
+  }
+  if (!deferredCleanup.size) return;
+  if (!managedCleanup) throw new Error(`P10_OWNED_CLEANUP_FAILED ${[...deferredCleanup].join(",")}`);
+  console.info(`P10_PARENT_CLEANUP_REQUIRED ${[...deferredCleanup].join(",")}`);
 });
 
 function insertNode(db: KnowledgeDB, id: string, name: string, summary: string): void {
@@ -77,12 +98,9 @@ describe("hybridSearch (vector enabled)", () => {
     const db = freshDb();
     insertNode(db, "alpha", "Alpha Book", "reading");
     insertNode(db, "beta", "Beta Pen", "writing");
-    const vec = new Float32Array([1, 0, 0, 0]);
-    const buf = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
-    // Named param: libsql panics on single-positional Buffer statements.
-    db.execSqlRun("UPDATE nodes SET embedding = @e", { e: buf });
-    db.setMetaValue("embed_model", MODEL_NAME); // enable vector channel
-    db.setMetaValue("embed_dim", "4");
+    // Explicit indexing establishes the fixture's active generation; model-only
+    // stamps must never launder unknown historical vectors.
+    await reembed(db, { embedFn: fakeEmbed([1, 0, 0, 0]) });
 
     const hits = await hybridSearch(db, "book", {
       topK: 5,
@@ -138,24 +156,10 @@ describe("patches v1.1: prefix morphology (М3), sanitization (М1), native vect
     const db = freshDb();
     insertNode(db, "alpha", "Alpha Book", "reading");
     insertNode(db, "beta", "Beta Pen", "writing");
-    const v1 = new Float32Array([1, 0, 0, 0]);
-    const v2 = new Float32Array([0, 1, 0, 0]);
-    const toBuf = (v: Float32Array) =>
-      Buffer.from(v.buffer, v.byteOffset, v.byteLength);
-    db.execSqlRun("UPDATE nodes SET embedding = @e WHERE id = @id", {
-      e: toBuf(v1),
-      id: "alpha",
-    });
-    db.execSqlRun("UPDATE nodes SET embedding = @e WHERE id = @id", {
-      e: toBuf(v2),
-      id: "beta",
-    });
-    db.setMetaValue("embed_model", MODEL_NAME);
-    db.setMetaValue("embed_dim", "4");
+    await reembed(db, { embedFn: async (text) =>
+      fakeEmbed(text.includes("Alpha Book") ? [1, 0, 0, 0] : [0, 1, 0, 0])() });
 
-    // Populate the native shadow table — the SQL path must serve the hits.
-    db.upsertVector("alpha", toBuf(v1));
-    db.upsertVector("beta", toBuf(v2));
+    // Explicit publication fills the current native projection atomically.
     expect(db.vectorTableCount()).toBe(2);
     expect(db.vectorTableCount()).toBeGreaterThanOrEqual(
       db.countActiveWithEmbeddings()

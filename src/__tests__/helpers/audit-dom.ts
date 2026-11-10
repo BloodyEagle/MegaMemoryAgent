@@ -188,6 +188,11 @@ export interface AuditGraphNode {
   parent_id: string | null;
   status: string;
   edge_count?: number;
+  /** The server serializes this for every node (null when unset). */
+  epistemic_status?: string | null;
+  valid_until?: string | null;
+  expired?: boolean;
+  removed_at?: string | null;
 }
 export interface AuditGraph {
   nodes: AuditGraphNode[];

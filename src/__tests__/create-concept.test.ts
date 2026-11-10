@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { KnowledgeDB } from "../db.js";
+import { claimDigestOf, statusDigestOf } from "../support-baselines.js";
 import { createConcept } from "../tools.js";
 import fs from "fs";
 import path from "path";
@@ -113,16 +114,16 @@ describe("createConcept: duplicate evidence refs (2.1.2 F1)", () => {
     });
 
     // The node itself was created (the transaction did not roll back).
-    expect(db.getNode(result.id)).toBeDefined();
+    expect(db.getNode(result.id!)).toBeDefined();
     // Exactly one fact node, one support edge, one snapshot row.
     const factIds = db
-      .getInformedByEdges(result.id, "ancestry", false)
+      .getInformedByEdges(result.id!, "ancestry", false)
       .map((e) => e.other_id);
     expect(factIds).toHaveLength(1);
     const fact = db.getNode(factIds[0])!;
     expect(fact.kind).toBe("feature");
     expect(fact.file_refs ? JSON.parse(fact.file_refs) : null).toEqual(["docs/spec.md"]);
-    const check = db.getSupportBaselines(result.id);
+    const check = db.getSupportBaselines(result.id!);
     expect(check).toHaveLength(1);
     expect(check[0].support_id).toBe(factIds[0]);
   });
@@ -134,25 +135,27 @@ describe("createConcept: duplicate evidence refs (2.1.2 F1)", () => {
       summary: "creates the file fact node on the first evidence ref that points at docs/other.md",
       evidence: [{ ref: "docs/other.md", why: "почему опора" }],
     });
-    const factId = db.getInformedByEdges(first.id, "ancestry", false)[0].other_id;
+    const factId = db.getInformedByEdges(first.id!, "ancestry", false)[0].other_id;
 
     // Second call: the ref now resolves to the existing fact node — and the
-    // evidence lists that node twice.
+    // evidence lists that node twice. Frozen C-02: a reused support confirms
+    // only against an asserted expectation (the agent pins what it just read).
+    const factRow = db.getNode(factId)!;
     const second = await createConcept(db, {
       name: "Second",
       kind: "decision",
       summary: "reuses the existing file fact node instead of creating a second one for the same ref",
       evidence: [
-        { node: factId, why: "опора существует" },
-        { node: factId, why: "дубль той же опоры" },
+        { node: factId, why: "опора существует", expect: { claim_digest: claimDigestOf(factRow.summary), status_digest: statusDigestOf(factRow.status, factRow.epistemic_status) } },
+        { node: factId, why: "дубль той же опоры", expect: { claim_digest: claimDigestOf(factRow.summary), status_digest: statusDigestOf(factRow.status, factRow.epistemic_status) } },
       ],
     });
 
-    expect(db.getNode(second.id)).toBeDefined();
+    expect(db.getNode(second.id!)).toBeDefined();
     const factIds = db
-      .getInformedByEdges(second.id, "ancestry", false)
+      .getInformedByEdges(second.id!, "ancestry", false)
       .map((e) => e.other_id);
     expect(factIds).toEqual([factId]);
-    expect(db.getSupportBaselines(second.id)).toHaveLength(1);
+    expect(db.getSupportBaselines(second.id!)).toHaveLength(1);
   });
 });

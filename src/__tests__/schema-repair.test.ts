@@ -387,9 +387,9 @@ describe("schema repair on open (plan 16)", () => {
         )
       ).toBeTruthy();
     }
-    expect(result.repair_steps).toContain("restored nodes_ai/ad/au triggers");
+    expect(result.repair_steps).toContain("restored nodes_fts sync triggers and rebuilt index");
     expect(describeSchemaRepair(result)).toContain(
-      "restored nodes_ai/ad/au triggers"
+      "restored nodes_fts sync triggers and rebuilt index"
     );
   });
 
@@ -459,7 +459,7 @@ describe("schema repair on open (plan 16)", () => {
       ).toBeTruthy();
     }
     expect(result.repair_steps).toContain(
-      "restored nodes_tri_ai/ad/au triggers"
+      "restored nodes_fts_tri sync triggers and rebuilt index"
     );
   });
 });

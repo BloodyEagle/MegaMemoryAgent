@@ -34,6 +34,12 @@ vi.mock("../embeddings.js", () => ({
   queryText: vi.fn((q: string) => q),
 }));
 
+/** CreateConceptResult.id опционален по API (отказ дедупликации); в этих сценариях узел всегда создаётся. */
+function createdId(result: { id?: string }): string {
+  if (result.id === undefined) throw new Error("createConcept returned no id");
+  return result.id;
+}
+
 let tmpDir: string;
 let db: KnowledgeDB;
 
@@ -518,14 +524,14 @@ describe("§9.17 accepted auto edge", () => {
       why: "from the file",
       file_refs: ["src/a.ts"],
     });
-    const edges = db.getInformedByEdges(res.id, "ancestry", false);
+    const edges = db.getInformedByEdges(createdId(res), "ancestry", false);
     expect(edges.length).toBe(1);
     expect((edges[0] as { created_via?: string }).created_via).toBe("auto");
 
     const supportId = edges[0].other_id;
     const supportRow = db.getNode(supportId)!;
     confirmSupports(db, {
-      decision_id: res.id,
+      decision_id: createdId(res),
       expected_claim_digest: claimDigestOf("auto d хранит вывод из файла, подтверждение идёт тем же вызовом"),
       items: [
         {
@@ -614,17 +620,18 @@ describe("§9.20 no history journal", () => {
 describe("create_concept evidence snapshot", () => {
   it("evidence supports are confirmed in the same call; auto-ground is not", async () => {
     node("f", "fact");
+    const support = db.getNode("f")!;
     const res = await createConcept(db, {
       name: "d",
       kind: "decision",
       summary: "decision d plus the fixture context of this check and the call keeps its contract with the evidence passed in the call",
-      evidence: [{ node: "f", why: "because f" }],
+      evidence: [{ node: "f", why: "because f", expect: { claim_digest: claimDigestOf(support.summary), status_digest: statusDigestOf(support.status, support.epistemic_status) } }],
     });
-    const rows = db.getSupportBaselines(res.id);
+    const rows = db.getSupportBaselines(createdId(res));
     expect(rows).toHaveLength(1);
     expect(rows[0].support_id).toBe("f");
     expect(rows[0].confirmed_by).toBe("agent");
-    const view = computeSupportCheck(db, res.id, new CheckBudget(10, 1_000_000))!;
+    const view = computeSupportCheck(db, createdId(res), new CheckBudget(10, 1_000_000))!;
     expect(view.state).toBe("unchanged");
   });
 
@@ -634,7 +641,7 @@ describe("create_concept evidence snapshot", () => {
       kind: "feature",
       summary: "plain feature plus the fixture context of this check and the call keeps its contract",
     });
-    expect(computeSupportCheck(db, res.id, new CheckBudget(10, 1_000_000))).toBeNull();
+    expect(computeSupportCheck(db, createdId(res), new CheckBudget(10, 1_000_000))).toBeNull();
   });
 });
 
@@ -756,25 +763,26 @@ describe("F1: edges from input.edges never confirm", () => {
       edges: [{ to: "f", relation: "informed_by", description: "why f" }],
     });
     // The edge exists — but nothing was confirmed along with it.
-    expect(db.getInformedByEdges(res.id, "ancestry", false)).toHaveLength(1);
-    expect(db.getNode(res.id)!.claim_digest ?? null).toBeNull();
-    expect(db.getSupportBaselines(res.id)).toEqual([]);
-    const view = computeSupportCheck(db, res.id, new CheckBudget(10, 1_000_000))!;
+    expect(db.getInformedByEdges(createdId(res), "ancestry", false)).toHaveLength(1);
+    expect(db.getNode(createdId(res))!.claim_digest ?? null).toBeNull();
+    expect(db.getSupportBaselines(createdId(res))).toEqual([]);
+    const view = computeSupportCheck(db, createdId(res), new CheckBudget(10, 1_000_000))!;
     expect(view.state).toBe("unknown");
   });
 
   it("26. evidence in the same call still confirms (the §2.1 carve-out holds)", async () => {
     node("f", "fact");
+    const support = db.getNode("f")!;
     const res = await createConcept(db, {
       name: "d2",
       kind: "decision",
       summary: "decision d2 plus the fixture context of this check and the call keeps its contract",
-      evidence: [{ node: "f", why: "because f" }],
+      evidence: [{ node: "f", why: "because f", expect: { claim_digest: claimDigestOf(support.summary), status_digest: statusDigestOf(support.status, support.epistemic_status) } }],
     });
-    const rows = db.getSupportBaselines(res.id);
+    const rows = db.getSupportBaselines(createdId(res));
     expect(rows).toHaveLength(1);
     expect(rows[0].confirmed_by).toBe("agent");
-    expect(computeSupportCheck(db, res.id, new CheckBudget(10, 1_000_000))!.state).toBe(
+    expect(computeSupportCheck(db, createdId(res), new CheckBudget(10, 1_000_000))!.state).toBe(
       "unchanged"
     );
   });

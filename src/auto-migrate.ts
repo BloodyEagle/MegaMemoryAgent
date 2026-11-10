@@ -10,6 +10,7 @@ import {
   emptyReport,
   type MigrationReport,
 } from "./migrate-schema.js";
+import { readFtsTriggerHealth } from "./fts-triggers.js";
 import { planIdRepair, applyIdRepair, backupDb } from "./migrate.js";
 
 /**
@@ -98,23 +99,15 @@ function readSchemaCompleteness(db: KnowledgeDB): {
     (process.env.MEGAMEMORY_FTS_TOKENIZER ?? "").toLowerCase() === "trigram";
   const complete =
     fts &&
-    triggers === 3 &&
+    triggers === 3 && readFtsTriggerHealth(db).healthy &&
     (!trigramRequested || tri) &&
-    (!tri || triTriggers === 3);
+    (!tri || (triTriggers === 3 && readFtsTriggerHealth(db, true).healthy));
   return { fts, tri, triggers, triTriggers, complete };
 }
 
 export function preflight(db: KnowledgeDB): PreflightReport {
-  const integrityRow = db.execSqlFirst("PRAGMA integrity_check") as
-    | { result?: string }
-    | string
-    | undefined;
-  const integrity =
-    typeof integrityRow === "object" && integrityRow !== null
-      ? (integrityRow.result ?? "ok")
-      : typeof integrityRow === "string"
-        ? integrityRow
-        : "ok";
+  db.assertIntegrity();
+  const integrity = "ok";
 
   const count = (sql: string): number =>
     (db.execSqlFirst(sql) as { n: number }).n;

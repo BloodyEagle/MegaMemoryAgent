@@ -265,7 +265,7 @@ describe.sequential("KnowledgeDB multi-process concurrency", () => {
             iterations: 60,
             sleepMs: 20,
           },
-          ...CONCURRENT_WRITERS.map((workerId) => ({
+          ...CONCURRENT_WRITERS.map((workerId): WorkerPayload => ({
             mode: "writer",
             dbPath,
             workerId,

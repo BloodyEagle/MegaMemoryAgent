@@ -20,12 +20,18 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // Release the tracked connection first so libsql's post-close Windows lock
+  // is not retried against a still-referenced native handle.
+  await fixture.release(db);
+  db = undefined as unknown as KnowledgeDB;
+  (globalThis as { gc?: () => void }).gc?.();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   await fixture.close();
   delete process.env.MEGAMEMORY_DB_PATH;
 });
 
 /** Имитация добавки MCP-обработчика: instructions_status + stats. */
-function handlerExtra(testStats = { nodes: 1 }): Record<string, unknown> {
+function handlerExtra(testStats: Record<string, unknown> = { nodes: 1 }): Record<string, unknown> {
   return {
     instructions_status: { current: "v1", stale: false },
     stats: testStats,

@@ -5,18 +5,18 @@ on:
     types: [published]
 
 jobs:
-  publish:
+  # Gate job: full test suite on the built tree, then npm pack with exact JSON
+  # capture. The tarball and its sha256 are stored as artifacts; publishing
+  # never repacks the checkout directory.
+  package:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          registry-url: "https://registry.npmjs.org"
+          node-version: "22"
+          cache: npm
 
       - run: npm ci
 
@@ -34,46 +34,58 @@ jobs:
       - run: npm test
 
       - name: Package version matches the release tag
-        run: |
-          PKG=$(node -p 'require("./package.json").version')
-          TAG="${{ github.event.release.tag_name }}"
-          TAG=${TAG#v}
-          test "$PKG" = "$TAG" || { echo "package.json $PKG != release tag $TAG"; exit 1; }
+        run: node scripts/verify.mjs metadata "${{ github.event.release.tag_name }}"
 
-      - run: npm pack
+      - name: Pack and verify the tested tree (exact capture + composition + smoke)
+        run: node scripts/package.mjs "$GITHUB_WORKSPACE/staging"
 
-      - name: Tarball composition (required files present, sources absent)
-        run: |
-          TARBALL=$(ls *.tgz | head -1)
-          tar -tzf "$TARBALL" > /tmp/tarball-list.txt
-          for required in \
-            package/dist/index.js \
-            package/web/index.html \
-            package/web/vendor/d3.min.js \
-            package/plugin/megamemory.ts \
-            package/commands \
-            package/docs \
-            package/fixtures/eval.jsonl \
-            package/fixtures/demo.db \
-            package/README.md \
-            package/README.ru.md \
-            package/LICENSE; do
-            grep -q "^${required}" /tmp/tarball-list.txt \
-              || { echo "tarball is missing ${required}"; exit 1; }
-          done
-          for forbidden in package/src/ package/tests/ package/plans/; do
-            if grep -q "^${forbidden}" /tmp/tarball-list.txt; then
-              echo "tarball must not contain ${forbidden}"; exit 1
-            fi
-          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: megamemory-tarball
+          path: staging/
+          if-no-files-found: error
 
-      - name: Tarball smoke (installs and starts)
+  # Publishes exactly the tested tarball byte-for-byte (sha256 verified against
+  # pack-result.json from the gate job), after a real install smoke.
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: megamemory-tarball
+          path: staging
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Resolve the tested tarball
+        run: echo "filename=$(node -p "require('./staging/pack-result.json').filename")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify sha256 of the tested tarball
         run: |
-          TARBALL=$(ls *.tgz | head -1)
+          FILENAME="${{ steps.resolve.outputs.filename }}"
+          node -e "
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const expected = require('./staging/pack-result.json').sha256;
+            const actual = crypto.createHash('sha256').update(fs.readFileSync('staging/' + process.argv[1])).digest('hex');
+            if (actual !== expected) { console.error('sha256 mismatch: ' + actual + ' != ' + expected); process.exit(1); }
+            console.log('sha256 verified: ' + actual);
+          " "$FILENAME"
+
+      - name: Tarball installs and starts
+        run: |
+          FILENAME="${{ steps.resolve.outputs.filename }}"
           mkdir -p /tmp/mm-smoke
           cd /tmp/mm-smoke
           npm init -y >/dev/null
-          npm install "$GITHUB_WORKSPACE/$TARBALL" >/dev/null
+          npm install "$GITHUB_WORKSPACE/staging/$FILENAME" >/dev/null
           ./node_modules/.bin/megamemory --version
           ./node_modules/.bin/megamemory --help >/dev/null
           # План 11 (2.2.1): фикстуры только для чтения — stats работает на
@@ -82,11 +94,12 @@ jobs:
           cp ./node_modules/@bloodyeagle/megamemory/fixtures/demo.db /tmp/mm-smoke/demo-copy.db
           ./node_modules/.bin/megamemory stats --db /tmp/mm-smoke/demo-copy.db >/dev/null
 
-      - run: npm publish --provenance --access public
+      - name: Publish the tested tarball
+        run: npm publish "staging/${{ steps.resolve.outputs.filename }}" --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Attach tarball to the release
-        run: gh release upload "${{ github.event.release.tag_name }}" ./*.tgz --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" "staging/${{ steps.resolve.outputs.filename }}" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

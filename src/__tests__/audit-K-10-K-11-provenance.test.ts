@@ -37,6 +37,9 @@ function readConfirmation(db: KnowledgeDB, decision: string) {
       expected_claim_digest: support.claim_digest!,
       expected_status_digest: support.status_digest!,
       expected_edge_digest: support.edge_digest,
+      // R-04/frozen 14: the artifact anchor is written only when the agent
+      // pins what it read; an unpinned confirm leaves the anchor NULL.
+      expected_artifacts_digest: support.artifacts_digest,
     })),
   };
 }

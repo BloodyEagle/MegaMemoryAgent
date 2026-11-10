@@ -71,10 +71,14 @@ export function nodesAreIdentical(left: NodeRow, right: NodeRow): boolean {
   // side's copy wins.
   if ((left.status ?? "active") !== (right.status ?? "active")) return false;
   if ((left.epistemic_status ?? null) !== (right.epistemic_status ?? null)) return false;
-  // Confirmation time is a saved evidence snapshot, not updated_at noise.
-  // Until the full revision journal carry lands (P-04), choosing one would
-  // erase the other confirmation. Preserve both as an explicit conflict.
-  for (const field of ["task_state", "due_at", "valid_from", "valid_until", "status_scope", "removed_reason", "created_by_task", "claim_digest", "claim_digest_at", "created_via"] as const) {
+  // Semantic workflow state: a task/TTL/scope/tombstone divergence is real
+  // content. Deliberately NOT here: claim_digest/claim_digest_at (a
+  // wall-clock confirmation stamp — two honest copies of the same wording
+  // would never merge, and both confirmations travel losslessly in the
+  // revision journal carry, P-04) and created_via (per-database provenance:
+  // a re-migrated copy gets the v12 backfill value where the original has
+  // NULL; the merged node keeps the left copy verbatim either way).
+  for (const field of ["task_state", "due_at", "valid_from", "valid_until", "status_scope", "removed_reason", "created_by_task"] as const) {
     if ((left[field] ?? null) !== (right[field] ?? null)) return false;
   }
 
@@ -102,6 +106,48 @@ export function edgeSetsAreIdentical(left: EdgeRow[], right: EdgeRow[]): boolean
     if (!rightKeys.has(k)) return false;
   }
   return true;
+}
+
+export function resolveEdgeConflicts(
+  db: KnowledgeDB,
+  input: { merge_group: string; prefer: "left" | "right"; reason: string }
+): { message: string } {
+  return db.runInTransaction(() => {
+    const conflicts = db.getMergeConflicts(input.merge_group);
+    if (conflicts.length === 0 || conflicts.some(row => row.object_kind !== "edge" || row.format_version !== 1)) {
+      throw new Error("Unsupported or missing edge conflict group; nothing was written.");
+    }
+    for (const conflict of conflicts) {
+      const mapping = JSON.parse(conflict.mapping_json);
+      const side = JSON.parse(input.prefer === "left" ? conflict.left_payload : conflict.right_payload);
+      if (mapping.format !== "megamemory-conflict-map/1" || side.format !== "megamemory-conflict/1" || side.rows?.length !== 1) {
+        throw new Error("Unsupported edge conflict payload; nothing was written.");
+      }
+      const current = db.getEdgeById(mapping.edge.id);
+      const snapshotKeys = Object.keys(mapping.edge.applied).filter(key => key !== "_metadata");
+      if (!current || snapshotKeys.some(key =>
+        (current as unknown as Record<string, unknown>)[key] !== mapping.edge.applied[key]
+      ) || Object.keys(current).some(key => key !== "_metadata" && !snapshotKeys.includes(key))) {
+        throw new Error("version_conflict: the conflict edge changed; nothing was written.");
+      }
+      const address = mapping.sides[input.prefer === "left" ? 0 : 1];
+      const selected: EdgeRow = side.rows[0];
+      if (!address || !db.getNodeIncludingRemoved(address.from_id) || !db.getNodeIncludingRemoved(address.to_id)) {
+        throw new Error("Missing mapped conflict endpoints; nothing was written.");
+      }
+      db.execSqlRun(
+        `UPDATE edges SET from_id=?,to_id=?,relation=?,description=?,created_at=?,merge_group=?,needs_merge=?,source_branch=?,merge_timestamp=?,removed_at=?,created_via=?,accepted_at=? WHERE id=?`,
+        address.from_id, address.to_id, selected.relation, selected.description, selected.created_at,
+        selected.merge_group, selected.needs_merge, selected.source_branch, selected.merge_timestamp,
+        selected.removed_at ?? null, selected.created_via ?? "unknown", selected.accepted_at ?? null, current.id
+      );
+      if (!db.markMergeConflictResolved(conflict.id, { prefer: input.prefer, reason: input.reason, edge_id: current.id })) {
+        throw new Error("version_conflict: the conflict was already resolved; nothing was written.");
+      }
+    }
+    if (db.informedByCycleComponents().length > 0) throw new Error("Resolution would leave an informed_by cycle; nothing was written.");
+    return { message: `Resolved edge conflicts in "${input.merge_group}". Reason: ${input.reason}` };
+  });
 }
 
 /**
@@ -156,7 +202,7 @@ export class MergeEngine {
       const result = targetDb.runInTransaction(() => {
         ensureSchema(targetDb);
         if (leftDb.execSqlFirst("SELECT 1 FROM sqlite_master WHERE name='digest_sources'") || sourceRight.execSqlFirst("SELECT 1 FROM sqlite_master WHERE name='digest_sources'")) {
-          targetDb.execSqlRun("CREATE TABLE IF NOT EXISTS digest_sources(digest_id TEXT PRIMARY KEY, sources TEXT NOT NULL)");
+          targetDb.ensureDigestSourcesTable();
         }
         if (leftDb.execSqlFirst("SELECT 1 FROM sqlite_master WHERE name='provenance_audit_runs'") || sourceRight.execSqlFirst("SELECT 1 FROM sqlite_master WHERE name='provenance_audit_runs'")) {
           targetDb.ensureProvenanceAuditTable();
@@ -681,12 +727,51 @@ export class MergeEngine {
         outId = existing;
       }
       outEdgeIdByEnds.set(endsKey, outId);
+      if (diverged && mergeGroup) {
+        const versions = group.copies.filter((copy, index, copies) =>
+          copies.findIndex(candidate => {
+            const { _originSide: _side, _srcEdgeIds: _ids, ...payload } = candidate;
+            const { _originSide: _copySide, _srcEdgeIds: _copyIds, ...copyPayload } = copy;
+            return JSON.stringify(payload) === JSON.stringify(copyPayload);
+          }) === index
+        );
+        if (versions.length > 2) {
+          throw new Error(`Merge rejected: unsupported ${versions.length} edge versions for ${endsKey}; nothing was published.`);
+        }
+        const payloads = versions.map(copy => {
+          const address = copy._srcEdgeIds[0];
+          const source = address.side === "left" ? leftDb : rightDb;
+          const original = source.getEdgeById(address.id);
+          if (!original) throw new Error(`Missing source edge ${address.id}; nothing was published.`);
+          const pairRows = (table: string): Array<Record<string, unknown>> =>
+            source.execSqlAll(`SELECT * FROM "${table}" WHERE edge_key = ?`, String(address.id)) as Array<Record<string, unknown>>;
+          return {
+            format: "megamemory-conflict/1", origin: { side: address.side, label: address.side === "left" ? leftLabel : rightLabel },
+            object_kind: "edge", object_key: endsKey, rows: [original],
+            related_history: { support_baselines: pairRows("support_baselines"), support_revisions: pairRows("support_revisions") },
+            qualification: { confirmed: false },
+          };
+        });
+        outputDb.insertMergeConflict({
+          merge_group: mergeGroup, object_kind: "edge", object_key: endsKey, format_version: 1,
+          left_payload: JSON.stringify(payloads[0]), right_payload: JSON.stringify(payloads[1]),
+          mapping_json: JSON.stringify({
+            format: "megamemory-conflict-map/1",
+            edge: { id: outId, applied: outputDb.getEdgeById(outId) },
+            sides: versions.map(copy => ({ side: copy._originSide,
+              edge_ids: copy._srcEdgeIds, from_id: copy.from_id, to_id: group.remappedToId })),
+          }),
+        });
+      }
       for (const copy of group.copies) {
         for (const src of copy._srcEdgeIds) {
           edgeIdRemapping.set(`${src.side}:${src.id}`, outId);
         }
       }
     }
+
+    this.carryMergeConflicts(leftDb, outputDb, "left", idRemapping, edgeIdRemapping);
+    this.carryMergeConflicts(rightDb, outputDb, "right", idRemapping, edgeIdRemapping);
 
     // ---- Plan 4 (v8) §7: carry the support snapshots over ----
     // After every edge row exists in the output, so edge_key can be remapped
@@ -748,6 +833,41 @@ export class MergeEngine {
     }
 
     return result;
+  }
+
+  private carryMergeConflicts(
+    sourceDb: KnowledgeDB,
+    outputDb: KnowledgeDB,
+    side: "left" | "right",
+    nodes: Map<string, string>,
+    edges: Map<string, number>
+  ): void {
+    for (const conflict of sourceDb.getMergeConflicts(undefined, true)) {
+      const mapping = JSON.parse(conflict.mapping_json);
+      if (mapping.format !== "megamemory-conflict-map/1") {
+        throw new Error("Merge rejected: unsupported conflict mapping; nothing was published.");
+      }
+      const mapped = edges.get(`${side}:${mapping.edge.id}`);
+      if (mapped === undefined) {
+        throw new Error("Merge rejected: a saved conflict edge has no identity map; nothing was published.");
+      }
+      mapping.edge.id = mapped;
+      mapping.edge.applied = outputDb.getEdgeById(mapped);
+      for (const address of mapping.sides) {
+        address.from_id = nodes.get(`${side}:${address.from_id}`) ?? address.from_id;
+        address.to_id = nodes.get(`${side}:${address.to_id}`) ?? address.to_id;
+      }
+      const mappingJSON = JSON.stringify(mapping);
+      const duplicate = outputDb.getMergeConflicts(conflict.merge_group, true).find(row =>
+        row.object_kind === conflict.object_kind && row.object_key === conflict.object_key &&
+        row.left_payload === conflict.left_payload && row.right_payload === conflict.right_payload &&
+        row.state === conflict.state && row.mapping_json === mappingJSON && row.resolution_json === conflict.resolution_json
+      );
+      if (!duplicate) {
+        const { id: _id, ...row } = conflict;
+        outputDb.insertMergeConflict({ ...row, mapping_json: mappingJSON });
+      }
+    }
   }
 
   private insertNodeAsIs(db: KnowledgeDB, node: NodeRow): void {
@@ -1146,7 +1266,11 @@ export class MergeEngine {
       );
       if (exists) {
         const existing = outputDb.getSupportBaselineRow(decisionId, supportId, edgeKey)!;
-        if (["claim_digest", "status_digest", "edge_digest", "format_version", "confirmed_at", "confirmed_by", "superseded_at", "artifacts_digest"].some(column => ((existing as unknown as Record<string, unknown>)[column] ?? null) !== ((row as unknown as Record<string, unknown>)[column] ?? null))) {
+        // Only the snapshot's semantic content conflicts. Wall-clock fields
+        // are excluded: confirmed_at differs between two honest copies of
+        // the same confirmation (identical inputs merged must NOT throw),
+        // and confirmed_by is normalized to 'import' on carry anyway.
+        if (["claim_digest", "status_digest", "edge_digest", "format_version", "superseded_at", "artifacts_digest"].some(column => ((existing as unknown as Record<string, unknown>)[column] ?? null) !== ((row as unknown as Record<string, unknown>)[column] ?? null))) {
           throw new Error(`Merge rejected: conflicting support snapshot for "${decisionId}" and "${supportId}".`);
         }
         continue;
@@ -1160,11 +1284,17 @@ export class MergeEngine {
         edge_digest: row.edge_digest,
         format_version: row.format_version,
         confirmed_at: row.confirmed_at,
-        confirmed_by: row.confirmed_by,
+        // §7: the import never confirms. The row describes a confirmation
+        // that happened in the SOURCE db; in the output it is an import.
+        confirmed_by: "import",
         superseded_at: row.superseded_at ?? null,
         // 2.1.3 F2: the confirmed artifacts state travels verbatim — a remap
         // must not re-observe the artifacts (the import never checks files).
         artifacts_digest: row.artifacts_digest ?? null,
+        // Frozen 14: the per-pair authority binding travels with the pair,
+        // otherwise a carried pair loses its claim anchor and degrades to
+        // "unknown" in the output db.
+        decision_claim_digest: row.decision_claim_digest ?? null,
       });
       // Import events do not apply writer retention to a lossless carried journal.
       outputDb.execSqlRun(

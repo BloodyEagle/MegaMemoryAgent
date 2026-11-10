@@ -9,9 +9,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
-import { createConcept, updateConcept, looksLikeStateClaim } from "../tools.js";
+import { createConcept, updateConcept, looksLikeStateClaim, type ConceptWarning } from "../tools.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
+
+// tools.ts объявляет возврат update_concept как { message: string }, но реализация
+// расширяет warnings в рантайме (spread при warnings.length > 0). Приведение к
+// фактической форме ответа; объявленную сигнатуру исходника правит основной агент.
+type UpdateConceptResult = { message: string; warnings?: ConceptWarning[] };
 
 vi.mock("../embeddings.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../embeddings.js")>();
@@ -79,25 +84,25 @@ describe("state claim warnings (F4 2.1.13)", () => {
       kind: "module",
       summary: "обычное описание без маркеров",
     });
-    const updated = await updateConcept(db, {
+    const updated = (await updateConcept(db, {
       id: "plain-node",
       changes: { summary: "релиз 2.1.13 выпущен, тег стоит на main" },
-    });
+    })) as UpdateConceptResult;
     expect(updated.warnings).toHaveLength(1);
     expect(updated.warnings![0].code).toBe("state_claim_without_expiry");
 
     // правка с действующим сроком не предупреждает
-    const withExpiry = await updateConcept(db, {
+    const withExpiry = (await updateConcept(db, {
       id: "plain-node",
       changes: { summary: "влит в main, окно наблюдения до конца месяца", valid_until: "2099-06-01" },
-    });
+    })) as UpdateConceptResult;
     expect(withExpiry.warnings).toBeUndefined();
 
     // правка без смены саммари не проверяется вовсе
-    const noSummary = await updateConcept(db, {
+    const noSummary = (await updateConcept(db, {
       id: "plain-node",
       changes: { why: "уточнение" },
-    });
+    })) as UpdateConceptResult;
     expect(noSummary.warnings).toBeUndefined();
   });
 

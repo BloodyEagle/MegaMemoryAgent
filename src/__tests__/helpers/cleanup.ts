@@ -16,6 +16,10 @@ export async function closeAndCleanup(
   tmpDir: string
 ): Promise<void> {
   db.close();
+  // libsql releases the native handle on GC; yield first so a collectible
+  // handle is not retried against a still-locked file.
+  (globalThis as { gc?: () => void }).gc?.();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   for (let i = 0; i < 40; i++) {
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });

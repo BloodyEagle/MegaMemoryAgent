@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureSchema } from "../migrate-schema.js";
+import { claimDigestOf, statusDigestOf } from "../support-baselines.js";
 import { createConcept, getConcept, link, updateConcept } from "../tools.js";
 import { addNode, auditFixture, sqlState, type AuditFixture } from "./helpers/audit.js";
 import type { KnowledgeDB } from "../db.js";
@@ -63,10 +64,16 @@ describe("K-05: create with supersedes is one atomic write", () => {
     addNode(db, "old-two");
     addNode(db, "evidence");
 
+    const evidenceRow = db.getNode("evidence")!;
     const result = await createConcept(db, {
       name: "replacement", kind: "feature", summary: SUMMARY, force: true,
       supersedes: ["old-one", "old-two"],
-      evidence: [{ node: "evidence", why: "The independent measurement demonstrates the replacement behavior." }],
+      evidence: [{
+        node: "evidence",
+        why: "The independent measurement demonstrates the replacement behavior.",
+        // Frozen C-02: only an asserted expectation confirms the pair.
+        expect: { claim_digest: claimDigestOf(evidenceRow.summary), status_digest: statusDigestOf(evidenceRow.status, evidenceRow.epistemic_status) },
+      }],
     });
 
     expect(result.id).toBe("replacement");

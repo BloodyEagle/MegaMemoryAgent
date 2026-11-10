@@ -241,7 +241,7 @@ describe("MergeEngine", () => {
       output.close();
     });
 
-    it("preserves Buffer embeddings through merge round-trip", () => {
+    it("carries Buffer embeddings verbatim but marks them not-current until reembed (schema14)", () => {
       const left = createTmpDb("left.db");
       const right = createTmpDb("right.db");
       const outputPath = path.join(tmpDir, "output.db");
@@ -277,29 +277,16 @@ describe("MergeEngine", () => {
 
       engine.merge(left.path, right.path, outputPath);
 
+      // Historical bytes are preserved verbatim in the raw rows…
       const output = new KnowledgeDB(outputPath);
-      const outNodes = output.getAllActiveNodesWithEmbeddings();
-      const leftNode = outNodes.find((node) => node.id === "left-emb");
-      const rightNode = outNodes.find((node) => node.id === "right-emb");
+      const leftRaw = output.getAllNodesRaw().find((node) => node.id === "left-emb");
+      const rightRaw = output.getAllNodesRaw().find((node) => node.id === "right-emb");
+      expect(Buffer.from(leftRaw!.embedding as ArrayBuffer).equals(leftEmbedding)).toBe(true);
+      expect(Buffer.from(rightRaw!.embedding as ArrayBuffer).equals(rightEmbedding)).toBe(true);
 
-      expect(leftNode).toBeDefined();
-      const outputEmbedding = leftNode!.embedding;
-      expect(Buffer.isBuffer(outputEmbedding)).toBe(true);
-      if (!Buffer.isBuffer(outputEmbedding)) {
-        throw new Error("Expected Buffer embedding");
-      }
-      expect(outputEmbedding).toHaveLength(1536);
-      expect(outputEmbedding.equals(leftEmbedding)).toBe(true);
-
-      expect(rightNode).toBeDefined();
-      const rightOutputEmbedding = rightNode!.embedding;
-      expect(Buffer.isBuffer(rightOutputEmbedding)).toBe(true);
-      if (!Buffer.isBuffer(rightOutputEmbedding)) {
-        throw new Error("Expected Buffer embedding");
-      }
-      expect(rightOutputEmbedding).toHaveLength(1536);
-      expect(rightOutputEmbedding.equals(rightEmbedding)).toBe(true);
-
+      // …but a merged output has no active vector generation: foreign vectors
+      // are never blindly adopted as current search space (P-10 / A-01).
+      expect(output.getAllActiveNodesWithEmbeddings()).toEqual([]);
       output.close();
     });
 
@@ -414,7 +401,7 @@ describe("MergeEngine", () => {
       output.close();
     });
 
-    it("merges cleanly when both sides removed the same node", () => {
+    it("surfaces a conflict when both sides removed the same node with different reasons (full semantic equality)", () => {
       const left = createTmpDb("left.db");
       const right = createTmpDb("right.db");
       const outputPath = path.join(tmpDir, "output.db");
@@ -428,9 +415,36 @@ describe("MergeEngine", () => {
       left.db.close();
       right.db.close();
 
+      // Full semantic equality includes removed_reason (P-05): divergent
+      // removal reasons are an explicit conflict with both payloads kept,
+      // never a silent pick of one history.
+      const result = engine.merge(left.path, right.path, outputPath);
+      expect(result.conceptConflicts).toBe(1);
+      const output = new KnowledgeDB(outputPath);
+      const leftNode = output.getAllNodesRaw().find((node) => node.id === "both-removed::left");
+      const rightNode = output.getAllNodesRaw().find((node) => node.id === "both-removed::right");
+      expect(leftNode!.removed_reason).toBe("Removed on left");
+      expect(rightNode!.removed_reason).toBe("Removed on right");
+      output.close();
+    });
+
+    it("merges cleanly when both sides removed the same node for the same reason", () => {
+      const left = createTmpDb("left.db");
+      const right = createTmpDb("right.db");
+      const outputPath = path.join(tmpDir, "output.db");
+
+      insertTestNode(left.db, "both-removed", { summary: "Gone" });
+      left.db.softDeleteNode("both-removed", "Removed on left");
+
+      insertTestNode(right.db, "both-removed", { summary: "Gone" });
+      right.db.softDeleteNode("both-removed", "Removed on left");
+
+      left.db.close();
+      right.db.close();
+
       const result = engine.merge(left.path, right.path, outputPath);
 
-      // Both agree on removal, so it should be clean
+      // Both agree on removal AND its reason, so it is clean.
       expect(result.conceptConflicts).toBe(0);
       expect(result.removedClean).toBe(1);
       output_check: {

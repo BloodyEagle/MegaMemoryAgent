@@ -54,6 +54,12 @@ function findByName(db: KnowledgeDB, name: string): { id: string; created_via: s
   ) as { id: string; created_via: string | null } | undefined;
 }
 
+/** CreateConceptResult.id опционален по API (отказ дедупликации); в этих сценариях узел всегда создаётся. */
+function createdId(result: { id?: string }): string {
+  if (result.id === undefined) throw new Error("createConcept returned no id");
+  return result.id;
+}
+
 describe("2.1.10 F1: created_via на путях записи", () => {
   it("1. evidence: [{ref}] → узел-якорь с created_via='file_ref'", async () => {
     const db = newDb();
@@ -67,7 +73,7 @@ describe("2.1.10 F1: created_via на путях записи", () => {
     const anchor = findByName(db, ANCHOR_NAME)!;
     expect(anchor).toBeDefined();
     expect(anchor.created_via).toBe("file_ref");
-    expect(db.getNode(r.id)!.created_via).toBe("agent");
+    expect(db.getNode(createdId(r))!.created_via).toBe("agent");
   });
 
   it("2. create_concept без evidence → created_via='agent'", async () => {
@@ -78,7 +84,7 @@ describe("2.1.10 F1: created_via на путях записи", () => {
       kind: "feature",
       summary: "хранилище возвращает превью по запросу и блокирует доступ без токена",
     });
-    expect(db.getNode(r.id)!.created_via).toBe("agent");
+    expect(db.getNode(createdId(r))!.created_via).toBe("agent");
   });
 
   it("8. allow_stub: true → created_via='agent', epistemic_status='stub'", async () => {
@@ -90,7 +96,7 @@ describe("2.1.10 F1: created_via на путях записи", () => {
       summary: ANCHOR_SUMMARY,
       allow_stub: true,
     });
-    const node = db.getNode(r.id)!;
+    const node = db.getNode(createdId(r))!;
     expect(node.created_via).toBe("agent");
     expect(node.epistemic_status).toBe("stub");
   });

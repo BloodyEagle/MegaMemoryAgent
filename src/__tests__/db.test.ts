@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { KnowledgeDB } from "../db.js";
+import { MODEL_NAME, embeddingProfile } from "../embeddings.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -206,6 +207,10 @@ describe("KnowledgeDB", () => {
 
     it("returns embeddings as Buffer instances with correct float32 data", () => {
       const original = makeEmbeddingBuffer([1.0, 2.0, 3.0, 4.0]);
+      // P-10: читатель отдаёт векторы только активного поколения — блоб без
+      // поколения это инертная история. Штампуем поколение под dim=4 и
+      // публикуем вектор по контракту.
+      const generation = db.beginVectorGeneration({ model: MODEL_NAME, profile: embeddingProfile(MODEL_NAME), dim: 4 });
       db.insertNode({
         id: "with-emb",
         name: "With Embedding",
@@ -215,8 +220,8 @@ describe("KnowledgeDB", () => {
         file_refs: null,
         parent_id: null,
         created_by_task: null,
-        embedding: original,
       });
+      expect(db.publishNodeEmbedding({ ...generation, id: "with-emb", name: "With Embedding", kind: "feature", summary: "Has an embedding" }, original)).toBe(true);
 
       const results = db.getAllActiveNodesWithEmbeddings();
       expect(results).toHaveLength(1);

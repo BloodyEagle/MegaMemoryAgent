@@ -38,7 +38,7 @@ import type {
 } from "./types.js";
 import { buildNextHints, type NextHintsCard } from "./next-hints.js";
 import { renderBrief, type BriefNodeInfo } from "./brief.js";
-import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
+import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
 import {
   readProvenanceConfig,
@@ -59,6 +59,7 @@ import {
 } from "./support-baselines.js";
 import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary } from "./stub.js";
+import { validationState } from "./validation.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
   const errorMsg = err instanceof Error ? err.message : String(err);
@@ -541,12 +542,15 @@ export async function understand(
     topMatches = hits.map((h) => ({ id: h.id, similarity: h.score }));
     for (const h of hits) viaById.set(h.id, h.via);
   } else if (mode === "vector" && vectorSearchEnabled(db)) {
-    const candidates = db.getAllActiveNodesWithEmbeddings();
+    const expectedGeneration = db.getVectorGeneration();
+    const candidates = db.getAllActiveNodesWithEmbeddings(expectedGeneration ?? undefined);
     if (candidates.length === 0) {
       // Empty vector results use the same budgeted envelope as every other path.
       topMatches = [];
     } else {
       const queryEmbedding = await embed(queryText(input.query));
+      const currentGeneration = db.getVectorGeneration();
+      if (!expectedGeneration || !currentGeneration || currentGeneration.generation !== expectedGeneration.generation || currentGeneration.profile !== expectedGeneration.profile) throw new Error("version_conflict: vector generation changed during understand.");
       topMatches = findTopK(queryEmbedding, candidates, searchPool);
     }
   } else {
@@ -1127,6 +1131,9 @@ export function currentDigestsOf(node: NodeRow): CurrentDigestsView {
     claim: claimDigestOf(node.summary),
     status: statusDigestOf(node.status, node.epistemic_status),
     format_version: BASELINE_FORMAT_VERSION,
+    validation_claim: node.validation_claim_digest ?? null,
+    validation_scope: node.validation_scope_digest ?? null,
+    validation_state: validationState(node),
     confirmed_claim: snapshotClaim,
     confirmed_at: node.claim_digest_at ?? null,
     source: snapshotClaim !== null ? "snapshot" : "computed",
@@ -1355,6 +1362,7 @@ export async function createConcept(
     toId: string;
     why: string;
     fromAutoGround: boolean;
+    expect?: import("./types.js").EvidenceInput["expect"];
   }
   const factNodesToCreate: Array<{
     id: string;
@@ -1379,7 +1387,7 @@ export async function createConcept(
       if (!db.nodeExists(item.node)) {
         throw new Error(`evidence.node "${item.node}" does not exist (or is removed).`);
       }
-      supports.push({ toId: item.node, why, fromAutoGround: false });
+      supports.push({ toId: item.node, why, fromAutoGround: false, expect: item.expect });
       usedEvidenceIds.add(item.node);
       continue;
     }
@@ -1391,7 +1399,7 @@ export async function createConcept(
     const found = resolveFileRef(db, ref);
     if (found) {
       if (!usedEvidenceIds.has(found.id)) {
-        supports.push({ toId: found.id, why, fromAutoGround: false });
+        supports.push({ toId: found.id, why, fromAutoGround: false, expect: item.expect });
         usedEvidenceIds.add(found.id);
       }
       continue;
@@ -1465,8 +1473,12 @@ export async function createConcept(
   // self-confirmation. Those pairs stay `unknown` until an explicit
   // confirm_supports.
   const confirmableSupportIds = new Set<string>();
+  const newAnchorIds = new Set(factNodesToCreate.map(fact => fact.id));
   for (const s of supports) {
-    if (!s.fromAutoGround) confirmableSupportIds.add(s.toId);
+    if (!s.fromAutoGround && (newAnchorIds.has(s.toId) ||
+        (typeof s.expect?.claim_digest === "string" && typeof s.expect?.status_digest === "string"))) {
+      confirmableSupportIds.add(s.toId);
+    }
   }
 
   // Embeddings for the file-fact nodes (computed before the transaction).
@@ -1480,6 +1492,10 @@ export async function createConcept(
   // Generate embedding (null when the vector path is disabled pending reembed)
   const text = embeddingText(input.name, input.kind, input.summary);
   const embedding = await embedForStorage(db, text);
+  // The generation snapshot is taken AFTER the last await: embedForStorage
+  // legitimately establishes the first generation on a fresh db, and any
+  // concurrent switch after this point is caught inside the transaction.
+  const generationAtEmbed = embedding ? db.getVectorGeneration() : null;
 
   // ---- 2.1.10 F4: дубликаты по смыслу не создаются ----
   // Вторая сессия, не посмотревшая базу, записывает ту же работу заново.
@@ -1515,6 +1531,17 @@ export async function createConcept(
   let supersededIds: string[] = [];
 
   db.runInTransaction(() => {
+    for (const supportPlan of supports) {
+      if (newAnchorIds.has(supportPlan.toId) || supportPlan.fromAutoGround) continue;
+      const current = db.getNode(supportPlan.toId);
+      if (!current) throw new Error(`version_conflict: evidence "${supportPlan.toId}" disappeared; nothing was written.`);
+      const expect = supportPlan.expect;
+      if (expect && ((expect.claim_digest !== undefined && expect.claim_digest !== claimDigestOf(current.summary)) ||
+          (expect.status_digest !== undefined && expect.status_digest !== statusDigestOf(current.status, current.epistemic_status)) ||
+          (expect.artifacts_digest !== undefined && expect.artifacts_digest !== artifactsDigestOf(activeArtifactRows(current, db.getNodeArtifacts(current.id)))))) {
+        throw new Error(`version_conflict: evidence "${supportPlan.toId}" changed; nothing was written.`);
+      }
+    }
     for (const fact of factNodesToCreate) {
       db.insertNode({
         id: fact.id,
@@ -1586,6 +1613,7 @@ export async function createConcept(
         if (!support) continue;
         const row = {
           decision_id: id,
+          decision_claim_digest: claimDigestOf(input.summary),
           support_id: e.other_id,
           edge_key: String(e.id),
           claim_digest: claimDigestOf(support.summary),
@@ -1597,9 +1625,7 @@ export async function createConcept(
           // 2.1.3 F2: the confirmed artifacts state at the moment of the call.
           // Plan 04 K-11: the ACTIVE observation set only — refs already
           // withdrawn from the support stay history, not part of the pin.
-          artifacts_digest: artifactsDigestOf(
-            activeArtifactRows(support, db.getNodeArtifacts(e.other_id))
-          ),
+          artifacts_digest: supports.find(plan => plan.toId === e.other_id)?.expect?.artifacts_digest ?? null,
         };
         // 2.1.3 F1: the journal is written where the snapshot is written —
         // this carve-out is a first confirmation, so it opens the chain with
@@ -1609,6 +1635,10 @@ export async function createConcept(
       }
     }
 
+    if (epistemic === "validated" && input.status_scope) {
+      db.setEpistemicStatus(id, "validated", "Validated by the creating call.", input.status_scope);
+      db.recordStatusHistory(id, null, "validated", "Validated by the creating call.", "epistemic_status");
+    }
     if (supersedesIds.length > 0) {
       const { superseded, missing } = db.supersedeNodes(id, supersedesIds);
       if (missing.length > 0) {
@@ -1618,11 +1648,16 @@ export async function createConcept(
       }
       supersededIds = superseded;
     }
+    if (embedding && generationAtEmbed) {
+      // CAS applies only when an active generation exists: a blob stored
+      // without one is inert history, never a current vector hit (P-10).
+      const active = db.getVectorGeneration();
+      if (!active || active.generation !== generationAtEmbed.generation || active.model !== generationAtEmbed.model || active.profile !== generationAtEmbed.profile) {
+        throw new Error("version_conflict: vector generation changed during create; nothing was written.");
+      }
+      if (!db.publishNodeEmbedding({ ...active, id, name: input.name, kind: input.kind, summary: input.summary }, embedding)) throw new Error("version_conflict: created vector input changed.");
+    }
   });
-  if (embedding) {
-    // В17: keep the native vector copy in sync.
-    db.upsertVector(id, embedding);
-  }
 
   // В16: warn (never block) when a near-duplicate already exists — cheaper
   // than cleaning up afterwards with consolidate.
@@ -1699,14 +1734,18 @@ export async function updateConcept(
   // path is disabled pending reembed — reembed will fill it in). Inference
   // runs BEFORE the write transaction — no model work under the write lock
   // (plan 04, F-04.5).
+  const sourceInputAtRead = JSON.stringify([existing.name, existing.kind, existing.summary]);
   let embedding: Buffer | undefined;
-  if (input.changes.summary !== undefined || input.changes.name !== undefined) {
+  if (input.changes.summary !== undefined || input.changes.name !== undefined || input.changes.kind !== undefined) {
     const name = input.changes.name ?? existing.name;
     const kind = input.changes.kind ?? existing.kind;
     const summary = input.changes.summary ?? existing.summary;
     const text = embeddingText(name, kind, summary);
     embedding = (await embedForStorage(db, text)) ?? undefined;
   }
+  // Snapshot after the last await — embedForStorage may legitimately establish
+  // the first generation on a fresh db; a later concurrent switch is a conflict.
+  const generationAtEmbed = embedding ? db.getVectorGeneration() : null;
 
   let epistemicNote = "";
   let noChanges = false;
@@ -1719,6 +1758,7 @@ export async function updateConcept(
       throw new Error(`Concept "${input.id}" not found.`);
     }
 
+    if (JSON.stringify([current.name, current.kind, current.summary]) !== sourceInputAtRead) throw new Error("version_conflict: concept input changed during update.");
     // K-07: the RESULTING state is validated like create would. A kind change
     // must not launder a placeholder summary past create-time guarantees, and
     // feature -> decision must not bypass require_support.
@@ -1775,6 +1815,10 @@ export async function updateConcept(
       }
     }
 
+    if (current.epistemic_status === "validated" &&
+        input.changes.summary !== undefined && input.changes.summary !== current.summary) {
+      db.recordStatusHistory(current.id, "validated", "validated", "Claim changed; previous validation retained as history.", "epistemic_status");
+    }
     const updated = db.updateNode(input.id, {
       ...input.changes,
       embedding,
@@ -1808,13 +1852,21 @@ export async function updateConcept(
       epistemicNote = ` Epistemic status: ${epistemicWrite.to}.`;
     }
 
+    if (embedding && generationAtEmbed) {
+      // Same generation CAS as create: only an existing active generation is
+      // guarded; a generationless blob stays inert history (P-10).
+      const active = db.getVectorGeneration();
+      if (!active || active.generation !== generationAtEmbed.generation || active.model !== generationAtEmbed.model || active.profile !== generationAtEmbed.profile) throw new Error("version_conflict: vector generation changed during update.");
+      const updatedNode = db.getNode(input.id)!;
+      if (!db.publishNodeEmbedding({ ...active, id: input.id, name: updatedNode.name, kind: updatedNode.kind, summary: updatedNode.summary }, embedding)) throw new Error("version_conflict: vector input changed during update.");
+    } else if (input.changes.summary !== undefined || input.changes.name !== undefined || input.changes.kind !== undefined) {
+      // No active generation: store the blob on the node (inert until
+      // reembed) and drop any stale native copy.
+      db.execSqlRun("UPDATE nodes SET embedding=NULL,embedding_generation=NULL WHERE id=?", input.id);
+      db.deleteVector(input.id);
+    }
     if (!updated && !epistemicWrite) noChanges = true;
   });
-
-  if (embedding) {
-    // В17: keep the native vector copy in sync.
-    db.upsertVector(input.id, embedding);
-  }
 
   if (noChanges) {
     return { message: `No changes applied to "${input.id}"` };
@@ -2173,7 +2225,8 @@ export function listConflicts(db: KnowledgeDB): ListConflictsOutput {
       .map((e) => e.from_id),
   }));
 
-  if (conflictNodes.length === 0) {
+  const savedConflicts = db.getMergeConflicts();
+  if (conflictNodes.length === 0 && savedConflicts.length === 0) {
     return { conflicts: [], contradicted };
   }
 
@@ -2218,6 +2271,14 @@ export function listConflicts(db: KnowledgeDB): ListConflictsOutput {
     });
   }
 
+  for (const saved of savedConflicts) {
+    let group = conflicts.find(conflict => conflict.merge_group === saved.merge_group);
+    if (!group) {
+      group = { merge_group: saved.merge_group, merge_timestamp: saved.created_at, versions: [] };
+      conflicts.push(group);
+    }
+    (group.edge_conflicts ??= []).push(saved);
+  }
   return { conflicts, contradicted };
 }
 
@@ -2228,6 +2289,10 @@ export async function resolveConflict(
   const nodes = db.getNodesByMergeGroup(input.merge_group);
 
   if (nodes.length === 0) {
+    if (db.getMergeConflicts(input.merge_group).some(conflict => conflict.object_kind === "edge")) {
+      if (!input.prefer) throw new Error("Edge-only resolution requires prefer=left or right.");
+      return resolveEdgeConflicts(db, { merge_group: input.merge_group, prefer: input.prefer, reason: input.reason });
+    }
     throw new Error(`No nodes found with merge_group: ${input.merge_group}`);
   }
 

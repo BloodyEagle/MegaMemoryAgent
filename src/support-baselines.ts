@@ -40,7 +40,7 @@ import type {
  */
 
 /** Bump when the digest payload changes; old rows honestly become `unknown`. */
-export const BASELINE_FORMAT_VERSION = 1;
+export const BASELINE_FORMAT_VERSION = 2;
 
 /** §6 defaults for one check call: 5000 edges / 2 MB of payload. */
 export const DEFAULT_MAX_CHECK_EDGES = 5000;
@@ -273,7 +273,8 @@ export function computeSupportCheck(
       const edgeKey = String(edge.id);
       const anchor = rowsForAnchor(edge.other_id, edgeKey);
       const compatible =
-        anchor !== null && anchor.format_version === BASELINE_FORMAT_VERSION;
+        anchor !== null && anchor.format_version === BASELINE_FORMAT_VERSION &&
+        anchor.decision_claim_digest === claimDigestOf(node.summary);
       const support = compatible ? db.getNode(edge.other_id) : undefined;
       // Bytes are charged for what is actually read: payload texts for a
       // compatible pair, nothing for an unknown one (F2). 2.1.2 F8: a
@@ -395,20 +396,29 @@ export function computeSupportCheck(
     ? "incomplete"
     : changedList.length > 0 || claimChanged
       ? "changed"
-      : unknownSet.size > 0 || claimAnchor === null
+      : unknownSet.size > 0 || (claimAnchor === null && liveCount === 0)
         ? "unknown"
         : "unchanged";
 
+  const semanticChanged = changedList.filter((pair) => pair.reasons.length > 0);
+  const artifactChanged = changedList.filter((pair) => pair.artifact_changed);
+  const semanticReasonCounts: Partial<Record<SupportChangeReason, number>> = {};
+  for (const pair of semanticChanged) {
+    for (const reason of pair.reasons) semanticReasonCounts[reason] = (semanticReasonCounts[reason] ?? 0) + 1;
+  }
   return {
     state,
+    semantic_changed_count: semanticChanged.length,
+    semantic_reason_counts: semanticReasonCounts,
+    semantic_changed: semanticChanged.slice(0, VIEW_LIST_CAP),
+    artifact_changed: artifactChanged.slice(0, VIEW_LIST_CAP),
     // Capped lists with honest totals — a 20k-entry array is exactly the
     // output bloat the weak-links bounds were written against.
     changed: changedList.slice(0, VIEW_LIST_CAP),
     ...(changedList.length > VIEW_LIST_CAP
       ? { changed_count: changedList.length }
       : {}),
-    // 2.1.3 F2: honest total for the weak-links layer (it subtracts this from
-    // changed_count to size the support_changed record).
+    // Full artifact count is independent of semantic count and their overlap.
     ...(artifactChangedTotal > 0 ? { artifact_changed_count: artifactChangedTotal } : {}),
     unknown: [...unknownSet].slice(0, VIEW_LIST_CAP).sort(compareIds),
     ...(unknownSet.size > VIEW_LIST_CAP ? { unknown_count: unknownSet.size } : {}),
@@ -448,6 +458,10 @@ function revisionOf(
 ): SupportRevisionRow {
   return {
     decision_id: row.decision_id,
+    decision_claim_digest: row.decision_claim_digest ?? null,
+    artifacts_digest: row.artifacts_digest ?? null,
+    confirmed_by: row.confirmed_by,
+    superseded_at: row.superseded_at ?? null,
     support_id: row.support_id,
     edge_key: row.edge_key,
     claim_digest: row.claim_digest,
@@ -484,7 +498,9 @@ export function journalSnapshotWrite(db: KnowledgeDB, row: SupportBaselineRow, n
     existing.claim_digest !== row.claim_digest ||
     existing.status_digest !== row.status_digest ||
     existing.edge_digest !== row.edge_digest ||
-    existing.format_version !== row.format_version
+    existing.format_version !== row.format_version ||
+    (existing.decision_claim_digest ?? null) !== (row.decision_claim_digest ?? null) ||
+    (existing.artifacts_digest ?? null) !== (row.artifacts_digest ?? null)
   ) {
     db.insertSupportRevision(revisionOf(existing, "superseded", "reconfirmed", now));
   }
@@ -577,6 +593,9 @@ export function confirmSupports(
         );
         continue;
       }
+      if (item.expected_edge_key !== undefined && item.expected_edge_key !== String(edge.id)) {
+        mismatches.push(`опора "${supportId}": identity ребра изменилась с момента чтения (expected_edge_key).`);
+      }
       const support = db.getNode(supportId);
       if (!support) {
         mismatches.push(`опора "${supportId}": узел отсутствует (или удалён)`);
@@ -649,6 +668,7 @@ export function confirmSupports(
         auto: (edge as EdgeRow).created_via === "auto",
         row: {
           decision_id: input.decision_id,
+          decision_claim_digest: currentClaim,
           support_id: supportId,
           edge_key: String(edge.id),
           claim_digest: currentSupportClaim,
@@ -662,7 +682,7 @@ export function confirmSupports(
           // NULL when nothing was observed: no signal until a check exists.
           // Plan 04 K-11: the ACTIVE set only — refs withdrawn from the node
           // before the confirmation do not pin the snapshot.
-          artifacts_digest: currentArtifactsDigest,
+          artifacts_digest: item.expected_artifacts_digest === undefined ? null : currentArtifactsDigest,
         },
       });
     }
@@ -868,6 +888,10 @@ function pairHistory(
     claim_digest: preview(r.claim_digest),
     status_digest: preview(r.status_digest),
     edge_digest: preview(r.edge_digest),
+    decision_claim_digest: r.decision_claim_digest == null ? null : preview(r.decision_claim_digest),
+    artifacts_digest: r.artifacts_digest == null ? null : preview(r.artifacts_digest),
+    confirmed_by: r.confirmed_by ?? null,
+    superseded_at: r.superseded_at ?? null,
     format_version: r.format_version,
     recorded_at: r.recorded_at,
     is_current: false,
@@ -886,6 +910,10 @@ function pairHistory(
       claim_digest: preview(b.claim_digest),
       status_digest: preview(b.status_digest),
       edge_digest: preview(b.edge_digest),
+      decision_claim_digest: b.decision_claim_digest == null ? null : preview(b.decision_claim_digest),
+      artifacts_digest: b.artifacts_digest == null ? null : preview(b.artifacts_digest),
+      confirmed_by: b.confirmed_by ?? null,
+      superseded_at: b.superseded_at ?? null,
       format_version: b.format_version,
       recorded_at: b.confirmed_at,
       is_current: true,
@@ -896,7 +924,7 @@ function pairHistory(
     (a, b) =>
       b.recorded_at.localeCompare(a.recorded_at) ||
       Number(b.is_current) - Number(a.is_current) ||
-      b.seq - a.seq
+      a.seq - b.seq
   );
   // The limit caps the WHOLE chain, the current version included.
   const hasMore = entries.length > limit;

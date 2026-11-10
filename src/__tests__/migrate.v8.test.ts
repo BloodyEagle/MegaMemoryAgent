@@ -58,7 +58,7 @@ describe("migration v7 -> v8 (plan 4 v8: support baselines)", () => {
     // then-current SCHEMA_VERSION and was updated with the bump — the old
     // value asserted a falsehood after the bump (see the 2.1.3 report,
     // «изменённые ассерты»).
-    expect(SCHEMA_VERSION).toBe(13);
+    expect(SCHEMA_VERSION).toBe(14);
 
     const nodeCols = (
       reopened.pragma("table_info(nodes)") as Array<{ name: string }>

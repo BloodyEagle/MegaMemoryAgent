@@ -25,7 +25,11 @@
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "prepublishOnly": "npm run build",
-    "posttest": "node scripts/check-fixtures.mjs"
+    "posttest": "node scripts/check-fixtures.mjs",
+    "typecheck": "node scripts/verify.mjs typecheck",
+    "typecheck:tests": "node scripts/verify.mjs typecheck-tests",
+    "lint": "node scripts/lint.mjs",
+    "package:verify": "node scripts/package.mjs"
   },
   "keywords": [
     "mcp",

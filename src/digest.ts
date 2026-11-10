@@ -18,8 +18,8 @@ import type { NodeRow } from "./types.js";
  * no schema bump, same pattern as status_history). staleness is derived by
  * CONTENT: membership differs, or a member's meaning-version moved — not by
  * comparing timestamps of whoever happens to remain. Expiry is computed at
- * read time and never hashed; a legacy digest without a recorded membership
- * falls back to the old timestamp heuristic.
+ * read time and never hashed; a legacy digest without a complete format2
+ * input envelope stays stale/unknown until rebuilt.
  */
 
 export const DIGEST_MAX_SUMMARY = 800;
@@ -52,79 +52,79 @@ function existingDigest(db: KnowledgeDB, moduleId: string): string | undefined {
 
 interface DigestSourceRecord {
   node_id: string;
-  version: string;
+  version: string | null;
+}
+
+interface DigestSourcesEnvelope {
+  format: "digest-sources/2";
+  module: { id: string; name: string };
+  builder: { summary_cap: number; refs_cap: number; child_summary_cap: number; min_children: number };
+  sources: DigestSourceRecord[];
+}
+
+const DIGEST_CHILD_SUMMARY_CAP = 120;
+
+/** Canonical JSON for the frozen internal envelope; array order is meaningful. */
+function canonicalJSON(value: unknown): string {
+  const ordered = (item: unknown): unknown => Array.isArray(item)
+    ? item.map(ordered)
+    : item !== null && typeof item === "object"
+      ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, ordered((item as Record<string, unknown>)[key])]))
+      : item;
+  return JSON.stringify(ordered(value));
 }
 
 function hasDigestSourcesTable(db: KnowledgeDB): boolean {
-  return (
-    db.execSqlFirst(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='digest_sources'"
-    ) !== undefined
-  );
+  return db.execSqlFirst("SELECT 1 FROM sqlite_master WHERE type='table' AND name='digest_sources'") !== undefined;
 }
 
-function ensureDigestSourcesTable(db: KnowledgeDB): void {
-  db.execSqlRun(`CREATE TABLE IF NOT EXISTS digest_sources (
-    digest_id TEXT PRIMARY KEY,
-    sources TEXT NOT NULL
-  )`);
-}
-
-/** null = nothing recorded (legacy digest or missing table) — timestamp fallback. */
-function readDigestSources(
-  db: KnowledgeDB,
-  digestId: string
-): DigestSourceRecord[] | null {
+/** Legacy arrays/unknown formats remain raw historical records, not proof of freshness. */
+function readDigestSources(db: KnowledgeDB, digestId: string): unknown {
   if (!hasDigestSourcesTable(db)) return null;
-  const row = db.execSqlFirst(
-    "SELECT sources FROM digest_sources WHERE digest_id = ?",
-    digestId
-  ) as { sources: string } | undefined;
-  if (!row) return null;
+  const row = db.execSqlFirst("SELECT sources, format_version FROM digest_sources WHERE digest_id = ?", digestId) as
+    { sources: string; format_version: number } | undefined;
+  if (!row || row.format_version !== 2) return null;
   try {
     const parsed: unknown = JSON.parse(row.sources);
-    if (!Array.isArray(parsed)) return null;
-    return parsed.filter(
-      (r): r is DigestSourceRecord =>
-        r !== null && typeof r === "object" &&
-        typeof (r as DigestSourceRecord).node_id === "string" &&
-        typeof (r as DigestSourceRecord).version === "string"
-    );
-  } catch {
-    return null;
-  }
+    if (!parsed || typeof parsed !== "object" || (parsed as { format?: unknown }).format !== "digest-sources/2") return null;
+    return parsed;
+  } catch { return null; }
 }
 
-/**
- * The meaning-version of one source: summary + lifecycle status + epistemic
- * status + valid_until VALUE (expiry itself is computed at read time, never
- * hashed — a clock passage must not require a rewrite). name, parent_id and
- * timestamps are excluded — a rename does not change what the digest says.
- */
-function sourceVersion(child: NodeRow): string {
-  return createHash("sha1")
-    .update(
-      [
-        child.summary,
-        child.status ?? "active",
-        child.epistemic_status ?? "",
-        child.valid_until ?? "",
-      ].join("\n")
-    )
-    .digest("hex");
+/** Invalid legacy refs stay unavailable, never silently filtered into a fresh proof. */
+function parsedSourceRefs(child: NodeRow): unknown[] | null | undefined {
+  if (child.file_refs === null) return null;
+  if (typeof child.file_refs !== "string") return undefined;
+  try {
+    const refs: unknown = JSON.parse(child.file_refs);
+    return Array.isArray(refs) && refs.every((ref) => typeof ref === "string") ? refs : undefined;
+  } catch { return undefined; }
 }
 
-function writeDigestSources(
-  db: KnowledgeDB,
-  digestId: string,
-  sources: DigestSourceRecord[]
-): void {
-  ensureDigestSourcesTable(db);
+function sourceVersion(child: NodeRow): string | null {
+  const refs = parsedSourceRefs(child);
+  if (refs === undefined) return null;
+  return createHash("sha256").update("digest-source-v2\n" + JSON.stringify([
+    child.name, child.kind, child.summary, refs, child.status ?? "active",
+    child.epistemic_status ?? null, child.valid_until ?? null,
+  ])).digest("hex");
+}
+
+function sourceEnvelope(module: NodeRow, children: NodeRow[]): DigestSourcesEnvelope {
+  return {
+    format: "digest-sources/2", module: { id: module.id, name: module.name },
+    builder: { summary_cap: DIGEST_MAX_SUMMARY, refs_cap: DIGEST_MAX_FILE_REFS,
+      child_summary_cap: DIGEST_CHILD_SUMMARY_CAP, min_children: DIGEST_MIN_CHILDREN },
+    sources: children.map((child) => ({ node_id: child.id, version: sourceVersion(child) })),
+  };
+}
+
+function writeDigestSources(db: KnowledgeDB, digestId: string, envelope: DigestSourcesEnvelope): void {
+  db.ensureDigestSourcesTable();
   db.execSqlRun(
-    `INSERT INTO digest_sources (digest_id, sources) VALUES (?, ?)
-     ON CONFLICT(digest_id) DO UPDATE SET sources = excluded.sources`,
-    digestId,
-    JSON.stringify(sources)
+    `INSERT INTO digest_sources (digest_id, sources, format_version) VALUES (?, ?, 2)
+     ON CONFLICT(digest_id) DO UPDATE SET sources = excluded.sources, format_version = 2`,
+    digestId, canonicalJSON(envelope)
   );
 }
 
@@ -141,7 +141,7 @@ export function digestEligibleChildren(db: KnowledgeDB, parentId: string): NodeR
     if (c.epistemic_status === "refuted" || c.epistemic_status === "abandoned") return false;
     if (isNodeExpired(c)) return false;
     return true;
-  });
+  }).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 }
 
 export interface DigestChild {
@@ -168,32 +168,17 @@ export function digestSourceChildren(
   if (!digest || digest.kind !== "digest") {
     throw new Error(`Node "${digestId}" is not a digest.`);
   }
-  const children = digestEligibleChildren(db, digest.parent_id ?? "").map((c) => ({
-    id: c.id,
-    name: c.name,
-    kind: c.kind,
-    updated_at: c.updated_at,
-  }));
-  const recorded = readDigestSources(db, digestId);
-  let stale: boolean;
-  if (recorded === null) {
-    // Legacy digest built before the membership table existed: the old
-    // timestamp heuristic, honestly weaker than the content comparison.
-    stale = children.some((c) => c.updated_at > digest.updated_at);
-  } else {
-    const currentIds = new Set(children.map((c) => c.id));
-    const recordedIds = new Set(recorded.map((r) => r.node_id));
-    const sameSet =
-      currentIds.size === recordedIds.size &&
-      [...currentIds].every((id) => recordedIds.has(id));
-    stale =
-      !sameSet ||
-      children.some((c) => {
-        const rec = recorded.find((r) => r.node_id === c.id)!;
-        return rec.version !== sourceVersion(db.getNode(c.id)!);
-      });
-  }
-  return { children, stale };
+  return db.runInTransaction(() => {
+    const module = digest.parent_id ? db.getNode(digest.parent_id) : undefined;
+    const sources = module ? digestEligibleChildren(db, module.id) : [];
+    const children = sources.map((c) => ({ id: c.id, name: c.name, kind: c.kind, updated_at: c.updated_at }));
+    const recorded = readDigestSources(db, digestId);
+    const current = module ? sourceEnvelope(module, sources) : null;
+    const stale = current === null || recorded === null ||
+      current.sources.some((source) => source.version === null) ||
+      canonicalJSON(recorded) !== canonicalJSON(current);
+    return { children, stale };
+  });
 }
 
 /** Build or refresh the digest of one module. */
@@ -211,12 +196,13 @@ export async function buildDigest(
   // superseded/expired source must not be republished as current knowledge
   // through a searchable digest.
   const children = digestEligibleChildren(db, moduleId);
+  const envelope = sourceEnvelope(module, children);
   const name = digestName(module.name);
   const digestId = makeId(name, moduleId);
 
   // Summary: name — truncated summary per child, capped.
   const parts = children.map(
-    (c) => `${c.name} — ${c.summary.replace(/\s+/g, " ").slice(0, 120)}`
+    (c) => `${c.name} — ${c.summary.replace(/\s+/g, " ").slice(0, DIGEST_CHILD_SUMMARY_CAP)}`
   );
   let summary = `${children.length} concepts: ${parts.join("; ")}`;
   if (summary.length > DIGEST_MAX_SUMMARY) {
@@ -226,16 +212,11 @@ export async function buildDigest(
   // Union of children's file_refs, max 10.
   const refs: string[] = [];
   for (const child of children) {
-    if (!child.file_refs) continue;
-    try {
-      const parsed = JSON.parse(child.file_refs);
-      if (!Array.isArray(parsed)) continue;
-      for (const ref of parsed.map(String)) {
-        if (!refs.includes(ref)) refs.push(ref);
-        if (refs.length >= DIGEST_MAX_FILE_REFS) break;
-      }
-    } catch {
-      // unparsable refs are skipped, not fatal
+    const parsed = parsedSourceRefs(child);
+    if (!parsed) continue;
+    for (const ref of parsed as string[]) {
+      if (!refs.includes(ref)) refs.push(ref);
+      if (refs.length >= DIGEST_MAX_FILE_REFS) break;
     }
     if (refs.length >= DIGEST_MAX_FILE_REFS) break;
   }
@@ -252,6 +233,11 @@ export async function buildDigest(
   }
 
   db.runInTransaction(() => {
+    const currentModule = db.getNode(moduleId);
+    if (!currentModule || canonicalJSON(sourceEnvelope(currentModule, digestEligibleChildren(db, moduleId))) !== canonicalJSON(envelope) ||
+        existingDigest(db, moduleId) !== existingId) {
+      throw new Error("version_conflict: digest inputs changed during build; nothing written.");
+    }
     if (created) {
       db.insertNode({
         id: targetId,
@@ -267,6 +253,8 @@ export async function buildDigest(
       });
     } else {
       db.updateNode(targetId, {
+        name,
+        why: `Auto-generated digest of "${module.name}" children.`,
         summary,
         file_refs: refs.length > 0 ? refs : [],
         ...(embedding !== undefined ? { embedding } : {}),
@@ -277,11 +265,7 @@ export async function buildDigest(
 
     // K-08: record what this digest was built from — the exact set of
     // sources and their meaning-versions, one atomic write with the node.
-    writeDigestSources(
-      db,
-      targetId,
-      children.map((c) => ({ node_id: c.id, version: sourceVersion(c) }))
-    );
+    writeDigestSources(db, targetId, envelope);
   });
 
   return { moduleId, digestId: targetId, created, children: children.length };

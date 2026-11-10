@@ -45,6 +45,12 @@ afterEach(() => {
   db.close();
 });
 
+/** CreateConceptResult.id опционален по API (отказ дедупликации); в этих сценариях узел всегда создаётся. */
+function createdId(result: { id?: string }): string {
+  if (result.id === undefined) throw new Error("createConcept returned no id");
+  return result.id;
+}
+
 function node(id: string, kind = "config", summary = `s-${id}`) {
   db.insertNode({ id, name: id.toUpperCase(), kind, summary });
 }
@@ -150,13 +156,28 @@ describe("F1: journal writes", () => {
 
   it("3. create_concept with evidence journals agent/confirmed; a rollback leaves neither snapshot nor journal", async () => {
     node("f", "fact");
+    // Frozen C-02: evidence without an expect block links but never confirms —
+    // no snapshot, no journal entry.
+    const unconfirmed = await createConcept(db, {
+      name: "d0",
+      kind: "decision",
+      summary: "decision d0 plus the fixture context of this check and the call keeps its contract with the evidence passed in the call",
+      evidence: [{ node: "f", why: "because f" }],
+    });
+    expect(revisions(createdId(unconfirmed), "f")).toHaveLength(0);
+    expect(db.getSupportBaselines(createdId(unconfirmed))).toHaveLength(0);
+
+    // With an expect block the agent asserts the state it just read: the pair
+    // is confirmed and journaled agent/confirmed.
+    const support = db.getNode("f")!;
     const res = await createConcept(db, {
       name: "d",
       kind: "decision",
       summary: "decision d plus the fixture context of this check and the call keeps its contract with the evidence passed in the call",
-      evidence: [{ node: "f", why: "because f" }],
+      force: true,
+      evidence: [{ node: "f", why: "because f", expect: { claim_digest: claimDigestOf(support.summary), status_digest: statusDigestOf(support.status, support.epistemic_status) } }],
     });
-    const rows = revisions(res.id, "f");
+    const rows = revisions(createdId(res), "f");
     expect(rows).toHaveLength(1);
     expect(rows[0].source).toBe("agent");
     expect(rows[0].reason).toBe("confirmed");
@@ -174,7 +195,8 @@ describe("F1: journal writes", () => {
         name: "d2",
         kind: "decision",
         summary: "decision d2 plus the fixture context of this check and the call keeps its contract",
-        evidence: [{ node: "f", why: "because f too" }],
+        force: true,
+        evidence: [{ node: "f", why: "because f too", expect: { claim_digest: claimDigestOf(support.summary), status_digest: statusDigestOf(support.status, support.epistemic_status) } }],
       });
     } catch {
       threw = true;

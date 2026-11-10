@@ -33,7 +33,7 @@ function node(id = "claim", overrides: Partial<NodeRow> = {}): NodeRow {
 function input(rows: NodeRow[], setup?: (db: KnowledgeDB) => void): string {
   const filename = path.join(temp, `input-${serial++}.db`);
   const db = new KnowledgeDB(filename);
-  try { ensureSchema(db); for (const row of rows) db.insertNodeRaw(row); setup?.(db); }
+  try { ensureSchema(db); for (const row of rows) db.insertNodeRaw({ ...row, embedding: row.embedding instanceof ArrayBuffer ? Buffer.from(row.embedding) : row.embedding }); setup?.(db); }
   finally { db.close(); }
   return filename;
 }
@@ -110,8 +110,7 @@ for (const reverse of [false, true]) {
       ["task_state", "done"], ["due_at", "2031-01-01"],
       ["valid_from", "2027-01-01"], ["valid_until", "2027-02-01"],
       ["status_scope", '{"artifact":"independent"}'], ["removed_reason", "Different reason"],
-      ["created_by_task", "Different context"], ["claim_digest", "independent-claim"],
-      ["claim_digest_at", "2026-02-01 00:00:00"], ["created_via", "file_ref"],
+      ["created_by_task", "Different context"],
     ])("B-01 %s difference preserves both payloads through public merge", (field, value) => {
       const a = input([node()]);
       const b = input([node("claim", { [field]: value })]);
@@ -138,6 +137,18 @@ for (const reverse of [false, true]) {
       const b = input([node("claim", { updated_at: "2026-09-01 00:00:00" })]);
       const output = merge(...ordered(a, b));
       expect(read(output, db => db.getAllNodesRaw().map(row => [row.id, row.needs_merge]))).toEqual([["claim", 0]]);
+    });
+
+    it("B-01 claim-anchor and provenance stamps are not identity: honest copies merge cleanly", () => {
+      const a = input([node("claim", { claim_digest: "h1", claim_digest_at: "2026-01-01 00:00:00" })]);
+      const b = input([node("claim", { claim_digest: "h1", claim_digest_at: "2026-02-01 00:00:00" })]);
+      const output = merge(...ordered(a, b));
+      expect(read(output, db => db.getAllNodesRaw().map(row => [row.id, row.needs_merge]))).toEqual([["claim", 0]]);
+      // per-database provenance: a re-migrated copy carries the v12 backfill
+      // value where the original has NULL — that must not split the node.
+      const c = input([node("claim", { created_via: "file_ref" })]);
+      const mergedVia = merge(...ordered(output, c));
+      expect(read(mergedVia, db => db.getAllNodesRaw().map(row => [row.id, row.needs_merge]))).toEqual([["claim", 0]]);
     });
 
     it("B-02 rejects unresolved pair plus a third canonical meaning atomically", () => {

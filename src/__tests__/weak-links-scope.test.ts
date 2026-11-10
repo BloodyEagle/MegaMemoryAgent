@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
+import { claimDigestOf, statusDigestOf } from "../support-baselines.js";
 import { createConcept } from "../tools.js";
 import { provenanceTrace } from "../provenance.js";
 import type { ProvenanceTraceOutput } from "../types.js";
@@ -18,6 +19,12 @@ let tmpDir: string;
 function newDb(): KnowledgeDB {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-wl-scope-"));
   return new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
+}
+
+/** CreateConceptResult.id опционален по API (отказ дедупликации); в этих сценариях узел всегда создаётся. */
+function createdId(result: { id?: string }): string {
+  if (result.id === undefined) throw new Error("createConcept returned no id");
+  return result.id;
 }
 
 const dbs: KnowledgeDB[] = [];
@@ -124,19 +131,26 @@ describe("2.1.10 F3: weak_links по всем носителям знания", 
     // заставляет проверку пересчитать claim — и байтовый бюджет в 1 байт
     // обрывает её: incomplete, не «чисто».
     const big = "x".repeat(100);
+    // Frozen C-02: снимок при создании пишут только за assert-ожиданием —
+    // агент закрепляет то, что прочитал.
+    const c1Row = db.getNode("c1")!;
     const r = await createConcept(db, {
       name: "d",
       kind: "decision",
       summary: big,
-      evidence: [{ node: "c1", why: "хранение превью — тот же слой" }],
+      evidence: [{
+        node: "c1",
+        why: "хранение превью — тот же слой",
+        expect: { claim_digest: claimDigestOf(c1Row.summary), status_digest: statusDigestOf(c1Row.status, c1Row.epistemic_status) },
+      }],
     });
-    db.updateNode(r.id, { summary: `${big}!` });
-    const out = trace(db, r.id, { checkBytes: 1 });
+    db.updateNode(createdId(r), { summary: `${big}!` });
+    const out = trace(db, createdId(r), { checkBytes: 1 });
     expect(out.support_check?.state).toBe("incomplete");
     // Оборванная проверка — слабое звено (type support_unreviewed, note
     // честно называет support_check: incomplete).
     const w = out.weak_links.find(
-      (t) => t.type === "support_unreviewed" && t.note.includes("incomplete")
+      (t) => t.type === "support_unreviewed" && t.note?.includes("incomplete")
     );
     expect(w).toBeDefined();
   });

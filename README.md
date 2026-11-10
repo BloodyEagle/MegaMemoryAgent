@@ -229,12 +229,33 @@ Graph path requires two endpoints, not a natural-language query:
 ```text
 node "C:/p/agent-skills/skills/token-economy-ts/scripts/graph-tool.js" op=path from=src/a.ts to=src/b.ts root=.
 python -I "C:/p/agent-skills/skills/token-economy-py/scripts/te.py" search "apply_catalog" --root "<project-root>"
+node "C:/p/agent-skills/skills/token-economy-har/har.js" search "AbsentNeedle" --file "<own-artificial.har>" --json
 ```
+
+PY search returns UTF-8 text, not JSON. HAR complete no-match returns its JSON
+payload with exit1 and empty stderr; parse/regex/read errors exit2 instead.
 
 TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 use separate CLI/output contracts; use the
 script from the source/staging package or an explicitly updated installation.
 A complete expected no-match is valid; errors, absent payloads and truncation are
 not proof of quality or a measurable advantage.
+
+`graph_metric=retrieval_wire_without_instructions` estimates the MCP content wrapper
+around retrieval (including `next`), **without MCP instructions metadata**. It is not
+exactly the default MCP response and not whole-task telemetry (`economy_status=not_measured`).
+No fixed token correction is applied. `ratio > 1` means the graph is cheaper;
+`ratio < 1` means the baseline is cheaper: 200 / 100 = 2, 100 / 200 = 0.5.
+
+For quality-gated TE comparisons, add `expected_outcome`, `expect_nodes`,
+`quality_contract` and `expected_te_refs`/`expected_te_symbols`/`expected_te_edges`
+to the dataset; see [the explicit adapter schemas](docs/bench-protocol.md#quality-and-completeness).
+`quality_ratio_te` and its median include only correct complete live pairs;
+legacy `ratio_te`/token totals are **raw retrieval costs**, not evidence of benefit.
+Preset counts are not live; malformed/error/absent payloads (even exit0) are never
+eligible. A complete valid expected negative passes quality and can be compared
+when both costs are positive. The report counts failures/unknowns over all questions.
+The runner captures at most 16 MiB of stdout/stderr each, counts all emitted bytes,
+and marks truncation; a partial prefix has no exact token cost or ratio.
 
 `ratio = baseline_tokens / graph_tokens` — but never read it without `hit_rate` (did the
 expected nodes surface in the top-10): a cheap but wrong answer is not savings.

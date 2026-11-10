@@ -135,10 +135,20 @@ const MEASURING_SECTION = `
 graph saves orientation time — three baselines, one flag:
 
 - \`--baseline files\` — versus reading the \`file_refs\` files of the found nodes;
-- \`--baseline te --te-cmd "tool path {query}"\` — versus an external structural tool
-  (symbol graph / outline); \`{query}\` is substituted escaped, stdout counts as tokens;
-- \`--baseline both\` — both ratios side by side: where memory wins and where the
-  structural tool is the right call.
+- \`--baseline te --te-exec <node> --te-arg <code-searcher.js> --te-arg "query={query}" --te-arg "root=."\`
+  — versus token-economy-ts 1.1.0 text search, from the analyzed project's cwd;
+  executable/script paths are absolute, and \`{query}\` stays one literal argv value;
+- \`--baseline both\` — both raw retrieval ratios side by side.
+
+\`lang\` groups results, not skills. Precedence: preset → structured runner → question
+shell → global shell; \`te_used_preset\` is not live. Shell templates are trusted advanced
+input (Windows expansion is lossy). Graph path needs \`from\` and \`to\`, not a question.
+\`graph_metric=retrieval_wire_without_instructions\` estimates the MCP content wrapper
+around retrieval, including \`next\`, but excludes MCP instructions metadata. It is not
+exactly the default MCP response or whole-task cost; \`economy_status=not_measured\`.
+Use dataset \`expected_outcome\`, \`expect_nodes\`, \`quality_contract\` and TE oracles:
+only complete correct live results enter \`quality_ratio_te\`; raw ratios are separate.
+A valid expected no-match passes quality. Error/unknown/truncation/preset is not eligible.
 
 \`ratio = baseline_tokens / graph_tokens\`; read it only together with \`hit_rate\` — a cheap
 but wrong answer is not savings. \`ratio > 1\` means the graph is cheaper;

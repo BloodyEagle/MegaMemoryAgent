@@ -76,7 +76,10 @@ function json(res: http.ServerResponse, data: unknown, status = 200): void {
 }
 
 function html(res: http.ServerResponse, content: string): void {
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  // no-cache: устаревшая копия explorer-а в кеше браузера молча ломает CSP
+  // (хеши инлайн-скриптов считаются на сервере под текущий HTML) и показывает
+  // старое UI поверх нового API.
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
   res.end(content);
 }
 
@@ -715,8 +718,13 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       !["http:", "https:"].includes(d3Url.protocol) || d3Url.username || d3Url.password || /[\u0000-\u0020\\]/.test(d3.src)) {
     throw new Error("Invalid D3 URL: use a local absolute path or an HTTP(S) URL without credentials");
   }
+  // HTML-парсер нормализует CRLF→LF во входном потоке ДО токенизации, поэтому
+  // браузер хеширует LF-контент. Рабочая копия на Windows может нести CRLF
+  // (git autocrlf) — хешируем и отдаём ровно те байты, которые увидит парсер,
+  // иначе CSP-хеши инлайн-скриптов не совпадают и скрипт блокируется.
   const htmlContent = fs
     .readFileSync(htmlPath, "utf-8")
+    .replaceAll("\r\n", "\n")
     .replaceAll("{{VERSION}}", escapeHtmlAttribute(VERSION))
     .replaceAll("{{D3_SRC}}", escapeHtmlAttribute(d3.src));
   const inlineHashes = [...htmlContent.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)]
@@ -776,8 +784,9 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
 
     // ---- Routes ----
 
-    if (pathname === "/" && req.method === "GET") {
-      html(res, htmlContent);
+    if (pathname === "/" && (req.method === "GET" || req.method === "HEAD")) {
+      // HEAD отдаёт те же заголовки (CSP в том числе) без тела.
+      html(res, req.method === "HEAD" ? "" : htmlContent);
       return;
     }
 

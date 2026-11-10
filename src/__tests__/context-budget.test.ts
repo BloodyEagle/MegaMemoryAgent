@@ -147,14 +147,19 @@ describe("patches v1.1: zh budget (А6/В15) and edges_between (В14)", () => {
       });
     }
     const result = await understand(db, { query: "支付", top_k: 20, max_tokens: 500 });
-    expect(result.meta!.returned).toBeGreaterThanOrEqual(1);
+    // План 06 K-04 / план 13: карточка ~2000+ токенов в бюджет 500 не
+    // помещается целиком — честный ответ воронки: пустой список, усечение
+    // помечено, полный размер оценён. Ноль — валидный результат, «хоть одна
+    // карточка любой ценой» (эпоха v1.1) больше не переувеличивает бюджет.
+    expect(result.meta!.returned).toBe(0);
+    expect(result.meta!.dropped).toBe(20);
+    expect(result.meta!.estimated_full_tokens).toBeGreaterThan(500);
     // План 13 §2.1: блок next присутствует в каждом ответе, и его record не
     // режется никогда — кап соблюдается с точностью до этого постоянного
     // минимума, а превышение помечается meta.truncated (мера остаётся честной).
     const NEXT_FLOOR_TOKENS = 96;
     expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500 + NEXT_FLOOR_TOKENS);
     expect(result.meta!.truncated).toBe(true);
-    expect(result.meta!.dropped).toBeGreaterThan(0);
   });
 
   it("compact output carries edges_between (В14)", async () => {

@@ -69,6 +69,76 @@ of this project are not our measurements** and must not be reproduced in this
 repository's docs, README, or CHANGELOG as if they were — cite your own runs
 or link the review verbatim.
 
+## Quality and completeness
+
+This retrieval metric is `graph_metric=retrieval_wire_without_instructions`: the
+estimator includes the MCP content wrapper, pretty JSON and `next`, but **excludes
+MCP instructions metadata**. It is not exactly the default MCP response. There is
+no magic fixed token offset. TE counts stdout only, not skill instructions or
+follow-up file reads. Whole-task economy remains `economy_status=not_measured`.
+
+### Additive dataset contract
+
+No new CLI flags or runtime routing are introduced. One JSON object per question:
+
+```json
+{"id":"lookup","query":"Needle","expected_outcome":"match","expect_nodes":["needle"],"quality_contract":{"adapter":"ts_search"},"expected_te_refs":["src/a.ts:2"]}
+{"id":"negative","query":"AbsentNeedle","expected_outcome":"no_match","quality_contract":{"adapter":"ts_search"}}
+```
+
+`expected_outcome` is `match` or `no_match`. Graph positives require at least one
+explicit expected node; every specified node must be present. Negative requires
+no graph match/refuted row and no TE result. `expect_nodes` never substitutes for
+a TE oracle. `expected_te_refs`, `expected_te_symbols` and `expected_te_edges`
+are arrays of exact strings; every expected item must occur. Edges use
+`from->to` or `from->to:relation`. A positive TE oracle is required; missing
+oracles/adapter make quality unknown, not an advantage.
+
+`quality_contract.adapter` declares the source format (no automatic language dispatch):
+
+- `ts_search`: TS 1.1.0 JSON `{count,matches:[{file,line,text}]}`. Ref is `file`
+  or `file:line`; `count > matches.length` is truncated. Count0/[] is a valid negative.
+- `py_search`: PY 1.2.1 UTF-8 text `filename`, `N: text`, and footer
+  `-- совпадений: N, файлов: M[, показано K]`. Negative must exactly match
+  `«query»: совпадений нет (N файлов просмотрено)`. No JSON flag is assumed;
+  shown fewer than count is truncated. Refs are filename or filename:line.
+- `har_search`: HAR 1.0.1 JSON `{command:"search",total,shown,omitted,items,truncated}`;
+  refs are exact item URLs. Complete no-match `total0/items[]/truncated:false`
+  with empty stderr **exits 1**, not 0; only this shape permits exit1.
+- `generic_json`: explicit test/source adapter, **not a claim that skills emit it**.
+  JSON `{results:[{refs?:string[],symbols?:string[],edges?:string[]}],complete:boolean}`.
+  Errors/malformed/absent payload never count as a negative.
+
+Four independent report axes: `quality=pass|fail|unknown`,
+`completeness=complete|truncated|unknown`, `measurement=live|preset|not_measured`,
+`comparison_te=eligible|not_comparable`. `quality_ratio_te` is defined only for
+complete correct live pairs with positive finite graph and TE costs; a valid
+negative can pass quality and be eligible. Legacy `ratio_te`/token totals remain
+**raw retrieval costs**; `quality_summary` counts pass/fail/unknown/error/truncation/
+preset/eligible across **all** questions, including excluded cases.
+Preset is not a live measurement. An exit0 process proves no payload quality.
+The structured runner caps each stream at 16 MiB, measures all emitted bytes,
+retains only whole UTF-8 code points, and reports truncation; partial stdout token
+cost and all corresponding ratios are null, with captured prefix cost separate.
+
+## Three-mode whole-task experiment
+
+The historical 10 questions A/B above is a manual pilot, not the current full
+three-mode acceptance. Freeze 12 independent tasks (two each: lookup, ESM/impact,
+architecture, stale/refuted evidence, config/cache, negative/no-memory), with
+TS/PY/HAR where appropriate. Run skills-only, memory-only and joint, three repeats
+per task: 108 runs **per cache profile**. Cold/warm remain separate. Predeclare
+oracle, versions/model, parameters, order/seed, reset and stop after the fixed matrix.
+No paid model/network runs are implied by this protocol.
+
+Full telemetry must include input/output/cached tokens, instructions, tool calls/
+responses, follow-up reads, retries, memory writes and final answers. Without that
+telemetry, functional/retrieval smoke is valid but `economy_not_measured`; it is
+not `integration_complete` before cross-project P-18/AS-08 handoffs. Aggregate
+paired baseline/joint task costs, repeats clustered within tasks, paired median
+and predeclared 95% cluster-bootstrap interval. Savings require quality not worse
+and the lower ratio bound >1 for every claimed baseline; incomplete matrix is pilot.
+
 ## How to read the numbers
 
 - **`hit_rate` vs `hit_rate@1`.** `hit_rate` counts a hit when any expected node

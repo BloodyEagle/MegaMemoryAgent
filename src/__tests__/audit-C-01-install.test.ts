@@ -24,13 +24,24 @@ const blocked = (command) => {
   console.error("[HARNESS_BLOCKED_COMMAND]", command);
   throw new Error("Unexpected external command in isolated installer");
 };
+// The installer locates global commands via execFileSync(<where.exe|which>, [name])
+// (System32 absolute path on win32) — that lookup is mocked to ENOENT. Everything
+// else on the process boundary is blocked outright.
+const isLocator = (command, args) => /(?:^|[\\\\/])(?:where(?:\\.exe)?|which)$/i.test(String(command)) &&
+  Array.isArray(args) && args.length === 1 && ["megamemory", "codex"].includes(String(args[0]));
+childProcess.execFileSync = (command, args) => {
+  if (isLocator(command, args)) {
+    throw Object.assign(new Error("Not installed in the audit fixture"), { code: "ENOENT" });
+  }
+  return blocked(command);
+};
 childProcess.execSync = (command) => {
   if (/^(where|which) (megamemory|codex)$/.test(command)) {
     throw Object.assign(new Error("Not installed in the audit fixture"), { code: "ENOENT" });
   }
   return blocked(command);
 };
-for (const key of ["exec", "execFile", "execFileSync", "spawn", "spawnSync", "fork"]) {
+for (const key of ["exec", "execFile", "spawn", "spawnSync", "fork"]) {
   childProcess[key] = blocked;
 }
 syncBuiltinESMExports();

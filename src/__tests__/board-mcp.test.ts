@@ -77,10 +77,10 @@ describe("P-13 genuine source MCP board and trail routing", () => {
     const mcp = await start(db => {
       for (let i = 0; i < count; i++) {
         const id = `done-${String(i).padStart(3, "0")}`;
-        addNode(db, id, { kind: "task" }); db.setTaskState(id, "done");
+        addNode(db, id, { kind: "task" }); db.setTaskState(id, "done", null);
         db.execSqlRun("UPDATE nodes SET updated_at = ? WHERE id = ?", i < Math.floor(count / 2) ? "2026-01-01 00:00:00" : "2026-02-01 00:00:00", id);
       }
-      addNode(db, "open", { kind: "task" }); db.setTaskState("open", "open");
+      addNode(db, "open", { kind: "task" }); db.setTaskState("open", "open", null);
     });
     const first = await mcp.call("board") as BoardOutput;
     const firstDone = first.columns.find(column => column.name === "done")!;

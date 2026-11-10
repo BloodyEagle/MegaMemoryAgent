@@ -110,6 +110,14 @@ export interface EvidenceInput {
   node?: string;
   /** Mandatory: what exactly in this support backs the new node. */
   why: string;
+  expect?: {
+    claim_digest?: string;
+    status_digest?: string;
+    edge_key?: string;
+    edge_digest?: string;
+    artifacts_digest?: string | null;
+    artifact_rows?: Array<{ kind: string; ref: string; digest: string | null; repo_path: string | null }>;
+  };
 }
 
 export interface UpdateConceptInput {
@@ -267,6 +275,9 @@ export interface NodeWithContext {
  * take it from.
  */
 export interface CurrentDigestsView {
+  validation_claim?: string | null;
+  validation_scope?: string | null;
+  validation_state?: "current" | "stale" | "unknown";
   claim: string;
   status: string;
   format_version: number;
@@ -546,6 +557,9 @@ export interface ListRootsOutput {
 // ---- DB row types (raw from SQLite) ----
 
 export interface NodeRow {
+  validation_claim_digest?: string | null;
+  validation_scope_digest?: string | null;
+  embedding_generation?: number | null;
   id: string;
   name: string;
   kind: string;
@@ -676,10 +690,26 @@ export interface ConflictVersion {
   removed_reason: string | null;
 }
 
+export interface MergeConflictRow {
+  id: number;
+  merge_group: string;
+  object_kind: string;
+  object_key: string;
+  format_version: number;
+  left_payload: string;
+  right_payload: string;
+  mapping_json: string;
+  state: "unresolved" | "resolved";
+  created_at: string;
+  resolved_at: string | null;
+  resolution_json: string | null;
+}
+
 export interface ConflictGroup {
   merge_group: string;
   merge_timestamp: string | null;
   versions: ConflictVersion[];
+  edge_conflicts?: MergeConflictRow[];
 }
 
 export interface ListConflictsOutput {
@@ -846,6 +876,7 @@ export interface ProvenanceWeakLink {
 
 /** One confirmed pair "decision — support" (support_baselines row). */
 export interface SupportBaselineRow {
+  decision_claim_digest?: string | null;
   decision_id: string;
   support_id: string;
   /** Stable edge identity: edges.id (the rowid); recomputed on merge. */
@@ -959,6 +990,10 @@ export type SupportRevisionReason = "confirmed" | "reconfirmed" | "removed" | "e
 
 /** One journal row: a confirmed version of a pair, past or superseded. */
 export interface SupportRevisionRow {
+  decision_claim_digest?: string | null;
+  artifacts_digest?: string | null;
+  confirmed_by?: string | null;
+  superseded_at?: string | null;
   id?: number;
   decision_id: string;
   support_id: string;
@@ -978,6 +1013,10 @@ export interface SupportRevisionRow {
 /** One chain entry as provenance_history returns it: digests are 12-char
  * previews, no node bodies (the answer must stay small). */
 export interface SupportRevisionEntry {
+  decision_claim_digest?: string | null;
+  artifacts_digest?: string | null;
+  confirmed_by?: string | null;
+  superseded_at?: string | null;
   edge_key: string;
   confirmed_at: string;
   source: string;
@@ -1038,6 +1077,10 @@ export interface SupportArtifactChange {
  * is never shown as verified.
  */
 export interface SupportCheckView {
+  semantic_changed_count?: number;
+  semantic_reason_counts?: Partial<Record<SupportChangeReason, number>>;
+  semantic_changed?: SupportPairChange[];
+  artifact_changed?: SupportPairChange[];
   state: "unchanged" | "changed" | "unknown" | "incomplete";
   /** Pairs that diverged from the confirmed snapshot (state = changed). */
   changed?: SupportPairChange[];
@@ -1084,6 +1127,7 @@ export interface ConfirmSupportsItem {
   expected_status_digest?: string;
   /** The rationale digest as the agent read it. */
   expected_edge_digest: string;
+  expected_edge_key?: string;
   /**
    * R-04 (plan 04): the combined digest of the support's ACTIVE artifact
    * observations as the agent read them (provenance_trace.supports[] carries

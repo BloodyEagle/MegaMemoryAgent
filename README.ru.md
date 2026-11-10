@@ -228,12 +228,33 @@ Graph path требует два endpoint, а не вопрос на естес�
 ```text
 node "C:/p/agent-skills/skills/token-economy-ts/scripts/graph-tool.js" op=path from=src/a.ts to=src/b.ts root=.
 python -I "C:/p/agent-skills/skills/token-economy-py/scripts/te.py" search "apply_catalog" --root "<project-root>"
+node "C:/p/agent-skills/skills/token-economy-har/har.js" search "AbsentNeedle" --file "<own-artificial.har>" --json
 ```
+
+PY search возвращает UTF-8 текст, не JSON. Полный HAR no-match возвращает JSON
+с exit1 и пустым stderr; ошибки чтения/regex/parse завершаются exit2.
 
 TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 используют разные CLI и форматы ответа;
 путь должен указывать на проверенный source/staging-пакет или явно обновлённую копию.
 Полный ожидаемый no-match корректен; ошибка, отсутствующий payload и усечение
 не доказывают качество или преимущество по стоимости.
+
+`graph_metric=retrieval_wire_without_instructions` оценивает MCP content wrapper
+вокруг retrieval (включая `next`), **без MCP instructions metadata**. Это не точный
+ответ обычного MCP и не полная стоимость задачи (`economy_status=not_measured`).
+Фиксированной поправки токенов нет. `ratio > 1` — граф дешевле; `ratio < 1` — baseline
+дешевле: 200 / 100 = 2, 100 / 200 = 0.5.
+
+Для сравнения с проверкой качества добавьте в dataset `expected_outcome`, `expect_nodes`,
+`quality_contract` и `expected_te_refs`/`expected_te_symbols`/`expected_te_edges`;
+[схемы адаптеров](docs/bench-protocol.md#quality-and-completeness) заданы явно.
+`quality_ratio_te` и его медиана включают только корректные полные живые пары;
+прежние `ratio_te` и суммы токенов — **сырая стоимость retrieval**, не доказательство пользы.
+Preset не живой замер; ошибочный/отсутствующий payload (даже exit0) не eligible.
+Полный корректный ожидаемый no-match проходит качество и сравним при положительных
+стоимостях обеих сторон. Ошибки и unknown считаются по всем вопросам.
+Runner сохраняет максимум 16 MiB stdout/stderr по отдельности, считает все полученные
+байты и отмечает усечение; частичный префикс не даёт точной стоимости или ratio.
 
 `ratio = baseline_tokens / graph_tokens` — но никогда не читайте его без `hit_rate`
 (попали ли ожидаемые узлы в топ-10): дешёвый, но неверный ответ — не экономия.

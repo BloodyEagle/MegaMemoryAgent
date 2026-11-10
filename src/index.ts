@@ -444,6 +444,12 @@ async function startMcpServer() {
         ref: z.string().optional().describe("Файл (+ строка), на котором держится вывод; узел-факт создастся, если файл ещё никто не цитирует"),
         node: z.string().optional().describe("Существующий узел-опора"),
         why: z.string().describe("Рационал: что именно в этой опоре поддерживает вывод — обязателен"),
+        expect: z.object({
+          claim_digest: z.string().optional(), status_digest: z.string().optional(),
+          edge_key: z.string().optional(), edge_digest: z.string().optional(),
+          artifacts_digest: z.string().nullable().optional(),
+          artifact_rows: z.array(z.object({ kind: z.string(), ref: z.string(), digest: z.string().nullable(), repo_path: z.string().nullable() })).optional(),
+        }).optional().describe("Прочитанные версии переиспользуемой опоры; без них связь создаётся без подтверждения"),
       })).optional().describe("Опоры для decision/pattern — {ref | node, why}: файл или существующий узел плюс рационал. Создаются в том же вызове; ровно одно из ref/node на элемент"),
       edges: z.array(z.object({
         to: z.string().describe("Target concept ID"),
@@ -720,6 +726,7 @@ async function startMcpServer() {
         file_refs: z.array(z.string()).optional().describe("Updated file references"),
       }).describe("The resolved content to write — must reflect current codebase truth"),
       reason: z.string().describe("Explanation of what you verified and why this resolution is correct"),
+      prefer: z.enum(["left", "right"]).optional().describe("Explicit side selection for a verified edge-only conflict"),
     },
     async (params) => {
       try {
@@ -727,6 +734,7 @@ async function startMcpServer() {
           merge_group: params.merge_group,
           resolved: params.resolved,
           reason: params.reason,
+          prefer: params.prefer,
         });
         timeline.log({
           tool: "resolve_conflict",
@@ -862,6 +870,7 @@ async function startMcpServer() {
         expected_claim_digest: z.string().describe("claim_digest саммари опоры, который агент читал (provenance_trace.supports[] отдаёт его целиком)"),
         expected_status_digest: z.string().optional().describe("status_digest опоры (оси статуса), который агент читал; без него подтверждение отказывает"),
         expected_edge_digest: z.string().describe("edge_digest рационала ребра, который агент читал"),
+        expected_edge_key: z.string().optional().describe("Точный edge_key прочитанного экземпляра связи"),
         expected_artifacts_digest: z.string().nullable().optional().describe("combined digest активных наблюдений артефактов опоры, который агент читал (provenance_trace.supports[].artifacts_digest); при передаче расхождение — version_conflict: чужой check_artifacts между чтением и подтверждением не подтверждает непрочитанную версию"),
       })).describe("Подтверждаемые опоры с ожидаемыми digest'ами; пустой массив = «опор нет»"),
       note: z.string().optional().describe("Произвольная пометка агента (попадает в timeline)"),

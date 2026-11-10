@@ -3,7 +3,7 @@ import path from "path";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
 import { MergeEngine, stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
-import { resolveConflict } from "./tools.js";
+import { resolveConflict, listConflicts } from "./tools.js";
 import { errorBold, success, info, error, openReadonlyOrExplain } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 import type { NodeRow } from "./types.js";
@@ -131,13 +131,23 @@ export async function runConflicts(args: string[]): Promise<void> {
   // открывается readonly. MEGAMEMORY_ALLOW_AUTO_MIGRATE=1 возвращает RW.
   const db = openReadonlyOrExplain(dbPath, "conflicts");
   try {
+    if (json) {
+      console.log(JSON.stringify(listConflicts(db), null, 2));
+      return;
+    }
+    const savedEdges = db.getMergeConflicts().filter(row => row.object_kind === "edge");
+    for (const saved of savedEdges) {
+      console.log(`Edge conflict ${saved.merge_group} ${saved.object_key}`);
+    }
     const conflictNodes = db.getConflictNodes();
 
     if (conflictNodes.length === 0) {
       if (json) {
         console.log(JSON.stringify({ conflicts: [] }, null, 2));
-      } else {
+      } else if (savedEdges.length === 0) {
         success("No unresolved conflicts.");
+      } else {
+        info("Resolve edge conflicts with --keep left or right.");
       }
       return;
     }

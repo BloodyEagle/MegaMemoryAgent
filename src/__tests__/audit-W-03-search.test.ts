@@ -40,7 +40,10 @@ describe("W-03 — live explorer search rendering", () => {
 
   it("unavailable semantic search renders a local keyword match without a global data variable", async () => {
     const ui = await auditDom({
-      graph: { nodes: [graphNode("local", { name: "Local needle", summary: "Local fallback result" })], edges: [] },
+      // The server always serializes epistemic_status (null when unset);
+      // an absent field is an unqualified old snapshot and the keyword
+      // fallback skips it by design.
+      graph: { nodes: [graphNode("local", { name: "Local needle", summary: "Local fallback result", epistemic_status: null, valid_until: null })], edges: [] },
       reply: ({ url }) => url.startsWith("/api/search?") ? { status: 503, body: { error: "offline" } } : undefined,
     });
     try {

@@ -35,6 +35,12 @@ function liveEdgeCount(from: string, to: string): number {
   ).length;
 }
 
+/** CreateConceptResult.id опционален по API (отказ дедупликации); в этих сценариях узел всегда создаётся. */
+function createdId(result: { id?: string }): string {
+  if (result.id === undefined) throw new Error("createConcept returned no id");
+  return result.id;
+}
+
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-informed-by-dag-"));
   db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
@@ -82,7 +88,7 @@ describe("informed_by is a strict DAG (plan 4 §5)", () => {
     expect(() =>
       link(db, {
         from: "evidence",
-        to: created.id,
+        to: createdId(created),
         relation: "informed_by",
         description: "back-reference",
       })

@@ -136,8 +136,9 @@ export function auditFixture() {
     disposed = true;
     const errors: unknown[] = [];
     while (resources.length) {
-      const resource = resources.pop()!;
-      try { await resource.close(); } catch (error) { errors.push(error); }
+      let resource: { close(): unknown } | undefined = resources.pop();
+      try { await resource?.close(); } catch (error) { errors.push(error); }
+      resource = undefined;
     }
     for (const restore of restorers.reverse()) restore();
     // libsql statements can retain the native file handle until collected.
@@ -151,7 +152,10 @@ export function auditFixture() {
         break;
       } catch (error) {
         cleanupError = error;
-        // Yield to native handle cleanup; concurrency tests use barriers, not this retry.
+        // Yield to native handle cleanup; re-run the collector every few
+        // attempts — statement garbage from a whole file of prior tests can
+        // surface the last lock only after more of the queue is reclaimed.
+        if (attempt % 5 === 4) globalThis.gc?.();
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
