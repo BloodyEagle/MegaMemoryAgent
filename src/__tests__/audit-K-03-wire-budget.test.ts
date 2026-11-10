@@ -145,7 +145,7 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
       expect(response.isError).not.toBe(true);
       const output = JSON.parse(response.content[0].text);
       expect(output.stats.nodes).toBe(30);
-      expect(output.server_version).toBe("2.4.0");
+      expect(output.server_version).toBe("2.5.0");
       expect(output.instructions_stale).toBe(false);
       expect(output.meta.tokens_estimated).toBe(wireTokens(JSON.stringify(response)));
       expect(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(max_tokens);
