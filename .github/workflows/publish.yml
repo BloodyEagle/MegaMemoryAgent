@@ -65,11 +65,13 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Resolve the tested tarball
-        run: echo "filename=$(node -p "require('./staging/pack-result.json').filename")" >> "$GITHUB_OUTPUT"
+        # $GITHUB_ENV, а не outputs: у шага не было id, и steps.resolve.outputs
+        # приходил пустым — sha-сверка читала каталог staging целиком.
+        run: echo "TARBALL=$(node -p "require('./staging/pack-result.json').filename")" >> "$GITHUB_ENV"
 
       - name: Verify sha256 of the tested tarball
         run: |
-          FILENAME="${{ steps.resolve.outputs.filename }}"
+          FILENAME="$TARBALL"
           node -e "
             const fs = require('node:fs');
             const crypto = require('node:crypto');
@@ -81,7 +83,7 @@ jobs:
 
       - name: Tarball installs and starts
         run: |
-          FILENAME="${{ steps.resolve.outputs.filename }}"
+          FILENAME="$TARBALL"
           mkdir -p /tmp/mm-smoke
           cd /tmp/mm-smoke
           npm init -y >/dev/null
@@ -95,11 +97,11 @@ jobs:
           ./node_modules/.bin/megamemory stats --db /tmp/mm-smoke/demo-copy.db >/dev/null
 
       - name: Publish the tested tarball
-        run: npm publish "staging/${{ steps.resolve.outputs.filename }}" --provenance --access public
+        run: npm publish "staging/$TARBALL" --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Attach tarball to the release
-        run: gh release upload "${{ github.event.release.tag_name }}" "staging/${{ steps.resolve.outputs.filename }}" --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" "staging/$TARBALL" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
