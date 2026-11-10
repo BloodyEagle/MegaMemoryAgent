@@ -1701,7 +1701,7 @@ export async function createConcept(
 export async function updateConcept(
   db: KnowledgeDB,
   input: UpdateConceptInput
-): Promise<{ message: string }> {
+): Promise<{ message: string; warnings?: ConceptWarning[] }> {
   // Verify node exists
   const existing = db.getNode(input.id);
   if (!existing) {
