@@ -21,21 +21,24 @@ describe("UX-01 — один планировщик последствий дл�
     addNode(db, "kid", { parent_id: "B" });
     addNode(db, "P", {});
     addNode(db, "Q", {});
+    db.insertEdge({ from_id: "A", to_id: "P", relation: "mentions", description: "already there" });
     db.insertEdge({ from_id: "B", to_id: "P", relation: "connects_to", description: "outgoing link" });
     db.insertEdge({ from_id: "Q", to_id: "B", relation: "depends_on", description: "incoming link" });
-    db.insertEdge({ from_id: "A", to_id: "P", relation: "connects_to", description: "already there" });
 
     const plan = describeConsolidation(db, "A", "B");
     expect(plan.rejection).toBeUndefined();
     expect(plan.base.survivor_updated_at).toBe(db.getNode("A")!.updated_at);
     expect(plan.base.other_updated_at).toBe(db.getNode("B")!.updated_at);
     expect(plan.base.digest).toMatch(/^[0-9a-f]{64}$/);
-    // B→P перемапился бы на A→P, но такое ребро у выжившего уже есть —
-    // перенос не обещается и падает в edgesDropped.
-    expect(plan.edgesToMove).toEqual([
+    // Замороженная политика full-carry: коллизия B→P с ребром выжившего —
+    // атомарный отказ (полный payload не выбирается), поэтому у выжившего
+    // ребро с другим отношением и оба переноса обещаются без потерь.
+    const moves = plan.edgesToMove.map(({ from_id, to_id, relation, description }) => ({ from_id, to_id, relation, description }));
+    expect(moves).toEqual([
+      { from_id: "A", to_id: "P", relation: "connects_to", description: "outgoing link" },
       { from_id: "Q", to_id: "A", relation: "depends_on", description: "incoming link" },
     ]);
-    expect(plan.edgesDropped).toBe(1);
+    expect(plan.edgesDropped).toBe(0);
 
     const result = mergeNodes(db, "A", "B");
     expect(result).toEqual({ survivor: "A", removed: "B" });
@@ -58,13 +61,13 @@ describe("UX-01 — один планировщик последствий дл�
     const liveAfter = db
       .getAllEdgesRaw()
       .filter((e) => e.removed_at === null && (e.from_id === "A" || e.to_id === "A"));
-    expect(liveAfter).toHaveLength(2); // A→P (было; B→P — дедуп) + Q→A (перенос)
+    expect(liveAfter).toHaveLength(3); // A→P mentions (было) + A→P connects_to и Q→A (переносы)
     // Дубль исчез; ребёнок переехал под выжившего.
     expect(db.getNode("B")).toBeUndefined();
     expect(db.getNode("kid")!.parent_id).toBe("A");
   });
 
-  it("надгробия и рёбра к удалённым узлам не обещаются переносом — apply их и не переносит", () => {
+  it("надгробия и рёбра к удалённым узлам переносятся verbatim — история не выбирается", () => {
     const db = database("tombstones.db");
     addNode(db, "A", { summary: "a" });
     addNode(db, "B", { summary: "b" });
@@ -78,29 +81,36 @@ describe("UX-01 — один планировщик последствий дл�
 
     const plan = describeConsolidation(db, "A", "B");
     expect(plan.rejection).toBeUndefined();
-    // Старый preview считал надгробия и мёртвые концы (getAllEdgesRaw) и
-    // обещал 3 переноса, а apply переносил только живые. Теперь числа сходятся.
-    expect(plan.edgesToMove).toEqual([
-      { from_id: "A", to_id: "P", relation: "connects_to", description: "live" },
+    // Замороженный full-carry: надгробия и мёртвые концы — тоже evidence;
+    // ноль отброшенных рёбер, полный payload каждой стороны сохраняется.
+    const moves = plan.edgesToMove.map(({ from_id, to_id, relation, description, removed_at }) => ({ from_id, to_id, relation, description, removed_at: removed_at ?? null }));
+    expect(moves).toEqual([
+      { from_id: "A", to_id: "P", relation: "connects_to", description: "live", removed_at: null },
+      { from_id: "A", to_id: "dead", relation: "connects_to", description: "dead target", removed_at: expect.any(String) },
+      { from_id: "A", to_id: "P", relation: "relates_to", description: "to tombstone", removed_at: expect.any(String) },
     ]);
     expect(plan.edgesDropped).toBe(0);
 
     mergeNodes(db, "A", "B");
+    const all = db.getAllEdgesRaw().map(({ from_id, to_id, relation, description, removed_at }) => ({ from_id, to_id, relation, description, removed_at: removed_at ?? null }));
+    expect(all).toEqual(moves);
     const live = db.getAllEdgesRaw().filter((e) => e.removed_at === null);
     expect(live.map((e) => `${e.from_id}->${e.to_id}:${e.relation}`))
       .toEqual(["A->P:connects_to"]);
   });
 
-  it("самопетля после ремапа не обещается переносом и считается dropped", () => {
+  it("самопетля после ремапа отвергается — сохранённое свидетельство не удаляется", () => {
     const db = database("selfloop.db");
     addNode(db, "A", { summary: "a" });
     addNode(db, "B", { summary: "b" });
     db.insertEdge({ from_id: "A", to_id: "B", relation: "connects_to", description: "A leads to B" });
+    const before = sqlState(db);
 
     const plan = describeConsolidation(db, "A", "B");
-    expect(plan.rejection).toBeUndefined();
-    expect(plan.edgesToMove).toEqual([]);
-    expect(plan.edgesDropped).toBe(1);
+    expect(plan.rejection).toMatch(/self.loop/i);
+    expect(plan.edgesDropped).toBe(0);
+    expect(() => mergeNodes(db, "A", "B")).toThrow(/self.loop/i);
+    expect(sqlState(db)).toEqual(before);
   });
 
   it("цикл informed_by предсказан preview и отвергнут apply тем же текстом, ноль записей", () => {

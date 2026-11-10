@@ -5,11 +5,13 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  # Dev toolchain job: Vitest (Vite) requires Node >= 20.19, so the dev suite
+  # runs on 22. This job does not prove the runtime minimum.
+  source:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: ["20", "22"]
+        node: ["22"]
     steps:
       - uses: actions/checkout@v4
 
@@ -19,15 +21,27 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      - name: "Lint (bounded AST policy: syntax, debugger, duplicate keys, UTF-8; vendor excluded)"
+        run: node scripts/lint.mjs
+
+      - name: Typecheck source
+        run: node scripts/verify.mjs typecheck
+
+      - name: Typecheck tests (strict)
+        run: node scripts/verify.mjs typecheck-tests
+
       - run: npm run build
 
       - name: Version badge matches package.json
+        run: node scripts/verify.mjs metadata
+
+      # README-примеры исполняются тестами: им нужен каталог agent-skills.
+      # Без него контракты S-04/S-05 пропускаются, а не падают на чужом пути.
+      - name: Checkout agent-skills (README command contracts)
         run: |
-          PKG=$(node -p 'require("./package.json").version')
-          for f in README.md README.ru.md; do
-            BADGE=$(grep -oE "version-[0-9]+\.[0-9]+\.[0-9]+(--fork\.[0-9]+)?" "$f" | head -1 | sed "s/version-//; s/--/-/")
-            test "$PKG" = "$BADGE" || { echo "$f badge $BADGE != package.json $PKG"; exit 1; }
-          done
+          git clone --depth 1 https://github.com/BloodyEagle/agent-skills.git "$RUNNER_TEMP/agent-skills"
+          echo "AGENT_SKILLS_ROOT=$RUNNER_TEMP/agent-skills" >> "$GITHUB_ENV"
 
       # Model cache: the multilingual model is ~120 MB, do not download it per run
       - uses: actions/cache@v4
@@ -35,9 +49,9 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-multilingual-e5-small
 
-      - name: Targeted tests (fast, no full suite)
+      - name: Targeted tests (fast, no full suite, offline-guarded and bounded)
         run: |
-          npx vitest run \
+          node scripts/verify.mjs test \
             src/__tests__/id-generation.test.ts \
             src/__tests__/migration.test.ts \
             src/__tests__/search.hybrid.test.ts \
@@ -56,3 +70,49 @@ jobs:
       # интеграции проверяют собранный dist, поэтому шаг после npm run build.
       - name: Full test suite (unit/db/integration)
         run: npm test
+
+  # Platform gate on Windows. The matrix separates the product runtime engine
+  # (engines.node = >=20.10: build + packaged smoke, no Vitest) from the dev
+  # toolchain (>= 20.19: strict test typecheck + pure unit project).
+  platform-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - node: "20.10.0"
+            suite: runtime
+          - node: "22"
+            suite: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: node scripts/lint.mjs
+
+      - name: Typecheck source
+        run: node scripts/verify.mjs typecheck
+
+      - run: npm run build
+
+      - name: Version badge matches package.json
+        run: node scripts/verify.mjs metadata
+
+      # Runtime minimum proof: pack the built tree, validate composition
+      # exactly (npm pack JSON, no ls/head) and smoke the extracted package
+      # with redirected local dependencies (no install, no junction).
+      - name: Packaged runtime smoke (Node 20.10 = engines minimum)
+        if: matrix.suite == 'runtime'
+        run: node scripts/package.mjs "$env:RUNNER_TEMP\mm-pack"
+
+      - name: Dev toolchain checks (Node >= 20.19 for Vitest)
+        if: matrix.suite == 'dev'
+        run: |
+          node scripts/verify.mjs typecheck-tests
+          node scripts/verify.mjs test --project unit

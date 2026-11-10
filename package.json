@@ -1,6 +1,6 @@
 {
   "name": "@bloodyeagle/megamemory",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "MCP server that gives coding agents persistent project understanding via a knowledge graph",
   "type": "module",
   "main": "dist/index.js",
@@ -25,7 +25,11 @@
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "prepublishOnly": "npm run build",
-    "posttest": "node scripts/check-fixtures.mjs"
+    "posttest": "node scripts/check-fixtures.mjs",
+    "typecheck": "node scripts/verify.mjs typecheck",
+    "typecheck:tests": "node scripts/verify.mjs typecheck-tests",
+    "lint": "node scripts/lint.mjs",
+    "package:verify": "node scripts/package.mjs"
   },
   "keywords": [
     "mcp",
@@ -49,7 +53,7 @@
     "url": "https://github.com/BloodyEagle/MegaMemoryAgent/issues"
   },
   "engines": {
-    "node": ">=20.9.0"
+    "node": ">=20.10.0"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.2",

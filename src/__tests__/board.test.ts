@@ -1,30 +1,31 @@
 import { describe, it, expect, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { auditFixture, sqlState, type AuditFixture } from "./helpers/audit.js";
 import { KnowledgeDB } from "../db.js";
-import { taskAdd, taskDone, board, computeBoard, taskRot } from "../tools.js";
-import { closeAndCleanup } from "./helpers/cleanup.js";
+import { taskAdd, taskDone, board, computeBoard, taskRot, trailSave, trailRefresh, trailGet } from "../tools.js";
 
-let tmpDir: string;
+let fixture: AuditFixture | undefined;
 let db: KnowledgeDB;
 
 function freshDb(): KnowledgeDB {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-board-"));
-  db = new KnowledgeDB(tmpDir + "/knowledge.db");
+  fixture = auditFixture();
+  db = fixture.db("knowledge.db");
   return db;
 }
 
 afterEach(async () => {
-  if (db) await closeAndCleanup(db, tmpDir);
+  await fixture?.close();
+  fixture = undefined;
 });
 
 /** Backdate a task so age-based rot is deterministic. */
 function backdate(id: string, days: number): void {
+  const expected = db.execSqlFirst("SELECT datetime('now', ?) AS at", `-${days} days`) as { at: string };
   db.execSqlRun(
-    "UPDATE nodes SET created_at = datetime('now', ?) WHERE id = ?",
-    `-${days} days`
+    "UPDATE nodes SET created_at = ? WHERE id = ?",
+    expected.at,
+    id
   );
+  expect(db.getNode(id)?.created_at).toBe(expected.at);
 }
 
 describe("task rot formula (plan 2 §3)", () => {
@@ -41,6 +42,16 @@ describe("task rot formula (plan 2 §3)", () => {
 });
 
 describe("task board (plan 2 §3)", () => {
+  it("backdating targets only the requested task and sets the exact timestamp", () => {
+    freshDb();
+    const target = taskAdd(db, "target task");
+    const other = taskAdd(db, "untouched task");
+    const untouched = db.getNode(other.id)!.created_at;
+    backdate(target.id, 10);
+    const expected = db.execSqlFirst("SELECT datetime('now', '-10 days') AS at") as { at: string };
+    expect(db.getNode(target.id)!.created_at).toBe(expected.at);
+    expect(db.getNode(other.id)!.created_at).toBe(untouched);
+  });
   it("task_add creates a task node with task_state open; task_done closes it and clears due_at", async () => {
     freshDb();
     const added = taskAdd(db, "fix flaky test", "2020-01-01");
@@ -95,6 +106,24 @@ describe("task board (plan 2 §3)", () => {
     expect(out.summary).toContain("0 open");
     taskAdd(db, "something", "2020-01-01");
     expect(board(db).summary).toContain("1 overdue");
+  });
+
+  it.each(["", "not-a-cursor", Buffer.from(JSON.stringify({ updated_at: 0, id: "task" })).toString("base64url"), Buffer.from(JSON.stringify({ updated_at: "2026-01-01", id: "" })).toString("base64url"), Buffer.from(JSON.stringify({ updated_at: "2026-01-01", id: "task" })).toString("base64url") + "!"])("D-03 malformed keyset cursor refuses without SQL changes: %s", done_cursor => {
+    freshDb();
+    const before = sqlState(db);
+    expect(() => board(db, { done_cursor })).toThrow(/invalid done_cursor/);
+    expect(sqlState(db)).toEqual(before);
+  });
+
+  it("D-04 broken refresh refuses with a reason and leaves the complete SQL snapshot unchanged", () => {
+    freshDb();
+    db.insertNode({ id: "member", name: "member", kind: "feature", summary: "Independent measured member" });
+    const saved = trailSave(db, { node_ids: ["member"], summary: "Reasoning chain", name: "broken" });
+    db.execSqlRun("DELETE FROM nodes WHERE id = 'member'");
+    const before = sqlState(db);
+    expect(() => trailRefresh(db, saved.id)).toThrow(/chain is broken, refresh impossible/);
+    expect(sqlState(db)).toEqual(before);
+    expect(trailGet(db, saved.id).state).toBe("broken");
   });
 
   it("task_add rejects duplicates and bad dates; task_done rejects unknown ids", async () => {

@@ -40,7 +40,7 @@ You have access to a project knowledge graph via the \`megamemory\` MCP server a
 **Workflow: understand → work → update**
 
 1. **Session start:** You must call \`megamemory\` with action \`overview\` (or \`megamemory:list_roots\` directly) before you begin work.
-2. **Before each task:** You must call \`megamemory\` with action \`query\` (or \`megamemory:understand\` directly) before reading source files for project understanding. The answer ends with a \`next\` block — follow it: read \`must_read\` refs before editing, don't read \`skip\` files whole (already covered by cards), run \`followups\` as written (args are ready), record per \`record\` after the change.
+2. **Before each task:** You must call \`megamemory\` with action \`query\` (or \`megamemory:understand\` directly) before reading source files for project understanding. The answer ends with a \`next\` block — follow relevant instructions: read \`must_read\` refs before editing, run \`followups\` as written (args are ready), record per \`record\` after the change. File refs and brief text do not prove whole-file coverage; \`skip\` does not replace checking current code.
 3. **After each task:** You must call \`megamemory\` with action \`record\` to create/update/link concepts for what you built.
 
 Be specific in summaries: parameter names, defaults, file locations, rationale. One idea — one node; update an existing node instead of creating a near-duplicate; when a decision dies, mark it superseded — do not delete. Keep concepts max 3 levels deep.
@@ -49,7 +49,7 @@ Good node: \`auth-token-refresh\` (decision) — "Silent refresh 30 s before tok
 Bad node: \`auth\` — "Everything about auth." — a vague label no query can retrieve.
 
 4. **Budget:** \`understand\` is compact by default and bounded by \`max_tokens\` (1500).
-   Use \`mode:"full"\` only when you need \`why\` and full children/edges; \`mode:"brief"\` gives a ≤8-line orientation plus \`next\`, no cards.
+   Use \`mode:"full"\` only when you need \`why\` and full children/edges; \`mode:"brief"\` gives a ≤8-line orientation plus \`next\`, no cards. All modes honor the wire budget; an impossible required envelope is refused.
 5. **Freshness:** when a decision replaces an older one, pass \`supersedes: [old_id]\` to
    \`create_concept\` instead of deleting. If a search finds nothing, retry with
    \`include_inactive: true\` — the concept may be marked superseded.
@@ -135,14 +135,25 @@ const MEASURING_SECTION = `
 graph saves orientation time — three baselines, one flag:
 
 - \`--baseline files\` — versus reading the \`file_refs\` files of the found nodes;
-- \`--baseline te --te-cmd "tool path {query}"\` — versus an external structural tool
-  (symbol graph / outline); \`{query}\` is substituted escaped, stdout counts as tokens;
-- \`--baseline both\` — both ratios side by side: where memory wins and where the
-  structural tool is the right call.
+- \`--baseline te --te-exec <node> --te-arg <code-searcher.js> --te-arg "query={query}" --te-arg "root=."\`
+  — versus token-economy-ts 1.1.0 text search, from the analyzed project's cwd;
+  executable/script paths are absolute, and \`{query}\` stays one literal argv value;
+- \`--baseline both\` — both raw retrieval ratios side by side.
+
+\`lang\` groups results, not skills. Precedence: preset → structured runner → question
+shell → global shell; \`te_used_preset\` is not live. Shell templates are trusted advanced
+input (Windows expansion is lossy). Graph path needs \`from\` and \`to\`, not a question.
+\`graph_metric=retrieval_wire_without_instructions\` estimates the MCP content wrapper
+around retrieval, including \`next\`, but excludes MCP instructions metadata. It is not
+exactly the default MCP response or whole-task cost; \`economy_status=not_measured\`.
+Use dataset \`expected_outcome\`, \`expect_nodes\`, \`quality_contract\` and TE oracles:
+only complete correct live results enter \`quality_ratio_te\`; raw ratios are separate.
+A valid expected no-match passes quality. Error/unknown/truncation/preset is not eligible.
 
 \`ratio = baseline_tokens / graph_tokens\`; read it only together with \`hit_rate\` — a cheap
-but wrong answer is not savings. Questions with fewer tokens than the baseline
-(\`ratio < 1\`) are printed, not hidden.
+but wrong answer is not savings. \`ratio > 1\` means the graph is cheaper;
+\`ratio < 1\` means the baseline is cheaper. Examples: 200 / 100 = 2;
+100 / 200 = 0.5. Questions where the graph loses are printed, not hidden.
 
 For an honest number run with \`--files-top 3\` — a live agent reads two or three files, not
 every \`file_refs\` of every found node — and read \`hit_rate@1\` (expected node ranked first)

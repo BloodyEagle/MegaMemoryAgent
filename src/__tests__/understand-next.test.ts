@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { auditFixture, type AuditFixture } from "./helpers/audit.js";
 import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { estimateTokens, link, understand } from "../tools.js";
@@ -14,28 +12,27 @@ import {
 } from "../support-baselines.js";
 import { buildNextHints } from "../next-hints.js";
 import type { UnderstandOutput } from "../types.js";
-import { closeAndCleanup } from "./helpers/cleanup.js";
 
 // План 13 §2.1: блок next в ответе understand — машинно-исполнимый контракт
 // действия (must_read/skip/followups/record). Логика живёт в src/next-hints.ts;
 // здесь проверяются контракт, честность покрытия, приоритеты follow-ups,
 // бюджетная обрезка и обратная совместимость формы ответа.
 
-let tmpDir: string;
+let fixture: AuditFixture;
 let db: KnowledgeDB;
 
 beforeEach(() => {
   // FTS-режим: детерминированный ранжинг без векторной модели.
   vi.stubEnv("MEGAMEMORY_SEARCH", "fts");
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-understand-next-"));
-  db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
+  fixture = auditFixture();
+  db = fixture.db("knowledge.db");
   ensureSchema(db);
   db.setMetaValue("embed_model", "understand-next-disabled-vector-space");
 });
 
 afterEach(async () => {
   vi.unstubAllEnvs();
-  if (db) await closeAndCleanup(db, tmpDir);
+  await fixture.close();
 });
 
 // ---- Фикстуры (детерминированные, совпадают с базовой линией совместимости) ----
@@ -225,6 +222,28 @@ function wireTokensOf(payload: unknown): number {
 function expectCompatibleWith220(out: UnderstandOutput, captured: string): void {
   const old = JSON.parse(captured) as Record<string, unknown>;
   const fresh = JSON.parse(JSON.stringify(out)) as Record<string, unknown>;
+  // Additive qualification is expected; every historical payload field remains exact.
+  const freshCards = ((fresh.compact ?? []) as Array<Record<string, unknown>>).concat((fresh.refuted ?? []) as Array<Record<string, unknown>>);
+  for (const card of freshCards) {
+    expect(card.status_scope).toBeNull();
+    expect(card.valid_until).toBeNull();
+    expect(card.expired).toBe(false);
+    delete card.status_scope;
+    delete card.valid_until;
+    delete card.expired;
+  }
+  const oldSupports = ((old.compact ?? []) as Array<{ supports?: Array<Record<string, unknown>> }>).flatMap(card => card.supports ?? []);
+  const freshSupports = ((fresh.compact ?? []) as Array<{ supports?: Array<Record<string, unknown>> }>).flatMap(card => card.supports ?? []);
+  for (const [index, support] of freshSupports.entries()) {
+    const legacy = oldSupports[index];
+    if (!legacy) continue;
+    expect(support.status_scope).toBeNull();
+    expect(support.valid_until).toBeNull();
+    expect(support.expired).toBe(false);
+    delete support.status_scope;
+    delete support.valid_until;
+    delete support.expired;
+  }
   const freshNoNext = { ...fresh };
   delete freshNoNext.next;
   const oldMeta = { ...(old.meta as Record<string, unknown>) };
@@ -375,13 +394,8 @@ describe("План 13 §2.1: блок next в understand", () => {
     seedHonesty();
     const out = await understand(db, { query: "D1 mark", top_k: 6, max_tokens: 3000 });
     const next = out.next!;
-    // Целые файлы есть у всех четырёх узлов — но skip даёт только честное покрытие.
-    expect(next.skip).toEqual([
-      {
-        ref: "src/honest-covered.ts",
-        why: "целиком покрыт узлом «honest-cov» (fact), читать файл не нужно",
-      },
-    ]);
+    // File refs cannot prove that the whole source was transmitted.
+    expect(next.skip).toEqual([]);
     const skipRefs = next.skip.map((s) => s.ref);
     expect(skipRefs).not.toContain("src/stub-covered.ts"); // шаблонное саммари (stub.ts)
     expect(skipRefs).not.toContain("src/short-covered.ts"); // короче 80, без глагола
@@ -407,14 +421,14 @@ describe("План 13 §2.1: блок next в understand", () => {
     seedEdges();
     const factsOnly = await understand(db, { query: "node сборки", top_k: 5, max_tokens: 1500 });
     expect(factsOnly.next!.record).toBe(
-      "Запиши найденное по задаче: create_concept kind=fact с evidence на файл+строки."
+      "Запиши найденное по задаче: create_concept kind=feature с evidence на файл+строки."
     );
 
     seedBudget();
     const withRefuted = await understand(db, { query: "кэширует все ответы", top_k: 3, max_tokens: 1200 });
     expect(withRefuted.next!.record).toBe(
       "Опираться на refuted «refuted-claim» нельзя: Измерение показало обратное: кэш не даёт выигрыша. " +
-        "Запиши проверенное: create_concept kind=fact с evidence на файл+строки."
+        "Запиши проверенное: create_concept kind=feature с evidence на файл+строки."
     );
   });
 
@@ -427,7 +441,7 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(out.next!.skip).toEqual([]);
     expect(out.next!.followups).toEqual([]);
     expect(out.next!.record).toBe(
-      "По ходу задачи записывай найденное: create_concept kind=fact с evidence на файл+строки."
+      "По ходу задачи записывай найденное: create_concept kind=feature с evidence на файл+строки."
     );
   });
 
@@ -439,13 +453,18 @@ describe("План 13 §2.1: блок next в understand", () => {
     });
     // Щедрый бюджет показывает, что skip и followups в этой базе есть вообще.
     const generous = await understand(db, { query: "ответа wire", top_k: 5, max_tokens: 2500 });
-    expect(generous.next!.skip.map((s) => s.ref)).toEqual(["src/db.ts"]);
+    expect(generous.next!.skip).toEqual([]);
     expect(generous.next!.followups.map((f) => f.tool)).toEqual(["check_artifacts"]);
 
     expect(tight.next!.skip).toEqual([]); // порезан
     expect(tight.next!.followups).toEqual([]); // порезан
-    expect(tight.next!.must_read.length).toBeGreaterThanOrEqual(1); // не резался
-    expect(tight.next!.record.length).toBeGreaterThan(0); // не резался
+    // Cards that cannot fit together with their mandatory next block are omitted,
+    // not returned with cut references or a silently oversized response.
+    expect(tight.compact).toEqual([]);
+    expect(tight.meta!.returned).toBe(0);
+    expect(tight.meta!.dropped).toBe(2);
+    expect(tight.next!.must_read).toEqual([]);
+    expect(tight.next!.record).toContain("create_concept kind=feature");
     expect(tight.meta!.truncated).toBe(true);
     // Мера считается по той же wire-форме, что уходит по проводу (K-03),
     // включая extra_payload обработчика и блок next.

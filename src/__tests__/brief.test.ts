@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { auditFixture, type AuditFixture } from "./helpers/audit.js";
 import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { estimateTokens, link, understand } from "../tools.js";
@@ -13,28 +11,27 @@ import {
 } from "../support-baselines.js";
 import { BRIEF_EMPTY_TEXT } from "../brief.js";
 import type { BriefOutput, UnderstandInput } from "../types.js";
-import { closeAndCleanup } from "./helpers/cleanup.js";
 
 // План 13 §2.2: режим brief в understand — до 8 строк текста плюс блок next,
 // БЕЗ карточек. compact остаётся режимом по умолчанию; brief включается только
 // явным mode: "brief". Логика текста живёт в src/brief.ts, ветка режима — в
 // understand (tools.ts), блок next — buildNextHints группы A как есть.
 
-let tmpDir: string;
+let fixture: AuditFixture;
 let db: KnowledgeDB;
 
 beforeEach(() => {
   // FTS-режим: детерминированный ранжинг без векторной модели.
   vi.stubEnv("MEGAMEMORY_SEARCH", "fts");
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-understand-brief-"));
-  db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
+  fixture = auditFixture();
+  db = fixture.db("knowledge.db");
   ensureSchema(db);
   db.setMetaValue("embed_model", "understand-brief-disabled-vector-space");
 });
 
 afterEach(async () => {
   vi.unstubAllEnvs();
-  if (db) await closeAndCleanup(db, tmpDir);
+  await fixture.close();
 });
 
 // ---- Фикстуры ----
@@ -174,9 +171,8 @@ describe("План 13 §2.2: режим brief в understand", () => {
           : out.brief.includes(`Ключевое: ${name} (${ref})`)
       )
     ).toBe(true);
-    // (3) «Не читай X целиком — покрыто» из next.skip.
-    expect(out.next.skip.length).toBeGreaterThanOrEqual(1);
-    expect(out.brief).toContain("Не читай ");
+    expect(out.next.skip).toEqual([]);
+    expect(out.brief).not.toContain("Не читай ");
     // (4) Следующий шаг из next.followups: устаревший снимок brief-dec-2.
     expect(out.next.followups[0]?.tool).toBe("check_artifacts");
     expect(out.brief).toContain("Дальше: check_artifacts для узла brief-dec-2");
@@ -230,7 +226,7 @@ describe("План 13 §2.2: режим brief в understand", () => {
       db,
       briefMode({ query: "ответа wire", top_k: 5, max_tokens: 2500, extra_payload: extra })
     )) as unknown as BriefResult;
-    expect(generous.next.skip.map((s) => s.ref)).toEqual(["src/db.ts"]);
+    expect(generous.next.skip).toEqual([]);
     expect(generous.next.followups.map((f) => f.tool)).toEqual(["check_artifacts"]);
     expect(generous.next.must_read.length).toBeGreaterThanOrEqual(1);
     expect(generous.meta.truncated).toBe(false);
@@ -239,19 +235,13 @@ describe("План 13 §2.2: режим brief в understand", () => {
     // Малый бюджет: сначала режется skip, затем followups; must_read и
     // record не режутся никогда; текст брифа не режется (ограничен 8 строками
     // по построению); усечение помечается в meta.
-    const tight = (await understand(
+    await expect(understand(
       db,
       briefMode({ query: "ответа wire", top_k: 5, max_tokens: 400, extra_payload: extra })
-    )) as unknown as BriefResult;
-    expect(tight.next.skip).toEqual([]);
-    expect(tight.next.followups).toEqual([]);
-    expect(tight.next.must_read.length).toBeGreaterThanOrEqual(1);
-    expect(tight.next.record.length).toBeGreaterThan(0);
-    expect(tight.brief.split("\n").length).toBeLessThanOrEqual(8);
-    expect(tight.meta.truncated).toBe(true);
-    // Мера считается по той же wire-форме, что уходит по проводу (K-03),
-    // включая extra_payload обработчика, — байт-в-байт.
-    expect(tight.meta.tokens_estimated).toBe(wireTokensOf({ ...tight, ...extra }));
+    )).rejects.toThrow(/max_tokens=400 cannot fit/);
+    // The failed response cannot trim mandatory references or return an over-budget success.
+    expect(generous.next.must_read.length).toBeGreaterThanOrEqual(1);
+    expect(generous.next.record).toContain("create_concept kind=decision");
   });
 
   it("дефолтный режим не изменился: без mode ответ — compact-форма с next", async () => {
@@ -292,6 +282,6 @@ describe("План 13 §2.2: режим brief в understand", () => {
     expect(out.next.must_read).toEqual([]);
     expect(out.next.skip).toEqual([]);
     expect(out.next.followups).toEqual([]);
-    expect(out.next.record).toContain("create_concept kind=fact");
+    expect(out.next.record).toContain("create_concept kind=feature");
   });
 });

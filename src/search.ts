@@ -1,5 +1,14 @@
 import type { KnowledgeDB } from "./db.js";
-import { embed, findTopK, queryText, vectorSearchEnabled } from "./embeddings.js";
+import {
+  MODEL_NAME,
+  embed,
+  embeddingValues,
+  findTopK,
+  queryText,
+  validEmbedding,
+  vectorGenerationMatches,
+  vectorSearchEnabled,
+} from "./embeddings.js";
 import { normalizeName } from "./norm.js";
 
 /** Digest nodes weigh less in search so they never displace concrete nodes. */
@@ -38,6 +47,8 @@ export interface HybridSearchOptions {
   k?: number;
   /** Injectable query embedder for tests. */
   embedFn?: (text: string) => Promise<Buffer>;
+  /** Alternate model identity requires an injected embedder. */
+  model?: string;
 }
 
 // CJK Unicode ranges (hiragana/katakana, CJK ext A, CJK unified, compat).
@@ -221,37 +232,33 @@ export async function hybridSearch(
     pools.push({ hits: ftsSearch(db, query, poolSize), via: "fts" });
   }
 
-  if (mode !== "fts" && vectorSearchEnabled(db)) {
-    const embedFn = opts.embedFn ?? ((text: string) => embed(queryText(text)));
-    const queryEmbedding = await embedFn(query);
-
-    // В17: native SQL top-k when the shadow table is fully populated.
+  const model = opts.model ?? MODEL_NAME;
+  if (model !== MODEL_NAME && !opts.embedFn) throw new Error("Alternate model requires embedFn");
+  if (mode !== "fts" && vectorSearchEnabled(db, model)) {
+    const generation = db.getVectorGeneration()!;
     let vectorHits: Array<{ id: string }> | null = null;
     try {
-      const sqlHits = db.vectorTopK(
-        JSON.stringify([
-          ...new Float32Array(
-            queryEmbedding.buffer,
-            queryEmbedding.byteOffset,
-            queryEmbedding.byteLength / Float32Array.BYTES_PER_ELEMENT
-          ),
-        ]),
-        poolSize
-      );
-      if (sqlHits) {
-        vectorHits = sqlHits;
+      // Both real and injected embedders see exactly one model query prefix.
+      const queryEmbedding = await (opts.embedFn ?? embed)(queryText(query, model));
+      if (vectorGenerationMatches(db, generation) && validEmbedding(queryEmbedding, generation.dim)) {
+        const candidates = db.getAllActiveNodesWithEmbeddings(generation);
+        const eligibleIds = new Set(candidates.map((candidate) => candidate.id));
+        try {
+          vectorHits = db.vectorTopK(JSON.stringify([...embeddingValues(queryEmbedding)]), poolSize, generation);
+        } catch {
+          vectorHits = null;
+        }
+        if (vectorHits === null) vectorHits = findTopK(queryEmbedding, candidates, poolSize);
+        else vectorHits = vectorHits.filter((hit) => eligibleIds.has(hit.id));
       }
     } catch {
+      // Inference/capability failures never turn an old query into a new-space hit.
       vectorHits = null;
     }
-    if (vectorHits === null) {
-      vectorHits = findTopK(
-        queryEmbedding,
-        db.getAllActiveNodesWithEmbeddings(),
-        poolSize
-      );
-    }
-    pools.push({ hits: vectorHits, via: "vector" });
+    if (vectorHits !== null) pools.push({ hits: vectorHits, via: "vector" });
+    else if (mode === "vector") pools.push({ hits: ftsSearch(db, query, poolSize), via: "fts" });
+  } else if (mode === "vector") {
+    pools.push({ hits: ftsSearch(db, query, poolSize), via: "fts" });
   }
 
   if (pools.length === 0) return [];

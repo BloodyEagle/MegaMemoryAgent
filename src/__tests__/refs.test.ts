@@ -164,8 +164,9 @@ describe("git-ссылка не режется и проверяется как 
   it("git:tag:v2.1.12 резолвится в sha коммита", async () => {
     const repo = path.join(tmpDir, "repo");
     fs.mkdirSync(repo);
-    const git = (args: string): void =>
+    const git = (args: string): void => {
       execFileSync("git", args.split(" "), { cwd: repo, stdio: "ignore" });
+    };
     git("init -b main");
     git("config user.email t@example.com");
     git("config user.name t");

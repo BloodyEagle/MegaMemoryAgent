@@ -7,6 +7,12 @@ import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
+/** CreateConceptResult.id опционален по API (отказ дедупликации); в этих сценариях узел всегда создаётся. */
+function createdId(result: { id?: string }): string {
+  if (result.id === undefined) throw new Error("createConcept returned no id");
+  return result.id;
+}
+
 describe("makeId", () => {
   it("converts a simple name to a slug", () => {
     expect(makeId("MCP Server")).toBe("mcp-server");
@@ -146,8 +152,8 @@ describe("createConcept collision handling (T10 hardening)", () => {
     expect(a.id).toBe("еж");
     expect(b.id).toMatch(/^еж-[0-9a-f]{8}$/);
     expect(b.id).not.toBe(a.id);
-    expect(db.getNode(a.id)?.name).toBe("Ёж");
-    expect(db.getNode(b.id)?.name).toBe("Еж");
+    expect(db.getNode(createdId(a))?.name).toBe("Ёж");
+    expect(db.getNode(createdId(b))?.name).toBe("Еж");
 
     // Same name again → "already exists" (update_concept path).
     await expect(

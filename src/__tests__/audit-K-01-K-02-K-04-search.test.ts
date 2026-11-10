@@ -168,7 +168,7 @@ describe("K-04: refuted search results carry their reason", () => {
     } catch (error) {
       const refusal = formatError(error);
       expect(refusal.content[0].text).toMatch(/budget|max_tokens|бюджет|токен/i);
-      expect(refusal.content[0].text).toMatch(/exceed|insufficient|too (?:small|low)|cannot fit|does not fit|не помещ|недостат|слишком мал|превыш/i);
+      expect(refusal.content[0].text).toMatch(/exceed|insufficient|too (?:small|low)|cannot fit|does not fit|не помещ|недостат|слишком мал|превыш|ниже минимума/i);
       expect(Math.ceil(Buffer.byteLength(JSON.stringify(refusal), "utf8") / 3)).toBeLessThanOrEqual(maxTokens);
       return;
     }
@@ -187,11 +187,8 @@ describe("K-04: refuted search results carry their reason", () => {
         (meta !== undefined && "truncated" in meta && meta.truncated === true);
       expect(explicitlyTruncated, "Omitted refuted knowledge requires an explicit budget truncation marker").toBe(true);
     }
-    // K-03 checks the complete MCP envelope; here the tool's pretty payload must already fit.
-    // План 13 §2.1: блок next (record не режется никогда) добавляет постоянный
-    // минимум к ответу; превышение помечается meta.truncated.
-    const NEXT_FLOOR_TOKENS = 96;
-    expect(Math.ceil(Buffer.byteLength(JSON.stringify(result, null, 2), "utf8") / 3)).toBeLessThanOrEqual(maxTokens + NEXT_FLOOR_TOKENS);
+    const wire = JSON.stringify({ content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
+    expect(Math.ceil(Buffer.byteLength(wire, "utf8") / 3)).toBeLessThanOrEqual(maxTokens);
     expect(result.meta?.truncated).toBe(true);
   });
 

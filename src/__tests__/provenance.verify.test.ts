@@ -86,7 +86,7 @@ describe("retrospective weak links match the shown graph (F8)", () => {
     expect(live.nodes.map((n) => n.id).sort()).toEqual(["a", "d"]);
     expect(live.edges.map((e) => `${e.from}->${e.to}`)).toEqual(["d->a"]);
     expect(supportWarningIds(live)).toEqual(["d"]);
-    expect(live.weak_links.some((w) => w.note.includes("b"))).toBe(false);
+    expect(live.weak_links.some((w) => w.note?.includes("b"))).toBe(false);
     const liveIds = new Set(live.nodes.map((n) => n.id));
     for (const id of supportWarningIds(live)) expect(liveIds.has(id)).toBe(true);
 
@@ -101,12 +101,12 @@ describe("retrospective weak links match the shown graph (F8)", () => {
     ]);
     expect(
       retro.weak_links.some(
-        (w) => w.type === "missing_support" && w.id === "d" && w.note.includes("b")
+        (w) => w.type === "missing_support" && w.id === "d" && w.note?.includes("b")
       )
     ).toBe(true);
     expect(
       retro.weak_links.some(
-        (w) => w.type === "ungrounded_support" && w.id === "d" && w.note.includes("a")
+        (w) => w.type === "ungrounded_support" && w.id === "d" && w.note?.includes("a")
       )
     ).toBe(true);
     expect(retro.weak_links.some((w) => w.type === "no_support")).toBe(false);

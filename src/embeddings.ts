@@ -1,5 +1,5 @@
 import { pipeline, type FeatureExtractionPipeline } from "@huggingface/transformers";
-import type { KnowledgeDB } from "./db.js";
+import type { KnowledgeDB, VectorGeneration } from "./db.js";
 import { CURRENT_EMBED_MODEL } from "./embed-model.js";
 
 /**
@@ -173,36 +173,105 @@ export function dimOf(buffer: Buffer): number {
   return buffer.length / Float32Array.BYTES_PER_ELEMENT;
 }
 
+/** Actual preprocessing identity; unknown concrete weight revision stays null. */
+export function embeddingProfile(model: string = MODEL_NAME, dim = 0): string {
+  return JSON.stringify({
+    dim,
+    dtype: "q8",
+    input_text_format: "kind: name — summary",
+    max_length: 256,
+    model,
+    normalize: true,
+    passage_prefix: prefixFor(model, "passage"),
+    pooling: "mean",
+    query_prefix: prefixFor(model, "query"),
+    revision: null,
+  });
+}
+
+/** Compare preprocessing independently of the dimension learned on first publish. */
+export function sameEmbeddingProfile(a: string, b: string): boolean {
+  try {
+    const normalize = (value: string) => {
+      const parsed = JSON.parse(value);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      return JSON.stringify(Object.keys(parsed).filter((key) => key !== "dim").sort()
+        .map((key) => [key, parsed[key]]));
+    };
+    const left = normalize(a);
+    return left !== null && left === normalize(b);
+  } catch {
+    return false;
+  }
+}
+
+/** Read float32 bytes safely even when a pooled Buffer is not aligned. */
+export function embeddingValues(buffer: Buffer): Float32Array {
+  if (buffer.length === 0 || buffer.length % Float32Array.BYTES_PER_ELEMENT !== 0) {
+    throw new Error("Invalid embedding buffer length");
+  }
+  const values = new Float32Array(dimOf(buffer));
+  for (let i = 0; i < values.length; i++) values[i] = buffer.readFloatLE(i * 4);
+  return values;
+}
+
+/** Invalid, nonfinite, zero and wrong-space dimensions cannot be vector hits. */
+export function validEmbedding(buffer: Buffer, dim = dimOf(buffer)): boolean {
+  if (!Number.isSafeInteger(dim) || dim <= 0 || buffer.length !== dim * 4) return false;
+  let norm = 0;
+  for (let i = 0; i < dim; i++) {
+    const value = buffer.readFloatLE(i * 4);
+    if (!Number.isFinite(value)) return false;
+    norm += value * value;
+  }
+  return norm > 0 && Number.isFinite(norm);
+}
+
 /** F9.6: text-only mode — the model must never be loaded at all. */
 export function isTextOnlySearchMode(): boolean {
   return (process.env.MEGAMEMORY_SEARCH ?? "hybrid").toLowerCase() === "fts";
 }
 
-/**
- * Vector search is safe only when every stored vector came from the same
- * model. meta.embed_model records that; a mismatch (or an upstream database
- * with vectors but no meta at all) disables the vector path until
- * `megamemory reembed` reindexes everything.
- */
-export function vectorSearchEnabled(db: KnowledgeDB): boolean {
-  return db.getMetaValue("embed_model") === MODEL_NAME;
+/** Active generation and actual preprocessing jointly authorize vector reads. */
+export function vectorSearchEnabled(db: KnowledgeDB, model: string = MODEL_NAME): boolean {
+  const active = db.getVectorGeneration();
+  if (!active || !Number.isSafeInteger(active.generation) || active.generation <= 0 ||
+      active.model !== model || !Number.isSafeInteger(active.dim) || active.dim <= 0 ||
+      !sameEmbeddingProfile(active.profile, embeddingProfile(model, active.dim))) return false;
+  try { return JSON.parse(active.profile).dim === active.dim; }
+  catch { return false; }
+}
+
+export function vectorGenerationMatches(db: KnowledgeDB, expected: VectorGeneration): boolean {
+  const active = db.getVectorGeneration();
+  return active !== null && active.generation === expected.generation &&
+    active.model === expected.model && active.dim === expected.dim &&
+    active.profile === expected.profile;
+}
+
+export interface StorageEmbeddingOptions {
+  /** Alternate models are only allowed with an injected embedder, never a download. */
+  model?: string;
+  embedFn?: (text: string) => Promise<Buffer>;
 }
 
 /**
- * Embed text for indexing/storing, or null when the vector path is disabled
- * (model mismatch — writes must not mix vector spaces). Stamps
- * meta.embed_model/embed_dim on the first successful embed.
+ * Keep the Buffer|null API; the DB publisher must additionally CAS the node
+ * input and generation inside its transaction. A model switch during inference
+ * returns null without stamping metadata or laundering historical vectors.
  */
 export async function embedForStorage(
   db: KnowledgeDB,
-  text: string
+  text: string,
+  opts: StorageEmbeddingOptions = {}
 ): Promise<Buffer | null> {
-  if (!vectorSearchEnabled(db)) return null;
-  const buffer = await embed(passageText(text));
-  if (db.getMetaValue("embed_model") === undefined) {
-    db.setMetaValue("embed_model", MODEL_NAME);
-    db.setMetaValue("embed_dim", String(dimOf(buffer)));
-  }
+  const model = opts.model ?? MODEL_NAME;
+  if (model !== MODEL_NAME && !opts.embedFn) throw new Error("Alternate model requires embedFn");
+  if (!vectorSearchEnabled(db, model)) return null;
+  const expected = db.getVectorGeneration()!;
+  const buffer = await (opts.embedFn ?? embed)(passageText(text, model));
+  if (!vectorGenerationMatches(db, expected)) return null;
+  if (!validEmbedding(buffer, expected.dim)) throw new Error("Invalid storage embedding dimension or values");
   return buffer;
 }
 
@@ -223,16 +292,8 @@ export function embeddingText(
  * Both buffers must contain float32 arrays of the same length.
  */
 export function cosineSimilarity(a: Buffer, b: Buffer): number {
-  const vecA = new Float32Array(
-    a.buffer,
-    a.byteOffset,
-    a.byteLength / Float32Array.BYTES_PER_ELEMENT
-  );
-  const vecB = new Float32Array(
-    b.buffer,
-    b.byteOffset,
-    b.byteLength / Float32Array.BYTES_PER_ELEMENT
-  );
+  const vecA = embeddingValues(a);
+  const vecB = embeddingValues(b);
 
   if (vecA.length !== vecB.length) {
     throw new Error(
@@ -269,7 +330,7 @@ export function findTopK(
   topK: number
 ): Array<{ id: string; similarity: number }> {
   const scored = candidates
-    .filter((c) => c.embedding !== null && c.embedding.length > 0)
+    .filter((c) => c.embedding !== null && validEmbedding(c.embedding, dimOf(queryEmbedding)))
     .map((c) => ({
       id: c.id,
       similarity: cosineSimilarity(queryEmbedding, c.embedding!),

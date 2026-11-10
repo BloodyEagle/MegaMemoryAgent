@@ -188,6 +188,11 @@ export interface AuditGraphNode {
   parent_id: string | null;
   status: string;
   edge_count?: number;
+  /** The server serializes this for every node (null when unset). */
+  epistemic_status?: string | null;
+  valid_until?: string | null;
+  expired?: boolean;
+  removed_at?: string | null;
 }
 export interface AuditGraph {
   nodes: AuditGraphNode[];
@@ -241,7 +246,7 @@ export async function auditDom(options: {
     removeEventListener: documentRoot.removeEventListener.bind(documentRoot),
   };
   const context = vm.createContext({
-    document, Element: AuditElement, URL, URLSearchParams, location, EventSource: FakeEventSource,
+    document, Element: AuditElement, URL, URLSearchParams, AbortController, location, EventSource: FakeEventSource,
     console: { log() {}, warn: (...args: unknown[]) => errors.push(args.map(String).join(" ")), error: (...args: unknown[]) => errors.push(args.map(String).join(" ")) },
     alert: (message: unknown) => alerts.push(String(message)),
     localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },

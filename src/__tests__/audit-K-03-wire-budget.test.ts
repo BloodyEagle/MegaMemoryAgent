@@ -48,7 +48,7 @@ afterEach(async () => {
   }
 });
 
-async function wireResponse(seed: (db: KnowledgeDB) => void, input: UnderstandInput) {
+async function wireResponse(seed: (db: KnowledgeDB) => void, input: UnderstandInput, allowError = false) {
   const db = fixture.db("wire.db");
   ensureSchema(db);
   db.setMetaValue("embed_model", "audit-disabled-vector-space");
@@ -77,16 +77,82 @@ async function wireResponse(seed: (db: KnowledgeDB) => void, input: UnderstandIn
   const handler = boundary.handlers.get("understand");
   if (!handler) throw new Error("MCP harness did not register understand");
   const response = await handler(input);
-  expect(response.isError).not.toBe(true);
+  if (!allowError) expect(response.isError).not.toBe(true);
   expect(response.content).toHaveLength(1);
   const text = response.content[0].text;
-  return { response, text, output: JSON.parse(text) as UnderstandOutput & { instructions_stale: boolean; server_version: string } };
+  return { response, text, output: (response.isError ? {} : JSON.parse(text)) as UnderstandOutput & { instructions_stale: boolean; server_version: string } };
 }
 
 // Independent oracle for the documented UTF-8/3 estimate, applied to the actual wire shape.
 function wireTokens(value: string) { return Math.ceil(Buffer.byteLength(value, "utf8") / 3); }
 
 describe("K-03: the actual pretty MCP response obeys the token cap", () => {
+  it.each([undefined, "compact", "full", "brief"] as const)("D-05 actual %s MCP wire fits caps 500..1500 or refuses required floor", async mode => {
+    const { response, output } = await wireResponse(db => {
+      addNode(db, "escaped-claim", { name: "Имя \\\" 中文", summary: "escapedwireneedle Measured claim", file_refs: [`src/${"кириллица\\\"\\\\\n".repeat(80)}.ts:10-30`] });
+    }, { query: "escapedwireneedle", mode, max_tokens: 10000 });
+    const handler = boundary.handlers.get("understand")!;
+    expect(output.next?.must_read).toHaveLength(1);
+    expect(output.meta?.tokens_estimated).toBe(wireTokens(JSON.stringify(response)));
+    for (const max_tokens of [500, 700, 900, 1200, 1500]) {
+      const actual = await handler({ query: "escapedwireneedle", mode, max_tokens });
+      if (actual.isError) {
+        expect(actual.content[0].text).toMatch(/max_tokens.*(?:минимум|minimum|cannot fit)/);
+      } else {
+        const payload = JSON.parse(actual.content[0].text) as UnderstandOutput;
+        expect(wireTokens(JSON.stringify(actual))).toBeLessThanOrEqual(max_tokens);
+        expect(payload.meta?.tokens_estimated).toBe(wireTokens(JSON.stringify(actual)));
+        expect(payload.next?.record).toContain("kind=feature");
+        if (payload.meta?.returned) expect(payload.next?.must_read).toEqual(output.next?.must_read);
+      }
+    }
+  });
+
+  it.each(["compact", "full", "brief"] as const)("D-05 actual %s MCP empty floor rejects without success payload", async mode => {
+    const { response } = await wireResponse(() => {}, { query: "emptyfloor", mode, max_tokens: 1500 });
+    const floor = wireTokens(JSON.stringify(response));
+    const rejected = await boundary.handlers.get("understand")!({ query: "emptyfloor", mode, max_tokens: floor - 1 });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content[0].text).toMatch(/max_tokens.*(?:минимум|minimum|cannot fit)/);
+  });
+
+  it.each([undefined, "compact", "full", "brief"] as const)("D-05 actual %s MCP retains useful qualified content when it fits", async mode => {
+    await wireResponse(db => addNode(db, "useful", { summary: "usefulwireneedle Measured result", file_refs: ["src/quoted\\\"\\\\файл.ts:10-20"] }), { query: "usefulwireneedle", mode, max_tokens: 1500 });
+    const handler = boundary.handlers.get("understand")!;
+    for (const max_tokens of [500, 700, 900, 1200, 1500]) {
+      const response = await handler({ query: "usefulwireneedle", mode, max_tokens });
+      if (response.isError) expect(response.content[0].text).toMatch(/max_tokens.*cannot fit/);
+      else {
+        const output = JSON.parse(response.content[0].text) as UnderstandOutput;
+        expect(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(max_tokens);
+        expect(output.meta?.tokens_estimated).toBe(wireTokens(JSON.stringify(response)));
+        expect(output.next?.skip).toEqual([]);
+        if (max_tokens === 1500) {
+          expect(output.meta?.returned).toBe(1);
+          expect(output.next?.must_read.map(hint => hint.ref)).toEqual(["src/quoted\\\"\\\\файл.ts:10-20"]);
+        }
+      }
+    }
+  });
+
+  it("D-05 actual list_roots MCP includes stats, instructions and escaped content under all caps", async () => {
+    await wireResponse(db => {
+      for (let i = 0; i < 30; i++) addNode(db, `root-${i}`, { name: `Корень \\\"\\\\中文 ${i}`, summary: "Measured root" });
+    }, { query: "nothing", max_tokens: 1500 });
+    const handler = boundary.handlers.get("list_roots")!;
+    for (const max_tokens of [500, 700, 900, 1200, 1500]) {
+      const response = await handler({ max_tokens } as UnderstandInput);
+      expect(response.isError).not.toBe(true);
+      const output = JSON.parse(response.content[0].text);
+      expect(output.stats.nodes).toBe(30);
+      expect(output.server_version).toBe("2.5.0");
+      expect(output.instructions_stale).toBe(false);
+      expect(output.meta.tokens_estimated).toBe(wireTokens(JSON.stringify(response)));
+      expect(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(max_tokens);
+      expect(output.meta.dropped + output.meta.returned).toBe(30);
+    }
+  });
+
   it("Q3: budgets refuted-only output including metadata and the MCP content envelope", async () => {
     const { response, text, output } = await wireResponse((db) => {
       for (let i = 0; i < 8; i++) {
@@ -125,11 +191,7 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
       }
     }, { query: "edgebudget", top_k: 6, max_tokens: 900 });
 
-    // План 13 §2.1: блок next (record не режется никогда) добавляет
-    // постоянный минимум к wire-форме; при исчерпании бюджета превышение
-    // помечается meta.truncated, мера остаётся честной.
-    const NEXT_FLOOR_TOKENS = 96;
-    expect.soft(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(900 + NEXT_FLOOR_TOKENS);
+    expect.soft(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(900);
     expect(output.meta?.truncated).toBe(true);
     expect(output.meta?.tokens_estimated).toBeGreaterThanOrEqual(wireTokens(JSON.stringify(response)));
   });

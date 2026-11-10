@@ -224,21 +224,24 @@ function resolveCommandFile(filename: string): string {
   return path.resolve(thisDir, "..", "commands", filename);
 }
 
-async function detectGlobalCommand(): Promise<CommandRuntime> {
-  const { execSync } = await import("child_process");
-  let isGlobal = false;
-
+async function findExecutable(name: string): Promise<string | undefined> {
+  const { execFileSync } = await import("child_process");
   try {
-    execSync(
-      process.platform === "win32" ? "where megamemory" : "which megamemory",
-      { stdio: "ignore" }
-    );
-    isGlobal = true;
+    const locator = process.platform === "win32"
+      ? path.join(process.env.SystemRoot ?? "C:/Windows", "System32", "where.exe")
+      : "which";
+    const output = execFileSync(locator, [name], {
+      shell: false, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10000, windowsHide: true,
+    });
+    return output.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
   } catch {
-    isGlobal = false;
+    return undefined;
   }
+}
 
-  if (isGlobal) {
+async function detectGlobalCommand(): Promise<CommandRuntime> {
+  if (await findExecutable("megamemory")) {
     return {
       opencodeCommand: ["megamemory"],
       stdioCommand: "megamemory",
@@ -254,17 +257,19 @@ async function detectGlobalCommand(): Promise<CommandRuntime> {
   };
 }
 
-async function detectCodexCli(): Promise<boolean> {
-  const { execSync } = await import("child_process");
-  try {
-    execSync(
-      process.platform === "win32" ? "where codex" : "which codex",
-      { stdio: "ignore" }
-    );
-    return true;
-  } catch {
-    return false;
+/** npm's Windows shim is not executable with shell:false. Read its JS entry
+ * as data and run Node directly; never interpolate a path into cmd.exe. */
+function codexInvocation(executable: string): { executable: string; args: string[] } {
+  if (/\.[cm]?js$/i.test(executable)) return { executable: process.execPath, args: [executable] };
+  if (/\.(cmd|bat)$/i.test(executable)) {
+    const shim = fs.readFileSync(executable, "utf8");
+    const match = /"(?:%dp0%|%~dp0)[\\/]+([^"\r\n]+\.[cm]?js)"/i.exec(shim);
+    if (!match) throw new Error(`Unsupported Codex Windows shim at ${executable}; using atomic config fallback.`);
+    const script = path.resolve(path.dirname(executable), match[1].replace(/[\\/]/g, path.sep));
+    if (!fs.existsSync(script)) throw new Error(`Codex shim entry not found at ${script}; using atomic config fallback.`);
+    return { executable: process.execPath, args: [script] };
   }
+  return { executable, args: [] };
 }
 
 /**
@@ -422,6 +427,18 @@ function setupCommand(destinationDir: string, filename: string, label: string): 
   success(`Installed ${label} at ${pc.dim(dest)}`);
 }
 
+function managedServerOptions(
+  servers: Record<string, unknown>,
+  filePath: string
+): Record<string, unknown> {
+  if (!("megamemory" in servers)) return {};
+  const existing = servers["megamemory"];
+  if (!isObject(existing)) {
+    throw formatConfigReadError(filePath, "'megamemory' is present but is not an object");
+  }
+  return { ...existing };
+}
+
 async function setupOpencodeMcpConfig(runtime: CommandRuntime): Promise<void> {
   fs.mkdirSync(OPENCODE_CONFIG_DIR, { recursive: true });
 
@@ -434,10 +451,13 @@ async function setupOpencodeMcpConfig(runtime: CommandRuntime): Promise<void> {
   const mcp = isObject(config["mcp"]) ? config["mcp"] : {};
   const existed = "megamemory" in mcp;
 
+  const options = managedServerOptions(mcp, OPENCODE_CONFIG_PATH);
+  delete options["args"]; // OpenCode carries executable and argv in command.
   mcp["megamemory"] = {
+    ...options,
     type: "local",
     command: runtime.opencodeCommand,
-    enabled: true,
+    enabled: options["enabled"] ?? true,
   };
   config["mcp"] = mcp;
 
@@ -458,6 +478,7 @@ async function setupClaudeConfig(runtime: CommandRuntime): Promise<void> {
   const existed = "megamemory" in mcpServers;
 
   mcpServers["megamemory"] = {
+    ...managedServerOptions(mcpServers, CLAUDE_CONFIG_PATH),
     type: "stdio",
     command: runtime.stdioCommand,
     args: runtime.stdioArgs,
@@ -481,6 +502,7 @@ async function setupAntigravityConfig(runtime: CommandRuntime): Promise<void> {
   const existed = "megamemory" in mcpServers;
 
   mcpServers["megamemory"] = {
+    ...managedServerOptions(mcpServers, ANTIGRAVITY_CONFIG_PATH),
     command: runtime.stdioCommand,
     args: runtime.stdioArgs,
   };
@@ -497,61 +519,96 @@ async function setupAntigravityConfig(runtime: CommandRuntime): Promise<void> {
 }
 
 function buildCodexToml(runtime: CommandRuntime): string {
-  const escapedCommand = runtime.stdioCommand.replace(/\\/g, "\\\\");
-  const escapedArgs = runtime.stdioArgs.map((a) => a.replace(/\\/g, "\\\\"));
-  const argsToml =
-    escapedArgs.length === 0
-      ? "[]"
-      : `[${escapedArgs.map((a) => `"${a}"`).join(", ")}]`;
-  return `[mcp_servers.megamemory]\ncommand = "${escapedCommand}"\nargs = ${argsToml}\n`;
+  // JSON basic strings use the same escapes required by TOML basic strings.
+  return `[mcp_servers.megamemory]\ncommand = ${JSON.stringify(runtime.stdioCommand)}\nargs = ${JSON.stringify(runtime.stdioArgs)}\n`;
 }
 
-/** Table key of a TOML header line ("[a.b]" / "[[a.b]]"), or null. Quoted
- * keys containing "]" are out of scope — real MCP config names never have them. */
+function tomlKeySegment(part: string): string {
+  if (part.startsWith('"')) return JSON.parse(part) as string;
+  return part.startsWith("'") ? part.slice(1, -1) : part;
+}
+
+/** Normalize quoted or bare TOML dotted keys for exact table matching. */
 function tomlHeaderKey(rawLine: string): string | null {
-  const line = rawLine.replace(/\r$/, "");
-  const m = /^\s*\[\[?\s*([^\]]*?)\s*\]?\]\s*(?:#.*)?$/.exec(line);
-  return m ? m[1] : null;
+  const match = /^\s*\[\[?\s*([^\]]*?)\s*\]?\]\s*(?:#.*)?$/.exec(rawLine.replace(/\r$/, ""));
+  if (!match) return null;
+  const parts = match[1].match(/"(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_-]+/g);
+  if (!parts) return null;
+  // Keep key segments distinct: ["mcp_servers.megamemory"] is one unrelated
+  // key, not the nested [mcp_servers.megamemory] server table.
+  return JSON.stringify(parts.map(tomlKeySegment));
 }
 
-/** Odd number of """ or ''' delimiters on one line toggles multi-line state,
- * so a "[table]"-looking line inside a string value is never a real header. */
-function togglesMultilineString(rawLine: string): boolean {
-  const line = rawLine.replace(/\r$/, "");
-  const count = (seq: string): number => line.split(seq).length - 1;
-  return count('"""') % 2 === 1 || count("'''") % 2 === 1;
+/** Locate the end of a TOML value without mistaking comments, quoted brackets
+ * or multi-line arrays/strings for the following option. */
+function tomlValueEnd(lines: string[], start: number): number {
+  let depth = 0;
+  let quote = "";
+  let triple = false;
+  let escaped = false;
+  for (let lineIndex = start; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
+    const begin = lineIndex === start ? line.indexOf("=") + 1 : 0;
+    for (let i = begin; i < line.length; i++) {
+      const char = line[i];
+      if (quote) {
+        if (escaped) { escaped = false; continue; }
+        if (quote === '"' && char === "\\") { escaped = true; continue; }
+        if (triple ? line.slice(i, i + 3) === quote.repeat(3) : char === quote) {
+          if (triple) i += 2;
+          quote = "";
+          triple = false;
+        }
+      } else {
+        if (char === "#") break;
+        if (char === '"' || char === "'") {
+          quote = char;
+          triple = line.slice(i, i + 3) === char.repeat(3);
+          if (triple) i += 2;
+        } else if (char === "[" || char === "{") depth++;
+        else if (char === "]" || char === "}") depth--;
+      }
+    }
+    if (depth === 0 && !quote) return lineIndex + 1;
+    if (depth < 0 || (quote && !triple)) break;
+    escaped = false;
+  }
+  throw formatConfigReadError(CODEX_CONFIG_PATH, "unterminated TOML value");
 }
 
-/**
- * C-02 (plan 05): replace exactly the target TOML table. A table runs from
- * its header to the NEXT table header — and `[mcp_servers.megamemory-dev]`
- * is a different server whose bytes must survive untouched, so any header
- * line ends the region. (The old regex skipped megamemory-prefixed siblings
- * as if they belonged to the target and deleted them with it.) When the
- * target is absent the section is appended; neighboring bytes are kept as-is.
- */
+function preserveCodexOptions(lines: string[], newSection: string): string {
+  const kept: string[] = [];
+  for (let i = 1; i < lines.length;) {
+    const assignment = /^\s*([^#=]+?)\s*=/.exec(lines[i]);
+    if (!assignment) { kept.push(lines[i++]); continue; }
+    const end = tomlValueEnd(lines, i);
+    const key = tomlKeySegment(assignment[1].trim());
+    if (key !== "command" && key !== "args") kept.push(...lines.slice(i, end));
+    i = end;
+  }
+  const options = kept.join("\n").replace(/\n*$/, "");
+  return newSection.replace(/\n$/, "") + (options ? `\n${options}` : "");
+}
+
+/** Refresh command/args only in the exact target table. Neighboring tables
+ * (including env and megamemory-prefixed servers) and user options survive. */
 function replaceOrAppendTomlSection(
   existing: string,
   sectionKey: string,
   newSection: string
 ): { content: string; existed: boolean } {
+  const targetKey = JSON.stringify(sectionKey.split("."));
   const lines = existing.split("\n");
   let headerIndex = -1;
   let endIndex = lines.length;
-  let inMultiline = false;
   for (let i = 0; i < lines.length; i++) {
-    if (inMultiline) {
-      if (togglesMultilineString(lines[i])) inMultiline = false;
-      continue;
-    }
-    if (togglesMultilineString(lines[i])) {
-      inMultiline = true;
-      continue;
-    }
     const key = tomlHeaderKey(lines[i]);
-    if (key === null) continue;
+    if (key === null) {
+      if (/^\s*[^#=]+\s*=/.test(lines[i])) i = tomlValueEnd(lines, i) - 1;
+      continue;
+    }
     if (headerIndex === -1) {
-      if (key === sectionKey) headerIndex = i;
+      if (key === targetKey) headerIndex = i;
     } else {
       endIndex = i;
       break;
@@ -563,7 +620,7 @@ function replaceOrAppendTomlSection(
   }
   const before = lines.slice(0, headerIndex).join("\n");
   const after = lines.slice(endIndex).join("\n");
-  const block = newSection.replace(/\n$/, "");
+  const block = preserveCodexOptions(lines.slice(headerIndex, endIndex), newSection);
   return {
     content: (before ? `${before}\n` : "") + `${block}\n${after}`,
     existed: true,
@@ -586,57 +643,41 @@ function writeFileSyncAtomic(filePath: string, content: string): void {
   }
 }
 
-function writeCodexTomlFallback(runtime: CommandRuntime): void {
-  fs.mkdirSync(CODEX_DIR, { recursive: true });
-  const tomlBlock = buildCodexToml(runtime);
-
-  if (fs.existsSync(CODEX_CONFIG_PATH)) {
-    const existing = fs.readFileSync(CODEX_CONFIG_PATH, "utf-8");
-    const { content: updated, existed } = replaceOrAppendTomlSection(
-      existing,
-      "mcp_servers.megamemory",
-      tomlBlock
-    );
-    writeFileSyncAtomic(CODEX_CONFIG_PATH, updated);
-    success(
-      existed
-        ? `Updated megamemory MCP in ${pc.dim(CODEX_CONFIG_PATH)}`
-        : `Added megamemory MCP to ${pc.dim(CODEX_CONFIG_PATH)}`
-    );
-  } else {
-    writeFileSyncAtomic(CODEX_CONFIG_PATH, tomlBlock);
-    success(`Created ${pc.dim(CODEX_CONFIG_PATH)}`);
-  }
-  info(
-    `Command: ${pc.cyan(JSON.stringify([runtime.stdioCommand, ...runtime.stdioArgs]))}`
-  );
-}
-
 async function setupCodexConfig(runtime: CommandRuntime): Promise<void> {
-  const hasCodexCli = await detectCodexCli();
+  // Inspect the real target before any external command. Existing runtime
+  // tables are updated locally: `codex mcp add` may reset env/custom options.
+  const existed = fs.existsSync(CODEX_CONFIG_PATH);
+  const existing = existed ? fs.readFileSync(CODEX_CONFIG_PATH, "utf8") : "";
+  const update = replaceOrAppendTomlSection(existing, "mcp_servers.megamemory", buildCodexToml(runtime));
+  const codex = update.existed ? undefined : await findExecutable("codex");
 
-  if (hasCodexCli) {
-    const { execSync } = await import("child_process");
-
+  if (codex) {
+    let staging: string | undefined;
     try {
-      execSync("codex mcp remove megamemory", { stdio: "pipe" });
-    } catch {
-      // Expected if megamemory wasn't previously configured
-    }
-
-    const addArgs = [runtime.stdioCommand, ...runtime.stdioArgs];
-    const addCmd = `codex mcp add megamemory -- ${addArgs.join(" ")}`;
-    try {
-      execSync(addCmd, { stdio: "pipe" });
-      success(`Configured megamemory MCP via codex CLI`);
-      info(`Command: ${pc.cyan(JSON.stringify(addArgs))}`);
-      return;
-    } catch {
-      warn(`codex CLI failed, falling back to manual config`);
+      const invocation = codexInvocation(codex);
+      staging = fs.mkdtempSync(path.join(os.tmpdir(), "megamemory-codex-install-"));
+      if (existed) fs.writeFileSync(path.join(staging, "config.toml"), existing, "utf8");
+      const { execFileSync } = await import("child_process");
+      execFileSync(invocation.executable, [
+        ...invocation.args, "mcp", "add", "megamemory", "--", runtime.stdioCommand, ...runtime.stdioArgs,
+      ], {
+        shell: false, stdio: "pipe", timeout: 10000, windowsHide: true,
+        env: { ...process.env, CODEX_HOME: staging },
+      });
+      info("Codex CLI add succeeded in an isolated staging profile.");
+    } catch (err) {
+      warn(`Codex CLI unavailable or failed (${err instanceof Error ? err.message : String(err)}); using atomic config fallback.`);
+    } finally {
+      if (staging) fs.rmSync(staging, { recursive: true, force: true });
     }
   }
 
-  writeCodexTomlFallback(runtime);
+  // Publish our managed-fields merge, never the CLI's potentially destructive
+  // rewrite. A failed add/write/rename leaves the previous working file intact.
+  fs.mkdirSync(CODEX_DIR, { recursive: true });
+  writeFileSyncAtomic(CODEX_CONFIG_PATH, update.content);
+  success(`${existed ? "Updated" : "Created"} megamemory MCP in ${pc.dim(CODEX_CONFIG_PATH)}`);
+  info(`Command: ${pc.cyan(JSON.stringify([runtime.stdioCommand, ...runtime.stdioArgs]))}`);
 }
 
 function createTargetConfigs(runtime: CommandRuntime): Record<InstallTarget, TargetConfig> {

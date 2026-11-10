@@ -40,7 +40,7 @@ const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 function sanitizeExportSegment(part: string): string {
   const safe = part.replace(/[<>:"|?*\\]/g, "_").replace(/[. ]+$/g, "");
   if (safe === "" || safe === "." || safe === "..") return "_";
-  return WINDOWS_RESERVED.test(safe) ? `_${safe}` : safe;
+  return WINDOWS_RESERVED.test(safe.split(".")[0]) ? `_${safe}` : safe;
 }
 
 function nodeFileName(id: string): string {
@@ -143,9 +143,35 @@ export function renderNodeMarkdown(
 /** Render the whole graph as { relativePath -> content }, sorted by id. */
 export function renderAllMarkdown(db: KnowledgeDB): Map<string, string> {
   const files = new Map<string, string>();
-  const rows = [...db.getAllNodesRaw()].sort((a, b) => (a.id < b.id ? -1 : 1));
+  const rows = [...db.getAllNodesRaw()]
+    .filter((node) => node.removed_at === null)
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+  const filenames = new Map<string, string>();
+  const entries = new Map<string, { directory: boolean; source: string; id: string }>();
+  // Preflight every file and directory prefix before rendering or writing.
+  // Only identical original directory prefixes may share a normalized path:
+  // Auth/a + auth/b must not silently become one directory on Windows.
   for (const node of rows) {
-    if (node.removed_at !== null) continue;
+    const filename = nodeFileName(node.id);
+    const parts = filename.split("/");
+    const originalParts = node.id.split("/");
+    for (let index = 0; index < parts.length; index++) {
+      const prefix = parts.slice(0, index + 1).join("/");
+      const key = prefix.toLowerCase();
+      const directory = index < parts.length - 1;
+      const source = originalParts.slice(0, index + 1).join("/");
+      const previous = entries.get(key);
+      if (previous && !(directory && previous.directory && previous.source === source)) {
+        throw new ExportPathError(
+          `export filename or directory collision at ${JSON.stringify(prefix)}: ` +
+            `${JSON.stringify(previous.id)} and ${JSON.stringify(node.id)}; rename one of the nodes before exporting`
+        );
+      }
+      entries.set(key, { directory, source, id: node.id });
+    }
+    filenames.set(node.id, filename);
+  }
+  for (const node of rows) {
     const children = db
       .getChildren(node.id)
       .filter((c) => c.kind !== "digest");
@@ -156,16 +182,7 @@ export function renderAllMarkdown(db: KnowledgeDB): Map<string, string> {
         to_id: e.to_id,
         description: e.description,
       }));
-    const filename = nodeFileName(node.id);
-    // S-02: distinct ids may sanitize to the same filename ("same?name" and
-    // "same*name"). Silently overwriting the Map entry would lose a node —
-    // fail loudly instead.
-    if (files.has(filename)) {
-      throw new ExportPathError(
-        `export filename collision: two different node ids map to the same file "${filename}" ` +
-          `(one of them is ${JSON.stringify(node.id)}); rename one of the nodes before exporting`
-      );
-    }
+    const filename = filenames.get(node.id)!;
     files.set(
       filename,
       renderNodeMarkdown(node, outgoing, children)
@@ -176,14 +193,14 @@ export function renderAllMarkdown(db: KnowledgeDB): Map<string, string> {
 
 /**
  * Write all files; creates subdirectories as needed. Every resolved path is
- * checked against the target directory right before the write (S-02), and
+ * checked against the target directory before any write (S-02), and
  * the whole render — including collision and safety validation — happens
  * before the first byte hits the disk.
  */
 export function exportMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
   const files = renderAllMarkdown(db);
   const root = path.resolve(dir);
-  for (const [rel, content] of files) {
+  const writes = [...files].map(([rel, content]) => {
     const full = path.resolve(root, rel);
     const contained = path.relative(root, full);
     if (contained === "" || contained.startsWith("..") || path.isAbsolute(contained)) {
@@ -191,6 +208,9 @@ export function exportMarkdown(db: KnowledgeDB, dir: string): ExportDiff {
         `export path escapes the target directory: ${JSON.stringify(rel)}`
       );
     }
+    return { full, content };
+  });
+  for (const { full, content } of writes) {
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, content, "utf8");
   }

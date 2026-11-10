@@ -62,7 +62,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
       summary: "no support passed at all plus the fixture context of this check and the call keeps its contract",
     });
 
-    expect(db.getNode(result.id).kind).toBe("decision");
+    expect(db.getNode(result.id!)?.kind).toBe("decision");
   });
 
   it("8.4.2: flag on — refusal with the exact message, nothing written", async () => {
@@ -90,10 +90,10 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
       evidence: [{ node: "support-node", why: "measured in support-node" }],
     });
 
-    expect(db.getNode(result.id).kind).toBe("decision");
+    expect(db.getNode(result.id!)?.kind).toBe("decision");
     const edges = db.execSqlAll(
       "SELECT to_id FROM edges WHERE from_id = ? AND relation = 'informed_by' AND removed_at IS NULL",
-      [result.id]
+      [result.id!]
     );
     expect(edges).toHaveLength(1);
   });
@@ -107,7 +107,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
       summary: "no support and that is fine plus the fixture context of this check and the call keeps its contract",
     });
 
-    expect(db.getNode(result.id).kind).toBe("feature");
+    expect(db.getNode(result.id!)?.kind).toBe("feature");
   });
 
   it("8.4.5: flag flip without a restart — two consecutive calls behave differently", async () => {
@@ -118,7 +118,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
 
     setRequireSupport(false);
     const ok = await createConcept(db, { name: "Second Try", kind: "decision", summary: "s plus the fixture context of this check and the call keeps its contract with the evidence passed in the call" });
-    expect(db.getNode(ok.id).kind).toBe("decision");
+    expect(db.getNode(ok.id!)?.kind).toBe("decision");
   });
 
   it("8.4.5b: env alias MEGAMEMORY_REQUIRE_SUPPORT overrides without a restart", async () => {
@@ -129,7 +129,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
 
     process.env.MEGAMEMORY_REQUIRE_SUPPORT = "0";
     const ok = await createConcept(db, { name: "Env Allowed", kind: "decision", summary: "s plus the fixture context of this check and the call keeps its contract with the evidence passed in the call" });
-    expect(db.getNode(ok.id).kind).toBe("decision");
+    expect(db.getNode(ok.id!)?.kind).toBe("decision");
   });
 
   it("a direct informed_by edge counts as support (step 8.2 wording)", async () => {
@@ -143,7 +143,7 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
       edges: [{ to: "source-node", relation: "informed_by", description: "read from source-node" }],
     });
 
-    expect(db.getNode(result.id).kind).toBe("decision");
+    expect(db.getNode(result.id!)?.kind).toBe("decision");
   });
 
   it("auto_ground counts as support when it actually derives edges", async () => {
@@ -165,6 +165,6 @@ describe("provenance.require_support strict mode (plan 3 step 8)", () => {
       file_refs: ["src/impl.ts"],
     });
 
-    expect(db.getNode(result.id).kind).toBe("decision");
+    expect(db.getNode(result.id!)?.kind).toBe("decision");
   });
 });

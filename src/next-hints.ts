@@ -1,16 +1,14 @@
 import type { KnowledgeDB } from "./db.js";
-import { isUngrounded } from "./provenance.js";
 import {
   CheckBudget,
   DEFAULT_MAX_CHECK_BYTES,
   DEFAULT_MAX_CHECK_EDGES,
   computeSupportCheck,
 } from "./support-baselines.js";
-import { isStubSummary, looksLikeFileRefAnchor } from "./stub.js";
+import { NODE_KINDS } from "./types.js";
 import type {
   NextHintFollowup,
   NextHintRead,
-  NextHintSkip,
   NextHints,
   NodeRow,
 } from "./types.js";
@@ -75,20 +73,6 @@ export interface NextHintsInput {
   checkBudget?: { edges: number; bytes: number };
 }
 
-/** file_ref с диапазоном строк покрывает участок, а не целый файл. */
-const REF_RANGE_RE = /:(\d+)(?:-\d+)?$/;
-
-/** Диапазон «:N» / «:N-M» в конце ссылки; сам ref остаётся дословным. */
-function hasLineRange(ref: string): boolean {
-  return REF_RANGE_RE.test(ref);
-}
-
-/** Файл из ссылки: хвост «:N-M» снимается — skip и must_read сравнивают файлы. */
-function filePathOf(ref: string): string {
-  const m = ref.match(REF_RANGE_RE);
-  return m ? ref.slice(0, ref.length - m[0].length) : ref;
-}
-
 /** file_refs узла из JSON-строки; мусор и не-строки отсеиваются. */
 function fileRefsOf(raw: string | null | undefined): string[] {
   if (!raw) return [];
@@ -133,26 +117,6 @@ function readWhy(row: NodeRow): string {
   return essence ? `${base}: ${essence}` : base;
 }
 
-/**
- * Честное покрытие файла узлом: у узла есть file_refs, summary не заглушка
- * (шаблонное/якорное саммари не описывает содержимое файла — см. src/stub.ts)
- * и узел не слабый: опровергнутое, брошенное или без опоры знание файл
- * целиком не покрывает.
- */
-function coversWholeFileHonesty(db: KnowledgeDB, row: NodeRow, refs: string[]): boolean {
-  if (refs.length === 0) return false;
-  if (isStubSummary(row.summary, row.kind, row.created_via)) return false;
-  if (looksLikeFileRefAnchor(row.summary, row.name, refs)) return false;
-  if (
-    row.epistemic_status === "refuted" ||
-    row.epistemic_status === "abandoned" ||
-    isUngrounded(db, row)
-  ) {
-    return false;
-  }
-  return true;
-}
-
 /** Форма записи для опровергнутого знания: имя, сколько их и причина. */
 function refutedNote(refuted: NextHintsRefuted[]): string {
   const first = refuted[0];
@@ -168,7 +132,7 @@ function refutedRecord(refuted: NextHintsRefuted[]): string {
   const reason = first.reason?.trim() ? first.reason.trim() : "причина не записана";
   return (
     `Опираться на refuted «${first.name}»${more} нельзя: ${reason}. ` +
-    `Запиши проверенное: create_concept kind=fact с evidence на файл+строки.`
+    `Запиши проверенное: create_concept kind=${NODE_KINDS[0]} с evidence на файл+строки.`
   );
 }
 
@@ -191,9 +155,9 @@ function buildRecord(
   }
   if (refuted.length > 0) return refutedRecord(refuted);
   if (cards.length > 0) {
-    return "Запиши найденное по задаче: create_concept kind=fact с evidence на файл+строки.";
+    return `Запиши найденное по задаче: create_concept kind=${NODE_KINDS[0]} с evidence на файл+строки.`;
   }
-  return "По ходу задачи записывай найденное: create_concept kind=fact с evidence на файл+строки.";
+  return `По ходу задачи записывай найденное: create_concept kind=${NODE_KINDS[0]} с evidence на файл+строки.`;
 }
 
 /** Next для вырожденного ответа (0 карточек, векторный ранний возврат). */
@@ -202,7 +166,7 @@ export function emptyNextHints(): NextHints {
     must_read: [],
     skip: [],
     followups: [],
-    record: "По ходу задачи записывай найденное: create_concept kind=fact с evidence на файл+строки.",
+    record: `По ходу задачи записывай найденное: create_concept kind=${NODE_KINDS[0]} с evidence на файл+строки.`,
   };
 }
 
@@ -211,8 +175,8 @@ export function emptyNextHints(): NextHints {
  *
  * must_read — до 3 дословных file_refs узлов ответа (верхний уровень в
  * ранговом порядке, затем вложенные опоры), с дедупликацией; почему — узел и
- * его суть. skip — целые файлы (file_ref без диапазона строк) с честным
- * покрытием; файл из must_read в skip не попадает. followups — до 3 готовых
+ * его суть. skip сохраняется пустым: refs и summary не доказывают полного
+ * покрытия файла. followups — до 3 готовых
  * вызовов по приоритету плана: check_artifacts для устаревших снимков
  * подтверждения, get_concept для решений с невидимыми в ответе опорами,
  * provenance_trace для решений с нечистым (unknown/incomplete) support_check;
@@ -252,27 +216,8 @@ export function buildNextHints(input: NextHintsInput): NextHints {
     }
   }
 
-  // ---- skip: целые файлы с честным покрытием; must_read-файлы исключаются ----
-  const mustReadFiles = new Set(mustRead.map((m) => filePathOf(m.ref)));
-  const skip: NextHintSkip[] = [];
-  const seenSkipFiles = new Set<string>();
-  for (const card of cards) {
-    const row = rowById.get(card.id);
-    if (!row) continue;
-    const refs = fileRefsOf(row.file_refs);
-    if (!coversWholeFileHonesty(db, row, refs)) continue;
-    for (const ref of refs) {
-      // «:N-M» — покрытие участка, а не файла: в skip не даётся.
-      if (hasLineRange(ref)) continue;
-      const file = filePathOf(ref);
-      if (mustReadFiles.has(file) || seenSkipFiles.has(file)) continue;
-      seenSkipFiles.add(file);
-      skip.push({
-        ref: file,
-        why: `целиком покрыт узлом «${row.name}» (${row.kind}), читать файл не нужно`,
-      });
-    }
-  }
+  // Citations and summaries do not prove whole-file coverage; preserve skip's shape.
+  const skip: NextHints["skip"] = [];
 
   // ---- followups: до 3 готовых вызовов, один узел — один follow-up ----
   const followups: NextHintFollowup[] = [];

@@ -2,6 +2,8 @@ import { KnowledgeDB } from "./db.js";
 import { normalizeName } from "./norm.js";
 import { planIdRepair, applyIdRepair } from "./migrate.js";
 import { CURRENT_EMBED_MODEL } from "./embed-model.js";
+import { ensureFtsTriggerSet } from "./fts-triggers.js";
+export { readFtsTriggerHealth } from "./fts-triggers.js";
 
 /**
  * Fork schema migration (plan T0.5): additive-only, upstream-compatible.
@@ -62,48 +64,21 @@ function tableExists(db: KnowledgeDB, name: string): boolean {
  * "created" or "restored" and words its own report line.
  */
 export function ensureFtsTriggers(db: KnowledgeDB): void {
-  db.execSql(`
-    CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-      INSERT INTO nodes_fts(rowid, name, summary, why)
-      VALUES (new.rowid, new.name, new.summary, new.why);
-    END;
-    CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-      INSERT INTO nodes_fts(nodes_fts, rowid, name, summary, why)
-      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-    END;
-    CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-      INSERT INTO nodes_fts(nodes_fts, rowid, name, summary, why)
-      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-      INSERT INTO nodes_fts(rowid, name, summary, why)
-      VALUES (new.rowid, new.name, new.summary, new.why);
-    END;
-  `);
+  ensureFtsTriggerSet(db);
 }
 
 /** Trigram twin of ensureFtsTriggers (same single-source rules). */
 export function ensureTrigramTriggers(db: KnowledgeDB): void {
-  db.execSql(`
-    CREATE TRIGGER IF NOT EXISTS nodes_tri_ai AFTER INSERT ON nodes BEGIN
-      INSERT INTO nodes_fts_tri(rowid, name, summary, why)
-      VALUES (new.rowid, new.name, new.summary, new.why);
-    END;
-    CREATE TRIGGER IF NOT EXISTS nodes_tri_ad AFTER DELETE ON nodes BEGIN
-      INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
-      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-    END;
-    CREATE TRIGGER IF NOT EXISTS nodes_tri_au AFTER UPDATE ON nodes BEGIN
-      INSERT INTO nodes_fts_tri(nodes_fts_tri, rowid, name, summary, why)
-      VALUES ('delete', old.rowid, old.name, old.summary, old.why);
-      INSERT INTO nodes_fts_tri(rowid, name, summary, why)
-      VALUES (new.rowid, new.name, new.summary, new.why);
-    END;
-  `);
+  ensureFtsTriggerSet(db, true);
 }
 
 /** FTS index + sync triggers. Trigger-managed, so upstream INSERTs stay indexed. */
 function ensureFts(db: KnowledgeDB, report: MigrationReport): void {
   if (tableExists(db, "nodes_fts")) {
-    report.alreadyOk.push("nodes_fts");
+    if (ensureFtsTriggerSet(db)) {
+      db.execSql("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')");
+      report.applied.push("restored nodes_fts sync triggers and rebuilt index");
+    } else report.alreadyOk.push("nodes_fts");
     return;
   }
   db.execSql(`
@@ -126,15 +101,14 @@ function ensureFts(db: KnowledgeDB, report: MigrationReport): void {
  * Created when MEGAMEMORY_FTS_TOKENIZER=trigram; both tables may coexist.
  */
 function ensureTrigramFts(db: KnowledgeDB, report: MigrationReport): void {
-  if (
-    (process.env.MEGAMEMORY_FTS_TOKENIZER ?? "").toLowerCase() !== "trigram"
-  ) {
-    return;
-  }
   if (tableExists(db, "nodes_fts_tri")) {
-    report.alreadyOk.push("nodes_fts_tri");
+    if (ensureFtsTriggerSet(db, true)) {
+      db.execSql("INSERT INTO nodes_fts_tri(nodes_fts_tri) VALUES('rebuild')");
+      report.applied.push("restored nodes_fts_tri sync triggers and rebuilt index");
+    } else report.alreadyOk.push("nodes_fts_tri");
     return;
   }
+  if ((process.env.MEGAMEMORY_FTS_TOKENIZER ?? "").toLowerCase() !== "trigram") return;
   db.execSql(`
     CREATE VIRTUAL TABLE nodes_fts_tri USING fts5(
       name, summary, why,
@@ -152,6 +126,11 @@ export function ensureSchema(
   db: KnowledgeDB,
   report: MigrationReport = emptyReport()
 ): MigrationReport {
+  db.assertIntegrity();
+  return db.runInTransaction(() => ensureSchemaInside(db, report));
+}
+
+function ensureSchemaInside(db: KnowledgeDB, report: MigrationReport): MigrationReport {
   // Step 1: meta table.
   if (tableExists(db, "meta")) {
     report.alreadyOk.push("meta table");
@@ -203,17 +182,7 @@ export function ensureSchema(
   // U5: status lifecycle history (active -> superseded/deprecated, ...).
   // Plan 1 (v5): the field column separates the lifecycle axis (status) from
   // the epistemic axis (epistemic_status).
-  db.execSql(
-    "CREATE TABLE IF NOT EXISTS status_history (\
-      id INTEGER PRIMARY KEY AUTOINCREMENT,\
-      node_id TEXT NOT NULL,\
-      from_status TEXT,\
-      to_status TEXT NOT NULL,\
-      reason TEXT,\
-      field TEXT NOT NULL DEFAULT 'status',\
-      at TEXT NOT NULL DEFAULT (datetime('now'))\
-    )"
-  );
+  db.ensureSchemaTable("status_history");
   {
     const hcols = tableColumns(db, "status_history");
     if (!hcols.has("field")) {
@@ -330,6 +299,7 @@ export async function runMigration(
   db: KnowledgeDB,
   opts: { apply: boolean; backup?: (dbPath: string) => string | null; dbPath?: string }
 ): Promise<MigrationReport> {
+  db.assertIntegrity();
   const report = emptyReport();
 
   // Read-only previews (also shown in dry-run).

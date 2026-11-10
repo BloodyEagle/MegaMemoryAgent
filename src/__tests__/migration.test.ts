@@ -297,9 +297,9 @@ describe("schema v10 → v11 (2.1.3: revisions + artifacts)", () => {
 
     const db = new KnowledgeDB(dbPath);
     try {
-      // the migration ran to the new version (2.1.12: the pin moves with
-      // the schema bump, v12 → v13)
-      expect(db.getUserVersion()).toBe(13);
+      // the migration ran to the new version (schema 14: the pin moves with
+      // the schema bump, v13 → v14)
+      expect(db.getUserVersion()).toBe(14);
       // both tables exist, empty journal: old dbs start honest (no invented
       // history — the chain opens at the first post-upgrade confirmation)
       expect(db.hasSupportRevisionsTable()).toBe(true);
@@ -366,7 +366,9 @@ describe("embedding meta on migration (F10)", () => {
     try {
       ensureEmbedMeta(db, emptyReport());
       expect(db.getMetaValue("embed_model")).toBe(MODEL_NAME);
-      expect(vectorSearchEnabled(db)).toBe(true);
+      // P-10: мета-штамп модели — это заявка, не включение. Поиск по
+      // векторам открывается только активным поколением (reembed).
+      expect(vectorSearchEnabled(db)).toBe(false);
     } finally {
       db.close();
     }
@@ -417,14 +419,14 @@ describe("08-N1 (план 09): сырая upstream-база с user_version = 0"
     expect(err.message).not.toContain("no such column");
   });
 
-  it("migrate --apply на той же базе проходит и поднимает схему до v13", async () => {
+  it("migrate --apply на той же базе проходит и поднимает схему до v14", async () => {
     const { dbPath } = freshRawDir();
     await runMigrate(["--db", dbPath, "--apply"]);
 
     // База открывается штатно: миграция завершена, версия проставлена.
     const db = new KnowledgeDB(dbPath);
     try {
-      expect(db.getUserVersion()).toBe(13);
+      expect(db.getUserVersion()).toBe(14);
       const raw = db.getAllNodesRaw();
       expect(raw).toHaveLength(20);
       expect(raw.every((n) => (n as { status?: string }).status === "active")).toBe(true);
@@ -464,7 +466,7 @@ describe("08-N1 (план 09): сырая upstream-база с user_version = 0"
     const dbPath = path.join(dir, "fresh.db");
     const db = new KnowledgeDB(dbPath);
     try {
-      expect(db.getUserVersion()).toBe(13);
+      expect(db.getUserVersion()).toBe(14);
       expect(db.getAllNodesRaw()).toHaveLength(0);
     } finally {
       db.close();

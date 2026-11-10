@@ -9,6 +9,8 @@ import { resolveDbPathOrExit, resolveRepoPath } from "./db-path.js";
 import { buildHelp } from "./help.js";
 import { createTimelineLogger } from "./timeline.js";
 import { instructionsStatus } from "./instructions.js";
+import { commandIndex } from "./cli-flags.js";
+import { NODE_KINDS } from "./types.js";
 
 // ---- CLI routing ----
 
@@ -32,20 +34,29 @@ function parseFlags(args: string[]): { port?: number; rawPort?: string; host?: s
   return { port, rawPort, host };
 }
 
-const cmd = process.argv[2];
+const argv = process.argv.slice(2);
+let cmdIndex: number;
+try {
+  cmdIndex = commandIndex(argv);
+} catch (err) {
+  errorBold(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+}
+const cmd = argv[cmdIndex];
+const commandArgs = [...argv.slice(0, cmdIndex), ...argv.slice(cmdIndex + 1)];
 
 switch (cmd) {
   case "install": {
     const { runInstall } = await import("./install.js");
     // План 06 (C-01): провал критического шага настройки — неуспех процесса,
     // а не exit(0): CI и скрипты обязаны видеть, что установка не прошла.
-    const outcome = await runInstall(process.argv.slice(3));
+    const outcome = await runInstall(commandArgs);
     process.exit(outcome.ok ? 0 : 1);
     break;
   }
 
   case "serve": {
-    const flags = parseFlags(process.argv.slice(3));
+    const flags = parseFlags(commandArgs);
     const port = flags.port ?? 4321;
     // F1 2.1.13: интерфейс локальный по построению — 127.0.0.1 по умолчанию,
     // ::1 явным флагом. Wildcard (0.0.0.0/::) и имена хостов не принимаются:
@@ -71,84 +82,84 @@ switch (cmd) {
 
   case "stats": {
     const { runStats } = await import("./stats.js");
-    await runStats(process.argv.slice(3));
+    await runStats(commandArgs);
     process.exit(0);
     break;
   }
 
   case "merge": {
     const { runMerge } = await import("./merge-cli.js");
-    await runMerge(process.argv.slice(3));
+    await runMerge(commandArgs);
     process.exit(0);
     break;
   }
 
   case "conflicts": {
     const { runConflicts } = await import("./merge-cli.js");
-    await runConflicts(process.argv.slice(3));
+    await runConflicts(commandArgs);
     process.exit(0);
     break;
   }
 
   case "resolve": {
     const { runResolve } = await import("./merge-cli.js");
-    await runResolve(process.argv.slice(3));
+    await runResolve(commandArgs);
     process.exit(0);
     break;
   }
 
   case "repair-ids": {
     const { runRepairIds } = await import("./migrate-cli.js");
-    await runRepairIds(process.argv.slice(3));
+    await runRepairIds(commandArgs);
     process.exit(0);
     break;
   }
 
   case "migrate": {
     const { runMigrate } = await import("./migrate-cli.js");
-    await runMigrate(process.argv.slice(3));
+    await runMigrate(commandArgs);
     process.exit(0);
     break;
   }
 
   case "eval": {
     const { runEvalCli } = await import("./eval-cli.js");
-    await runEvalCli(process.argv.slice(3));
+    await runEvalCli(commandArgs);
     process.exit(0);
     break;
   }
 
   case "doctor": {
     const { runDoctorCli } = await import("./doctor-cli.js");
-    await runDoctorCli(process.argv.slice(3));
+    await runDoctorCli(commandArgs);
     process.exit(0);
     break;
   }
 
   case "export": {
     const { runExport } = await import("./export-cli.js");
-    await runExport(process.argv.slice(3));
+    await runExport(commandArgs);
     process.exit(0);
     break;
   }
 
   case "digest": {
     const { runDigest } = await import("./digest-cli.js");
-    await runDigest(process.argv.slice(3));
+    await runDigest(commandArgs);
     process.exit(0);
     break;
   }
 
   case "consolidate": {
     const { runConsolidate } = await import("./consolidate-cli.js");
-    await runConsolidate(process.argv.slice(3));
+    await runConsolidate(commandArgs);
     process.exit(0);
     break;
   }
 
   case "reembed": {
     const { runReembed } = await import("./reembed-cli.js");
-    await runReembed(process.argv.slice(3));
+    await runReembed(commandArgs);
     process.exit(0);
     break;
   }
@@ -164,7 +175,7 @@ switch (cmd) {
 
   case "bench": {
     const { runBenchCli } = await import("./bench-cli.js");
-    await runBenchCli(process.argv.slice(3));
+    await runBenchCli(commandArgs);
     process.exit(0);
     break;
   }
@@ -175,7 +186,7 @@ switch (cmd) {
     // expire-cli оставалось тестируемым (бросает, а не умирает).
     try {
       const { runExpire } = await import("./expire-cli.js");
-      await runExpire(process.argv.slice(3));
+      await runExpire(commandArgs);
       process.exit(0);
     } catch (err) {
       errorBold(err instanceof Error ? err.message : String(err));
@@ -305,9 +316,7 @@ async function startMcpServer() {
   });
 
   // ---- Zod schemas ----
-  const NodeKindEnum = z.enum([
-    "feature", "module", "pattern", "config", "decision", "component", "digest",
-  ]);
+  const NodeKindEnum = z.enum(NODE_KINDS);
   const RelationEnum = z.enum([
     "connects_to", "depends_on", "implements", "calls", "configured_by", "supersedes", "contradicts", "informed_by",
   ]);
@@ -316,11 +325,11 @@ async function startMcpServer() {
 
   server.tool(
     "understand",
-    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node. Ответ несёт блок next — исполняй его дословно: must_read (до 3 ссылок) прочитай перед правками, файлы из skip целиком не читай (уже покрыты карточками), followups выполни как написаны (аргументы готовые), после правки запиши знание по строке record. mode:'brief' — до 8 строк текста плюс next, без карточек, для быстрой ориентации.",
+    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node. Ответ несёт блок next — исполняй его дословно: must_read (до 3 ссылок) прочитай перед правками; skip сейчас пуст, refs и summary не доказывают покрытия всего файла; followups выполни как написаны (аргументы готовые), после правки запиши знание по строке record. mode:'brief' — до 8 строк текста плюс next, без карточек, для быстрой ориентации.",
     {
       query: z.string().describe("Natural language query describing what you want to understand about the project"),
       top_k: z.number().int().min(1).max(50).optional().describe("Number of top results to return (default: 10)"),
-      max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the answer (default: 1500)"),
+      max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the actual MCP content envelope, including instructions; refuses when required instructions cannot fit (default: 1500)"),
       mode: z.enum(["compact", "full", "brief"]).optional().describe("compact (default) trims each node to essentials under the budget; full returns legacy verbose output; brief returns up to 8 lines of text plus the next block, no cards"),
       include_inactive: z.boolean().optional().describe("Include superseded/deprecated nodes (default: false)"),
       include_stale: z.boolean().optional().describe("Вернуть и просроченные факты (valid_until в прошлом) — с пометкой expired: true (по умолчанию исключены, meta.stale_excluded считает исключённых)"),
@@ -435,6 +444,12 @@ async function startMcpServer() {
         ref: z.string().optional().describe("Файл (+ строка), на котором держится вывод; узел-факт создастся, если файл ещё никто не цитирует"),
         node: z.string().optional().describe("Существующий узел-опора"),
         why: z.string().describe("Рационал: что именно в этой опоре поддерживает вывод — обязателен"),
+        expect: z.object({
+          claim_digest: z.string().optional(), status_digest: z.string().optional(),
+          edge_key: z.string().optional(), edge_digest: z.string().optional(),
+          artifacts_digest: z.string().nullable().optional(),
+          artifact_rows: z.array(z.object({ kind: z.string(), ref: z.string(), digest: z.string().nullable(), repo_path: z.string().nullable() })).optional(),
+        }).optional().describe("Прочитанные версии переиспользуемой опоры; без них связь создаётся без подтверждения"),
       })).optional().describe("Опоры для decision/pattern — {ref | node, why}: файл или существующий узел плюс рационал. Создаются в том же вызове; ровно одно из ref/node на элемент"),
       edges: z.array(z.object({
         to: z.string().describe("Target concept ID"),
@@ -711,6 +726,7 @@ async function startMcpServer() {
         file_refs: z.array(z.string()).optional().describe("Updated file references"),
       }).describe("The resolved content to write — must reflect current codebase truth"),
       reason: z.string().describe("Explanation of what you verified and why this resolution is correct"),
+      prefer: z.enum(["left", "right"]).optional().describe("Explicit side selection for a verified edge-only conflict"),
     },
     async (params) => {
       try {
@@ -718,6 +734,7 @@ async function startMcpServer() {
           merge_group: params.merge_group,
           resolved: params.resolved,
           reason: params.reason,
+          prefer: params.prefer,
         });
         timeline.log({
           tool: "resolve_conflict",
@@ -853,6 +870,7 @@ async function startMcpServer() {
         expected_claim_digest: z.string().describe("claim_digest саммари опоры, который агент читал (provenance_trace.supports[] отдаёт его целиком)"),
         expected_status_digest: z.string().optional().describe("status_digest опоры (оси статуса), который агент читал; без него подтверждение отказывает"),
         expected_edge_digest: z.string().describe("edge_digest рационала ребра, который агент читал"),
+        expected_edge_key: z.string().optional().describe("Точный edge_key прочитанного экземпляра связи"),
         expected_artifacts_digest: z.string().nullable().optional().describe("combined digest активных наблюдений артефактов опоры, который агент читал (provenance_trace.supports[].artifacts_digest); при передаче расхождение — version_conflict: чужой check_artifacts между чтением и подтверждением не подтверждает непрочитанную версию"),
       })).describe("Подтверждаемые опоры с ожидаемыми digest'ами; пустой массив = «опор нет»"),
       note: z.string().optional().describe("Произвольная пометка агента (попадает в timeline)"),
@@ -1288,11 +1306,14 @@ async function startMcpServer() {
 
   server.tool(
     "board",
-    "Show the task board: the open column sorted by rot (overdue > isolated > oldest) and the terminal done column fresh-first. Call this instead of guessing what to work on next.",
-    {},
-    async () => {
+    "Show the task board: the open column sorted by rot (overdue > isolated > oldest) and the terminal done column fresh-first, paginated by done_cursor/done_limit. Done count is the total; returned, has_more and next_cursor describe the current page. Call this instead of guessing what to work on next.",
+    {
+      done_cursor: z.string().optional().describe("Keyset continuation from the done column's next_cursor"),
+      done_limit: z.number().int().min(1).max(100).optional().describe("Done cards per page (default: 20)"),
+    },
+    async (params) => {
       try {
-        const result = board(db);
+        const result = board(db, params);
         timeline.log({
           tool: "board",
           params: {},

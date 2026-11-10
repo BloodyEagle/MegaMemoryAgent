@@ -55,24 +55,54 @@ describe("estimateTokens / trimSummary", () => {
 });
 
 describe("understand compact mode budget", () => {
-  it("respects max_tokens, drops nodes, always returns at least one", async () => {
+  it("keeps the hard cap: no card fits — empty answer with an explicit budget reason", async () => {
+    const db = freshDb();
+    insertFatNodes(db, 20);
+
+    // Минимальный конверт считает сам сервер: ниже него он отказывает и
+    // называет цифру. Берём «минимум + запас» — в него гарантированно не
+    // влезает ни одна карточка, и это не зависит от того, есть ли модель.
+    let minBudget = 0;
+    try {
+      await understand(db, { query: "Слово", top_k: 20, max_tokens: 1 });
+    } catch (error) {
+      expect(String(error)).toMatch(/минимума \d+/);
+      minBudget = Number(String(error).match(/минимума (\d+)/)?.[1]);
+    }
+    expect(minBudget).toBeGreaterThan(0);
+
+    const result = await understand(db, { query: "Слово", top_k: 20, max_tokens: minBudget + 20 });
+
+    expect(result.meta).toBeDefined();
+    // Бюджет — жёсткий потолок, а не пожелание: карточка сверх лимита не
+    // отдаётся. Пустой ответ обязан называть причину, иначе он читается как
+    // «ничего не нашлось» — это и было регрессом.
+    expect(result.compact!.length).toBe(0);
+    expect(result.meta!.returned).toBe(0);
+    expect(result.meta!.truncated).toBe(true);
+    expect(result.meta!.reason).toBe("budget");
+    expect(result.meta!.dropped).toBe(20);
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(minBudget + 20);
+    // U6: the explorer derives "saved vs full" from this pair.
+    expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);
+  });
+
+  it("places cards when the budget has room and never claims a budget reason", async () => {
     const db = freshDb();
     insertFatNodes(db, 20);
 
     const result = await understand(db, {
       query: "Слово",
       top_k: 20,
-      max_tokens: 500,
+      max_tokens: 8000,
     });
 
     expect(result.meta).toBeDefined();
     expect(result.meta!.returned).toBeGreaterThanOrEqual(1);
-    expect(result.meta!.dropped).toBeGreaterThan(0);
+    expect(result.meta!.returned).toBe(result.compact!.length);
     expect(result.meta!.returned + result.meta!.dropped).toBe(20);
-    // U6: the explorer derives "saved vs full" from this pair.
-    expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);
-    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500);
-    expect(result.compact!.length).toBe(result.meta!.returned);
+    expect(result.meta!.reason).toBeUndefined();
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(8000);
     // Every compact node is trimmed to <=240 chars.
     expect(result.compact!.every((m) => m.summary.length <= 240)).toBe(true);
   });
@@ -147,14 +177,19 @@ describe("patches v1.1: zh budget (А6/В15) and edges_between (В14)", () => {
       });
     }
     const result = await understand(db, { query: "支付", top_k: 20, max_tokens: 500 });
-    expect(result.meta!.returned).toBeGreaterThanOrEqual(1);
+    // План 06 K-04 / план 13: карточка ~2000+ токенов в бюджет 500 не
+    // помещается целиком — честный ответ воронки: пустой список, усечение
+    // помечено, полный размер оценён. Ноль — валидный результат, «хоть одна
+    // карточка любой ценой» (эпоха v1.1) больше не переувеличивает бюджет.
+    expect(result.meta!.returned).toBe(0);
+    expect(result.meta!.dropped).toBe(20);
+    expect(result.meta!.estimated_full_tokens).toBeGreaterThan(500);
     // План 13 §2.1: блок next присутствует в каждом ответе, и его record не
     // режется никогда — кап соблюдается с точностью до этого постоянного
     // минимума, а превышение помечается meta.truncated (мера остаётся честной).
     const NEXT_FLOOR_TOKENS = 96;
     expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500 + NEXT_FLOOR_TOKENS);
     expect(result.meta!.truncated).toBe(true);
-    expect(result.meta!.dropped).toBeGreaterThan(0);
   });
 
   it("compact output carries edges_between (В14)", async () => {

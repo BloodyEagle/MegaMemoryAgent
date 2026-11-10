@@ -75,6 +75,11 @@ export function questionNotes(
   if (q.missing_files > 0) notes.push(`missing:${q.missing_files}`);
   if (q.line_refs > 0) notes.push("refs:line");
   if (q.te_used_preset) notes.push("te:preset");
+  if (q.graph_quality) notes.push(`graph:${q.graph_quality.quality}/${q.graph_quality.completeness}`);
+  if (q.te_quality) notes.push(`te:${q.te_quality.quality}/${q.te_quality.completeness}/${q.te_quality.measurement}`);
+  if (q.comparison_te === "not_comparable") notes.push("te:not_comparable");
+  if (q.te_stdout_truncated) notes.push(`te:truncated:${q.te_stdout_captured_bytes}/${q.te_stdout_bytes}B`);
+  if (q.te_error) notes.push("te:error");
   if (q.stale_ids.length > 0) notes.push(`st:${q.stale_ids.length}`);
   if (q.unknown_support_ids.length > 0) notes.push(`unk:${q.unknown_support_ids.length}`);
   if (report.cold_start && report.questions[0]?.id === q.id) notes.push("cold-start");
@@ -150,7 +155,7 @@ function printTable(report: BenchReport): void {
         : []),
       ...(showTe
         ? [
-            fmtNum(q.baseline_te_tokens ?? 0).padStart(8),
+            (q.baseline_te_tokens === null ? "-" : fmtNum(q.baseline_te_tokens)).padStart(8),
             fmtRatio(q.ratio_te).padStart(8),
             fmtMs(q.time_to_te_ms).padStart(9),
           ]
@@ -205,6 +210,12 @@ function printSummary(report: BenchReport): void {
       `  lang ${l.lang} (${l.questions}): median r(files) ${fmtRatio(l.median_ratio_files)}` +
         (report.te ? ` · median r(te) ${fmtRatio(l.median_ratio_te)}` : "")
     );
+  }
+  if (report.quality_summary) {
+    const q = report.quality_summary;
+    console.log(`  metric: ${report.graph_metric} · instructions:${report.instructions_scope} · economy:${report.economy_status}`);
+    console.log(`  quality TE: median r ${fmtRatio(q.median_quality_ratio_te)} · eligible ${q.eligible_te}/${q.total} · pass/fail/unknown ${q.te.pass}/${q.te.fail}/${q.te.unknown} · errors ${q.errors_te} · truncated ${q.truncated_te} · preset ${q.preset_te}`);
+    console.log(`  quality graph: pass/fail/unknown ${q.graph.pass}/${q.graph.fail}/${q.graph.unknown} (all ${q.total} questions); legacy ratios/totals are raw retrieval costs`);
   }
   console.log(pc.yellow(`  NOTE: ${report.disclaimer}`));
 }

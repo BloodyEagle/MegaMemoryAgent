@@ -38,6 +38,12 @@ afterEach(() => {
 const STUB_SUMMARY =
   'File-fact node for "server/src/lib/scanner.ts:817-878" — created as a provenance support.';
 
+/** CreateConceptResult.id опционален по API (отказ дедупликации); в этих сценариях узел всегда создаётся. */
+function createdId(result: { id?: string }): string {
+  if (result.id === undefined) throw new Error("createConcept returned no id");
+  return result.id;
+}
+
 /** Raw inserts: заглушки уже записаны до 2.1.9 и не удаляются, только помечаются.
  * created_via="agent" явно (2.1.10: заглушкой бывает только ручной узел). */
 function node(id: string, kind: string, summary: string): void {
@@ -80,7 +86,7 @@ describe("2.1.9 F2: опоры-заглушки не принимаются", ()
       kind: "feature",
       summary: "кэш хранит превью на диске",
     });
-    const created = db.getNode(r.id);
+    const created = db.getNode(createdId(r));
     expect(created).toBeDefined();
     expect(created!.summary).toBe("кэш хранит превью на диске");
   });
@@ -92,7 +98,7 @@ describe("2.1.9 F2: опоры-заглушки не принимаются", ()
       summary: STUB_SUMMARY,
       allow_stub: true,
     });
-    expect(db.getNode(r.id)!.epistemic_status).toBe("stub");
+    expect(db.getNode(createdId(r))!.epistemic_status).toBe("stub");
   });
 
   it("11. kind=module с коротким summary → принят (проверка на модули не действует)", async () => {
@@ -101,7 +107,7 @@ describe("2.1.9 F2: опоры-заглушки не принимаются", ()
       kind: "module",
       summary: "модуль",
     });
-    expect(db.getNode(r.id)).toBeDefined();
+    expect(db.getNode(createdId(r))).toBeDefined();
   });
 
   it("12. weak_links показывает stub_support для существующей заглушки", () => {

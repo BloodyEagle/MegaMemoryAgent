@@ -227,6 +227,13 @@ export function artifactsDigestOf(rows: NodeArtifactRow[]): string | null {
  * and reported via truncated: true. Nodes are taken in the order passed, refs
  * in file_refs order — the cut is deterministic.
  */
+function observationSnapshot(rows: NodeArtifactRow[]): string {
+  return JSON.stringify([...rows]
+    .sort((a, b) => a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0)
+    .map((row) => [row.kind, row.ref, row.digest, row.prev_digest, row.size_bytes,
+      row.checked_at, row.changed_at, row.checked_by, row.repo_path ?? null]));
+}
+
 export async function checkArtifacts(
   db: KnowledgeDB,
   input: CheckArtifactsInput
@@ -265,14 +272,15 @@ export async function checkArtifacts(
         refs = [];
       }
     }
-    const existing = new Map(db.getNodeArtifacts(nodeId).map((r) => [`${r.kind}\t${r.ref}`, r]));
     for (const ref of refs) {
       if (output.checked >= maxFiles) {
         output.truncated = true;
         break outer;
       }
       const { kind, rev, scheme, name } = classifyRef(ref);
-      const row = existing.get(`${kind}\t${ref}`);
+      const observations = db.getNodeArtifacts(nodeId);
+      const before = observationSnapshot(observations);
+      const row = observations.find((r) => r.kind === kind && r.ref === ref);
 
       // 2.1.12 F2: репозиторий для git:-ref — явный input.repo, затем
       // закреплённый на строке (первое разрешение), затем каталог базы.
@@ -304,12 +312,22 @@ export async function checkArtifacts(
         );
       }
       const repoPin = { repo_path: baseUsed };
+      const writeObservation = (next: NodeArtifactRow): void => {
+        db.runInTransaction(() => {
+          const current = db.getNode(nodeId);
+          if (!current || current.file_refs !== node.file_refs ||
+              observationSnapshot(db.getNodeArtifacts(nodeId)) !== before) {
+            throw new Error(`version_conflict: check_artifacts "${nodeId}" — refs/observations/root changed during hashing; observation not written.`);
+          }
+          db.upsertNodeArtifact(next);
+        });
+      };
 
       if (!fresh) {
         // Missing now. The row keeps the last-seen digest in prev_digest so
         // the warning text can say "was → missing, noticed then".
         if (row && row.digest !== null) {
-          db.upsertNodeArtifact({
+          writeObservation({
             ...row,
             digest: null,
             prev_digest: row.digest,
@@ -318,7 +336,7 @@ export async function checkArtifacts(
             ...repoPin,
           });
         } else {
-          db.upsertNodeArtifact({
+          writeObservation({
             node_id: nodeId,
             kind,
             ref,
@@ -338,7 +356,7 @@ export async function checkArtifacts(
 
       if (!row) {
         // First observation: recorded, never a divergence (nothing to compare).
-        db.upsertNodeArtifact({
+        writeObservation({
           node_id: nodeId,
           kind,
           ref,
@@ -357,7 +375,7 @@ export async function checkArtifacts(
 
       if (row.digest === null) {
         // Was missing, is back: honest change (old = null), dated for the text.
-        db.upsertNodeArtifact({
+        writeObservation({
           ...row,
           digest: fresh.digest,
           size_bytes: fresh.size,
@@ -374,12 +392,12 @@ export async function checkArtifacts(
         // Same content: only the check time moves; prev_digest/changed_at are
         // NOT touched — a steady re-check must not look like a change. The
         // pin follows the resolution root that was actually used.
-        db.upsertNodeArtifact({ ...row, checked_at: now, ...repoPin });
+        writeObservation({ ...row, checked_at: now, ...repoPin });
         output.checked += 1;
         continue;
       }
 
-      db.upsertNodeArtifact({
+      writeObservation({
         ...row,
         digest: fresh.digest,
         prev_digest: row.digest,

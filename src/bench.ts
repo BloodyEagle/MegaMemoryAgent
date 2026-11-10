@@ -2,6 +2,7 @@ import { exec, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { StringDecoder } from "node:string_decoder";
 import { KnowledgeDB } from "./db.js";
 import { estimateTokens, understand } from "./tools.js";
 import { parseRef } from "./refs.js";
@@ -30,6 +31,17 @@ export const BENCH_DISCLAIMER =
   "a cheap but wrong answer is not savings.";
 
 export type BenchBaselineMode = "files" | "te" | "both";
+export type BenchQuality = "pass" | "fail" | "unknown";
+export type BenchCompleteness = "complete" | "truncated" | "unknown";
+export interface QualityState {
+  quality: BenchQuality;
+  completeness: BenchCompleteness;
+  measurement: "live" | "preset" | "not_measured";
+  reasons: string[];
+}
+export interface QualityContract {
+  adapter: "ts_search" | "py_search" | "har_search" | "generic_json";
+}
 
 export interface BenchQuestion {
   id: string;
@@ -44,6 +56,11 @@ export interface BenchQuestion {
   baseline_te_tokens?: number;
   /** Extra roots for relative file_refs (plan 2.1.6 F3); overrides the run-level --ref-root. */
   ref_roots?: string[];
+  expected_outcome?: "match" | "no_match";
+  quality_contract?: QualityContract;
+  expected_te_refs?: string[];
+  expected_te_symbols?: string[];
+  expected_te_edges?: string[];
 }
 
 /** Parse the questions.jsonl format. Throws on a malformed line. */
@@ -65,6 +82,18 @@ export function loadQuestions(text: string): BenchQuestion[] {
       throw new Error(`questions file, line ${i + 1}: expected a JSON object`);
     }
     const obj = raw as Record<string, unknown>;
+    if (obj.expected_outcome !== undefined && !["match", "no_match"].includes(String(obj.expected_outcome))) {
+      throw new Error(`questions file, line ${i + 1}: invalid expected_outcome`);
+    }
+    if (obj.quality_contract !== undefined && (
+      !obj.quality_contract || typeof obj.quality_contract !== "object" ||
+      !["ts_search", "py_search", "har_search", "generic_json"].includes(String((obj.quality_contract as QualityContract).adapter))
+    )) throw new Error(`questions file, line ${i + 1}: invalid quality_contract.adapter`);
+    for (const key of ["expected_te_refs", "expected_te_symbols", "expected_te_edges"]) {
+      if (obj[key] !== undefined && (!Array.isArray(obj[key]) || !(obj[key] as unknown[]).every((v) => typeof v === "string" && v !== ""))) {
+        throw new Error(`questions file, line ${i + 1}: ${key} must be an array of nonempty strings`);
+      }
+    }
     if (typeof obj.query !== "string" || obj.query.trim() === "") {
       throw new Error(`questions file, line ${i + 1}: missing required string field "query"`);
     }
@@ -80,6 +109,11 @@ export function loadQuestions(text: string): BenchQuestion[] {
         typeof obj.baseline_te_tokens === "number" && obj.baseline_te_tokens >= 0
           ? obj.baseline_te_tokens
           : undefined,
+      expected_outcome: obj.expected_outcome as BenchQuestion["expected_outcome"],
+      quality_contract: obj.quality_contract as QualityContract | undefined,
+      expected_te_refs: obj.expected_te_refs as string[] | undefined,
+      expected_te_symbols: obj.expected_te_symbols as string[] | undefined,
+      expected_te_edges: obj.expected_te_edges as string[] | undefined,
       ref_roots: Array.isArray(obj.ref_roots)
         ? (obj.ref_roots as unknown[]).filter((r): r is string => typeof r === "string" && r !== "")
         : undefined,
@@ -93,6 +127,15 @@ export class BenchError extends Error {}
 export interface TeRunResult {
   stdout: string;
   durationMs: number;
+  stderr?: string;
+  exitCode?: number | null;
+  error?: string;
+  stdoutBytes?: number;
+  stdoutCapturedBytes?: number;
+  stdoutTruncated?: boolean;
+  stderrBytes?: number;
+  stderrTruncated?: boolean;
+  completeness?: "complete" | "truncated" | "unknown";
 }
 
 /**
@@ -199,6 +242,17 @@ export interface QuestionResult {
   time_to_te_ms: number | null;
   /** true when baseline_te_tokens came from the questions file, not a run */
   te_used_preset: boolean;
+  graph_quality: QualityState;
+  te_quality: QualityState;
+  comparison_te: "eligible" | "not_comparable";
+  comparison_te_reasons: string[];
+  quality_ratio_te: number | null;
+  te_stdout_bytes: number | null;
+  te_stdout_captured_bytes: number | null;
+  te_stdout_truncated: boolean;
+  te_captured_prefix_tokens: number | null;
+  te_exit_code: number | null;
+  te_error: string | null;
 }
 
 export interface ModeSummary {
@@ -261,6 +315,19 @@ export interface BenchReport {
   median_time_wo_warmup_ms: number | null;
   per_lang: LangSummary[];
   disclaimer: string;
+  graph_metric: "retrieval_wire_without_instructions";
+  instructions_scope: "excluded";
+  economy_status: "not_measured";
+  quality_summary: {
+    total: number;
+    graph: Record<BenchQuality, number>;
+    te: Record<BenchQuality, number>;
+    eligible_te: number;
+    errors_te: number;
+    truncated_te: number;
+    preset_te: number;
+    median_quality_ratio_te: number | null;
+  };
 }
 
 function median(values: number[]): number | null {
@@ -363,88 +430,83 @@ const TE_PROGRAM_MAX_BUFFER = 16 * 1024 * 1024;
  * POSIX (SIGTERM, then SIGKILL). Failures carry the exit status and a
  * bounded stderr tail.
  */
-async function defaultRunTeProgram(executable: string, args: string[]): Promise<TeRunResult> {
+export interface TeProgramOptions {
+  /** Test seams: tiny byte caps and fake child streams, never a large load. */
+  maxBufferBytes?: number;
+  timeoutMs?: number;
+  spawnProgram?: typeof spawn;
+}
+
+export async function defaultRunTeProgram(
+  executable: string, args: string[], options: TeProgramOptions = {}
+): Promise<TeRunResult> {
   const t0 = performance.now();
-  return new Promise<TeRunResult>((resolve, reject) => {
-    const child = spawn(executable, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      // Own process group on POSIX so the timeout can signal the tree.
+  const cap = options.maxBufferBytes ?? TE_PROGRAM_MAX_BUFFER;
+  const timeoutMs = options.timeoutMs ?? TE_PROGRAM_TIMEOUT_MS;
+  if (!Number.isSafeInteger(cap) || cap < 0 || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new BenchError("invalid te runner byte cap or timeout");
+  }
+  return new Promise<TeRunResult>((resolve) => {
+    const child = (options.spawnProgram ?? spawn)(executable, args, {
+      stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
       detached: process.platform !== "win32",
     });
-    let stdout = "";
-    let stderr = "";
-    let truncated = false;
-    let killedByTimeout = false;
+    const output = () => ({ bytes: 0, retained: 0, text: "", decoder: new StringDecoder("utf8") });
+    const stdout = output();
+    const stderr = output();
     let settled = false;
-    const finish = (build: () => TeRunResult): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      clearTimeout(escalateTimer);
-      let result: TeRunResult;
-      try {
-        result = build();
-      } catch (err) {
-        reject(err);
-        return;
-      }
-      resolve(result);
+    let killedByTimeout = false;
+    const collect = (stream: ReturnType<typeof output>, chunk: Buffer | string): void => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+      stream.bytes += bytes.length;
+      const prefix = bytes.subarray(0, Math.max(0, cap - stream.retained));
+      stream.retained += prefix.length;
+      stream.text += stream.decoder.write(prefix);
     };
     const killTree = (signal: NodeJS.Signals): void => {
-      if (child.pid === undefined) return;
+      if (child.pid === undefined) { child.kill(signal); return; }
       if (process.platform === "win32") {
-        // taskkill is a fixed system binary called with argv — no shell.
         const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
-          windowsHide: true,
-          stdio: "ignore",
+          windowsHide: true, stdio: "ignore",
         });
         killer.on("error", () => child.kill(signal));
       } else {
         try { process.kill(-child.pid, signal); } catch { child.kill(signal); }
       }
     };
-    // SIGTERM first so a well-behaved te tool can flush; SIGKILL if it ignores it.
-    const timer = setTimeout(() => {
+    const finish = (exitCode: number | null, error?: string): void => {
       if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(escalateTimer);
+      // Do not flush a decoder's incomplete final code point into U+FFFD.
+      const stdoutTruncated = stdout.bytes > cap;
+      const stderrTruncated = stderr.bytes > cap;
+      const stdoutCapturedBytes = Buffer.byteLength(stdout.text, "utf8");
+      if (!stdoutTruncated && stdoutCapturedBytes !== stdout.retained) error ??= "incomplete UTF-8 stdout";
+      resolve({
+        stdout: stdout.text, stderr: stderr.text, exitCode, error,
+        durationMs: performance.now() - t0,
+        stdoutBytes: stdout.bytes, stdoutCapturedBytes: Buffer.byteLength(stdout.text, "utf8"),
+        stdoutTruncated, stderrBytes: stderr.bytes, stderrTruncated,
+        completeness: stdoutTruncated ? "truncated" : error ? "unknown" : "complete",
+      });
+    };
+    const timer = setTimeout(() => {
       killedByTimeout = true;
       killTree("SIGTERM");
-    }, TE_PROGRAM_TIMEOUT_MS);
+    }, timeoutMs);
     const escalateTimer = setTimeout(() => {
       if (!settled && killedByTimeout) killTree("SIGKILL");
-    }, TE_PROGRAM_TIMEOUT_MS + 5_000);
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      if (stdout.length < TE_PROGRAM_MAX_BUFFER) stdout += chunk;
-      else truncated = true;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      if (stderr.length < TE_PROGRAM_MAX_BUFFER) stderr += chunk;
-      else truncated = true;
-    });
-    child.on("error", (err: Error) => {
-      finish(() => { throw new BenchError(`the te program could not be started: ${executable}\n${err.message}`); });
-    });
+    }, timeoutMs + 5_000);
+    child.stdout!.on("data", (chunk: Buffer) => collect(stdout, chunk));
+    child.stderr!.on("data", (chunk: Buffer) => collect(stderr, chunk));
+    child.on("error", (err: Error) => finish(null, `could not start ${executable}: ${err.message}`));
     child.on("close", (code, signal) => {
-      if (code === 0 && signal === null) {
-        finish(() => ({ stdout, durationMs: performance.now() - t0 }));
-        return;
-      }
-      const tail = stderr.trim().split("\n").slice(-3).join("\n");
-      const status = killedByTimeout
-        ? "killed by the 60 s timeout (own process tree terminated)"
-        : signal !== null
-          ? `terminated by ${signal}`
-          : `exit code ${code}`;
-      finish(() => {
-        throw new BenchError(
-          `the te program failed: ${executable} ${args.join(" ")} (${status})` +
-            (truncated ? " [output truncated at 16 MB]" : "") +
-            (tail ? `\n${tail}` : "")
-        );
-      });
+      const error = killedByTimeout ? `timeout after ${timeoutMs} ms (own process tree terminated)`
+        : signal !== null ? `terminated by ${signal}`
+        : code !== 0 && code !== 1 ? `exit code ${code}` : undefined;
+      finish(code, error);
     });
   });
 }
@@ -484,6 +546,98 @@ function countFile(
   return { ref, tokens: estimateTokens(content), estimated: false, missing: false };
 }
 
+function qualityState(
+  quality: BenchQuality, completeness: BenchCompleteness,
+  measurement: QualityState["measurement"], ...reasons: string[]
+): QualityState { return { quality, completeness, measurement, reasons }; }
+
+/** Explicit source adapters: a successful process is not a payload oracle. */
+function teQuality(q: BenchQuestion, run: TeRunResult | null, preset: boolean): QualityState {
+  if (preset) return qualityState("unknown", "unknown", "preset", "preset_not_live");
+  if (!run) return qualityState("unknown", "unknown", "not_measured", "not_measured");
+  if (run.stdoutTruncated || run.completeness === "truncated") {
+    return qualityState("unknown", "truncated", "live", "stdout_truncated");
+  }
+  if (run.error || run.completeness === "unknown") return qualityState("fail", "unknown", "live", "runner_error");
+  const adapter = q.quality_contract?.adapter;
+  if (!adapter) return qualityState("unknown", "unknown", "live", "adapter_missing");
+  const refs: string[] = [], symbols: string[] = [], edges: string[] = [];
+  let count = 0;
+  let completeness: BenchCompleteness = "complete";
+  const integer = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
+  try {
+    if (adapter === "py_search") {
+      const text = run.stdout.trim();
+      const negative = text.match(/^«([\s\S]*)»: совпадений нет \((\d+) файлов просмотрено\)$/);
+      if (negative) {
+        if (negative[1] !== q.query) throw new Error("wrong negative query");
+      } else {
+        const lines = text.split(/\r?\n/);
+        const footer = lines.pop()?.match(/^-- совпадений: (\d+), файлов: (\d+)(?:, показано (\d+))?$/);
+        if (!footer) throw new Error("missing text footer");
+        count = Number(footer[1]);
+        let file = "", shown = 0;
+        for (const line of lines) {
+          const match = line.match(/^\s+(\d+): (.*)$/);
+          if (match && file) { refs.push(file, `${file}:${match[1]}`); shown++; }
+          else if (line && !/^\s/.test(line)) file = line;
+          else throw new Error("malformed text row");
+        }
+        if (count === 0 || shown > count || (footer[3] !== undefined && Number(footer[3]) !== shown)) throw new Error("invalid text count");
+        if (shown < count) completeness = "truncated";
+      }
+    } else {
+      const payload = JSON.parse(run.stdout);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload) || "error" in payload || payload.isError) throw new Error("error payload");
+      if (adapter === "ts_search") {
+        if (!integer(payload.count) || !Array.isArray(payload.matches) || payload.matches.length > payload.count) throw new Error("invalid search payload");
+        count = payload.count;
+        for (const item of payload.matches) {
+          if (!item || typeof item.file !== "string" || !integer(item.line) || item.line < 1 || typeof item.text !== "string") throw new Error("invalid search row");
+          refs.push(item.file, `${item.file}:${item.line}`);
+        }
+        if (count > payload.matches.length || payload.truncated === true) completeness = "truncated";
+      } else if (adapter === "har_search") {
+        if (payload.command !== "search" || !integer(payload.total) || !integer(payload.shown) || !integer(payload.omitted) ||
+          typeof payload.truncated !== "boolean" || !Array.isArray(payload.items) || payload.shown !== payload.items.length ||
+          payload.total !== payload.shown + payload.omitted) throw new Error("invalid HAR payload");
+        count = payload.total;
+        for (const item of payload.items) {
+          if (!item || typeof item.url !== "string" || !integer(item.index)) throw new Error("invalid HAR row");
+          refs.push(item.url);
+        }
+        if (payload.truncated || payload.omitted > 0) completeness = "truncated";
+      } else {
+        if (!Array.isArray(payload.results) || typeof payload.complete !== "boolean") throw new Error("invalid generic payload");
+        count = payload.results.length;
+        for (const item of payload.results) {
+          if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("invalid generic row");
+          for (const [key, target] of [["refs", refs], ["symbols", symbols], ["edges", edges]] as const) {
+            if (item[key] !== undefined) {
+              if (!strings(item[key])) throw new Error("invalid generic oracle fields");
+              target.push(...item[key]);
+            }
+          }
+        }
+        if (!payload.complete) completeness = "truncated";
+      }
+    }
+  } catch {
+    return qualityState("fail", "unknown", "live", "invalid_payload");
+  }
+  const exit = run.exitCode ?? 0;
+  const harNegative = adapter === "har_search" && count === 0 && completeness === "complete" && exit === 1 && !(run.stderr ?? "").trim();
+  if (exit !== 0 && !harNegative) return qualityState("fail", completeness, "live", "exit_error");
+  if (completeness !== "complete") return qualityState("unknown", completeness, "live", "adapter_truncated");
+  if (!q.expected_outcome) return qualityState("unknown", completeness, "live", "outcome_missing");
+  if (q.expected_outcome === "no_match") return qualityState(count === 0 ? "pass" : "fail", completeness, "live", ...(count ? ["unexpected_match"] : []));
+  const expected = [q.expected_te_refs ?? [], q.expected_te_symbols ?? [], q.expected_te_edges ?? []];
+  if (!expected.some((items) => items.length)) return qualityState("unknown", completeness, "live", "te_oracle_missing");
+  const passed = count > 0 && expected.every((items, i) => items.every((item) => [refs, symbols, edges][i].includes(item)));
+  return qualityState(passed ? "pass" : "fail", completeness, "live", ...(passed ? [] : ["te_oracle_mismatch"]));
+}
+
 function summarize(
   questions: QuestionResult[],
   pick: (q: QuestionResult) => { baseline: number | null; ratio: number | null }
@@ -511,8 +665,9 @@ function summarize(
 
 /**
  * Run the bench over the questions. Understand is called with top_k 10 — the
- * hit_rate contract — and the default 1500-token budget, exactly what an
- * agent gets from the default compact mode.
+ * hit_rate contract — and the default 1500-token budget. The estimator wraps
+ * retrieval as MCP content but excludes runtime instructions metadata; this is
+ * not exactly the default MCP response or a whole-task cost measurement.
  */
 export async function runBench(
   db: KnowledgeDB,
@@ -546,9 +701,15 @@ export async function runBench(
   const results: QuestionResult[] = [];
 
   for (const q of questions) {
-    // 1. the graph answer — same call the agent makes
+    // Retrieval wire estimator without the MCP instructions metadata.
     const t0 = performance.now();
-    const r = await understand(db, { query: q.query, top_k: 10 });
+    let graphError: string | null = null;
+    let r: Awaited<ReturnType<typeof understand>>;
+    try { r = await understand(db, { query: q.query, top_k: 10 }); }
+    catch (err) {
+      graphError = err instanceof Error ? err.message : String(err);
+      r = { matches: [], compact: [] };
+    }
     const timeToGraphMs = performance.now() - t0;
     const graphTokens = r.meta?.tokens_estimated ?? 0;
     const matches = r.compact ?? [];
@@ -680,6 +841,7 @@ export async function runBench(
     let baselineTe: number | null = null;
     let timeToTeMs: number | null = null;
     let usedPreset = false;
+    let teRun: TeRunResult | null = null;
     if (mode === "te" || mode === "both") {
       if (q.baseline_te_tokens !== undefined) {
         // recorded beforehand — the external command is not run at all
@@ -699,9 +861,8 @@ export async function runBench(
             );
           }
           const args = opts.teRunner.args.map((a) => a.split("{query}").join(q.query));
-          const run = await runTeProgram(opts.teRunner.executable, args);
-          baselineTe = estimateTokens(run.stdout);
-          timeToTeMs = run.durationMs;
+          try { teRun = await runTeProgram(opts.teRunner.executable, args); }
+          catch (err) { teRun = { stdout: "", durationMs: 0, error: err instanceof Error ? err.message : String(err), completeness: "unknown" }; }
         } else {
           const template = q.te_cmd ?? opts.teCmd;
           if (!template) {
@@ -716,12 +877,35 @@ export async function runBench(
               `Question "${q.id}": the te command template must contain {query}, got: ${template}`
             );
           }
-          const run = await runTe(substituteQuery(template, q.query));
-          baselineTe = estimateTokens(run.stdout);
-          timeToTeMs = run.durationMs;
+          try { teRun = await runTe(substituteQuery(template, q.query)); }
+          catch (err) { teRun = { stdout: "", durationMs: 0, error: err instanceof Error ? err.message : String(err), completeness: "unknown" }; }
         }
       }
     }
+
+    if (teRun) {
+      timeToTeMs = teRun.durationMs;
+      const acceptedExit = (teRun.exitCode ?? 0) === 0 || q.quality_contract?.adapter === "har_search";
+      if (!teRun.error && acceptedExit && !teRun.stdoutTruncated && teRun.completeness !== "truncated" && teRun.completeness !== "unknown") {
+        baselineTe = estimateTokens(teRun.stdout);
+      }
+    }
+    const graphComplete: BenchCompleteness = graphError || !r.meta ? "unknown"
+      : r.meta.truncated || r.meta.dropped > 0 ? "truncated" : "complete";
+    const graphPassed = q.expected_outcome === "no_match" ? !hasGraphAnswer
+      : (q.expect_nodes?.length ?? 0) > 0 && q.expect_nodes!.every((id) => allIds.includes(id));
+    const graphQuality = graphError ? qualityState("fail", "unknown", "not_measured", "graph_error")
+      : !q.expected_outcome || (q.expected_outcome === "match" && !q.expect_nodes?.length)
+        ? qualityState("unknown", graphComplete, "live", "graph_oracle_missing")
+        : qualityState(graphPassed ? "pass" : "fail", graphComplete, "live", ...(graphPassed ? [] : ["graph_oracle_mismatch"]));
+    const externalQuality = teQuality(q, teRun, usedPreset);
+    const comparisonReasons: string[] = [];
+    if (graphQuality.quality !== "pass") comparisonReasons.push("graph_quality_not_pass");
+    if (externalQuality.quality !== "pass") comparisonReasons.push("te_quality_not_pass");
+    if (graphQuality.completeness !== "complete" || externalQuality.completeness !== "complete") comparisonReasons.push("incomplete");
+    if (graphQuality.measurement !== "live" || externalQuality.measurement !== "live") comparisonReasons.push("not_live");
+    if (!(graphTokens > 0 && Number.isFinite(graphTokens) && baselineTe !== null && baselineTe > 0 && Number.isFinite(baselineTe))) comparisonReasons.push("nonpositive_or_unmeasured_cost");
+    const eligibleTe = comparisonReasons.length === 0;
 
     // 3. provenance bookkeeping over the found nodes — the union, not just
     // the top level: a nested support is still in the answer (2.1.7 F3), so
@@ -782,6 +966,17 @@ export async function runBench(
       time_to_baseline_ms: timeToBaselineMs,
       time_to_te_ms: timeToTeMs,
       te_used_preset: usedPreset,
+      graph_quality: graphQuality,
+      te_quality: externalQuality,
+      comparison_te: eligibleTe ? "eligible" : "not_comparable",
+      comparison_te_reasons: comparisonReasons,
+      quality_ratio_te: eligibleTe ? baselineTe! / graphTokens : null,
+      te_stdout_bytes: teRun ? teRun.stdoutBytes ?? Buffer.byteLength(teRun.stdout, "utf8") : null,
+      te_stdout_captured_bytes: teRun ? teRun.stdoutCapturedBytes ?? Buffer.byteLength(teRun.stdout, "utf8") : null,
+      te_stdout_truncated: teRun?.stdoutTruncated ?? teRun?.completeness === "truncated",
+      te_captured_prefix_tokens: teRun?.stdoutTruncated || teRun?.completeness === "truncated" ? estimateTokens(teRun.stdout) : null,
+      te_exit_code: teRun ? teRun.exitCode ?? 0 : null,
+      te_error: teRun?.error ?? ((teRun?.exitCode ?? 0) !== 0 && externalQuality.quality !== "pass" ? `exit code ${teRun!.exitCode}` : null),
     });
   }
 
@@ -868,5 +1063,26 @@ export async function runBench(
     median_time_wo_warmup_ms: cold.medianWithoutWarmupMs,
     per_lang: perLang,
     disclaimer: BENCH_DISCLAIMER,
+    graph_metric: "retrieval_wire_without_instructions",
+    instructions_scope: "excluded",
+    economy_status: "not_measured",
+    quality_summary: {
+      total: results.length,
+      graph: {
+        pass: results.filter((q) => q.graph_quality.quality === "pass").length,
+        fail: results.filter((q) => q.graph_quality.quality === "fail").length,
+        unknown: results.filter((q) => q.graph_quality.quality === "unknown").length,
+      },
+      te: {
+        pass: results.filter((q) => q.te_quality.quality === "pass").length,
+        fail: results.filter((q) => q.te_quality.quality === "fail").length,
+        unknown: results.filter((q) => q.te_quality.quality === "unknown").length,
+      },
+      eligible_te: results.filter((q) => q.comparison_te === "eligible").length,
+      errors_te: results.filter((q) => q.te_error !== null).length,
+      truncated_te: results.filter((q) => q.te_quality.completeness === "truncated").length,
+      preset_te: results.filter((q) => q.te_used_preset).length,
+      median_quality_ratio_te: median(results.map((q) => q.quality_ratio_te).filter((v): v is number => v !== null)),
+    },
   };
 }

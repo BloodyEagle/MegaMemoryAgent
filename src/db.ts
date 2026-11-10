@@ -8,16 +8,59 @@ import type {
   NodeArtifactRow,
   SupportBaselineRow,
   SupportRevisionRow,
+  MergeConflictRow,
 } from "./types.js";
 import { normalizeName } from "./norm.js";
 import { looksLikeFileRefAnchor } from "./stub.js";
+import { validationClaimDigest, validationScopeDigest } from "./validation.js";
 
 /** Plan 4 (informed_by provenance slice, schema v7); v8 baselines, v11 revisions
  * + artifacts, v12 nodes.created_via (anchor vs agent-node). */
 // 2.1.12: v13 — node_artifacts.repo_path (F2, где резолвился git:-ref);
 // nodes.valid_until для срока годности фактов (F1) существует с v5 — v13
 // его структуру не трогает, только семантику чтения.
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
+
+/** Frozen schema 14: every lazy writer uses these complete definitions. */
+export const SCHEMA14_LAZY_DDL = {
+  meta: "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+  status_history: `CREATE TABLE IF NOT EXISTS status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, node_id TEXT NOT NULL, from_status TEXT,
+    to_status TEXT NOT NULL, reason TEXT, field TEXT NOT NULL DEFAULT 'status',
+    at TEXT NOT NULL DEFAULT (datetime('now')), claim_digest TEXT, scope_digest TEXT,
+    status_scope TEXT);
+    CREATE INDEX IF NOT EXISTS idx_status_history_node ON status_history(node_id)`,
+  aliases: `CREATE TABLE IF NOT EXISTS aliases (
+    old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL,
+    renamed_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  usage: `CREATE TABLE IF NOT EXISTS usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT DEFAULT (datetime('now')),
+    tool TEXT NOT NULL, query TEXT, nodes INTEGER NOT NULL,
+    returned_chars INTEGER NOT NULL, returned_tokens INTEGER NOT NULL)`,
+  provenance_audit_runs: `CREATE TABLE IF NOT EXISTS provenance_audit_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, root_id TEXT NOT NULL, direction TEXT NOT NULL,
+    params TEXT, result TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+    CREATE INDEX IF NOT EXISTS idx_audit_root ON provenance_audit_runs(root_id, created_at)`,
+  digest_sources: `CREATE TABLE IF NOT EXISTS digest_sources (
+    digest_id TEXT PRIMARY KEY, sources TEXT NOT NULL, format_version INTEGER NOT NULL DEFAULT 1)`,
+  merge_conflicts: `CREATE TABLE IF NOT EXISTS merge_conflicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, merge_group TEXT NOT NULL,
+    object_kind TEXT NOT NULL, object_key TEXT NOT NULL,
+    format_version INTEGER NOT NULL DEFAULT 1, left_payload TEXT NOT NULL,
+    right_payload TEXT NOT NULL, mapping_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'unresolved',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), resolved_at TEXT, resolution_json TEXT);
+    CREATE INDEX IF NOT EXISTS idx_merge_conflicts_group ON merge_conflicts(merge_group, state)`,
+} as const;
+
+const SCHEMA14_COLUMNS: Record<string, Record<string, string>> = {
+  nodes: { validation_claim_digest: "TEXT", validation_scope_digest: "TEXT", embedding_generation: "INTEGER" },
+  support_baselines: { decision_claim_digest: "TEXT" },
+  support_revisions: { artifacts_digest: "TEXT", decision_claim_digest: "TEXT", confirmed_by: "TEXT", superseded_at: "TEXT" },
+  status_history: { claim_digest: "TEXT", scope_digest: "TEXT", status_scope: "TEXT" },
+  digest_sources: { format_version: "INTEGER NOT NULL DEFAULT 1" },
+  nodes_vec: { generation: "INTEGER" },
+};
 
 /**
  * 2.3.1: значение маркера конверсии для meta.schema_version, а не версия
@@ -138,6 +181,20 @@ export function isUnderFixturesDir(dbPath: string): boolean {
   return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
+export interface VectorGeneration {
+  generation: number;
+  model: string;
+  dim: number;
+  profile: string;
+}
+
+const sameVectorProfile = (a: string, b: string): boolean => {
+  try {
+    const normalize = (text: string) => { const value = JSON.parse(text); return JSON.stringify(Object.keys(value).filter(key => key !== "dim").sort().map(key => [key, value[key]])); };
+    return normalize(a) === normalize(b);
+  } catch { return false; }
+};
+
 export class KnowledgeDB {
   private db: Database.Database;
   private dbFile: string;
@@ -223,6 +280,16 @@ export class KnowledgeDB {
     }
 
     this.db = new Database(dbPath);
+    // Guard every opening, including autoMigrate:false, before persistent PRAGMAs.
+    this.dbFile = path.resolve(dbPath);
+    this.db.pragma("query_only = ON");
+    try {
+      this.assertSupportedVersion();
+    } catch (err) {
+      this.db.close();
+      throw err;
+    }
+    if (!readonly) this.db.pragma("query_only = OFF");
     if (readonly) {
       // libsql 0.5.x игнорирует И опцию конструктора readonly: true, И
       // fileMustExist (план 11: INSERT через «readonly»-соединение проходит,
@@ -364,9 +431,94 @@ export class KnowledgeDB {
     }
   }
 
-  private migrate(): void {
+  private assertSupportedVersion(): void {
     const version = this.getUserVersion();
-    if (version >= SCHEMA_VERSION) return;
+    if (!Number.isSafeInteger(version) || version < 0) {
+      throw new Error(`Invalid user_version: ${String(version)}`);
+    }
+    if (version > SCHEMA_VERSION) {
+      // План 18: текст читает агент — полный совет, без env-обходов.
+      throw new ReadonlyDbError("SCHEMA_TOO_NEW_READONLY",
+        `База "${this.dbFile}" создана более новой версией megamemory: ` +
+        `user_version = ${version}, этот билд понимает v${SCHEMA_VERSION}. ` +
+        `Обнови пакет: npm install -g @bloodyeagle/megamemory@latest.`);
+    }
+  }
+
+  /** A stamped table may not silently acquire another schema-14 format. */
+  private assertSchema14Columns(): void {
+    for (const [table, columns] of Object.entries(SCHEMA14_COLUMNS)) {
+      const rows = this.db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+      if (rows.length === 0) continue;
+      const names = new Set(rows.map((row) => row.name));
+      for (const name of Object.keys(columns)) {
+        if (!names.has(name)) throw new Error(`Incomplete schema 14: ${table}.${name}`);
+      }
+    }
+  }
+
+  /** Fail closed on every result row, never the first arbitrary value. */
+  assertIntegrity(): void {
+    for (const pragma of ["quick_check", "integrity_check"] as const) {
+      const rows = this.db.pragma(pragma) as Array<Record<string, unknown>>;
+      if (!Array.isArray(rows) || rows.length === 0 ||
+          rows.some((row) => row[pragma] !== "ok")) {
+        throw new Error(`PRAGMA ${pragma}: ${JSON.stringify(rows)}`);
+      }
+    }
+  }
+
+  /** Complete declared lazy definition, safe inside the caller's transaction. */
+  ensureSchemaTable(table: keyof typeof SCHEMA14_LAZY_DDL): void {
+    this.assertSupportedVersion();
+    this.db.exec(SCHEMA14_LAZY_DDL[table]);
+    if (this.getUserVersion() === SCHEMA_VERSION) this.assertSchema14Columns();
+  }
+
+  ensureDigestSourcesTable(): void { this.ensureSchemaTable("digest_sources"); }
+  ensureMergeConflictsTable(): void { this.ensureSchemaTable("merge_conflicts"); }
+
+  getMergeConflicts(group?: string, includeResolved = false): MergeConflictRow[] {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='merge_conflicts'").get()) return [];
+    return this.db.prepare(
+      `SELECT * FROM merge_conflicts WHERE ${includeResolved ? "1=1" : "state='unresolved'"}${group ? " AND merge_group=@group" : ""} ORDER BY id`
+    ).all(group ? { group } : {}) as MergeConflictRow[];
+  }
+
+  insertMergeConflict(row: Omit<MergeConflictRow, "id" | "created_at" | "resolved_at" | "resolution_json" | "state"> & Partial<Pick<MergeConflictRow, "created_at" | "resolved_at" | "resolution_json" | "state">>): number {
+    return this.runInTransaction(() => {
+      this.ensureMergeConflictsTable();
+      const result = this.db.prepare(
+        `INSERT INTO merge_conflicts(merge_group,object_kind,object_key,format_version,left_payload,right_payload,mapping_json,state,created_at,resolved_at,resolution_json)
+         VALUES (@merge_group,@object_kind,@object_key,@format_version,@left_payload,@right_payload,@mapping_json,@state,@created_at,@resolved_at,@resolution_json)`
+      ).run({ ...row, state: row.state ?? "unresolved", created_at: row.created_at ?? new Date().toISOString(), resolved_at: row.resolved_at ?? null, resolution_json: row.resolution_json ?? null });
+      return Number(result.lastInsertRowid);
+    });
+  }
+
+  markMergeConflictResolved(id: number, resolution: unknown, at = new Date().toISOString()): boolean {
+    const result = this.db.prepare("UPDATE merge_conflicts SET state='resolved', resolved_at=?, resolution_json=? WHERE id=? AND state='unresolved'").run(at, JSON.stringify(resolution), id);
+    return Number(result.changes) === 1;
+  }
+
+  private invalidateReadiness(): void {
+    this._hasStatusColumn = undefined;
+    this._hasNameNormColumn = undefined;
+    this.statusHistoryReady = false;
+    this.usageReady = false;
+    this.provenanceAuditReady = false;
+    this._vectorSupport = undefined;
+    this.timelineWritesSincePrune = 0;
+    this.supportRevisionWritesSincePrune = 0;
+  }
+
+  private migrate(): void {
+    this.assertSupportedVersion();
+    const version = this.getUserVersion();
+    if (version === SCHEMA_VERSION) {
+      this.assertSchema14Columns();
+      return;
+    }
 
     // 2.3.1: свежая база — та же проверка, что в assertMigratable(), но
     // ДО создания таблиц: после них `nodes` уже существует и предикат всегда
@@ -871,6 +1023,19 @@ export class KnowledgeDB {
         // v12 (test 8: migration fills nothing).
       }
 
+      if (currentVersion < 14) {
+        for (const [table, additions] of Object.entries(SCHEMA14_COLUMNS)) {
+          const rows = this.db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+          if (rows.length === 0) continue;
+          const names = new Set(rows.map(row => row.name));
+          for (const [name, declaration] of Object.entries(additions)) {
+            if (!names.has(name)) this.db.exec(`ALTER TABLE "${table}" ADD COLUMN "${name}" ${declaration}`);
+          }
+        }
+        this.assertSchema14Columns();
+        this.assertIntegrity();
+        this.setMetaValue("schema_contract", "megamemory-schema-14");
+      }
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       // 2.3.1: маркер конверсии ставится при создании — внутри транзакции,
       // при ROLLBACK уходит вместе со схемой (setMetaValue создаёт meta
@@ -879,6 +1044,7 @@ export class KnowledgeDB {
       this.db.exec("COMMIT");
     } catch (err) {
       this.db.exec("ROLLBACK");
+      this.invalidateReadiness();
       throw err;
     }
   }
@@ -958,6 +1124,7 @@ export class KnowledgeDB {
           return result;
         } catch (err) {
           this.db.exec("ROLLBACK");
+          this.invalidateReadiness();
           throw err;
         }
       });
@@ -1497,17 +1664,7 @@ export class KnowledgeDB {
 
   private ensureStatusHistoryTable(): void {
     if (this.statusHistoryReady) return;
-    this.db.exec(
-      "CREATE TABLE IF NOT EXISTS status_history (\
-        id INTEGER PRIMARY KEY AUTOINCREMENT,\
-        node_id TEXT NOT NULL,\
-        from_status TEXT,\
-        to_status TEXT NOT NULL,\
-        reason TEXT,\
-        field TEXT NOT NULL DEFAULT 'status',\
-        at TEXT NOT NULL DEFAULT (datetime('now'))\
-      )"
-    );
+    this.ensureSchemaTable("status_history");
     // Self-heal for tables created before plan 1: the field column separates
     // the lifecycle axis (status) from the epistemic axis (epistemic_status).
     const cols = this.db.pragma("table_info(status_history)") as Array<{ name: string }>;
@@ -1582,6 +1739,12 @@ export class KnowledgeDB {
          WHERE id = @id`
       )
       .run({ to, scope: scope ? JSON.stringify(scope) : null, id });
+    const current = this.getNodeIncludingRemoved(id);
+    if (current) this.db.prepare("UPDATE nodes SET validation_claim_digest=?,validation_scope_digest=? WHERE id=?").run(
+      to === "validated" && scope?.artifact ? validationClaimDigest(current.summary) : null,
+      to === "validated" && scope?.artifact ? validationScopeDigest(scope) : null,
+      id
+    );
 
     if (result.changes > 0 && previous !== to) {
       this.recordStatusHistory(id, previous ?? null, to, reason, "epistemic_status");
@@ -1624,11 +1787,15 @@ export class KnowledgeDB {
     field: "status" | "epistemic_status" = "status"
   ): void {
     this.ensureStatusHistoryTable();
+    const node = this.getNodeIncludingRemoved(nodeId);
     this.db
       .prepare(
-        "INSERT INTO status_history (node_id, from_status, to_status, reason, field) VALUES (?, ?, ?, ?, ?)"
+        "INSERT INTO status_history (node_id, from_status, to_status, reason, field,claim_digest,scope_digest,status_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
       )
-      .run(nodeId, fromStatus, toStatus, reason ?? null, field);
+      .run(nodeId, fromStatus, toStatus, reason ?? null, field,
+        field === "epistemic_status" ? node?.validation_claim_digest ?? null : null,
+        field === "epistemic_status" ? node?.validation_scope_digest ?? null : null,
+        field === "epistemic_status" ? node?.status_scope ?? null : null);
   }
 
   /** U5: transitions of one node, newest first. */
@@ -1900,7 +2067,7 @@ export class KnowledgeDB {
   /** Plan 3 §3 / §10 (decision 7): audit runs persist so a later re-run of a
    * shifted graph can be compared against what was actually found. The table
    * is created lazily like status_history/usage — no schema bump needed. */
-  private ensureProvenanceAuditTable(): void {
+  ensureProvenanceAuditTable(): void {
     if (this.provenanceAuditReady) return;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS provenance_audit_runs (
@@ -2006,7 +2173,7 @@ export class KnowledgeDB {
         .prepare(
           `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
                   edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                  artifacts_digest
+                  artifacts_digest, decision_claim_digest
            FROM support_baselines WHERE decision_id = ?
            ORDER BY support_id, confirmed_at, edge_key`
         )
@@ -2022,7 +2189,7 @@ export class KnowledgeDB {
         .prepare(
           `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
                   edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                  artifacts_digest
+                  artifacts_digest, decision_claim_digest
            FROM support_baselines WHERE decision_id = ? AND superseded_at IS NULL
            ORDER BY support_id, confirmed_at, edge_key`
         )
@@ -2047,7 +2214,7 @@ export class KnowledgeDB {
         .prepare(
           `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
                   edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                  artifacts_digest
+                  artifacts_digest, decision_claim_digest
            FROM support_baselines
            WHERE decision_id = ? AND support_id = ? AND edge_key = ? AND superseded_at IS NULL`
         )
@@ -2061,7 +2228,7 @@ export class KnowledgeDB {
       .prepare(
         `SELECT decision_id, support_id, edge_key, claim_digest, status_digest,
                 edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-                artifacts_digest
+                artifacts_digest, decision_claim_digest
          FROM support_baselines
          ORDER BY decision_id, support_id, confirmed_at, edge_key`
       )
@@ -2101,10 +2268,10 @@ export class KnowledgeDB {
         `INSERT INTO support_baselines
            (decision_id, support_id, edge_key, claim_digest, status_digest,
             edge_digest, format_version, confirmed_at, confirmed_by, superseded_at,
-            artifacts_digest)
+            artifacts_digest, decision_claim_digest)
          VALUES (@decision_id, @support_id, @edge_key, @claim_digest, @status_digest,
                  @edge_digest, @format_version, @confirmed_at, @confirmed_by, @superseded_at,
-                 @artifacts_digest)
+                 @artifacts_digest, @decision_claim_digest)
          ON CONFLICT(decision_id, support_id, edge_key) DO UPDATE SET
            claim_digest = excluded.claim_digest,
            status_digest = excluded.status_digest,
@@ -2116,11 +2283,13 @@ export class KnowledgeDB {
            -- state moves to what the agent has just seen (or stays NULL when
            -- none were observed).
            artifacts_digest = excluded.artifacts_digest,
+           decision_claim_digest = excluded.decision_claim_digest,
            -- a fresh confirmation of the same pair un-supersedes it (F7)
            superseded_at = NULL`
       )
       .run({
         ...(row as unknown as Record<string, unknown>),
+        decision_claim_digest: row.decision_claim_digest ?? null,
         superseded_at: row.superseded_at ?? null,
         artifacts_digest: row.artifacts_digest ?? null,
       });
@@ -2175,8 +2344,9 @@ export class KnowledgeDB {
       .prepare(
         `INSERT INTO support_revisions
            (decision_id, support_id, edge_key, claim_digest, status_digest,
-            edge_digest, format_version, confirmed_at, recorded_at, source, reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            edge_digest, format_version, confirmed_at, recorded_at, source, reason,
+            artifacts_digest, decision_claim_digest, confirmed_by, superseded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         row.decision_id,
@@ -2189,7 +2359,11 @@ export class KnowledgeDB {
         row.confirmed_at,
         row.recorded_at,
         row.source,
-        row.reason ?? null
+        row.reason ?? null,
+        row.artifacts_digest ?? null,
+        row.decision_claim_digest ?? null,
+        row.confirmed_by ?? null,
+        row.superseded_at ?? null
       );
     this.db
       .prepare(
@@ -2248,7 +2422,8 @@ export class KnowledgeDB {
       return this.db
         .prepare(
           `SELECT id, decision_id, support_id, edge_key, claim_digest, status_digest,
-                  edge_digest, format_version, confirmed_at, recorded_at, source, reason
+                  edge_digest, format_version, confirmed_at, recorded_at, source, reason,
+                  artifacts_digest, decision_claim_digest, confirmed_by, superseded_at
            FROM support_revisions
            WHERE decision_id = ? AND support_id = ?
            ORDER BY recorded_at DESC, id DESC LIMIT ?`
@@ -2258,7 +2433,8 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT id, decision_id, support_id, edge_key, claim_digest, status_digest,
-                edge_digest, format_version, confirmed_at, recorded_at, source, reason
+                edge_digest, format_version, confirmed_at, recorded_at, source, reason,
+                artifacts_digest, decision_claim_digest, confirmed_by, superseded_at
          FROM support_revisions
          WHERE decision_id = ?
          ORDER BY recorded_at DESC, id DESC LIMIT ?`
@@ -2649,23 +2825,90 @@ export class KnowledgeDB {
     return counts;
   }
 
-  getAllActiveNodesWithEmbeddings(): Array<{
-    id: string;
-    name: string;
-    kind: string;
-    summary: string;
-    embedding: Buffer | null;
-  }> {
-    const rows = this.db
-      .prepare(
-        "SELECT id, name, kind, summary, embedding FROM nodes WHERE removed_at IS NULL AND embedding IS NOT NULL"
-      )
-      .all() as Array<any>;
-    
-    return rows.map((row) => ({
-      ...row,
-      embedding: row.embedding ? Buffer.from(row.embedding) : null
-    }));
+  getVectorGeneration(): VectorGeneration | null {
+    const generation = Number(this.getMetaValue("active_vector_generation"));
+    const model = this.getMetaValue("embed_model"), profile = this.getMetaValue("embed_profile");
+    const dim = Number(this.getMetaValue("embed_dim"));
+    if (!Number.isSafeInteger(generation) || generation <= 0 || !model || !profile || !Number.isSafeInteger(dim) || dim < 0) return null;
+    try { if (JSON.parse(profile).dim !== dim) return null; } catch { return null; }
+    return { generation, model, dim, profile };
+  }
+
+  beginVectorGeneration(input: { model: string; profile: string; dim?: number }): VectorGeneration {
+    const active = this.getVectorGeneration();
+    if (active && active.model === input.model && sameVectorProfile(active.profile, input.profile)) return active;
+    return this.runInTransaction(() => {
+      const generation = Number(this.getMetaValue("vector_generation_counter") ?? 0) + 1;
+      if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error("Invalid vector generation counter");
+      const dim = input.dim ?? 0;
+      const profile = JSON.stringify({ ...JSON.parse(input.profile), dim });
+      this.db.prepare("UPDATE nodes SET embedding=NULL, embedding_generation=NULL").run();
+      if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='nodes_vec'").get()) this.db.prepare("DELETE FROM nodes_vec").run();
+      this.setMetaValue("vector_generation_counter", String(generation));
+      this.setMetaValue("active_vector_generation", String(generation));
+      this.setMetaValue("embed_model", input.model);
+      this.setMetaValue("embed_dim", String(dim));
+      this.setMetaValue("embed_profile", profile);
+      return { generation, model: input.model, dim, profile };
+    });
+  }
+
+  getReembedEligibleCount(_snapshot?: VectorGeneration): number {
+    return Number((this.db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE removed_at IS NULL AND status='active' AND COALESCE(epistemic_status,'') NOT IN ('refuted','abandoned') AND (valid_until IS NULL OR julianday(valid_until)>=julianday('now'))").get() as { n: number }).n);
+  }
+
+  getNodesNeedingReembed(snapshot: VectorGeneration, limit: number): NodeRow[] {
+    const eligible = this.db.prepare("SELECT * FROM nodes WHERE removed_at IS NULL AND status='active' AND COALESCE(epistemic_status,'') NOT IN ('refuted','abandoned') AND (valid_until IS NULL OR julianday(valid_until)>=julianday('now')) ORDER BY rowid").all() as NodeRow[];
+    const valid = new Set(this.getAllActiveNodesWithEmbeddings(snapshot).map(node => node.id));
+    return eligible.filter(node => !valid.has(node.id)).slice(0, limit);
+  }
+
+  publishNodeEmbedding(expected: VectorGeneration & { id: string; name: string; kind: string; summary: string }, buffer: Buffer): boolean {
+    return this.runInTransaction(() => {
+      const active = this.getVectorGeneration(), node = this.getNode(expected.id);
+      if (!active || !node || active.generation !== expected.generation || active.model !== expected.model || !sameVectorProfile(active.profile, expected.profile) || node.name !== expected.name || node.kind !== expected.kind || node.summary !== expected.summary || (node.status ?? 'active') !== 'active' || isNodeExpired(node) || ['refuted','abandoned'].includes(node.epistemic_status ?? '')) return false;
+      const dim = buffer.length / 4;
+      if (!Number.isSafeInteger(dim) || dim <= 0 || (active.dim > 0 && active.dim !== dim)) throw new Error("Invalid embedding dimension");
+      let norm = 0;
+      for (let i = 0; i < dim; i++) { const value = buffer.readFloatLE(i * 4); if (!Number.isFinite(value)) throw new Error("Invalid embedding value"); norm += value * value; }
+      if (norm === 0 || !Number.isFinite(norm)) throw new Error("Invalid embedding norm");
+      if (active.dim === 0) {
+        this.setMetaValue("embed_dim", String(dim));
+        this.setMetaValue("embed_profile", JSON.stringify({ ...JSON.parse(active.profile), dim }));
+      }
+      this.db.prepare("UPDATE nodes SET embedding=@embedding, embedding_generation=@generation WHERE id=@id").run({ embedding: buffer, generation: active.generation, id: expected.id });
+      if (this.vectorTableReady(dim)) {
+        const type = (this.db.pragma("table_info(nodes_vec)") as Array<{ name: string; type: string }>).find(column => column.name === 'embedding')?.type;
+        const nativeDim = Number(/F32_BLOB\((\d+)\)/i.exec(type ?? '')?.[1]);
+        if (nativeDim === dim) {
+          const values = Array.from({ length: dim }, (_, i) => buffer.readFloatLE(i * 4));
+          this.db.prepare("INSERT INTO nodes_vec(id,embedding,generation) VALUES (?,vector32(?),?) ON CONFLICT(id) DO UPDATE SET embedding=excluded.embedding,generation=excluded.generation").run(expected.id, JSON.stringify(values), active.generation);
+        }
+      }
+      return true;
+    });
+  }
+
+  finishVectorGeneration(snapshot: VectorGeneration): boolean {
+    return this.runInTransaction(() => {
+      const active = this.getVectorGeneration();
+      if (!active || active.generation !== snapshot.generation || active.model !== snapshot.model || !sameVectorProfile(active.profile, snapshot.profile) || this.getNodesNeedingReembed(active, 1).length > 0) return false;
+      this.setMetaValue("last_reembed", new Date().toISOString());
+      this.db.prepare("DELETE FROM meta WHERE key='reembed_cursor'").run();
+      return true;
+    });
+  }
+
+  getAllActiveNodesWithEmbeddings(snapshot?: VectorGeneration): Array<{ id: string; name: string; kind: string; summary: string; embedding: Buffer | null }> {
+    const active = this.getVectorGeneration();
+    if (!active || active.dim <= 0 || (snapshot && (snapshot.generation !== active.generation || snapshot.model !== active.model || snapshot.profile !== active.profile))) return [];
+    const rows = this.db.prepare("SELECT * FROM nodes WHERE removed_at IS NULL AND embedding IS NOT NULL AND embedding_generation=? AND status='active' ORDER BY id").all(active.generation) as NodeRow[];
+    return rows.filter(row => !isNodeExpired(row) && !['refuted','abandoned'].includes(row.epistemic_status ?? '')).map(row => ({ ...row, embedding: Buffer.from(row.embedding as ArrayBuffer) })).filter(row => {
+      if (row.embedding.length !== active.dim * 4) return false;
+      let norm = 0;
+      for (let i = 0; i < active.dim; i++) { const value = row.embedding.readFloatLE(i * 4); if (!Number.isFinite(value)) return false; norm += value * value; }
+      return norm > 0 && Number.isFinite(norm);
+    });
   }
 
   nodeExists(id: string): boolean {
@@ -2683,7 +2926,7 @@ export class KnowledgeDB {
     return this.db
       .prepare(
         `SELECT id, name, kind, summary, why, file_refs, parent_id,
-                created_by_task, created_at, updated_at, removed_at, removed_reason${this.hasStatusColumn ? ", status" : ""}
+                created_by_task, created_at, updated_at, removed_at, removed_reason${this.hasStatusColumn ? ", status, valid_from, valid_until" : ""}${this.hasEpistemicColumns ? ", epistemic_status, status_scope" : ""}
          FROM nodes WHERE removed_at IS NULL ORDER BY name`
       )
       .all() as Array<Omit<NodeRow, "embedding">>;
@@ -2923,6 +3166,21 @@ export class KnowledgeDB {
       .all(limit) as Array<{ id: string; name: string; summary: string; updated_at: string }>;
   }
 
+  getDoneTaskPage(limit = 20, after?: { updated_at: string; id: string }): {
+    rows: Array<{ id: string; name: string; updated_at: string }>;
+    total: number;
+    has_more: boolean;
+  } {
+    const total = Number((this.db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE task_state='done' AND removed_at IS NULL").get() as { n: number }).n);
+    const rows = this.db.prepare(
+      `SELECT id, name, COALESCE(updated_at,'') AS updated_at FROM nodes
+       WHERE task_state='done' AND removed_at IS NULL
+       ${after ? "AND (COALESCE(updated_at,'') < @at OR (COALESCE(updated_at,'') = @at AND id < @id))" : ""}
+       ORDER BY COALESCE(updated_at,'') DESC, id DESC LIMIT @limit`
+    ).all(after ? { at: after.updated_at, id: after.id, limit: limit + 1 } : { limit: limit + 1 }) as Array<{ id: string; name: string; updated_at: string }>;
+    return { rows: rows.slice(0, limit), total, has_more: rows.length > limit };
+  }
+
   // ---- Trails (plan 2 §1) ----
 
   /**
@@ -3142,56 +3400,71 @@ export class KnowledgeDB {
   }
 
   renameNodeId(oldId: string, newId: string): boolean {
-    // FK checks are DEFERRED to COMMIT instead of pragma foreign_keys=OFF:
-    // the pragma is a no-op inside a transaction, and renameNodeId is also
-    // called from inside one (resolveConflict) — where the old approach
-    // left enforcement on and the rename of a node that edges still
-    // reference failed with "FOREIGN KEY constraint failed". All the
-    // updates below run in one transaction, so the graph is consistent
-    // again by the time the deferral is checked.
-    this.db.pragma("defer_foreign_keys = ON");
-    try {
-      let changed = false;
-      this.runInTransaction(() => {
-        const result = this.db
-          .prepare("UPDATE nodes SET id = @newId, updated_at = datetime('now') WHERE id = @oldId")
-          .run({ oldId, newId });
+    if (oldId === newId) return this.getNodeIncludingRemoved(oldId) !== undefined;
+    return this.runInTransaction(() => {
+      if (!this.getNodeIncludingRemoved(oldId)) return false;
+      if (this.getNodeIncludingRemoved(newId)) throw new Error(`Node "${newId}" already exists.`);
+      this.db.pragma("defer_foreign_keys = ON");
+      const params = { oldId, newId };
+      this.db.prepare("UPDATE nodes SET id = @newId, updated_at = datetime('now') WHERE id = @oldId").run(params);
+      this.db.prepare("UPDATE nodes SET parent_id = @newId WHERE parent_id = @oldId").run(params);
+      this.db.prepare("UPDATE edges SET from_id = @newId WHERE from_id = @oldId").run(params);
+      this.db.prepare("UPDATE edges SET to_id = @newId WHERE to_id = @oldId").run(params);
+      this.remapNodeReferences(oldId, newId);
+      return true;
+    });
+  }
 
-        if (result.changes > 0) {
-          changed = true;
-          // Update parent_id references in children
-          this.db
-            .prepare("UPDATE nodes SET parent_id = @newId WHERE parent_id = @oldId")
-            .run({ oldId, newId });
-          // Update edge references
-          this.db
-            .prepare("UPDATE edges SET from_id = @newId WHERE from_id = @oldId")
-            .run({ oldId, newId });
-          this.db
-            .prepare("UPDATE edges SET to_id = @newId WHERE to_id = @oldId")
-            .run({ oldId, newId });
-          // Plan 4 (v8) §7: a technical id remap carries the snapshot keys
-          // along — the snapshot content itself is not touched. OR IGNORE:
-          // a pathological pre-existing row under the new id must not break
-          // the rename.
-          if (this.hasSupportBaselinesTable()) {
-            this.db
-              .prepare(
-                "UPDATE OR IGNORE support_baselines SET decision_id = @newId WHERE decision_id = @oldId"
-              )
-              .run({ oldId, newId });
-            this.db
-              .prepare(
-                "UPDATE OR IGNORE support_baselines SET support_id = @newId WHERE support_id = @oldId"
-              )
-              .run({ oldId, newId });
-          }
+  remapEdgeReferences(mapping: ReadonlyMap<number, number | string>): void {
+    this.runInTransaction(() => {
+      for (const [oldId, newId] of mapping) {
+        const oldKey = String(oldId), newKey = String(newId);
+        if (oldKey === newKey) continue;
+        for (const table of ["support_baselines", "support_revisions"]) {
+          if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(table)) continue;
+          this.db.prepare(`UPDATE "${table}" SET edge_key=? WHERE edge_key=?`).run(newKey, oldKey);
         }
-      });
-      return changed;
-    } finally {
-      this.db.pragma("defer_foreign_keys = OFF");
-    }
+      }
+    });
+  }
+
+  remapNodeReferences(oldId: string, newId: string, merging = false): void {
+    this.runInTransaction(() => {
+      const params = { oldId, newId };
+      const references: Array<[string, string[]]> = [
+        ["slots", ["node_id"]], ["trail_members", ["node_id"]],
+        ["node_artifacts", ["node_id"]], ["status_history", ["node_id"]],
+        ["support_baselines", ["decision_id", "support_id"]],
+        ["support_revisions", ["decision_id", "support_id"]],
+        ["aliases", ["new_id"]], ["provenance_audit_runs", ["root_id"]],
+        ["digest_sources", ["digest_id"]], ["nodes_vec", ["id"]],
+      ];
+      for (const [table, columns] of references) {
+        if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) continue;
+        if (merging && table === "nodes_vec") {
+          this.db.prepare("DELETE FROM nodes_vec WHERE id = ?").run(oldId);
+          continue;
+        }
+        for (const column of columns) {
+          this.db.prepare(`UPDATE "${table}" SET "${column}" = @newId WHERE "${column}" = @oldId`).run(params);
+        }
+      }
+      if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='digest_sources'").get()) {
+        const rows = this.db.prepare("SELECT digest_id, sources FROM digest_sources").all() as Array<{ digest_id: string; sources: string }>;
+        for (const row of rows) {
+          const parsed = JSON.parse(row.sources);
+          const members = Array.isArray(parsed) ? parsed : parsed?.format === "digest-sources/2" && Array.isArray(parsed.sources) ? parsed.sources : null;
+          if (!members || members.some((source: unknown) => !source || typeof source !== "object" || typeof (source as { node_id?: unknown }).node_id !== "string")) {
+            throw new Error(`Invalid digest source record "${row.digest_id}"; remap refused.`);
+          }
+          let changed = false;
+          for (const source of members as Array<{ node_id: string }>) if (source.node_id === oldId) { source.node_id = newId; changed = true; }
+          if (!Array.isArray(parsed) && parsed.module?.id === oldId) { parsed.module.id = newId; changed = true; }
+          if (changed) this.db.prepare("UPDATE digest_sources SET sources = ? WHERE digest_id = ?").run(JSON.stringify(parsed), row.digest_id);
+        }
+      }
+      return true;
+    });
   }
 
   getAllNodesRaw(): NodeRow[] {
@@ -3307,6 +3580,9 @@ export class KnowledgeDB {
     // базы с пустой больше не превращает задачу с дедлайном в ноду с NULL.
     task_state?: string | null;
     due_at?: string | null;
+    validation_claim_digest?: string | null;
+    validation_scope_digest?: string | null;
+    embedding_generation?: number | null;
   }): void {
     // Б10: fork columns exist only on migrated dbs — compose the column
     // list conditionally so upstream dbs keep working.
@@ -3328,13 +3604,15 @@ export class KnowledgeDB {
     const viaParams = this.hasCreatedViaColumn ? ", @created_via" : "";
     const taskCols = this.hasTaskColumns ? ", task_state, due_at" : "";
     const taskParams = this.hasTaskColumns ? ", @task_state, @due_at" : "";
+    const columns14 = this.getUserVersion() === 14 ? ", validation_claim_digest, validation_scope_digest, embedding_generation" : "";
+    const params14 = this.getUserVersion() === 14 ? ", @validation_claim_digest, @validation_scope_digest, @embedding_generation" : "";
     const stmt = this.db.prepare(`
       INSERT INTO nodes (id, name, kind, summary, why, file_refs, parent_id, created_by_task,
         created_at, updated_at, removed_at, removed_reason, embedding,
-        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols}${viaCols}${taskCols})
+        merge_group, needs_merge, source_branch, merge_timestamp${forkCols}${epiCols}${claimCols}${viaCols}${taskCols}${columns14})
       VALUES (@id, @name, @kind, @summary, @why, @file_refs, @parent_id, @created_by_task,
         @created_at, @updated_at, @removed_at, @removed_reason, @embedding,
-        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams}${viaParams}${taskParams})
+        @merge_group, @needs_merge, @source_branch, @merge_timestamp${forkParams}${epiParams}${claimParams}${viaParams}${taskParams}${params14})
     `);
     const values: Record<string, unknown> = {
       id: node.id,
@@ -3350,6 +3628,9 @@ export class KnowledgeDB {
       removed_at: node.removed_at ?? null,
       removed_reason: node.removed_reason ?? null,
       embedding: node.embedding ?? null,
+      validation_claim_digest: node.validation_claim_digest ?? null,
+      validation_scope_digest: node.validation_scope_digest ?? null,
+      embedding_generation: node.embedding_generation ?? null,
       merge_group: node.merge_group ?? null,
       needs_merge: node.needs_merge ?? 0,
       source_branch: node.source_branch ?? null,
@@ -3825,7 +4106,7 @@ export class KnowledgeDB {
       .get();
     if (!has) {
       this.db.exec(
-        `CREATE TABLE nodes_vec (id TEXT PRIMARY KEY, embedding F32_BLOB(${dim}))`
+        `CREATE TABLE nodes_vec (id TEXT PRIMARY KEY, embedding F32_BLOB(${dim}), generation INTEGER)`
       );
     }
     return true;
@@ -3875,15 +4156,23 @@ export class KnowledgeDB {
    * Native top-k by cosine distance. Returns null when the shadow table is
    * not populated for every embedded node — caller falls back to JS cosine.
    */
-  vectorTopK(queryJson: string, limit: number): Array<{ id: string; similarity: number }> | null {
-    const count = this.vectorTableCount();
-    if (count <= 0 || count < this.countActiveWithEmbeddings()) return null;
-    const rows = this.db
-      .prepare(
-        "SELECT id, vector_distance_cos(embedding, vector32(?)) AS d FROM nodes_vec ORDER BY d LIMIT ?"
-      )
-      .all(queryJson, limit) as Array<{ id: string; d: number }>;
-    return rows.map((r) => ({ id: r.id, similarity: 1 - r.d }));
+  vectorTopK(queryJson: string, limit: number, snapshot?: VectorGeneration): Array<{ id: string; similarity: number }> | null {
+    const active = this.getVectorGeneration();
+    if (!active || (snapshot && (snapshot.generation !== active.generation || snapshot.profile !== active.profile || snapshot.model !== active.model))) return null;
+    if (!this.vectorSupportOk() || !this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='nodes_vec'").get()) return null;
+    const candidates = this.getAllActiveNodesWithEmbeddings(active);
+    if (candidates.length === 0) return [];
+    const nativeType = (this.db.pragma("table_info(nodes_vec)") as Array<{ name: string; type: string }>).find(column => column.name === 'embedding')?.type;
+    if (Number(/F32_BLOB\((\d+)\)/i.exec(nativeType ?? '')?.[1]) !== active.dim) return null;
+    const placeholders = candidates.map(() => '?').join(',');
+    let rows: Array<{ id: string; generation: number | null; d: number }>;
+    try {
+      rows = this.db.prepare(`SELECT v.id,v.generation,vector_distance_cos(v.embedding,vector32(?)) AS d FROM nodes_vec v JOIN nodes n ON n.id=v.id WHERE v.generation=? AND n.embedding_generation=? AND n.embedding IS NOT NULL AND n.removed_at IS NULL AND v.id IN (${placeholders}) ORDER BY d,v.id`).all(queryJson, active.generation, active.generation, ...candidates.map(node => node.id)) as typeof rows;
+    } catch { return null; }
+    const allowed = new Set(candidates.map(node => node.id));
+    const current = rows.filter(row => allowed.has(row.id) && row.generation === active.generation && Number.isFinite(row.d));
+    if (current.length !== allowed.size) return null;
+    return current.slice(0, limit).map(row => ({ id: row.id, similarity: 1 - row.d }));
   }
 
 
@@ -3907,6 +4196,9 @@ export class KnowledgeDB {
   }
 
   close(): void {
-    this.db.close();
+    const database = this.db;
+    if (!database) return;
+    this.db = undefined as unknown as Database.Database;
+    database.close();
   }
 }

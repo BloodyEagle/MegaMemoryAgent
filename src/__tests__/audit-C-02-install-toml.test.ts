@@ -5,9 +5,11 @@ import { AuditHarnessError, auditFixture, type AuditFixture } from "./helpers/au
 
 const boundary = vi.hoisted(() => ({ unexpected: [] as string[] }));
 vi.mock("child_process", () => {
-  const blocked = (command: unknown): never => {
+  const blocked = (command: unknown, args?: unknown): never => {
     const text = String(command);
-    if (!/^(where|which) (megamemory|codex)$/.test(text)) boundary.unexpected.push(text);
+    const structured = /(?:^|[\\/])(?:where(?:\.exe)?|which)$/i.test(text) &&
+      Array.isArray(args) && args.length === 1 && ["megamemory", "codex"].includes(String(args[0]));
+    if (!structured && !/^(where|which) (megamemory|codex)$/.test(text)) boundary.unexpected.push(text);
     throw Object.assign(new Error("No external commands in installer fixtures"), { code: "ENOENT" });
   };
   return { execSync: blocked, exec: blocked, execFile: blocked, execFileSync: blocked, spawn: blocked, spawnSync: blocked, fork: blocked };

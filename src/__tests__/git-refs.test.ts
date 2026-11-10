@@ -80,6 +80,11 @@ function decisionWithSupport(id: string, supportId: string): void {
 function confirmNow(decisionId: string, supportIds: string[]) {
   const decision = db.getNode(decisionId)!;
   const edges = db.getInformedByEdges(decisionId, "ancestry", false);
+  // Frozen 14/R-04: пиним артефакты с серверного trace — null, если проверка
+  // ещё не гонялась, иначе дайджест наблюдения на момент чтения.
+  const observed = new Map(
+    (provenanceTrace(db, { node_id: decisionId }).supports ?? []).map((s) => [s.support_id, s.artifacts_digest])
+  );
   return confirmSupports(db, {
     decision_id: decisionId,
     expected_claim_digest: claimDigestOf(decision.summary),
@@ -91,6 +96,7 @@ function confirmNow(decisionId: string, supportIds: string[]) {
         expected_claim_digest: claimDigestOf(support.summary),
         expected_status_digest: statusDigestOf(support.status, support.epistemic_status),
         expected_edge_digest: edgeDigestOf(edge.description),
+        expected_artifacts_digest: observed.get(sid) ?? null,
       };
     }),
   });
@@ -228,7 +234,7 @@ describe("F2: git:-опоры", () => {
     // якорь: имя = ref, id — слаг makeId (двоеточия выпадают)
     const anchor = db
       .execSqlAll("SELECT id FROM nodes WHERE name = 'git:tag:v9.9.9'")
-      .map((r) => r.id as string);
+      .map((r) => (r as { id: string }).id);
     expect(anchor).toHaveLength(1);
     const anchorId = anchor[0];
     const row = db.getNode(anchorId)!;

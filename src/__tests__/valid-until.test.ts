@@ -101,7 +101,7 @@ describe("F1: understand и valid_until", () => {
     const res = await understand(db, { query: "планировщик очередь" });
     const match = res.compact!.find((m) => m.id === "future-fact");
     expect(match).toBeDefined();
-    expect(match!.expired).toBeUndefined();
+    expect(match!.expired).toBe(false); // явная квалификация карточки (2.1.12 F1/E-05)
     expect(res.meta?.stale_excluded).toBe(0);
   });
 
@@ -121,7 +121,7 @@ describe("F1: understand и valid_until", () => {
     const res = await understand(db, { query: "старый импорт", include_inactive: true });
     const match = res.compact!.find((m) => m.id === "old-fact");
     expect(match).toBeDefined();
-    expect(match!.expired).toBeUndefined();
+    expect(match!.expired).toBe(false); // явная квалификация карточки (2.1.12 F1/E-05)
   });
 });
 
@@ -234,7 +234,7 @@ describe("F1: миграция v12 → v13", () => {
 
     const reopened = new KnowledgeDB(dbPath);
     try {
-      expect(reopened.getUserVersion()).toBe(13);
+      expect(reopened.getUserVersion()).toBe(14);
       // данные целы
       const d = reopened.getNode("d")!;
       expect(d.summary).toContain("указател");

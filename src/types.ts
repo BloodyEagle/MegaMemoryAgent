@@ -19,15 +19,8 @@ export interface Node {
   merge_timestamp: string | null;
 }
 
-export type NodeKind =
-  | "feature"
-  | "module"
-  | "pattern"
-  | "config"
-  | "decision"
-  | "component"
-  /** T6: derived node compressing a module's children into one payload. */
-  | "digest";
+export const NODE_KINDS = ["feature", "module", "pattern", "config", "decision", "component", "digest"] as const;
+export type NodeKind = (typeof NODE_KINDS)[number];
 
 export interface Edge {
   id: number;
@@ -117,6 +110,14 @@ export interface EvidenceInput {
   node?: string;
   /** Mandatory: what exactly in this support backs the new node. */
   why: string;
+  expect?: {
+    claim_digest?: string;
+    status_digest?: string;
+    edge_key?: string;
+    edge_digest?: string;
+    artifacts_digest?: string | null;
+    artifact_rows?: Array<{ kind: string; ref: string; digest: string | null; repo_path: string | null }>;
+  };
 }
 
 export interface UpdateConceptInput {
@@ -175,6 +176,12 @@ export interface NodeWithContext {
     name: string;
     kind: NodeKind;
     summary: string;
+    status?: string;
+    epistemic_status?: string | null;
+    status_scope?: Record<string, unknown> | null;
+    valid_until?: string | null;
+    expired?: boolean;
+    refuted_reason?: string | null;
   }>;
   edges: Array<{
     to: string;
@@ -268,6 +275,9 @@ export interface NodeWithContext {
  * take it from.
  */
 export interface CurrentDigestsView {
+  validation_claim?: string | null;
+  validation_scope?: string | null;
+  validation_state?: "current" | "stale" | "unknown";
   claim: string;
   status: string;
   format_version: number;
@@ -324,6 +334,9 @@ export interface NestedSupportView {
   status: string;
   /** Epistemic axis (null = не оценивалось). */
   epistemic_status?: string | null;
+  status_scope?: Record<string, unknown> | null;
+  valid_until?: string | null;
+  refuted_reason?: string | null;
   file_refs?: string[] | null;
   /** past valid_until — при include_stale: true. */
   expired?: boolean;
@@ -339,6 +352,8 @@ export interface CompactMatch {
   status: string;
   /** Plan 1: epistemic axis, shown so refuted nodes are never mistaken for facts. */
   epistemic_status?: string | null;
+  status_scope?: Record<string, unknown> | null;
+  valid_until?: string | null;
   /**
    * План 06 (K-04): причина опровержения едет и в compact-выдаче —
    * «антизнание с причиной» не только в full-режиме.
@@ -351,8 +366,8 @@ export interface CompactMatch {
   /** Alias of score, kept for explorer UI compatibility. */
   similarity?: number;
   via?: "vector" | "fts" | "both";
-  /** Present only for the first 3 results (one level, names only). */
-  children?: Array<{ id: string; name: string; kind: NodeKind }>;
+  /** Present only for the first 3 results; historical children remain qualified. */
+  children?: Array<{ id: string; name: string; kind: NodeKind; status?: string; epistemic_status?: string | null; status_scope?: Record<string, unknown> | null; valid_until?: string | null; expired?: boolean; refuted_reason?: string | null }>;
   edges?: Array<{ to: string; to_name: string; relation: RelationType }>;
   /**
    * 2.1.7 F2: live informed_by supports of THIS node that the same query
@@ -401,6 +416,12 @@ export interface UnderstandMeta {
    * фактической выдачи.
    */
   truncated?: boolean;
+  /**
+   * Пустой compact при непустом результате поиска: в бюджет не поместилась
+   * ни одна карточка. Причина называется явно, чтобы пустой ответ не читался
+   * как «ничего не нашлось» — подними max_tokens или используй brief.
+   */
+  reason?: "budget";
 }
 
 export interface UnderstandOutput {
@@ -445,12 +466,7 @@ export interface NextHintRead {
   node_id: string;
 }
 
-/**
- * План 13 §2.1: файл, целиком покрытый карточкой ответа, — читать его целиком
- * не нужно. Даётся только при честном покрытии: у узла непустые file_refs,
- * summary не заглушка (см. src/stub.ts), узел не слабый (refuted/abandoned/
- * ungrounded), и файл не попал в must_read.
- */
+/** Legacy shape for explicit coverage proofs; current next output keeps this list empty. */
 export interface NextHintSkip {
   /** Целый файл — file_ref БЕЗ диапазона строк. */
   ref: string;
@@ -547,6 +563,9 @@ export interface ListRootsOutput {
 // ---- DB row types (raw from SQLite) ----
 
 export interface NodeRow {
+  validation_claim_digest?: string | null;
+  validation_scope_digest?: string | null;
+  embedding_generation?: number | null;
   id: string;
   name: string;
   kind: string;
@@ -649,6 +668,9 @@ export interface BoardColumn {
   name: string;
   terminal: boolean;
   count: number;
+  returned?: number;
+  has_more?: boolean;
+  next_cursor?: string | null;
   cards: Array<{ id: string; name: string; rot?: number; due_at?: string | null }>;
 }
 
@@ -674,10 +696,26 @@ export interface ConflictVersion {
   removed_reason: string | null;
 }
 
+export interface MergeConflictRow {
+  id: number;
+  merge_group: string;
+  object_kind: string;
+  object_key: string;
+  format_version: number;
+  left_payload: string;
+  right_payload: string;
+  mapping_json: string;
+  state: "unresolved" | "resolved";
+  created_at: string;
+  resolved_at: string | null;
+  resolution_json: string | null;
+}
+
 export interface ConflictGroup {
   merge_group: string;
   merge_timestamp: string | null;
   versions: ConflictVersion[];
+  edge_conflicts?: MergeConflictRow[];
 }
 
 export interface ListConflictsOutput {
@@ -844,6 +882,7 @@ export interface ProvenanceWeakLink {
 
 /** One confirmed pair "decision — support" (support_baselines row). */
 export interface SupportBaselineRow {
+  decision_claim_digest?: string | null;
   decision_id: string;
   support_id: string;
   /** Stable edge identity: edges.id (the rowid); recomputed on merge. */
@@ -957,6 +996,10 @@ export type SupportRevisionReason = "confirmed" | "reconfirmed" | "removed" | "e
 
 /** One journal row: a confirmed version of a pair, past or superseded. */
 export interface SupportRevisionRow {
+  decision_claim_digest?: string | null;
+  artifacts_digest?: string | null;
+  confirmed_by?: string | null;
+  superseded_at?: string | null;
   id?: number;
   decision_id: string;
   support_id: string;
@@ -976,6 +1019,10 @@ export interface SupportRevisionRow {
 /** One chain entry as provenance_history returns it: digests are 12-char
  * previews, no node bodies (the answer must stay small). */
 export interface SupportRevisionEntry {
+  decision_claim_digest?: string | null;
+  artifacts_digest?: string | null;
+  confirmed_by?: string | null;
+  superseded_at?: string | null;
   edge_key: string;
   confirmed_at: string;
   source: string;
@@ -1036,6 +1083,10 @@ export interface SupportArtifactChange {
  * is never shown as verified.
  */
 export interface SupportCheckView {
+  semantic_changed_count?: number;
+  semantic_reason_counts?: Partial<Record<SupportChangeReason, number>>;
+  semantic_changed?: SupportPairChange[];
+  artifact_changed?: SupportPairChange[];
   state: "unchanged" | "changed" | "unknown" | "incomplete";
   /** Pairs that diverged from the confirmed snapshot (state = changed). */
   changed?: SupportPairChange[];
@@ -1082,6 +1133,7 @@ export interface ConfirmSupportsItem {
   expected_status_digest?: string;
   /** The rationale digest as the agent read it. */
   expected_edge_digest: string;
+  expected_edge_key?: string;
   /**
    * R-04 (plan 04): the combined digest of the support's ACTIVE artifact
    * observations as the agent read them (provenance_trace.supports[] carries

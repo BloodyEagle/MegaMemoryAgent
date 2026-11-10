@@ -5,8 +5,8 @@
 
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
-  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.9-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.4.0-orange?style=flat-square" />
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.5.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -52,7 +52,7 @@
 
 1. **Начало сессии** — агент вызывает `list_roots` (с бюджетом), чтобы сориентироваться.
 2. **Перед задачей** — `understand` с запросом на естественном языке или `get_concept` по точному id.
-3. **Исполни блок `next`** из ответа — прочитай ссылки `must_read`, файлы из `skip` целиком не читай (уже покрыты карточками), выполни готовые `followups`, после правки запиши по строке `record` (`mode: "brief"` даёт тот же контракт в ≤8 строках, без карточек).
+3. **Исполняй релевантные инструкции `next`** — читай `must_read`, выполняй готовые `followups`, после правки записывай по `record`. Ссылки и brief без утверждения не доказывают полного покрытия файла; `skip` не заменяет проверку актуального кода. Все режимы учитывают настоящий MCP wire-бюджет и отказывают, если обязательный конверт не помещается.
 4. **После задачи** — `create_concept` / `update_concept`, затем `link` для связей.
 
 ---
@@ -92,7 +92,10 @@ git, а не файлами: `git:tag:<имя>`, `git:commit:<sha>` (полны�
 разрешённый sha; тег переехал или ветка уехала → `changed` с обоими sha в
 `weak_links`; ref исчез → `missing`. `git:branch:` — только для проверок
 «уехал ли», никогда как доказательство «влито». Репозиторий — `--repo PATH`
-при старте сервера (по умолчанию — каталог базы); путь закрепляется в
+при старте сервера (по умолчанию — каталог базы). MCP запускается без
+подкоманды: `megamemory --db PATH --repo REPO`; формы `--db=PATH` и
+`--repo=REPO` равнозначны. Пустые и повторные значения отклоняются до открытия
+базы; подкоманда CLI может следовать после глобальных флагов. Путь закрепляется в
 `node_artifacts.repo_path` при первом разрешении, дальнейшие проверки не
 зависят от cwd сервера. Автовывод опор из `why` + `file_refs`
 существует, но **выключен по умолчанию** (`provenance.auto_ground` в
@@ -204,23 +207,54 @@ git, а не файлами: `git:tag:<имя>`, `git:commit:<sha>` (полны�
 # против чтения файлов из file_refs найденных узлов (по умолчанию)
 megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline files
 
-# против внешнего структурного инструмента (граф символов, outline): {query}
-# подставляется экранированным
-megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline te \
-  --te-cmd "node ~/agent-skills/graph.js path {query}"
+# против текстового поиска token-economy-ts 1.1.0: cwd — корень анализируемого проекта
+# Подставьте абсолютные локальные пути executable и script.
+megamemory bench --db "<owned-copy.db>" --questions q.jsonl --baseline te \
+  --te-exec "C:/Program Files/nodejs/node.exe" \
+  --te-arg "C:/p/agent-skills/skills/token-economy-ts/scripts/code-searcher.js" \
+  --te-arg "query={query}" --te-arg "root=." --te-arg "ext=.ts,.tsx,.js,.jsx,.mjs,.cjs"
 
 # оба отношения рядом: где память выигрывает, а где структурный инструмент — верный вызов
 megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline both
 ```
 
-Многоязычный репозиторий: правильный структурный инструмент зависит от языка модуля,
-поэтому `te_cmd` и `lang` задаются **на вопрос**, а отчёт выводит медиану отношения
-отдельно по каждому языку:
+`lang` группирует результаты, но не выбирает скилл. `root`/`--ref-root` разрешают
+файловые ссылки и не меняют cwd runner. Готовое число токенов обходит запуск;
+приоритет: preset → structured runner → shell вопроса → общий shell.
+Shell-шаблоны — доверенный расширенный вариант, особенно на Windows.
 
-```json
-{"id": "q7", "query": "где вызывается apply_catalog", "lang": "python",
- "te_cmd": "python ~/agent-skills/graph.py rdeps {query}"}
+Graph path требует два endpoint, а не вопрос на естественном языке:
+
+```text
+node "C:/p/agent-skills/skills/token-economy-ts/scripts/graph-tool.js" op=path from=src/a.ts to=src/b.ts root=.
+python -I "C:/p/agent-skills/skills/token-economy-py/scripts/te.py" search "apply_catalog" --root "<project-root>"
+node "C:/p/agent-skills/skills/token-economy-har/har.js" search "AbsentNeedle" --file "<own-artificial.har>" --json
 ```
+
+PY search возвращает UTF-8 текст, не JSON. Полный HAR no-match возвращает JSON
+с exit1 и пустым stderr; ошибки чтения/regex/parse завершаются exit2.
+
+TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 используют разные CLI и форматы ответа;
+путь должен указывать на проверенный source/staging-пакет или явно обновлённую копию.
+Полный ожидаемый no-match корректен; ошибка, отсутствующий payload и усечение
+не доказывают качество или преимущество по стоимости.
+
+`graph_metric=retrieval_wire_without_instructions` оценивает MCP content wrapper
+вокруг retrieval (включая `next`), **без MCP instructions metadata**. Это не точный
+ответ обычного MCP и не полная стоимость задачи (`economy_status=not_measured`).
+Фиксированной поправки токенов нет. `ratio > 1` — граф дешевле; `ratio < 1` — baseline
+дешевле: 200 / 100 = 2, 100 / 200 = 0.5.
+
+Для сравнения с проверкой качества добавьте в dataset `expected_outcome`, `expect_nodes`,
+`quality_contract` и `expected_te_refs`/`expected_te_symbols`/`expected_te_edges`;
+[схемы адаптеров](docs/bench-protocol.md#quality-and-completeness) заданы явно.
+`quality_ratio_te` и его медиана включают только корректные полные живые пары;
+прежние `ratio_te` и суммы токенов — **сырая стоимость retrieval**, не доказательство пользы.
+Preset не живой замер; ошибочный/отсутствующий payload (даже exit0) не eligible.
+Полный корректный ожидаемый no-match проходит качество и сравним при положительных
+стоимостях обеих сторон. Ошибки и unknown считаются по всем вопросам.
+Runner сохраняет максимум 16 MiB stdout/stderr по отдельности, считает все полученные
+байты и отмечает усечение; частичный префикс не даёт точной стоимости или ratio.
 
 `ratio = baseline_tokens / graph_tokens` — но никогда не читайте его без `hit_rate`
 (попали ли ожидаемые узлы в топ-10): дешёвый, но неверный ответ — не экономия.
@@ -270,7 +304,7 @@ megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline bo
 
 ## Установка
 
-Нужен Node.js >= 20.9 (поднят с 18: sharp 0.35 из цепочки эмбеддингов требует >= 20.9; dev-инструментарий — vite/vitest — требует >= 20.19). Для чисто русских проектов подойдёт значительно меньшая модель (`cointegrated/rubert-tiny2`, 312-мерная) после конвертации в ONNX; модель выгружается после 5 минут простоя (`MEGAMEMORY_EMBED_IDLE_MS=0` отключает выгрузку), а `MEGAMEMORY_SEARCH=fts` не загружает её вовсе. Модель эмбеддингов (~120 МБ, мультиязычная) скачивается при первом
+Нужен Node.js >= 20.10 (поднят с 18: sharp из цепочки эмбеддингов использует import-атрибуты `with { type: "json" }`, которых нет в 20.9; dev-инструментарий — vite/vitest — требует >= 20.19). Для чисто русских проектов подойдёт значительно меньшая модель (`cointegrated/rubert-tiny2`, 312-мерная) после конвертации в ONNX; модель выгружается после 5 минут простоя (`MEGAMEMORY_EMBED_IDLE_MS=0` отключает выгрузку), а `MEGAMEMORY_SEARCH=fts` не загружает её вовсе. Модель эмбеддингов (~120 МБ, мультиязычная) скачивается при первом
 запуске и кешируется в `~/.cache/huggingface`.
 
 Установка глобально из npm:
@@ -349,7 +383,7 @@ megamemory doctor               # проверка здоровья, код вы
 
 | Инструмент | Что делает |
 |---|---|
-| `understand` | Гибридный поиск по графу. `top_k`, `max_tokens`, `mode: "compact" \| "full" \| "brief"`, `include_inactive`, `include_stale` (просроченные факты). Каждый ответ заканчивается блоком `next`: ссылки `must_read` прочитать, файлы `skip` уже покрыты, готовые `followups` выполнить, запись по строке `record`. |
+| `understand` | Гибридный поиск по графу. `top_k`, `max_tokens`, `mode: "compact" \| "full" \| "brief"`, `include_inactive`, `include_stale` (просроченные факты). Каждый ответ заканчивается блоком `next`: ссылки `must_read` прочитать, `skip` не заменяет проверку актуальных источников, готовые `followups` выполнить, запись по строке `record`. |
 | `get_concept` | Точный поиск по id: дети, рёбра, входящие рёбра, родитель. |
 | `create_concept` | Новая концепция с рёбрами, ссылками на файлы и `supersedes`; `valid_until` задаёт срок годности. |
 | `update_concept` | Обновление полей; эмбеддинг пересчитывается. `valid_until: null` снимает срок. |
@@ -361,6 +395,8 @@ megamemory doctor               # проверка здоровья, код вы
 | `provenance_trace` | Обход `informed_by` (`ancestry` / `impact`) с честной полнотой и слабыми звеньями в начале. |
 | `provenance_audit` | Аудит провенанса по всему графу: слабые звенья, необоснованные решения, ретеншн прошлых аудитов. |
 | `check_artifacts` | Хеширует файловые/git-blob артефакты узла (ссылки могут нести локатор строк — хешируется файл целиком), разрешает `git:tag/commit/branch` в sha; расхождения всплывают как `artifact_changed`. |
+| `board` | Доска задач; done содержит полный `count`, `returned`, `has_more`, `next_cursor`. Продолжение: `done_cursor`, размер страницы `done_limit` (1–100, по умолчанию 20). |
+| `trail_refresh` | Обновляет fingerprints и возвращает фактический fresh/stale с причинами; broken-цепочка отклоняется без записи. |
 
 **Типы узлов:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest`
 

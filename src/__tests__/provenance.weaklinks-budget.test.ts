@@ -325,7 +325,7 @@ describe("8 KB weak_links cap (D2.4)", () => {
     expect(out.weak_links.some((w) => w.type === "refuted" && w.id === "d007")).toBe(true);
     const marker = out.weak_links.find((w) => w.type === "weak_links_truncated")!;
     expect(marker).toBeDefined();
-    expect(marker.shown).toBeLessThan(marker.total);
+    expect(marker.shown).toBeLessThan(marker.total!);
     // The refuted record is the FIRST thing kept — antiknowledge outranks
     // everything else in the priority order.
     expect(out.weak_links[0].type).toBe("refuted");

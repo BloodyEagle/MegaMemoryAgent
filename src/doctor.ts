@@ -5,6 +5,7 @@ import { MIGRATION_TARGET_SCHEMA_VERSION } from "./migrate-schema.js";
 import { isBrokenId } from "./migrate.js";
 import { D3_CDN_FALLBACK_NOTE, d3Source } from "./d3-asset.js";
 import { countStubSupports } from "./stub.js";
+import { probeFtsHealth, type FtsHealth } from "./fts-health.js";
 
 /**
  * F13 helper: turn probe counts into a drift message. Exported for tests —
@@ -41,7 +42,7 @@ export interface HealthReport {
   embed_dim: number;
   nodes: number;
   vectors: { have: number; total: number };
-  fts: { rows: number; nodes: number; in_sync: boolean };
+  fts: FtsHealth;
   digests: { count: number; stale: number };
   empty_ids: number;
   orphan_edges: number;
@@ -63,13 +64,7 @@ export function healthReport(db: KnowledgeDB): HealthReport {
     ) as { n: number }
   ).n;
 
-  const ftsExists =
-    db.execSqlFirst(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
-    ) !== undefined;
-  const ftsRows = ftsExists
-    ? (db.execSqlFirst("SELECT count(*) AS n FROM nodes_fts") as { n: number }).n
-    : 0;
+  const ftsHealth = probeFtsHealth(db);
 
   const digestCount = (
     db.execSqlFirst(
@@ -112,7 +107,7 @@ export function healthReport(db: KnowledgeDB): HealthReport {
     embed_dim: Number(db.getMetaValue("embed_dim") ?? 0),
     nodes: nodesCount,
     vectors: { have: vectorsHave, total: nodesCount },
-    fts: { rows: ftsRows, nodes: nodesCount, in_sync: ftsRows === nodesCount },
+    fts: ftsHealth,
     digests: { count: digestCount, stale: digestStale },
     empty_ids: emptyIds,
     orphan_edges: orphanEdges,
@@ -182,63 +177,14 @@ export function runDoctor(db: KnowledgeDB): {
         : "not recorded — run 'megamemory migrate --apply'"
   );
 
-  // FTS index
-  const fts = db.execSqlFirst(
-    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
-  );
-  let ftsCount = -1;
-  let nodesCount = -1;
-  if (fts) {
-    ftsCount = (db.execSqlFirst("SELECT count(*) AS n FROM nodes_fts") as { n: number }).n;
-    nodesCount = (db.execSqlFirst(
-      "SELECT count(*) AS n FROM nodes WHERE removed_at IS NULL"
-    ) as { n: number }).n;
-  }
-  // F13: count equality is not enough after a VACUUM (rowids can shift).
-  // FTS5 ships a built-in verification command that compares the index
-  // with the content table and throws on any mismatch (stale rowids too).
-  let ftsDrift: string | null = null;
-  if (fts) {
-    // План 06 (C-04): проба ищет ИМЯ узла (первый токен) и ждёт его rowid
-    // в выдаче — раньше интерполяция была экранирована, и MATCH шёл по
-    // фиксированной строке: ноль проб считался «нет drift», а неработающий
-    // индекс выглядел исправным.
-    const sample = db.execSqlAll(
-      "SELECT rowid, name FROM nodes WHERE removed_at IS NULL ORDER BY rowid DESC LIMIT 20"
-    ) as Array<{ rowid: number; name: string }>;
-    let probes = 0;
-    let misses = 0;
-    for (const node of sample) {
-      const token = node.name.trim().split(/\s+/)[0];
-      if (!token) continue;
-      try {
-        const phrase = `"${token.replace(/"/g, '""')}"*`;
-        const hits = db.execSqlAll(
-          "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT 1000",
-          phrase
-        ) as Array<{ rowid: number }>;
-        probes += 1;
-        if (!hits.some((h) => h.rowid === node.rowid)) misses += 1;
-      } catch {
-        // an unparseable token is not a drift signal
-      }
-    }
-    ftsDrift = summarizeFtsProbe(probes, misses);
-    if (ftsDrift === null && probes === 0 && nodesCount > 0) {
-      // План 06 (C-04): ни одной пробы не выполнилось — индекс НЕ ПРОВЕРЕН,
-      // и это не «здоров» (пустая база 0/0 остаётся корректным случаем).
-      ftsDrift = `index not verifiable: 0 probes against ${nodesCount} rows`;
-    }
-  }
-  const ftsOk = Boolean(fts) && ftsCount === nodesCount && ftsDrift === null;
+  // Shared bounded read-only MATCH probe; external-content counts are not evidence.
+  const ftsHealth = probeFtsHealth(db);
   add(
     "FTS index",
-    ftsOk,
-    !fts
-      ? "missing — run 'megamemory migrate --apply'"
-      : ftsDrift
-        ? `${ftsDrift} — run 'megamemory migrate --apply' (rebuilds the index)`
-        : `${ftsCount}/${nodesCount} rows indexed`
+    ftsHealth.in_sync,
+    ftsHealth.detail
+      ? `${ftsHealth.detail} — run 'megamemory migrate --apply' (rebuilds the index)`
+      : `${ftsHealth.rows}/${ftsHealth.nodes} rows indexed`
   );
 
   // legacy ids

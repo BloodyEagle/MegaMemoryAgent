@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
 import { createConcept } from "../tools.js";
-import { MODEL_NAME, vectorSearchEnabled } from "../embeddings.js";
+import { MODEL_NAME, embeddingProfile, vectorSearchEnabled } from "../embeddings.js";
 import { cleanupDir } from "./helpers/cleanup.js";
 
 // 2.1.10 F4: дубликаты по смыслу при создании. Две сессии независимо
@@ -64,6 +64,14 @@ const SUMMARY =
 const FAR =
   "очередь хранит письма и повторяет отправку с бэкоффом по расписанию smtp";
 
+/** P-10: векторный канал включается только активным поколением. Штампуем
+ * поколение с явным dim: на пустой базе reembed не публикует ни одного
+ * вектора, и dim остался бы нулём (канал всё ещё закрыт). */
+async function enableSemantic(db: KnowledgeDB) {
+  const generation = db.beginVectorGeneration({ model: MODEL_NAME, profile: embeddingProfile(MODEL_NAME), dim: DIM });
+  db.finishVectorGeneration(generation);
+}
+
 describe("2.1.10 F4: дедупликация при создании", () => {
   it("15. близкое имя (регистр/пунктуация/ё-е) → duplicate_of, узел не создан", async () => {
     const db = newDb();
@@ -95,7 +103,7 @@ describe("2.1.10 F4: дедупликация при создании", () => {
   it("16. близкий смысл при разных именах → duplicate_of, matched_by: semantic", async () => {
     const db = newDb();
     dbs.push(db);
-    db.setMetaValue("embed_model", MODEL_NAME); // векторный канал включён
+    await enableSemantic(db); // векторный канал включён активным поколением
     const first = await createConcept(db, {
       name: "Импорт",
       kind: "decision",
@@ -138,7 +146,7 @@ describe("2.1.10 F4: дедупликация при создании", () => {
   it("18. далёкий текст → создан без предупреждения", async () => {
     const db = newDb();
     dbs.push(db);
-    db.setMetaValue("embed_model", MODEL_NAME);
+    await enableSemantic(db);
     await createConcept(db, {
       name: "Планировщик Ёлки",
       kind: "feature",
@@ -201,7 +209,7 @@ describe("2.1.10 F4: дедупликация при создании", () => {
   it("порог читается из megamemory.config.json (dedupe.threshold)", async () => {
     const db = newDb();
     dbs.push(db);
-    db.setMetaValue("embed_model", MODEL_NAME);
+    await enableSemantic(db);
     fs.writeFileSync(
       path.join(path.dirname(db.dbPath), "megamemory.config.json"),
       JSON.stringify({ dedupe: { threshold: 0.5 } })

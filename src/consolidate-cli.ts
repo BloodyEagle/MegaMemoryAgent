@@ -5,13 +5,7 @@ import { findDuplicates, mergeNodes } from "./consolidate.js";
 import { backupDb } from "./migrate.js";
 import { success, info, heading, skip } from "./cli-utils.js";
 import { resolveDbPathOrExit } from "./db-path.js";
-
-function numFlag(args: string[], flag: string, fallback: number): number {
-  const idx = args.indexOf(flag);
-  if (idx === -1) return fallback;
-  const v = parseInt(args[idx + 1], 10);
-  return isNaN(v) ? fallback : v;
-}
+import { numberFlag } from "./cli-flags.js";
 
 /**
  * `megamemory consolidate [--dry-run] [--threshold 0.95] [--limit 100] [--apply]`
@@ -23,8 +17,8 @@ function numFlag(args: string[], flag: string, fallback: number): number {
 export async function runConsolidate(args: string[]): Promise<void> {
   const apply = args.includes("--apply");
   const dryRun = args.includes("--dry-run") || !apply;
-  const threshold = numFlag(args, "--threshold", 0.95);
-  const limit = numFlag(args, "--limit", 100);
+  const threshold = numberFlag(args, "--threshold", 0.95, false);
+  const limit = numberFlag(args, "--limit", 100, true);
 
   const p = resolveDbPathOrExit(args);
 

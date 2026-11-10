@@ -36,13 +36,9 @@ import type {
   NodeRow,
   RelationType,
 } from "./types.js";
-import {
-  buildNextHints,
-  emptyNextHints,
-  type NextHintsCard,
-} from "./next-hints.js";
-import { BRIEF_EMPTY_TEXT, renderBrief, type BriefNodeInfo } from "./brief.js";
-import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT } from "./merge.js";
+import { buildNextHints, type NextHintsCard } from "./next-hints.js";
+import { renderBrief, type BriefNodeInfo } from "./brief.js";
+import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
 import {
   readProvenanceConfig,
@@ -63,6 +59,7 @@ import {
 } from "./support-baselines.js";
 import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary } from "./stub.js";
+import { validationState } from "./validation.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
   const errorMsg = err instanceof Error ? err.message : String(err);
@@ -200,6 +197,18 @@ export function validateEpistemicTransition(
   }
 }
 
+/** Qualification shared by child cards and nested supports. */
+function nodeQualification(db: KnowledgeDB, node: NodeRow) {
+  return {
+    status: node.status ?? "active",
+    epistemic_status: node.epistemic_status ?? null,
+    status_scope: parseStatusScope(node.status_scope),
+    valid_until: node.valid_until ?? null,
+    expired: isNodeExpired(node),
+    ...(node.epistemic_status === "refuted" ? { refuted_reason: db.getLatestEpistemicReason(node.id, "refuted") } : {}),
+  };
+}
+
 /**
  * Build a NodeWithContext from a node row and DB lookups.
  */
@@ -214,6 +223,7 @@ export function buildNodeWithContext(
     name: c.name,
     kind: c.kind as NodeWithContext["kind"],
     summary: c.summary,
+    ...nodeQualification(db, c),
   }));
 
   const outgoing = db.getOutgoingEdges(node.id).map((e) => ({
@@ -354,6 +364,19 @@ export function estimateTokens(text: string): number {
   return Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 }
 
+/** Actual MCP content wrapper, including pretty JSON escaping and its own estimate. */
+function measureMcpPayload(payload: unknown): number {
+  const value = payload as { meta?: { tokens_estimated: number } };
+  let tokens = 0;
+  for (;;) {
+    const measured = estimateTokens(JSON.stringify({
+      content: [{ type: "text", text: JSON.stringify(value.meta ? { ...value, meta: { ...value.meta, tokens_estimated: tokens } } : value, null, 2) }],
+    }));
+    if (measured === tokens) return tokens;
+    tokens = measured;
+  }
+}
+
 /**
  * Truncate to maxChars at a word boundary with an ellipsis. Operates on
  * UTF-16 code units but never splits a surrogate pair.
@@ -456,13 +479,9 @@ function compactMatch(
     id: node.id,
     name: node.name,
     kind: node.kind as CompactMatch["kind"],
-    status: node.status ?? "active",
-    epistemic_status: node.epistemic_status ?? null,
+    ...nodeQualification(db, node),
     // План 06 (K-04): «антизнание с причиной» и в compact — причина была
     // только в full-режиме, в компактной выдаче опровержение теряло смысл.
-    ...(node.epistemic_status === "refuted"
-      ? { refuted_reason: db.getLatestEpistemicReason(node.id, "refuted") }
-      : {}),
     summary: trimSummary(node.summary),
     file_refs: fileRefs,
     // План 06 (K-03): RRF-score несёт 17 значащих цифр и дублируется в
@@ -483,6 +502,7 @@ function compactMatch(
         id: c.id,
         name: c.name,
         kind: c.kind as CompactMatch["kind"],
+        ...nodeQualification(db, c),
       }));
     match.edges = db
       .getOutgoingEdges(node.id)
@@ -522,40 +542,17 @@ export async function understand(
     topMatches = hits.map((h) => ({ id: h.id, similarity: h.score }));
     for (const h of hits) viaById.set(h.id, h.via);
   } else if (mode === "vector" && vectorSearchEnabled(db)) {
-    const candidates = db.getAllActiveNodesWithEmbeddings();
+    const expectedGeneration = db.getVectorGeneration();
+    const candidates = db.getAllActiveNodesWithEmbeddings(expectedGeneration ?? undefined);
     if (candidates.length === 0) {
-      // План 13 §2.2: в brief-режиме пустой ответ — тоже brief-форма
-      // (строка «ничего не нашлось» + next с пустыми списками и record).
-      if (outputMode === "brief") {
-        const emptyBrief: BriefOutput & { matches: never[] } = {
-          matches: [],
-          brief: BRIEF_EMPTY_TEXT,
-          next: emptyNextHints(),
-          meta: { returned: 0, dropped: 0, tokens_estimated: 0 },
-        };
-        // Честная мера пустого ответа по той же wire-форме (K-03): число
-        // токенов само едет в meta — итерация до сходимости разрядов.
-        const emptyEnvelope = (payload: unknown): string =>
-          JSON.stringify({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
-        for (let i = 0; i < 3; i++) {
-          const tokens = estimateTokens(emptyEnvelope(emptyBrief));
-          if (tokens === emptyBrief.meta.tokens_estimated) break;
-          emptyBrief.meta.tokens_estimated = tokens;
-        }
-        // BriefOutput не входит в UnderstandOutput (matches обязателен);
-        // matches: [] держит обработчик MCP безопасным и карточек не несёт.
-        return emptyBrief as unknown as UnderstandOutput;
-      }
-      // План 13 §2.1: пустой ответ тоже заканчивается блоком next.
-      return {
-        matches: [],
-        compact: [],
-        meta: { returned: 0, dropped: 0, tokens_estimated: 0 },
-        next: emptyNextHints(),
-      };
+      // Empty vector results use the same budgeted envelope as every other path.
+      topMatches = [];
+    } else {
+      const queryEmbedding = await embed(queryText(input.query));
+      const currentGeneration = db.getVectorGeneration();
+      if (!expectedGeneration || !currentGeneration || currentGeneration.generation !== expectedGeneration.generation || currentGeneration.profile !== expectedGeneration.profile) throw new Error("version_conflict: vector generation changed during understand.");
+      topMatches = findTopK(queryEmbedding, candidates, searchPool);
     }
-    const queryEmbedding = await embed(queryText(input.query));
-    topMatches = findTopK(queryEmbedding, candidates, searchPool);
   } else {
     topMatches = basicSearch(db, input.query, searchPool);
   }
@@ -611,23 +608,13 @@ export async function understand(
   // идут с visibleSupports: 0 — подсказка get_concept для решений с опорами
   // остаётся честной. Бюджет считается по ТОЙ ЖЕ wire-форме, что уйдёт по
   // проводу (K-03): pretty-JSON внутри MCP-конверта с extra_payload
-  // обработчика. При превышении цели режется только next (skip → followups;
-  // must_read и record не режутся никогда), текст брифа не режется — он
-  // ограничен 8 строками по построению. Перерасход и порезка помечаются в
-  // meta.truncated, tokens_estimated остаётся честным числом фактической
-  // выдачи.
+  // обработчика. При превышении режутся только optional followups; must_read
+  // и record сохраняются. Если обязательная форма не влезает, запрос отклоняется.
+  // meta.truncated отмечает реальную порезку, а не разрешение перерасхода.
   if (outputMode === "brief") {
     const extra = input.extra_payload ?? {};
 
-    /** Wire-ответ, как его соберёт MCP-обработчик (см. index.ts). */
-    const wireEnvelope = (payload: unknown): string =>
-      JSON.stringify({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
-
-    const measure = (payload: unknown): number => estimateTokens(wireEnvelope(payload));
-
-    // Тот же запас на рост чисел в meta, что в compact-ветке (см. ниже).
-    const RESERVE = 16;
-    const target = maxTokens - RESERVE;
+    // Brief keeps its text and mandatory instructions intact; only followups may be cut.
 
     // Основа брифа: верхний уровень выдачи в ранговом порядке (top_k).
     const nodes = eligible.slice(0, topK);
@@ -678,41 +665,17 @@ export async function understand(
       ...extra,
     });
 
-    // Порезка по бюджету: только next — сначала skip, затем followups, по
-    // одному элементу с перемериванием после каждого. Текст брифа строится
-    // ИЗ next, поэтому при каждом замере он перерисовывается сам и текст с
-    // блоком не расходятся.
+    // Remove optional followups only; mandatory references and record stay intact.
     let nextCut = false;
-    const measureWith = (tokens: number): number => measure(buildPayload(tokens, false));
-    while (next.skip.length > 0 && measureWith(0) > target) {
-      next.skip.pop();
-      nextCut = true;
-    }
-    while (next.followups.length > 0 && measureWith(0) > target) {
+    while (next.followups.length > 0 && measureMcpPayload(buildPayload(0, nextCut)) > maxTokens) {
       next.followups.pop();
       nextCut = true;
     }
-
-    // Финальная честная мера: число токенов само едет в meta, поэтому замер
-    // повторяется до стабильности разрядов (как в compact-ветке).
-    let tokensEstimated = measureWith(0);
-    for (let i = 0; i < 3; i++) {
-      const again = measureWith(tokensEstimated);
-      if (again === tokensEstimated) break;
-      tokensEstimated = again;
+    const truncated = nextCut;
+    const tokensEstimated = measureMcpPayload(buildPayload(0, truncated));
+    if (tokensEstimated > maxTokens) {
+      throw new Error(`understand: max_tokens=${maxTokens} cannot fit the brief instructions and required references (minimum ${tokensEstimated}); increase the budget.`);
     }
-
-    // Порезанный next и перерасход — усечение. Затем перемер с финальным
-    // флагом: "truncated": true короче false, а tokens_estimated обязан
-    // сходиться с реальной wire-формой байт-в-байт.
-    let truncated = nextCut || tokensEstimated > maxTokens;
-    const measureFinal = (tokens: number): number => measure(buildPayload(tokens, truncated));
-    for (let i = 0; i < 3; i++) {
-      const again = measureFinal(tokensEstimated);
-      if (again === tokensEstimated) break;
-      tokensEstimated = again;
-    }
-
     const output: BriefOutput & { matches: never[] } = {
       matches: [],
       brief: renderBrief(briefNodes, next),
@@ -749,10 +712,7 @@ export async function understand(
       if (via) ctx.via = via;
       return ctx;
     });
-    // План 13 §2.1: full-режим тоже заканчивается блоком next. Опор на
-    // карточке full-режима видно все (informed_by-рёбра с rationale), поэтому
-    // get_concept-подсказка для них не нужна; бюджета в full-режиме нет —
-    // next не режется.
+    // Full preserves every selected card and instruction, refusing budgets that cannot fit.
     const fullNext = buildNextHints({
       db,
       cards: matches.map((m) => ({
@@ -762,28 +722,34 @@ export async function understand(
       })),
       refuted: refuted.map((r) => ({ name: r.name, reason: r.refuted_reason ?? null })),
     });
-    const payload = JSON.stringify({ matches, refuted, next: fullNext });
-    db.insertUsage({
-      tool: "understand",
-      query: input.query,
-      nodes: matches.length,
-      returnedChars: payload.length,
-      returnedTokens: estimateTokens(payload),
-      estimatedFullTokens: estimateTokens(payload), // full mode IS the full cost
-    });
-    return {
+    const output: UnderstandOutput = {
       matches,
       compact: undefined,
       refuted,
       meta: {
         returned: matches.length,
         dropped: eligible.length - matches.length,
-        tokens_estimated: estimateTokens(payload),
+        tokens_estimated: 0,
         stale_excluded: staleExcluded,
         inactive_excluded: inactiveExcluded,
       },
       next: fullNext,
     };
+    const tokensEstimated = measureMcpPayload({ ...output, ...input.extra_payload });
+    if (tokensEstimated > maxTokens) {
+      throw new Error(`understand: max_tokens=${maxTokens} cannot fit the full response and required instructions (minimum ${tokensEstimated}); increase the budget or use compact mode.`);
+    }
+    output.meta!.tokens_estimated = tokensEstimated;
+    const payload = JSON.stringify(output);
+    db.insertUsage({
+      tool: "understand",
+      query: input.query,
+      nodes: matches.length,
+      returnedChars: payload.length,
+      returnedTokens: tokensEstimated,
+      estimatedFullTokens: tokensEstimated,
+    });
+    return output;
   }
 
   // ---- compact: единый сериализатор бюджета и MCP-ответа (план 06, K-03) ----
@@ -811,11 +777,7 @@ export async function understand(
         )
       : [];
 
-  /** Wire-ответ, как его соберёт MCP-обработчик (см. index.ts). */
-  const wireEnvelope = (payload: unknown): string =>
-    JSON.stringify({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
-
-  const measure = (payload: unknown): number => estimateTokens(wireEnvelope(payload));
+  const measure = measureMcpPayload;
 
   // План 06 (K-03, работа 5): полный граф ради оценки «сэкономленных
   // токенов» на каждом compact-запросе не строим — стоимость full-режима
@@ -888,6 +850,11 @@ export async function understand(
     stale_excluded: staleExcluded,
     inactive_excluded: inactiveExcluded,
     truncated,
+    // Пустой ответ при непустом поиске — это не «ничего не нашлось»:
+    // причина называется, чтобы агент поднял бюджет или взял brief.
+    // Условие не зависит от truncated: иначе бюджет мерился бы без поля,
+    // которое реально уйдёт по проводу.
+    ...(displayList().length === 0 && eligible.length > 0 ? { reason: "budget" as const } : {}),
   });
 
   /** Тот объект, который уйдёт по проводу (со всеми секциями, extra и next). */
@@ -902,13 +869,22 @@ export async function understand(
     refuted: refutedList,
     edges_between: edgesFor(compactList),
     meta,
-    ...(next ? { next } : {}),
+    next: next ?? buildNextHints({
+      db,
+      cards: compactList.flatMap(card => [{ id: card.id, kind: card.kind, visibleSupports: card.supports?.length ?? 0 }, ...(card.supports ?? []).map(support => ({ id: support.id }))]),
+      refuted: refutedList.map(card => ({ name: card.name, reason: card.refuted_reason ?? null })),
+    }),
     ...extra,
   });
 
   /** Мера текущей формы ответа с заданным списком refuted (числа-заглушки). */
-  const measureWith = (refutedList: CompactMatch[]): number =>
-    measure(buildPayload(withNested(displayList()), refutedList, metaFor(0, 0, false)));
+  const measureWith = (refutedList: CompactMatch[]): number => {
+    const payload = buildPayload(withNested(displayList()), refutedList, metaFor(0, 0, false));
+    while (payload.next.followups.length > 0 && measure(payload) > maxTokens) {
+      payload.next.followups.pop();
+    }
+    return measure(payload);
+  };
 
   // Ниже минимума — понятный отказ: пустой конверт (meta + instructions +
   // MCP-обёртка) сам стоит токенов.
@@ -921,10 +897,7 @@ export async function understand(
     );
   }
 
-  // Запас на рост чисел в meta (tokens_estimated и др. подставляются в
-  // последнюю очередь) — порезка идёт с зазором, финальный замер честный.
-  const RESERVE = 16;
-  const target = maxTokens - RESERVE;
+  const target = maxTokens;
 
   /**
    * Fold pass — recomputed from scratch, so repeated calls (after each
@@ -964,10 +937,8 @@ export async function understand(
             id: sup.id,
             name: sup.name,
             summary: trimSummary(row.summary),
-            status: sup.status,
-            epistemic_status: sup.epistemic_status ?? null,
+            ...nodeQualification(db, row),
             file_refs: parseFileRefs(row.file_refs),
-            ...(sup.expired ? { expired: true } : {}),
             ...(row.epistemic_status === "abandoned" ||
             row.epistemic_status === "refuted" ||
             isUngrounded(db, row)
@@ -1006,8 +977,8 @@ export async function understand(
         continue;
       }
       if (displayList().length >= topK) {
-        if (foldSupports() > 0) continue; // слот освобождён — добираем
-        break; // top_k заполнен верхним уровнем
+        foldSupports();
+        if (displayList().length >= topK) break;
       }
       const candidate = compactMatch(db, eligible[idx].node, {
         score: eligible[idx].score,
@@ -1045,20 +1016,15 @@ export async function understand(
   // Освободившиеся токены — ограниченный добор матчей.
   placeLoop();
 
-  const compact = withNested(displayList());
+  let compact = withNested(displayList());
   // План 06 (K-01): счётчики не смешиваются — dropped считает усечённых
   // (top_k/бюджет, включая порезанных refuted), фильтрованные живут в
   // stale_excluded/inactive_excluded.
-  const dropped = eligible.length - top.length + refutedCut;
+  let dropped = eligible.length - top.length + refutedCut;
   const supportsInlined = foldedIds.size;
 
-  // ---- План 13 (§2.1): блок next — контракт действия из размещённых карточек ----
-  //
-  // Строится ПОСЛЕ размещения (placeLoop/refuted-цикл не меняются — next не
-  // влияет на размещение) из того, что реально попало в ответ: верхний уровень
-  // в ранговом порядке, затем вложенные опоры. Блок входит в ту же wire-меру
-  // (K-03), поэтому единственное законно меняющееся старое значение —
-  // meta.tokens_estimated: оно растёт по сравнению с версией без next.
+  // Build final instructions from the placed top-level cards and nested supports.
+  // Placement measured this same next block before accepting each candidate.
   const nextCards: NextHintsCard[] = [];
   for (const m of compact) {
     nextCards.push({ id: m.id, kind: m.kind, visibleSupports: m.supports?.length ?? 0 });
@@ -1073,46 +1039,27 @@ export async function understand(
   }));
   let next: NextHints = buildNextHints({ db, cards: nextCards, refuted: refutedForNext });
 
-  // Обрезка по бюджету: сначала skip, затем followups — по одному элементу с
-  // перемериванием после каждого. must_read и record не режутся никогда; если
-  // выше цели и после порезок — так и остаётся, усечение помечается в meta.
-  let nextCut = false;
-  const measureWithNext = (tokens: number): number =>
-    measure(buildPayload(compact, refutedShown, metaFor(tokens, dropped, false), next));
-  while (next.skip.length > 0 && measureWithNext(0) > target) {
-    next.skip.pop();
-    nextCut = true;
-  }
-  while (next.followups.length > 0 && measureWithNext(0) > target) {
+  // Placement already includes next; only optional followups may be shortened.
+  const measureWithNext = (): number =>
+    measure(buildPayload(compact, refutedShown, metaFor(0, dropped, truncated), next));
+  while (next.followups.length > 0 && measureWithNext() > target) {
     next.followups.pop();
-    nextCut = true;
+    truncated = true;
   }
 
-  // Финальная честная мера: число токенов само едет в meta, поэтому замер
-  // повторяется до стабильности разрядов (число в payload == число в мере).
   const edgesBetween = edgesFor(compact);
-  const measureFinal = (tokens: number): number =>
-    measure({
-      matches: [],
-      compact,
-      refuted: refutedShown,
-      edges_between: edgesBetween,
-      meta: metaFor(tokens, dropped, false),
-      next,
-      ...extra,
-    });
-  tokensEstimated = measureFinal(0);
-  for (let i = 0; i < 3; i++) {
-    const again = measureFinal(tokensEstimated);
-    if (again === tokensEstimated) break;
-    tokensEstimated = again;
+  tokensEstimated = measure({
+    matches: [],
+    compact,
+    refuted: refutedShown,
+    edges_between: edgesBetween,
+    meta: metaFor(0, dropped, truncated),
+    next,
+    ...extra,
+  });
+  if (tokensEstimated > maxTokens) {
+    throw new Error(`understand: max_tokens=${maxTokens} cannot fit the instructions and required references (minimum ${tokensEstimated}); increase the budget.`);
   }
-  // Первая нода может игнорировать лимит («always return at least one») —
-  // тогда метка усечения обязательна: не утверждаем, что ответ уложился.
-  // (truncated: true короче false — замер с false остаётся верхней оценкой.)
-  // План 13: порезанный next — тоже усечение, даже если мера влезла в бюджет.
-  if (nextCut) truncated = true;
-  if (tokensEstimated > maxTokens) truncated = true;
   const payloadMeta = metaFor(tokensEstimated, dropped, truncated);
   const payload = JSON.stringify({
     matches: [],
@@ -1189,6 +1136,9 @@ export function currentDigestsOf(node: NodeRow): CurrentDigestsView {
     claim: claimDigestOf(node.summary),
     status: statusDigestOf(node.status, node.epistemic_status),
     format_version: BASELINE_FORMAT_VERSION,
+    validation_claim: node.validation_claim_digest ?? null,
+    validation_scope: node.validation_scope_digest ?? null,
+    validation_state: validationState(node),
     confirmed_claim: snapshotClaim,
     confirmed_at: node.claim_digest_at ?? null,
     source: snapshotClaim !== null ? "snapshot" : "computed",
@@ -1417,6 +1367,7 @@ export async function createConcept(
     toId: string;
     why: string;
     fromAutoGround: boolean;
+    expect?: import("./types.js").EvidenceInput["expect"];
   }
   const factNodesToCreate: Array<{
     id: string;
@@ -1441,7 +1392,7 @@ export async function createConcept(
       if (!db.nodeExists(item.node)) {
         throw new Error(`evidence.node "${item.node}" does not exist (or is removed).`);
       }
-      supports.push({ toId: item.node, why, fromAutoGround: false });
+      supports.push({ toId: item.node, why, fromAutoGround: false, expect: item.expect });
       usedEvidenceIds.add(item.node);
       continue;
     }
@@ -1453,7 +1404,7 @@ export async function createConcept(
     const found = resolveFileRef(db, ref);
     if (found) {
       if (!usedEvidenceIds.has(found.id)) {
-        supports.push({ toId: found.id, why, fromAutoGround: false });
+        supports.push({ toId: found.id, why, fromAutoGround: false, expect: item.expect });
         usedEvidenceIds.add(found.id);
       }
       continue;
@@ -1527,8 +1478,12 @@ export async function createConcept(
   // self-confirmation. Those pairs stay `unknown` until an explicit
   // confirm_supports.
   const confirmableSupportIds = new Set<string>();
+  const newAnchorIds = new Set(factNodesToCreate.map(fact => fact.id));
   for (const s of supports) {
-    if (!s.fromAutoGround) confirmableSupportIds.add(s.toId);
+    if (!s.fromAutoGround && (newAnchorIds.has(s.toId) ||
+        (typeof s.expect?.claim_digest === "string" && typeof s.expect?.status_digest === "string"))) {
+      confirmableSupportIds.add(s.toId);
+    }
   }
 
   // Embeddings for the file-fact nodes (computed before the transaction).
@@ -1542,6 +1497,10 @@ export async function createConcept(
   // Generate embedding (null when the vector path is disabled pending reembed)
   const text = embeddingText(input.name, input.kind, input.summary);
   const embedding = await embedForStorage(db, text);
+  // The generation snapshot is taken AFTER the last await: embedForStorage
+  // legitimately establishes the first generation on a fresh db, and any
+  // concurrent switch after this point is caught inside the transaction.
+  const generationAtEmbed = embedding ? db.getVectorGeneration() : null;
 
   // ---- 2.1.10 F4: дубликаты по смыслу не создаются ----
   // Вторая сессия, не посмотревшая базу, записывает ту же работу заново.
@@ -1577,6 +1536,17 @@ export async function createConcept(
   let supersededIds: string[] = [];
 
   db.runInTransaction(() => {
+    for (const supportPlan of supports) {
+      if (newAnchorIds.has(supportPlan.toId) || supportPlan.fromAutoGround) continue;
+      const current = db.getNode(supportPlan.toId);
+      if (!current) throw new Error(`version_conflict: evidence "${supportPlan.toId}" disappeared; nothing was written.`);
+      const expect = supportPlan.expect;
+      if (expect && ((expect.claim_digest !== undefined && expect.claim_digest !== claimDigestOf(current.summary)) ||
+          (expect.status_digest !== undefined && expect.status_digest !== statusDigestOf(current.status, current.epistemic_status)) ||
+          (expect.artifacts_digest !== undefined && expect.artifacts_digest !== artifactsDigestOf(activeArtifactRows(current, db.getNodeArtifacts(current.id)))))) {
+        throw new Error(`version_conflict: evidence "${supportPlan.toId}" changed; nothing was written.`);
+      }
+    }
     for (const fact of factNodesToCreate) {
       db.insertNode({
         id: fact.id,
@@ -1648,6 +1618,7 @@ export async function createConcept(
         if (!support) continue;
         const row = {
           decision_id: id,
+          decision_claim_digest: claimDigestOf(input.summary),
           support_id: e.other_id,
           edge_key: String(e.id),
           claim_digest: claimDigestOf(support.summary),
@@ -1659,9 +1630,7 @@ export async function createConcept(
           // 2.1.3 F2: the confirmed artifacts state at the moment of the call.
           // Plan 04 K-11: the ACTIVE observation set only — refs already
           // withdrawn from the support stay history, not part of the pin.
-          artifacts_digest: artifactsDigestOf(
-            activeArtifactRows(support, db.getNodeArtifacts(e.other_id))
-          ),
+          artifacts_digest: supports.find(plan => plan.toId === e.other_id)?.expect?.artifacts_digest ?? null,
         };
         // 2.1.3 F1: the journal is written where the snapshot is written —
         // this carve-out is a first confirmation, so it opens the chain with
@@ -1671,6 +1640,10 @@ export async function createConcept(
       }
     }
 
+    if (epistemic === "validated" && input.status_scope) {
+      db.setEpistemicStatus(id, "validated", "Validated by the creating call.", input.status_scope);
+      db.recordStatusHistory(id, null, "validated", "Validated by the creating call.", "epistemic_status");
+    }
     if (supersedesIds.length > 0) {
       const { superseded, missing } = db.supersedeNodes(id, supersedesIds);
       if (missing.length > 0) {
@@ -1680,11 +1653,16 @@ export async function createConcept(
       }
       supersededIds = superseded;
     }
+    if (embedding && generationAtEmbed) {
+      // CAS applies only when an active generation exists: a blob stored
+      // without one is inert history, never a current vector hit (P-10).
+      const active = db.getVectorGeneration();
+      if (!active || active.generation !== generationAtEmbed.generation || active.model !== generationAtEmbed.model || active.profile !== generationAtEmbed.profile) {
+        throw new Error("version_conflict: vector generation changed during create; nothing was written.");
+      }
+      if (!db.publishNodeEmbedding({ ...active, id, name: input.name, kind: input.kind, summary: input.summary }, embedding)) throw new Error("version_conflict: created vector input changed.");
+    }
   });
-  if (embedding) {
-    // В17: keep the native vector copy in sync.
-    db.upsertVector(id, embedding);
-  }
 
   // В16: warn (never block) when a near-duplicate already exists — cheaper
   // than cleaning up afterwards with consolidate.
@@ -1728,7 +1706,7 @@ export async function createConcept(
 export async function updateConcept(
   db: KnowledgeDB,
   input: UpdateConceptInput
-): Promise<{ message: string }> {
+): Promise<{ message: string; warnings?: ConceptWarning[] }> {
   // Verify node exists
   const existing = db.getNode(input.id);
   if (!existing) {
@@ -1761,14 +1739,18 @@ export async function updateConcept(
   // path is disabled pending reembed — reembed will fill it in). Inference
   // runs BEFORE the write transaction — no model work under the write lock
   // (plan 04, F-04.5).
+  const sourceInputAtRead = JSON.stringify([existing.name, existing.kind, existing.summary]);
   let embedding: Buffer | undefined;
-  if (input.changes.summary !== undefined || input.changes.name !== undefined) {
+  if (input.changes.summary !== undefined || input.changes.name !== undefined || input.changes.kind !== undefined) {
     const name = input.changes.name ?? existing.name;
     const kind = input.changes.kind ?? existing.kind;
     const summary = input.changes.summary ?? existing.summary;
     const text = embeddingText(name, kind, summary);
     embedding = (await embedForStorage(db, text)) ?? undefined;
   }
+  // Snapshot after the last await — embedForStorage may legitimately establish
+  // the first generation on a fresh db; a later concurrent switch is a conflict.
+  const generationAtEmbed = embedding ? db.getVectorGeneration() : null;
 
   let epistemicNote = "";
   let noChanges = false;
@@ -1781,6 +1763,7 @@ export async function updateConcept(
       throw new Error(`Concept "${input.id}" not found.`);
     }
 
+    if (JSON.stringify([current.name, current.kind, current.summary]) !== sourceInputAtRead) throw new Error("version_conflict: concept input changed during update.");
     // K-07: the RESULTING state is validated like create would. A kind change
     // must not launder a placeholder summary past create-time guarantees, and
     // feature -> decision must not bypass require_support.
@@ -1837,6 +1820,10 @@ export async function updateConcept(
       }
     }
 
+    if (current.epistemic_status === "validated" &&
+        input.changes.summary !== undefined && input.changes.summary !== current.summary) {
+      db.recordStatusHistory(current.id, "validated", "validated", "Claim changed; previous validation retained as history.", "epistemic_status");
+    }
     const updated = db.updateNode(input.id, {
       ...input.changes,
       embedding,
@@ -1870,13 +1857,21 @@ export async function updateConcept(
       epistemicNote = ` Epistemic status: ${epistemicWrite.to}.`;
     }
 
+    if (embedding && generationAtEmbed) {
+      // Same generation CAS as create: only an existing active generation is
+      // guarded; a generationless blob stays inert history (P-10).
+      const active = db.getVectorGeneration();
+      if (!active || active.generation !== generationAtEmbed.generation || active.model !== generationAtEmbed.model || active.profile !== generationAtEmbed.profile) throw new Error("version_conflict: vector generation changed during update.");
+      const updatedNode = db.getNode(input.id)!;
+      if (!db.publishNodeEmbedding({ ...active, id: input.id, name: updatedNode.name, kind: updatedNode.kind, summary: updatedNode.summary }, embedding)) throw new Error("version_conflict: vector input changed during update.");
+    } else if (input.changes.summary !== undefined || input.changes.name !== undefined || input.changes.kind !== undefined) {
+      // No active generation: store the blob on the node (inert until
+      // reembed) and drop any stale native copy.
+      db.execSqlRun("UPDATE nodes SET embedding=NULL,embedding_generation=NULL WHERE id=?", input.id);
+      db.deleteVector(input.id);
+    }
     if (!updated && !epistemicWrite) noChanges = true;
   });
-
-  if (embedding) {
-    // В17: keep the native vector copy in sync.
-    db.upsertVector(input.id, embedding);
-  }
 
   if (noChanges) {
     return { message: `No changes applied to "${input.id}"` };
@@ -2044,10 +2039,8 @@ export function listRoots(
   // числа корней (COUNT), так что выдача совпадает с прежним цельным чтением
   // на любом бюджете.
   const ROOT_PAGE = 500;
-  // Запас на цифры tokens_estimated в meta (после подстановки ответ чуть
-  // растёт) — порезка идёт с зазором, финальный замер честный.
-  const RESERVE = 32;
-  const target = maxTokens - RESERVE;
+  // Each fit check includes the final token field; no fixed reserve is needed.
+  const target = maxTokens;
   const totalRoots = db.countRootNodes();
   const rootRows: Array<{
     id: string;
@@ -2095,9 +2088,7 @@ export function listRoots(
   }));
   const boardTop = computeBoard(db).columns.find((c) => c.name === "open")!.cards.slice(0, 5);
 
-  /** Сериализованный размер ответа — байт/3, как его увидит модель. */
-  const measure = (payload: unknown): number =>
-    estimateTokens(JSON.stringify(payload, null, 2));
+  const measure = measureMcpPayload;
 
   type RootsCompact = (typeof rootsCompact)[number];
   type Slots = (typeof slots)[number];
@@ -2201,13 +2192,9 @@ export function listRoots(
   );
   const withExtra = { ...payload, ...extra };
 
-  // Фикспойнт: подставляем tokens_estimated и перемеряем, пока цифры
-  // не перестанут менять размер сериализации (2 итераций достаточно).
-  let tokens = measure(withExtra);
-  for (let i = 0; i < 2; i++) {
-    const next = measure({ ...withExtra, meta: { ...payload.meta, tokens_estimated: tokens } });
-    if (next === tokens) break;
-    tokens = next;
+  const tokens = measure(withExtra);
+  if (tokens > maxTokens) {
+    throw new Error(`list_roots: max_tokens=${maxTokens} cannot fit the response envelope (minimum ${tokens}); increase the budget.`);
   }
   const finalPayload: ListRootsOutput & { hint?: string } = {
     ...payload,
@@ -2243,7 +2230,8 @@ export function listConflicts(db: KnowledgeDB): ListConflictsOutput {
       .map((e) => e.from_id),
   }));
 
-  if (conflictNodes.length === 0) {
+  const savedConflicts = db.getMergeConflicts();
+  if (conflictNodes.length === 0 && savedConflicts.length === 0) {
     return { conflicts: [], contradicted };
   }
 
@@ -2288,6 +2276,14 @@ export function listConflicts(db: KnowledgeDB): ListConflictsOutput {
     });
   }
 
+  for (const saved of savedConflicts) {
+    let group = conflicts.find(conflict => conflict.merge_group === saved.merge_group);
+    if (!group) {
+      group = { merge_group: saved.merge_group, merge_timestamp: saved.created_at, versions: [] };
+      conflicts.push(group);
+    }
+    (group.edge_conflicts ??= []).push(saved);
+  }
   return { conflicts, contradicted };
 }
 
@@ -2298,6 +2294,10 @@ export async function resolveConflict(
   const nodes = db.getNodesByMergeGroup(input.merge_group);
 
   if (nodes.length === 0) {
+    if (db.getMergeConflicts(input.merge_group).some(conflict => conflict.object_kind === "edge")) {
+      if (!input.prefer) throw new Error("Edge-only resolution requires prefer=left or right.");
+      return resolveEdgeConflicts(db, { merge_group: input.merge_group, prefer: input.prefer, reason: input.reason });
+    }
     throw new Error(`No nodes found with merge_group: ${input.merge_group}`);
   }
 
@@ -2447,17 +2447,29 @@ export function taskRot(task: {
 }
 
 /** Full board: the `open` column sorted by rot, the terminal `done` fresh-first. */
-export function computeBoard(db: KnowledgeDB): BoardOutput {
+export function computeBoard(db: KnowledgeDB, input: { done_cursor?: string; done_limit?: number } = {}): BoardOutput {
   const openTasks = db.getOpenTasks().map((t) => {
     const { rot, overdue } = taskRot(t);
     return { id: t.id, name: t.name, rot, due_at: t.due_at, overdue };
   });
   openTasks.sort((a, b) => b.rot - a.rot);
 
-  const doneTasks = db.getDoneTasks().map((t) => ({
-    id: t.id,
-    name: t.name,
-  }));
+  let after: { updated_at: string; id: string } | undefined;
+  if (input.done_cursor !== undefined) {
+    try {
+      if (typeof input.done_cursor !== "string" || !/^[A-Za-z0-9_-]+$/.test(input.done_cursor)) throw new Error();
+      const decoded = Buffer.from(input.done_cursor, "base64url");
+      if (decoded.toString("base64url") !== input.done_cursor) throw new Error();
+      const parsed = JSON.parse(decoded.toString("utf8"));
+      if (typeof parsed?.updated_at !== "string" || typeof parsed?.id !== "string" || parsed.id.length === 0) throw new Error();
+      after = { updated_at: parsed.updated_at, id: parsed.id };
+    } catch { throw new Error("board: invalid done_cursor."); }
+  }
+  const limit = input.done_limit ?? 20;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("board: done_limit must be between 1 and 100.");
+  const donePage = db.getDoneTaskPage(limit, after);
+  const doneTasks = donePage.rows.map(t => ({ id: t.id, name: t.name }));
+  const last = donePage.rows[donePage.rows.length - 1];
 
   const columns: BoardColumn[] = [
     {
@@ -2469,7 +2481,10 @@ export function computeBoard(db: KnowledgeDB): BoardOutput {
     {
       name: "done",
       terminal: true,
-      count: doneTasks.length,
+      count: donePage.total,
+      returned: doneTasks.length,
+      has_more: donePage.has_more,
+      next_cursor: donePage.has_more && last ? Buffer.from(JSON.stringify({ updated_at: last.updated_at, id: last.id }), "utf8").toString("base64url") : null,
       cards: doneTasks,
     },
   ];
@@ -2607,13 +2622,18 @@ export function trailGet(db: KnowledgeDB, id: string): TrailView {
   };
 }
 
-export function trailRefresh(db: KnowledgeDB, id: string): { message: string } {
+export function trailRefresh(db: KnowledgeDB, id: string): { message: string; state: TrailView["state"]; reasons: Array<string | null> } {
   const trail = db.getTrail(id);
   if (!trail) {
     throw new Error(`Trail "${id}" not found.`);
   }
   db.refreshTrailFingerprints(id);
-  return { message: `Trail "${id}" refreshed: fingerprints re-snapshotted, chain is fresh.` };
+  const actual = trailGet(db, id);
+  return {
+    message: `Trail "${id}" refreshed: fingerprints re-snapshotted, chain is ${actual.state}.`,
+    state: actual.state,
+    reasons: actual.members.filter(member => member.state !== "fresh").map(member => member.reason),
+  };
 }
 
 export function trailExtend(db: KnowledgeDB, id: string, nodeIds: string[]): { message: string } {
@@ -2718,8 +2738,8 @@ export function taskDone(db: KnowledgeDB, id: string): { message: string } {
   return { message: `Task "${id}" done${wasDue ? ` (was due ${wasDue})` : ""}.` };
 }
 
-export function board(db: KnowledgeDB): BoardOutput & { summary: string } {
-  const output = computeBoard(db);
+export function board(db: KnowledgeDB, input: { done_cursor?: string; done_limit?: number } = {}): BoardOutput & { summary: string } {
+  const output = computeBoard(db, input);
   const openCol = output.columns.find((c) => c.name === "open")!;
   return {
     ...output,

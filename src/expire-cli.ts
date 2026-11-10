@@ -187,10 +187,6 @@ export async function runExpire(argv: string[]): Promise<void> {
   }
   const untilIso = resolveUntil(untilArg);
 
-  // expire не создаёт базу: опечатка в пути не должна выглядеть чистой командой
-  const dbPath = resolveDbPathOrExit(argv, { requireExisting: true });
-  const db = new KnowledgeDB(dbPath);
-
   let ids: string[];
   let verdicts: Map<string, string> | undefined;
   if (reportArg) {
@@ -201,8 +197,11 @@ export async function runExpire(argv: string[]): Promise<void> {
     ids = (idsArg ?? "").split(",").map((s) => s.trim()).filter((s) => s !== "");
   }
 
-  const result = expireNodes(db, ids, untilIso, apply);
-  printTable(result.rows.map((r) => ({ ...r, verdict: verdicts?.get(r.id) })));
+  const dbPath = resolveDbPathOrExit(argv, { requireExisting: true });
+  const db = new KnowledgeDB(dbPath, { readonly: !apply });
+  try {
+    const result = expireNodes(db, ids, untilIso, apply);
+    printTable(result.rows.map((r) => ({ ...r, verdict: verdicts?.get(r.id) })));
   console.log();
   if (result.applied) {
     console.log(
@@ -212,5 +211,7 @@ export async function runExpire(argv: string[]): Promise<void> {
   } else {
     console.log(pc.dim("  Dry-run: база не менялась. Для применения добавь --apply."));
   }
-  db.close();
+  } finally {
+    db.close();
+  }
 }

@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "libsql";
 import { KnowledgeDB } from "../db.js";
 import { link } from "../tools.js";
 import {
@@ -176,10 +177,10 @@ describe("2.1.2 F12: consume flags an attempt beyond the limit", () => {
 
 /** Count the rows the SQL engine hands back for support_baselines reads. */
 function countBaselineRows(db: KnowledgeDB): () => number {
-  const raw = (db as unknown as { db: Database }).db;
+  const raw = (db as unknown as { db: InstanceType<typeof Database> }).db;
   const realPrepare = raw.prepare.bind(raw);
   let rows = 0;
-  (raw as unknown as { prepare: (sql: string) => Database.Statement }).prepare = (
+  (raw as unknown as { prepare: unknown }).prepare = (
     sql: string
   ) => {
     const stmt = realPrepare(sql);

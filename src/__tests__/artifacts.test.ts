@@ -64,6 +64,12 @@ function decisionWithSupport(id: string, supportId: string, ref: string) {
 function confirmNow(decisionId: string, supportIds: string[]) {
   const decision = db.getNode(decisionId)!;
   const edges = db.getInformedByEdges(decisionId, "ancestry", false);
+  // Frozen 14/R-04: the artifact anchor is pinned from the server-returned
+  // trace — null when nothing was observed yet, the combined digest when a
+  // check_artifacts ran before this confirm.
+  const observed = new Map(
+    (provenanceTrace(db, { node_id: decisionId }).supports ?? []).map((s) => [s.support_id, s.artifacts_digest])
+  );
   return confirmSupports(db, {
     decision_id: decisionId,
     expected_claim_digest: claimDigestOf(decision.summary),
@@ -75,6 +81,7 @@ function confirmNow(decisionId: string, supportIds: string[]) {
         expected_claim_digest: claimDigestOf(support.summary),
         expected_status_digest: statusDigestOf(support.status, support.epistemic_status),
         expected_edge_digest: edgeDigestOf(edge.description),
+        expected_artifacts_digest: observed.get(sid) ?? null,
       };
     }),
   });

@@ -131,7 +131,7 @@ describe("edge tombstones (plan 1 §4)", () => {
     d.insertEdge({ from_id: "a", to_id: "b", relation: "connects_to" });
     d.hardDeleteNode("a");
     expect(rawEdges(d)).toHaveLength(0);
-    expect(d.execSqlFirst("SELECT count(*) AS n FROM nodes")!.n).toBe(1);
+    expect((d.execSqlFirst("SELECT count(*) AS n FROM nodes") as { n: number }).n).toBe(1);
   });
 
   it("getAllEdgesRaw stays unfiltered (raw export path)", () => {

@@ -4,22 +4,17 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { execSyncMock } = vi.hoisted(() => ({
-  execSyncMock: vi.fn((command: string) => {
-    if (
-      command === "which megamemory" ||
-      command === "where megamemory" ||
-      command === "which codex" ||
-      command === "where codex"
-    ) {
-      throw new Error("not found");
-    }
-
-    return Buffer.from("");
+const { execFileSyncMock, execSyncMock } = vi.hoisted(() => ({
+  execFileSyncMock: vi.fn(() => {
+    throw Object.assign(new Error("not found in isolated profile"), { code: "ENOENT" });
+  }),
+  execSyncMock: vi.fn(() => {
+    throw new Error("Shell execution is forbidden in install tests");
   }),
 }));
 
 vi.mock("child_process", () => ({
+  execFileSync: execFileSyncMock,
   execSync: execSyncMock,
 }));
 
@@ -40,11 +35,9 @@ interface Sandbox {
   opencodeDir: string;
 }
 
-const originalEnv = {
-  HOME: process.env.HOME,
-  OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
-};
+const sandboxes: Sandbox[] = [];
 const originalCwd = process.cwd();
+let originalExitCode: typeof process.exitCode;
 
 function makeSandbox(): Sandbox {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "megamemory-install-test-"));
@@ -56,36 +49,43 @@ function makeSandbox(): Sandbox {
   fs.mkdirSync(workspaceDir, { recursive: true });
   fs.mkdirSync(opencodeDir, { recursive: true });
 
-  return { root, homeDir, workspaceDir, opencodeDir };
+  const sandbox = { root, homeDir, workspaceDir, opencodeDir };
+  sandboxes.push(sandbox);
+  return sandbox;
 }
 
 async function loadInstallModule(sandbox: Sandbox) {
-  process.env.HOME = sandbox.homeDir;
-  process.env.OPENCODE_CONFIG_DIR = sandbox.opencodeDir;
+  for (const [key, value] of Object.entries({
+    HOME: sandbox.homeDir, USERPROFILE: sandbox.homeDir,
+    APPDATA: path.join(sandbox.homeDir, "AppData/Roaming"),
+    LOCALAPPDATA: path.join(sandbox.homeDir, "AppData/Local"),
+    XDG_CONFIG_HOME: path.join(sandbox.homeDir, ".config"),
+    XDG_CACHE_HOME: path.join(sandbox.homeDir, ".cache"),
+    XDG_DATA_HOME: path.join(sandbox.homeDir, ".local/share"),
+    OPENCODE_CONFIG_DIR: sandbox.opencodeDir,
+    CODEX_HOME: path.join(sandbox.homeDir, ".codex"),
+    CLAUDE_CONFIG_DIR: path.join(sandbox.homeDir, ".claude"),
+    MEGAMEMORY_DB_PATH: path.join(sandbox.root, "never-opened.db"),
+  })) vi.stubEnv(key, value);
   process.chdir(sandbox.workspaceDir);
   vi.resetModules();
   return import("../install.js");
 }
 
 beforeEach(() => {
+  originalExitCode = process.exitCode;
+  execFileSyncMock.mockClear();
   execSyncMock.mockClear();
   vi.spyOn(console, "log").mockImplementation(() => undefined);
 });
 
 afterEach(() => {
+  process.exitCode = originalExitCode;
   vi.restoreAllMocks();
   process.chdir(originalCwd);
-
-  if (originalEnv.HOME === undefined) {
-    delete process.env.HOME;
-  } else {
-    process.env.HOME = originalEnv.HOME;
-  }
-
-  if (originalEnv.OPENCODE_CONFIG_DIR === undefined) {
-    delete process.env.OPENCODE_CONFIG_DIR;
-  } else {
-    process.env.OPENCODE_CONFIG_DIR = originalEnv.OPENCODE_CONFIG_DIR;
+  vi.unstubAllEnvs();
+  for (const sandbox of sandboxes.splice(0)) {
+    fs.rmSync(sandbox.root, { recursive: true, force: true });
   }
 });
 

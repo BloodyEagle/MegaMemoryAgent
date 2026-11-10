@@ -26,6 +26,7 @@ import {
   statusDigestOf,
 } from "./support-baselines.js";
 import { isStubSummary } from "./stub.js";
+import { validationState } from "./validation.js";
 import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 
 // ---- Config flags (plan 3 §4.1.3, §11) ----
@@ -139,7 +140,7 @@ export function isUngroundedRow(node: NodeRow, hasLiveOutgoingInformedBy: boolea
   }
   if (node.epistemic_status === "validated") {
     const scope = parseScope(node.status_scope);
-    if (scope && scope.artifact) return false;
+    if (scope && scope.artifact && validationState(node) === "current") return false;
   }
   return true;
 }
@@ -897,18 +898,15 @@ function weakLinks(
     const check = isDecision ? checker.check(n.id) : null;
     if (check && check.state === "changed") {
       const changed = check.changed ?? [];
-      const changedTotal = check.changed_count ?? changed.length;
-      // 2.1.3 F2: artifact-only pairs must not inflate the support_changed
-      // record — the divergence of an external artifact is its own type.
-      // artifact_changed_count is the honest full-set total of artifact
-      // pairs (the changed list is capped), so the reason-pair total is the
-      // difference; both counters travel on the view.
+      // These axes overlap: union minus artifacts is not the semantic count.
       const artifactTotal = check.artifact_changed_count ?? 0;
-      const reasonPairs = changed.filter((c) => c.reasons.length > 0);
-      const reasonTotal = Math.max(0, changedTotal - artifactTotal);
-      const reasonCounts: Record<string, number> = {};
-      for (const c of reasonPairs) {
-        for (const r of c.reasons) reasonCounts[r] = (reasonCounts[r] ?? 0) + 1;
+      const reasonPairs = check.semantic_changed ?? changed.filter((c) => c.reasons.length > 0);
+      const reasonTotal = check.semantic_changed_count ?? reasonPairs.length;
+      const reasonCounts: Record<string, number> = { ...check.semantic_reason_counts };
+      if (!check.semantic_reason_counts) {
+        for (const c of reasonPairs) {
+          for (const r of c.reasons) reasonCounts[r] = (reasonCounts[r] ?? 0) + 1;
+        }
       }
       if (check.claim_changed) reasonCounts["claim"] = (reasonCounts["claim"] ?? 0) + 1;
       const detail = reasonPairs
@@ -936,10 +934,10 @@ function weakLinks(
       }
       // The artifact divergence speaks for itself: path + both digest
       // previews («было → стало»), one record per decision.
-      const artifactPairs = changed.filter((c) => c.artifact_changed);
-      if (artifactPairs.length > 0) {
+      const artifactPairs = check.artifact_changed ?? changed.filter((c) => c.artifact_changed);
+      if (artifactTotal > 0) {
         const first = artifactPairs[0];
-        const artifact = first.artifacts?.[0];
+        const artifact = first?.artifacts?.[0];
         const previewText = artifact
           ? `: ${artifact.ref} (${artifact.prev_digest ?? "—"} → ${artifact.digest ?? "—"}, замечено ${artifact.changed_at})`
           : "";
