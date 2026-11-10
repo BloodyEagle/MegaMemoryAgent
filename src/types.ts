@@ -416,6 +416,12 @@ export interface UnderstandMeta {
    * фактической выдачи.
    */
   truncated?: boolean;
+  /**
+   * Пустой compact при непустом результате поиска: в бюджет не поместилась
+   * ни одна карточка. Причина называется явно, чтобы пустой ответ не читался
+   * как «ничего не нашлось» — подними max_tokens или используй brief.
+   */
+  reason?: "budget";
 }
 
 export interface UnderstandOutput {

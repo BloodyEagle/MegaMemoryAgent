@@ -7,8 +7,17 @@ import { buildGuideText } from "../guide.js";
 
 const root = path.resolve(import.meta.dirname, "../..");
 
+// README-примеры ссылаются на каталог agent-skills. Его расположение задаёт
+// AGENT_SKILLS_ROOT; без него контракт исполняется только у владельца репозитория,
+// поэтому тест честно пропускается, а не падает на чужом пути.
+const skillsRoot = process.env.AGENT_SKILLS_ROOT ?? "";
+const skillsReady = Boolean(skillsRoot)
+  && fs.existsSync(path.join(skillsRoot, "skills", "token-economy-ts", "scripts", "code-searcher.js"))
+  && fs.existsSync(path.join(skillsRoot, "skills", "token-economy-py", "scripts", "te.py"))
+  && fs.existsSync(path.join(skillsRoot, "skills", "token-economy-har", "har.js"));
+
 describe("S-04 README source commands on a fresh TEMP project", () => {
-  it("executes the actual README argv and PY text/path contracts without shell", () => {
+  it.skipIf(!skillsReady)("executes the actual README argv and PY text/path contracts without shell", () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), "mm-readme-пример с пробелами-"));
     try {
       const project = path.join(temp, "project");
@@ -24,7 +33,7 @@ describe("S-04 README source commands on a fresh TEMP project", () => {
         }
       };
       for (const skill of ["token-economy-ts", "token-economy-py", "token-economy-har"]) {
-        copyTree(`C:/p/agent-skills/skills/${skill}`, path.join(scripts, skill));
+        copyTree(path.join(skillsRoot, "skills", skill), path.join(scripts, skill));
       }
       fs.writeFileSync(path.join(project, "src/a.ts"), 'import { Needle } from "./b.js";\n// строка "с кавычками"\n', "utf8");
       fs.writeFileSync(path.join(project, "src/b.ts"), "export const Needle = 1;\n", "utf8");

@@ -20,7 +20,7 @@
 - Инструменты сборки: `scripts/lint.mjs` (AST-политика без новых зависимостей),
   `scripts/verify.mjs` (`typecheck`, `typecheck-tests`, `test`, `metadata`),
   `scripts/package*.mjs` (pack + smoke изолированной сборки).
-- CI-матрица: Linux (Node 22) и Windows (runtime 20.9 + dev 22) — линт, оба
+- CI-матрица: Linux (Node 22) и Windows (runtime 20.10 + dev 22) — линт, оба
   typecheck, сборка, полный suite, `eval` recall@10, packaged smoke на
   минимальном `engines.node`.
 
@@ -51,8 +51,22 @@
 
 ### Breaking
 
+- Минимальный Node поднят до **`>=20.10`**: `sharp` из цепочки эмбеддингов
+  использует import-атрибуты `import ... with { type: "json" }`, которых нет в
+  20.9 — собранный пакет там падал с синтаксической ошибкой, хотя `engines`
+  обещал 20.9.
 - Схема 14: сборки ≤ 2.4.0 открывают базу v14 без отказа — guard'ов у них нет.
   Откат — из бэкапа; обратная миграция не поддерживается.
+
+### Note
+
+- `understand` в режиме `compact` держит `max_tokens` жёстко: если ни одна
+  карточка не помещается, ответ приходит пустым с `meta.reason: "budget"` и
+  `meta.truncated: true` — вместо карточки сверх лимита. Поднять бюджет или
+  взять `mode: "brief"`.
+- Тесты README-контрактов (S-04/S-05) больше не зависят от пути
+  `C:/p/agent-skills` на машине автора: каталог задаётся `AGENT_SKILLS_ROOT`,
+  без него тесты пропускаются, а CI клонирует `agent-skills` сам.
 
 ## 2.4.0 (2026-11-09)
 

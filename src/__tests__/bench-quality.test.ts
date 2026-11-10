@@ -7,6 +7,13 @@ import { pathToFileURL } from "node:url";
 import { understand, estimateTokens } from "../tools.js";
 import { auditFixture, type AuditFixture } from "./helpers/audit.js";
 
+// README-примеры ссылаются на каталог agent-skills. Его расположение задаёт
+// AGENT_SKILLS_ROOT; без него контракт исполняется только у владельца репозитория,
+// поэтому тест честно пропускается, а не падает на чужом пути.
+const skillsRoot = process.env.AGENT_SKILLS_ROOT ?? "";
+const searcherPath = path.join(skillsRoot, "skills", "token-economy-ts", "scripts", "code-searcher.js");
+const skillsReady = Boolean(skillsRoot) && fs.existsSync(searcherPath);
+
 let fixture: AuditFixture;
 beforeEach(() => { fixture = auditFixture(); fixture.isolateHome(); vi.stubEnv("MEGAMEMORY_SEARCH", "fts"); });
 afterEach(async () => { vi.unstubAllEnvs(); await fixture.close(); });
@@ -45,7 +52,7 @@ describe("S-05 quality-gated retrieval comparison", () => {
     expect(report).toMatchObject({ graph_metric: "retrieval_wire_without_instructions", instructions_scope: "excluded", economy_status: "not_measured" });
   });
 
-  it("executes the README bench structured argv against a fresh owned DB using source CLI", async () => {
+  it.skipIf(!skillsReady)("executes the README bench structured argv against a fresh owned DB using source CLI", async () => {
     const dbPath = fixture.file("cli-owned.db");
     await fixture.release(fixture.db("cli-owned.db"));
     // A fresh separate source CLI database is created only under this fixture.
@@ -53,7 +60,11 @@ describe("S-05 quality-gated retrieval comparison", () => {
     fs.writeFileSync(questionsPath, JSON.stringify({ query: "AbsentNeedle", expected_outcome: "no_match", quality_contract: { adapter: "ts_search" } }) + "\n", "utf8");
     const readme = fs.readFileSync(path.resolve(import.meta.dirname, "../../README.md"), "utf8");
     const block = readme.match(/megamemory bench --db "<owned-copy.db>"[\s\S]*?--te-arg "ext=[^"]+"/)!;
-    const argv = [...block[0].matchAll(/--te-arg "([^"]+)"/g)].flatMap((m) => ["--te-arg", m[1]]);
+    const teArgs = [...block[0].matchAll(/--te-arg "([^"]+)"/g)].map((m) => m[1]);
+    // Первый --te-arg в README — путь к code-searcher.js с машины владельца.
+    // Подставляем реальный: иначе тест проверяет наличие C:/p/agent-skills.
+    teArgs[0] = searcherPath;
+    const argv = teArgs.flatMap((arg) => ["--te-arg", arg]);
     const source = path.resolve(import.meta.dirname, "..");
     const cli = spawnSync(process.execPath, ["--import", pathToFileURL(path.resolve(source, "../node_modules/tsx/dist/loader.mjs")).href, path.join(source, "index.ts"),
       "bench", "--db", dbPath, "--questions", questionsPath, "--baseline", "te", "--te-exec", process.execPath, ...argv], {

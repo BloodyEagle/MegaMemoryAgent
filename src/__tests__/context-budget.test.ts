@@ -55,7 +55,7 @@ describe("estimateTokens / trimSummary", () => {
 });
 
 describe("understand compact mode budget", () => {
-  it("respects max_tokens, drops nodes, always returns at least one", async () => {
+  it("keeps the hard cap: no card fits — empty answer with an explicit budget reason", async () => {
     const db = freshDb();
     insertFatNodes(db, 20);
 
@@ -66,13 +66,35 @@ describe("understand compact mode budget", () => {
     });
 
     expect(result.meta).toBeDefined();
-    expect(result.meta!.returned).toBeGreaterThanOrEqual(1);
-    expect(result.meta!.dropped).toBeGreaterThan(0);
-    expect(result.meta!.returned + result.meta!.dropped).toBe(20);
+    // Бюджет — жёсткий потолок, а не пожелание: карточка сверх лимита не
+    // отдаётся. Пустой ответ обязан называть причину, иначе он читается как
+    // «ничего не нашлось» — это и было регрессом.
+    expect(result.compact!.length).toBe(0);
+    expect(result.meta!.returned).toBe(0);
+    expect(result.meta!.truncated).toBe(true);
+    expect(result.meta!.reason).toBe("budget");
+    expect(result.meta!.dropped).toBe(20);
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500);
     // U6: the explorer derives "saved vs full" from this pair.
     expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);
-    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500);
-    expect(result.compact!.length).toBe(result.meta!.returned);
+  });
+
+  it("places cards when the budget has room and never claims a budget reason", async () => {
+    const db = freshDb();
+    insertFatNodes(db, 20);
+
+    const result = await understand(db, {
+      query: "Слово",
+      top_k: 20,
+      max_tokens: 8000,
+    });
+
+    expect(result.meta).toBeDefined();
+    expect(result.meta!.returned).toBeGreaterThanOrEqual(1);
+    expect(result.meta!.returned).toBe(result.compact!.length);
+    expect(result.meta!.returned + result.meta!.dropped).toBe(20);
+    expect(result.meta!.reason).toBeUndefined();
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(8000);
     // Every compact node is trimmed to <=240 chars.
     expect(result.compact!.every((m) => m.summary.length <= 240)).toBe(true);
   });

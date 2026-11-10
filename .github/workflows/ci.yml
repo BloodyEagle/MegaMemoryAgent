@@ -36,6 +36,13 @@ jobs:
       - name: Version badge matches package.json
         run: node scripts/verify.mjs metadata
 
+      # README-примеры исполняются тестами: им нужен каталог agent-skills.
+      # Без него контракты S-04/S-05 пропускаются, а не падают на чужом пути.
+      - name: Checkout agent-skills (README command contracts)
+        run: |
+          git clone --depth 1 https://github.com/BloodyEagle/agent-skills.git "$RUNNER_TEMP/agent-skills"
+          echo "AGENT_SKILLS_ROOT=$RUNNER_TEMP/agent-skills" >> "$GITHUB_ENV"
+
       # Model cache: the multilingual model is ~120 MB, do not download it per run
       - uses: actions/cache@v4
         with:
@@ -65,14 +72,14 @@ jobs:
         run: npm test
 
   # Platform gate on Windows. The matrix separates the product runtime engine
-  # (engines.node = >=20.9: build + packaged smoke, no Vitest) from the dev
+  # (engines.node = >=20.10: build + packaged smoke, no Vitest) from the dev
   # toolchain (>= 20.19: strict test typecheck + pure unit project).
   platform-windows:
     runs-on: windows-latest
     strategy:
       matrix:
         include:
-          - node: "20.9.0"
+          - node: "20.10.0"
             suite: runtime
           - node: "22"
             suite: dev
@@ -100,7 +107,7 @@ jobs:
       # Runtime minimum proof: pack the built tree, validate composition
       # exactly (npm pack JSON, no ls/head) and smoke the extracted package
       # with redirected local dependencies (no install, no junction).
-      - name: Packaged runtime smoke (Node 20.9 = engines minimum)
+      - name: Packaged runtime smoke (Node 20.10 = engines minimum)
         if: matrix.suite == 'runtime'
         run: node scripts/package.mjs "$env:RUNNER_TEMP\mm-pack"
 

@@ -5,7 +5,7 @@
 
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
-  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.9-brightgreen?style=flat-square" />
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
   <img alt="version" src="https://img.shields.io/badge/version-2.5.0-orange?style=flat-square" />
 </p>
 
@@ -307,7 +307,7 @@ agent A/B comparison, see [docs/bench-protocol.md](docs/bench-protocol.md).
 
 ## Install
 
-Requires Node.js >= 20.9 (raised from 18: sharp 0.35, pulled in by the embedding pipeline, needs >= 20.9; dev toolchain — vite/vitest — needs >= 20.19). For Russian-only projects a much smaller model (`cointegrated/rubert-tiny2`, 312-dim) works after an ONNX conversion; the model unloads after 5 minutes idle (`MEGAMEMORY_EMBED_IDLE_MS=0` disables that), and `MEGAMEMORY_SEARCH=fts` avoids loading it at all. The embedding model (~120 MB, multilingual) downloads on first use and is
+Requires Node.js >= 20.10 (raised from 18: sharp, pulled in by the embedding pipeline, uses `import ... with { type: "json" }`, which Node 20.9 cannot parse; dev toolchain — vite/vitest — needs >= 20.19). For Russian-only projects a much smaller model (`cointegrated/rubert-tiny2`, 312-dim) works after an ONNX conversion; the model unloads after 5 minutes idle (`MEGAMEMORY_EMBED_IDLE_MS=0` disables that), and `MEGAMEMORY_SEARCH=fts` avoids loading it at all. The embedding model (~120 MB, multilingual) downloads on first use and is
 cached in `~/.cache/huggingface`.
 
 Install globally from npm:

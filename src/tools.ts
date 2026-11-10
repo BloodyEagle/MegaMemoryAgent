@@ -850,6 +850,11 @@ export async function understand(
     stale_excluded: staleExcluded,
     inactive_excluded: inactiveExcluded,
     truncated,
+    // Пустой ответ при непустом поиске — это не «ничего не нашлось»:
+    // причина называется, чтобы агент поднял бюджет или взял brief.
+    // Условие не зависит от truncated: иначе бюджет мерился бы без поля,
+    // которое реально уйдёт по проводу.
+    ...(displayList().length === 0 && eligible.length > 0 ? { reason: "budget" as const } : {}),
   });
 
   /** Тот объект, который уйдёт по проводу (со всеми секциями, extra и next). */
