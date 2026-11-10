@@ -59,11 +59,19 @@ describe("understand compact mode budget", () => {
     const db = freshDb();
     insertFatNodes(db, 20);
 
-    const result = await understand(db, {
-      query: "Слово",
-      top_k: 20,
-      max_tokens: 500,
-    });
+    // Минимальный конверт считает сам сервер: ниже него он отказывает и
+    // называет цифру. Берём «минимум + запас» — в него гарантированно не
+    // влезает ни одна карточка, и это не зависит от того, есть ли модель.
+    let minBudget = 0;
+    try {
+      await understand(db, { query: "Слово", top_k: 20, max_tokens: 1 });
+    } catch (error) {
+      expect(String(error)).toMatch(/минимума \d+/);
+      minBudget = Number(String(error).match(/минимума (\d+)/)?.[1]);
+    }
+    expect(minBudget).toBeGreaterThan(0);
+
+    const result = await understand(db, { query: "Слово", top_k: 20, max_tokens: minBudget + 20 });
 
     expect(result.meta).toBeDefined();
     // Бюджет — жёсткий потолок, а не пожелание: карточка сверх лимита не
@@ -74,7 +82,7 @@ describe("understand compact mode budget", () => {
     expect(result.meta!.truncated).toBe(true);
     expect(result.meta!.reason).toBe("budget");
     expect(result.meta!.dropped).toBe(20);
-    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500);
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(minBudget + 20);
     // U6: the explorer derives "saved vs full" from this pair.
     expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);
   });
