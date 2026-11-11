@@ -103,7 +103,11 @@ jobs:
       - name: Publish the tested tarball
         # Абсолютный путь: относительный «staging/x.tgz» npm парсит как
         # github-shorthand owner/repo и лезет в ssh вместо чтения файла.
-        run: npm publish "$GITHUB_WORKSPACE/staging/$TARBALL" --provenance --access public
+        # verbose нужен, чтобы видеть HTTP-ответ реестра: «+ пакет@версия» при
+        # exit 0 не доказывает, что версия легла в реестр.
+        run: |
+          npm whoami || true
+          npm publish "$GITHUB_WORKSPACE/staging/$TARBALL" --provenance --access public --loglevel verbose
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
