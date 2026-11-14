@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureSchema } from "../migrate-schema.js";
@@ -145,7 +146,9 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
       expect(response.isError).not.toBe(true);
       const output = JSON.parse(response.content[0].text);
       expect(output.stats.nodes).toBe(30);
-      expect(output.server_version).toBe("2.5.0");
+      expect(output.server_version).toBe(
+        JSON.parse(fs.readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8")).version
+      );
       expect(output.instructions_stale).toBe(false);
       expect(output.meta.tokens_estimated).toBe(wireTokens(JSON.stringify(response)));
       expect(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(max_tokens);
