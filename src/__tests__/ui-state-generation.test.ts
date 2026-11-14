@@ -66,7 +66,12 @@ describe("E08 authoritative search", () => {
   });
 });
 
-const plan = (survivor: string, other: string, digest = "a".repeat(64)) => ({ survivor, other, base: { digest }, refsAdded: [], edgesToMove: [], children: [], slots: [] });
+const plan = (survivor: string, other: string, digest = "a".repeat(64)) => ({
+  survivor, other, base: { digest }, refsAdded: [], edgesToMove: [], children: [], slots: [],
+  // B-02: сервер отдаёт карточки в том же bundle (web.ts: cards.survivor/other),
+  // и клиент валидирует их наличие — мок обязан повторять контракт, а не старый ответ.
+  cards: { survivor: graphNode(survivor), other: graphNode(other) },
+});
 describe("E04/E06 preview generations", () => {
   it("A→B→A accepts only the latest orientation response", async () => {
     const plans: ReturnType<typeof deferred<{ body: unknown }>>[] = [];
