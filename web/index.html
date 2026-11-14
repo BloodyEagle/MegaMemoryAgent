@@ -1394,9 +1394,10 @@ async function loadConsolidatePreview() {
   state.planLoading = true;
   renderConsolidatePreview();
 
+  const implicitSurvivor = state.older || state.a;
   const orientation = state.survivor
     ? ccSurivorIds(state)
-    : { survivorId: state.older || state.a, otherId: state.older === state.a ? state.b : state.a };
+    : { survivorId: implicitSurvivor, otherId: implicitSurvivor === state.a ? state.b : state.a };
   const side = orientation.survivorId === state.a ? 'A' : 'B';
   const invalidation = state.invalidation;
   try {
@@ -1430,6 +1431,19 @@ function chooseConsolidateSurvivor(side) {
   const state = ccState;
   if (!state || state.merged || state.busy || !['A', 'B'].includes(side)) return;
   if (state.survivor === side) return;
+  // Opening starts a bundle request in the implicit older/A orientation while
+  // survivor is still null. Reuse that request or an already loaded bundle
+  // when the explicit choice has the same orientation.
+  const loaded = state.bundle && state.bundle.ok ? state.bundle : null;
+  const implicitSide = (state.older || state.a) === state.a ? 'A' : 'B';
+  const matchingRequest = state.survivor === null && state.planLoading &&
+    state.refreshInvalidation === state.invalidation && implicitSide === side;
+  if ((loaded && loaded.side === side) || matchingRequest) {
+    state.survivor = side;
+    state.confirmOpen = false;
+    renderConsolidatePreview();
+    return;
+  }
   state.survivor = side;
   state.confirmOpen = false;
   // Смена survivor — новое чтение ВСЕГО bundle (план+карточки атомарно),

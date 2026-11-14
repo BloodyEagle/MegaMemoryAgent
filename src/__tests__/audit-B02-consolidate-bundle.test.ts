@@ -16,8 +16,11 @@ import { KnowledgeDB } from "../db.js";
  *
  * Контракт после исправления: GET /api/consolidate/preview отвечает планом И
  * карточками участников (cards.survivor / cards.other) из одного снимка;
- * клиент принимает bundle атомарно, смена survivor перечитывает его целиком,
- * confirm разрешён только когда план и карточки — один ответ.
+ * клиент принимает bundle атомарно и переиспользует его, если явный выбор
+ * survivor совпадает с уже показанной ориентацией. Поздняя запись не делает
+ * этот снимок опасным: digest-CAS даёт 409, клиент перечитывает весь bundle и
+ * требует повторного подтверждения. Confirm разрешён только когда план и
+ * карточки — один ответ.
  */
 
 const OLD_A = "OLD visible summary a";
@@ -119,28 +122,32 @@ KnowledgeDB.prototype.runInTransaction = function (fn) {
     }
   }, 60_000);
 
-  it("DOM: смена survivor перечитывает карточки вместе с планом; confirm — ровно один POST", async () => {
+  it("DOM: совпавший выбор переиспользует bundle; поздняя запись даёт 409 и требует повторного confirm", async () => {
     const { server } = await startSeededServer();
     try {
       const ui = await auditDom({ reply: proxyReply(server) });
       try {
         await ui.invoke("openConsolidatePreview", "a", "b", { older: "a", similarity: 1 });
         const text = ui.element("#consolidate-preview").textContent;
-        // Карточки при открытии показывают содержимое на момент загрузки.
         expect(text).toContain(OLD_A);
         expect(text).toContain(OLD_B);
+        const previewRequestsBefore = ui.requests.filter((request) =>
+          request.url.includes("/api/consolidate/preview?")
+        ).length;
 
-        // Гонка: другой процесс меняет узел ПОСЛЕ загрузки карточек.
+        // Гонка: другой процесс меняет узел ПОСЛЕ согласованного bundle.
         writer!.updateNode("a", { summary: NEW_A, why: NEW_WHY });
 
-        // Выбор survivor: карточки и план обязаны прийти заново одним bundle.
+        // Явный выбор той же ориентации не тратит второй GET и продолжает
+        // показывать единый старый снимок — он будет защищён digest-CAS.
         await ui.invoke("chooseConsolidateSurvivor", "A");
-        const after = ui.element("#consolidate-preview").textContent;
-        // Целевой assert: показано содержимое, реально применяемое планом.
-        expect(after).toContain(NEW_A);
-        expect(after).not.toContain(OLD_A);
+        const afterChoice = ui.element("#consolidate-preview").textContent;
+        expect(afterChoice).toContain(OLD_A);
+        expect(afterChoice).not.toContain(NEW_A);
+        expect(ui.requests.filter((request) =>
+          request.url.includes("/api/consolidate/preview?")
+        )).toHaveLength(previewRequestsBefore);
 
-        // merge готов, подтверждение даёт ровно один POST.
         const merge = ui.element("#consolidate-preview").querySelectorAll("button")
           .find((button) => button.getAttribute("data-action") === "consolidate-merge");
         expect(merge!.hasAttribute("disabled")).toBe(false);
@@ -152,22 +159,23 @@ KnowledgeDB.prototype.runInTransaction = function (fn) {
         ui.dispatch(confirm!, "click");
         await ui.settle();
 
-        // Одна подтверждённая операция — ровно один POST; повторный submit
-        // заблокирован busy/merged.
-        await ui.invoke("submitConsolidateMerge");
         const posts = ui.requests.filter((request) => request.method === "POST");
         expect(posts).toHaveLength(1);
-        expect(ui.evaluate("ccState.merged")).toMatchObject({ survivor: "a", removed: "b" });
+        expect(ui.evaluate("ccState.merged")).toBeNull();
+        expect(ui.element("#consolidate-preview").textContent).toContain("preview was stale");
+        expect(ui.element("#consolidate-preview").textContent).toContain(NEW_A);
+        const refreshedMerge = ui.element("#consolidate-preview").querySelectorAll("button")
+          .find((button) => button.getAttribute("data-action") === "consolidate-merge");
+        expect(refreshedMerge!.hasAttribute("disabled")).toBe(false);
+        expect(ui.element("#consolidate-preview").querySelectorAll("button")
+          .some((button) => button.getAttribute("data-action") === "consolidate-confirm")).toBe(false);
 
-        // Слияние применило текст, который был В КАРТОЧКАХ подтверждения
-        // (план объединяет summary дубля — NEW читается в итоговом тексте).
+        // Сервер не применил unseen bundle: оба узла живы, текст A — только
+        // concurrent write, не результат merge.
         const survivorRes = await server.request("/api/node/a");
         expect(survivorRes.status).toBe(200);
-        const survivorCard = JSON.parse(survivorRes.text);
-        expect(survivorCard.summary).toContain(NEW_A);
-        expect(survivorCard.why).toBe(NEW_WHY);
-        const otherRes = await server.request("/api/node/b");
-        expect(otherRes.status).toBe(404);
+        expect(JSON.parse(survivorRes.text)).toMatchObject({ summary: NEW_A, why: NEW_WHY });
+        expect((await server.request("/api/node/b")).status).toBe(200);
         expect(ui.errors).toEqual([]);
       } finally {
         ui.close();
