@@ -572,7 +572,7 @@
 <header>
   <span class="logo">MegaMemory</span>
   <div class="search-shell" id="search-shell">
-    <input id="search" type="text" placeholder="Search concepts semantically..." autocomplete="off" />
+    <input id="search" type="text" placeholder="Search concepts..." autocomplete="off" />
     <span id="search-loading" aria-hidden="true"></span>
     <div id="search-results"></div>
   </div>
@@ -608,7 +608,7 @@
   <select id="timeline-kind" title="What to show on the timeline" style="display:none;margin-left:8px;background:#1e2333;color:#94a3b8;border:1px solid #64748b55;border-radius:8px;font-size:11px;padding:2px 6px">
     <option value="tools">tool calls</option>
     <option value="status">status changes</option>
-    <option value="all" selected>all</option>
+    <option value="all" selected>events</option>
   </select>
 </div>
 
@@ -1241,8 +1241,14 @@ async function openConsolidate() {
       value.candidates.every(c => isObject(c) && typeof c.a === 'string' && typeof c.b === 'string' && Number.isFinite(c.similarity)), { signal: request.signal });
     if (!request.current()) return;
     const candidates = data.candidates;
+    const truncated = Number.isFinite(data.candidates_truncated) && data.candidates_truncated > 0
+      ? data.candidates_truncated
+      : 0;
+    const truncationNote = truncated
+      ? ` · ${truncated} candidate pair(s) omitted by scan limits`
+      : '';
     if (!candidates.length) {
-      el.innerHTML = '<span class="stat">no duplicates found — graph is clean</span>' +
+      el.innerHTML = `<span class="stat">no duplicate candidates returned${truncationNote} — only concepts with embeddings are compared; the scan may be incomplete</span>` +
         '<button class="stat" data-action="reload" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">close</button>';
       return;
     }
@@ -1258,7 +1264,7 @@ async function openConsolidate() {
       `<span style="color:#64748b">recommendation: older ${esc(c.older)}</span></div>`
     ).join('');
     el.innerHTML = `<div style="display:flex;flex-direction:column;gap:4px;width:100%">` +
-      `<span class="stat">${candidates.length} duplicate candidate(s)</span>${rows}` +
+      `<span class="stat">${candidates.length} duplicate candidate(s)${truncationNote}</span>${rows}` +
       `<button class="stat" data-action="reload" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">close</button></div>`;
   } catch (err) {
     if (!request.current()) return;
@@ -1388,9 +1394,10 @@ async function loadConsolidatePreview() {
   state.planLoading = true;
   renderConsolidatePreview();
 
+  const implicitSurvivor = state.older || state.a;
   const orientation = state.survivor
     ? ccSurivorIds(state)
-    : { survivorId: state.older || state.a, otherId: state.older === state.a ? state.b : state.a };
+    : { survivorId: implicitSurvivor, otherId: implicitSurvivor === state.a ? state.b : state.a };
   const side = orientation.survivorId === state.a ? 'A' : 'B';
   const invalidation = state.invalidation;
   try {
@@ -1424,6 +1431,19 @@ function chooseConsolidateSurvivor(side) {
   const state = ccState;
   if (!state || state.merged || state.busy || !['A', 'B'].includes(side)) return;
   if (state.survivor === side) return;
+  // Opening starts a bundle request in the implicit older/A orientation while
+  // survivor is still null. Reuse that request or an already loaded bundle
+  // when the explicit choice has the same orientation.
+  const loaded = state.bundle && state.bundle.ok ? state.bundle : null;
+  const implicitSide = (state.older || state.a) === state.a ? 'A' : 'B';
+  const matchingRequest = state.survivor === null && state.planLoading &&
+    state.refreshInvalidation === state.invalidation && implicitSide === side;
+  if ((loaded && loaded.side === side) || matchingRequest) {
+    state.survivor = side;
+    state.confirmOpen = false;
+    renderConsolidatePreview();
+    return;
+  }
   state.survivor = side;
   state.confirmOpen = false;
   // Смена survivor — новое чтение ВСЕГО bundle (план+карточки атомарно),
@@ -1685,18 +1705,18 @@ function renderConsolidatePreview() {
   }
   if (state.merged) {
     h += `<span class="cc-ok">merged: survivor <b>${esc(state.merged.survivor)}</b>, absorbed <b>${esc(state.merged.removed)}</b>` +
-      ` — moved edges are recreated with origin "unknown" (server re-creation, plan 4 v8 §1.3)</span>`;
+      ` — edge rows were redirected to the survivor, preserving identity, created_via, and accepted_at</span>`;
     h += `<button class="cc-btn" data-action="consolidate-close">close</button>`;
   } else {
-    h += `<button class="cc-btn cc-merge" data-action="consolidate-merge" ${mergeReady ? '' : 'disabled'}>Объединить…</button>`;
+    h += `<button class="cc-btn cc-merge" data-action="consolidate-merge" ${mergeReady ? '' : 'disabled'}>merge…</button>`;
   }
   h += `</div>`;
 
   if (state.confirmOpen && !state.merged) {
     h += `<div class="cc-confirm"><div>Final confirmation: merge <b>${esc(otherId)}</b> into <b>${esc(survivorId)}</b>? ` +
       `The absorbed node is deleted irreversibly; versions are bound to the preview (stale preview → 409, nothing is written).</div>` +
-      `<button class="cc-btn cc-danger" data-action="consolidate-confirm">Объединить ${esc(survivorId)} + ${esc(otherId)}</button>` +
-      `<button class="cc-btn" data-action="consolidate-cancel-confirm">Отмена</button></div>`;
+      `<button class="cc-btn cc-danger" data-action="consolidate-confirm">merge ${esc(survivorId)} + ${esc(otherId)}</button>` +
+      `<button class="cc-btn" data-action="consolidate-cancel-confirm">cancel</button></div>`;
   }
 
   panel.innerHTML = h;
@@ -2580,7 +2600,7 @@ function renderSearchResults(query, matches, mode, meta) {
   }
 
   if (!matches.length) {
-    resultsEl.innerHTML = `<div class="search-empty">No semantic matches found.</div>`;
+    resultsEl.innerHTML = `<div class="search-empty">No matches found.</div>`;
     resultsEl.classList.add('open');
     activeSearchIndex = -1;
     return;
@@ -2669,7 +2689,7 @@ function renderSearchError(query, message) {
     resultsEl.classList.remove('open');
     return;
   }
-  resultsEl.innerHTML = `<div class="search-error">${esc(message || 'Semantic search failed.')}</div>`;
+  resultsEl.innerHTML = `<div class="search-error">${esc(message || 'Search failed.')}</div>`;
   resultsEl.classList.add('open');
   activeSearchIndex = -1;
 }

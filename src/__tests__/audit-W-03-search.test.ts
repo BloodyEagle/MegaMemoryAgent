@@ -59,7 +59,7 @@ describe("W-03 — live explorer search rendering", () => {
     const ui = await auditDom({ reply: ({ url }) => url.startsWith("/api/search?") ? { body: { matches: [], meta: null } } : undefined });
     try {
       await search(ui, "absent");
-      expect(ui.element("#search-results").textContent).toBe("No semantic matches found.");
+      expect(ui.element("#search-results").textContent).toBe("No matches found.");
       expect(ui.element("#search-loading").classList.contains("visible")).toBe(false);
       await ui.invoke("renderSearchResults", "", []);
       expect(ui.element("#search-results").textContent).toBe("");

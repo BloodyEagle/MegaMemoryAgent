@@ -7,7 +7,7 @@ import { resolveDbPathOrExit } from "./db-path.js";
 /**
  * `megamemory digest [--module <id>] [--apply]`
  *
- * Rebuilds digest nodes: all modules with >=5 children, or one module.
+ * Rebuilds digest nodes: all parents with >=5 eligible children, or one parent.
  * Default is a dry-run report; --apply writes/updates digest nodes.
  */
 export async function runDigest(args: string[]): Promise<void> {
@@ -22,7 +22,7 @@ export async function runDigest(args: string[]): Promise<void> {
     if (!apply) {
       const { build, skipped } = planDigests(db, moduleId);
       heading(
-        `  Digest plan: ${build.length} module(s) to build, ${skipped.length} skipped`
+        `  Digest plan: ${build.length} parent(s) to build, ${skipped.length} skipped`
       );
       for (const b of build) {
         console.log(

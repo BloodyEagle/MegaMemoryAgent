@@ -181,7 +181,7 @@ export function digestSourceChildren(
   });
 }
 
-/** Build or refresh the digest of one module. */
+/** Build or refresh the digest of one parent. */
 export async function buildDigest(
   db: KnowledgeDB,
   moduleId: string,
@@ -271,7 +271,7 @@ export async function buildDigest(
   return { moduleId, digestId: targetId, created, children: children.length };
 }
 
-/** Modules eligible for a digest: id + active non-digest child count. */
+/** Parents eligible for a digest: id + active non-digest child count. */
 function scanDigestCandidates(
   db: KnowledgeDB,
   moduleId?: string
@@ -323,7 +323,7 @@ export function planDigests(
 }
 
 /**
- * Rebuild digests for all modules with enough children, or just one module.
+ * Rebuild digests for all parents with enough eligible children, or just one parent.
  */
 export async function rebuildDigests(
   db: KnowledgeDB,

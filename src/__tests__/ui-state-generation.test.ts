@@ -35,7 +35,7 @@ describe("E08 authoritative search", () => {
       ui.dispatch(ui.element("#search"), "keydown", { key: "Enter" });
       await ui.settle();
       expect(ui.element("#search-results").querySelectorAll(".search-result")).toHaveLength(0);
-      expect(ui.element("#search-results").textContent).toContain("No semantic matches");
+      expect(ui.element("#search-results").textContent).toContain("No matches found");
     } finally { ui.close(); }
   });
   it("HTTP503 fallback keeps current qualification visible and excludes abandoned/expired", async () => {
@@ -92,7 +92,7 @@ describe("E04/E06 preview generations", () => {
       await ui.settle();
       ui.dispatch(ui.element('[data-action="consolidate-merge"]'), "click");
       expect(ui.element("#consolidate-preview").textContent).toContain("Final confirmation");
-      expect(ui.evaluate<string>("ccState.plan.data.base.digest")).toBe("c".repeat(64));
+      expect(ui.evaluate<string>("ccState.bundle.data.base.digest")).toBe("c".repeat(64));
     } finally { plans.forEach(p => p.resolve({ body: plan("a", "b") })); ui.close(); }
   });
   it("closed preview cannot launch a plan against a different newly opened pair", async () => {
@@ -108,7 +108,12 @@ describe("E04/E06 preview generations", () => {
       old.resolve({ body: graphNode("a") });
       await ui.settle();
       expect(ui.element("#consolidate-preview").textContent).toContain("Fixture c");
-      expect(ui.requests.filter(r => r.url.includes("/consolidate/preview?")).map(r => r.url)).toEqual(["/api/consolidate/preview?survivor=c&other=d"]);
+      expect(ui.requests.filter(r => r.url.includes("/consolidate/preview?")).map(r => r.url)).toEqual([
+        // open(a,b) sends its bundle immediately, before the panel is closed.
+        "/api/consolidate/preview?survivor=a&other=b",
+        // open(c,d) sends one bundle; choosing its matching implicit A side reuses it.
+        "/api/consolidate/preview?survivor=c&other=d",
+      ]);
     } finally { old.resolve({ body: graphNode("a") }); ui.close(); }
   });
   it("invalid merge response is an error, never successful apply", async () => {
@@ -128,10 +133,9 @@ describe("E04/E06 preview generations", () => {
   });
   it("invalidation during refresh keeps stale until a subsequent coherent refresh", async () => {
     let delayed = false;
-    const card = deferred<{ body: unknown }>();
+    const preview = deferred<{ body: unknown }>();
     const ui = await p14Dom({ reply: r => {
-      if (r.url === "/api/node/a" && delayed) return card.promise;
-      if (/^\/api\/node\/[ab]$/.test(r.url)) return { body: graphNode(r.url.endsWith("a") ? "a" : "b") };
+      if (r.url.startsWith("/api/consolidate/preview?") && delayed) return preview.promise;
       if (r.url.startsWith("/api/consolidate/preview?")) return { body: plan("a", "b") };
     } });
     try {
@@ -145,14 +149,14 @@ describe("E04/E06 preview generations", () => {
       ui.dispatch(ui.element('[data-action="consolidate-retry"]'), "click");
       await tick();
       ui.sse({ type: "node_updated", data: { id: "a", summary: "changed" } });
-      card.resolve({ body: graphNode("a") });
+      preview.resolve({ body: plan("a", "b") });
       await ui.settle();
       expect(ui.element("#consolidate-preview").textContent).toContain("preview stale");
       delayed = false;
       ui.dispatch(ui.element('[data-action="consolidate-retry"]'), "click");
       await ui.settle();
       expect(ui.element("#consolidate-preview").textContent).not.toContain("preview stale");
-    } finally { card.resolve({ body: graphNode("a") }); ui.close(); }
+    } finally { preview.resolve({ body: plan("a", "b") }); ui.close(); }
   });
 });
 

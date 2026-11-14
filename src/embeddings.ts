@@ -7,7 +7,8 @@ import { CURRENT_EMBED_MODEL } from "./embed-model.js";
  * (single source of truth lives in embed-model.ts). The fork default is
  * multilingual (trained on 100+ languages); all-MiniLM-L6-v2 stays
  * available for Latin-only projects or offline machines that already
- * downloaded it. ~120 MB is downloaded once and cached in ~/.cache/huggingface.
+ * downloaded it. ~120 MB is downloaded once and cached in Transformers.js's
+ * configured filesystem cache.
  */
 export const MODEL_NAME = CURRENT_EMBED_MODEL;
 

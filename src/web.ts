@@ -44,8 +44,8 @@ function resolveHtmlPath(): string {
 }
 
 /**
- * U3 metrics plus 2.1.9 F1 `d3_source` (local / cdn / env) — the explorer
- * header chip shows where the page's d3 came from, same data as doctor.
+ * U3 metrics plus 2.1.9 F1 `d3_source` (local / cdn / env), also reported by
+ * doctor. The explorer's health panel consumes the health metrics below.
  */
 export function healthPayload(db: KnowledgeDB): HealthReport & { d3_source: D3Source } {
   return { ...healthReport(db), d3_source: d3Source() };
@@ -1056,7 +1056,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     }
 
     if (pathname === "/api/health" && req.method === "GET") {
-      // U3: same metrics the CLI doctor prints, for the explorer header chip.
+      // U3: health metrics for the explorer chip/panel; payload also reports d3_source.
       json(res, healthPayload(db));
       return;
     }

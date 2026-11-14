@@ -3043,8 +3043,9 @@ export class KnowledgeDB {
         result = { taken: false, noop: true, previous_node: previous };
         return;
       }
-      // The old holder is demoted with a supersedes edge — only while it is
-      // still alive; a removed holder keeps no active edge to bury.
+      // Preserve a handoff edge from the new holder to the old one while the
+      // old node is still alive. The slot pointer moves, but the old node's
+      // lifecycle/status is deliberately unchanged.
       if (previous !== null && this.nodeExists(previous)) {
         this.insertEdge({
           from_id: nodeId,

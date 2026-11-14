@@ -54,7 +54,7 @@ function printReport(
     info(`reembed required: run ${pc.cyan("megamemory reembed")}`);
   }
   if (report.digestPending > 0) {
-    info(`digest pending for ${report.digestPending} module(s)`);
+    info(`digest pending for ${report.digestPending} parent group(s)`);
   }
 }
 

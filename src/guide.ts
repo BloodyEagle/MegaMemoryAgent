@@ -39,25 +39,24 @@ You have access to a project knowledge graph via the \`megamemory\` MCP server a
 
 **Workflow: understand → work → update**
 
-1. **Session start:** You must call \`megamemory\` with action \`overview\` (or \`megamemory:list_roots\` directly) before you begin work.
-2. **Before each task:** You must call \`megamemory\` with action \`query\` (or \`megamemory:understand\` directly) before reading source files for project understanding. The answer ends with a \`next\` block — follow relevant instructions: read \`must_read\` refs before editing, run \`followups\` as written (args are ready), record per \`record\` after the change. File refs and brief text do not prove whole-file coverage; \`skip\` does not replace checking current code.
+1. **Session start:** You must call \`megamemory\` with action \`overview\` (or \`megamemory:list_roots\` directly) before you begin work. Its \`roots_compact\` index carries \`child_count\`, not children; also inspect slots, board, meta/stats and staleness fields.
+2. **Before each task:** You must call \`megamemory\` with action \`query\` (or \`megamemory:understand\` directly) before reading source files for project understanding. \`compact\` is default, \`full\` is verbose, \`brief\` is ≤8 lines without cards. Every mode ends with \`next\`: read every \`must_read\`, run every \`followup\` exactly, then follow \`record\`. \`skip\` is empty; refs/summaries never prove coverage.
 3. **After each task:** You must call \`megamemory\` with action \`record\` to create/update/link concepts for what you built.
 
-Be specific in summaries: parameter names, defaults, file locations, rationale. One idea — one node; update an existing node instead of creating a near-duplicate; when a decision dies, mark it superseded — do not delete. Keep concepts max 3 levels deep.
+Be specific in summaries: parameters, defaults, files, rationale. One idea — one node; update instead of duplicating. Replacement = new \`create_concept\` with \`supersedes: [old_id]\`; disproved = \`update_concept\` → \`refuted\`; \`remove_concept\` = truly gone and no longer needed. Max 3 levels.
 
 Good node: \`auth-token-refresh\` (decision) — "Silent refresh 30 s before token expiry, because 401s on /expired broke long jobs; lives in src/auth/refresh.ts."
 Bad node: \`auth\` — "Everything about auth." — a vague label no query can retrieve.
 
-4. **Budget:** \`understand\` is compact by default and bounded by \`max_tokens\` (1500).
-   Use \`mode:"full"\` only when you need \`why\` and full children/edges; \`mode:"brief"\` gives a ≤8-line orientation plus \`next\`, no cards. All modes honor the wire budget; an impossible required envelope is refused.
-5. **Freshness:** when a decision replaces an older one, pass \`supersedes: [old_id]\` to
+4. **Budget:** \`max_tokens\` bounds actual MCP content: retrieval, mandatory \`next\`, and wrapper staleness fields (\`instructions_stale\`/\`instructions_version\`/\`server_version\`) — not initialize-level instructions. Too-small required envelopes are refused.
+5. **Startup shape:** \`list_roots\` has \`roots_compact\` (\`child_count\`/\`valid_until\`), \`slots\`, \`board_top\`, optional \`hint\`, \`meta\` truncation/drop fields, \`stats\`, and wrapper staleness fields; legacy \`roots\` is empty. Check \`meta.truncated\`.
+6. **Freshness:** when a decision replaces an older one, pass \`supersedes: [old_id]\` to
    \`create_concept\` instead of deleting. If a search finds nothing, retry with
    \`include_inactive: true\` — the concept may be marked superseded.
-6. **Digests:** \`digest\` nodes are per-module summaries rebuilt from children. Read the digest
-   first, children second. Never create digests by hand.
-7. **After changing the embedding model:** run \`megamemory reembed\`. Until it finishes, vector
-   search is off and results are FTS-only.
-8. **Supports:** for a decision/solution pass \`evidence: [{node | ref, why}]\` in the same call
+7. **Digests:** \`digest\` nodes summarize any parent with 5+ eligible children. Read the digest first,
+   source siblings second; generation is automatic/CLI, while manual digest is compatibility-only.
+8. **Embedding model changed?** Run \`megamemory reembed\`: vector search starts with the first valid current-generation row; FTS covers nodes not published yet.
+9. **Supports:** for a decision/solution pass \`evidence: [{node | ref, why}]\` in the same call
    that creates it; \`why\` names what exactly in the support backs the conclusion — not a
    retelling. A support on a file is a ref — \`evidence: [{ref: "src/x.ts:120-180", why}]\` — not
    a new node: create a support node only for a thought a link cannot express. The ref creates
@@ -67,7 +66,8 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
    A git object is a ref too: \`evidence: [{ref: "git:tag:v2.1.11", why}]\` (also \`git:commit:<sha>\`,
    \`git:branch:<name>\`) — the anchor resolves to a commit sha with LOCAL git; a moved tag flips
    \`check_artifacts\` to \`changed\`.
-9. **Confirm versions:** after reading a support, confirm it: \`confirm_supports(decision_id,
+   Relations (full enum): \`connects_to | depends_on | implements | calls | configured_by | supersedes | contradicts | informed_by\`; \`informed_by\` requires a rationale saying what in the target supports the source.
+10. **Confirm versions:** after reading a support, confirm it: \`confirm_supports(decision_id,
    expected_claim_digest, items:[{support_id, expected_claim_digest, expected_status_digest,
    expected_edge_digest}])\` — the decision's digest is \`get_concept.current_digests.claim\`, the
    supports' digests travel in \`provenance_trace.supports[]\` — never computed by hand, and
@@ -76,15 +76,15 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
    artifacts; \`unchanged\` compares observations against the confirmed snapshot);
    \`changed\` = diverged (see \`reasons\`); \`unknown\` = never checked; \`incomplete\` = the check hit
    its budget. \`unknown\` and \`incomplete\` are NOT "all good". On \`changed\`: re-read the support,
-   confirm again, or mark the decision \`refuted\`/\`superseded\` via \`update\` — never leave it
-   hanging. \`truncated_by: depth|nodes|scan\` in a trace means the traversal was partial — never
-   conclude "no more supports exist".
-10. **Stale instructions:** if \`list_roots\`/\`understand\` returns \`instructions_stale: true\`, run
+   confirm again, or mark the decision \`refuted\` via \`update_concept\` / replace it via
+   \`create_concept.supersedes\` — never leave it hanging. \`truncated_by: depth|nodes|scan\` in a
+   trace means the traversal was partial — never conclude "no more supports exist".
+11. **Stale instructions:** if \`list_roots\`/\`understand\` returns \`instructions_stale: true\`, run
     \`megamemory install\` (it refreshes this block) and treat in-project instructions as possibly outdated.
-11. **Asked "does this memory help?"** — don't argue, measure: \`megamemory bench\`
+12. **Asked "does this memory help?"** — don't argue, measure: \`megamemory bench\`
     (\`--baseline files\` vs reading files, \`te\` vs an external structural tool, \`both\`).
     Read \`ratio\` together with \`hit_rate\`: a cheap but wrong answer is not savings.
-12. **State claims expire:** a statement about the world AS IT WAS ("merged", "PR open",
+13. **State claims expire:** a statement about the world AS IT WAS ("merged", "PR open",
     "release shipped") MUST carry \`valid_until\` (ISO date) — it drops out of answers after
     that date (\`include_stale: true\` returns it marked \`expired\`). Architecture and
     conventions stay dateless; the server never invents an expiry for you. A state-claim
@@ -105,17 +105,18 @@ export const SESSION_EXAMPLE = `
 list_roots()
   -> 4 roots: build-pipeline, catalog-import, auth-model, ci-cache
 # 2. Before the task: query the graph instead of reading the repo
-understand("how does catalog import resolve module paths")
-  -> compact: catalog-import-entry (0.83), catalog-path-resolution (0.76)
-  -> support_check on catalog-import-entry: changed -> re-read that support first
-# 3. Record the decision WITH its evidence, in the same call
+understand("how does catalog import resolve module paths") -> compact: catalog-import-entry (0.83), catalog-path-resolution (0.76)
+  -> next.must_read: read src/catalog/import.ts before editing
+# 3. Read exact card: get_concept("catalog-import-entry") # support_check lives here, not in understand
+  -> support_check: changed -> re-read that support first
+# 4. Record the decision WITH its evidence, in the same call
 create_concept(
   name: "catalog-import-cache", kind: "decision",
   summary: "Import cache keyed by (path, mtime); invalidated on tsconfig change.",
   evidence: [{ node: "catalog-import-entry",
                why: "its loader graph is exactly what the cache wraps" }])
   -> created catalog-import-cache, informed_by -> catalog-import-entry
-# 4. Confirm the versions you actually read (digests from the responses)
+# 5. Confirm the versions you actually read (digests from the responses)
 confirm_supports("catalog-import-cache", expected_claim_digest,
   items: [{ support_id: "catalog-import-entry", expected_claim_digest,
             expected_status_digest, expected_edge_digest }])
@@ -144,7 +145,8 @@ graph saves orientation time — three baselines, one flag:
 shell → global shell; \`te_used_preset\` is not live. Shell templates are trusted advanced
 input (Windows expansion is lossy). Graph path needs \`from\` and \`to\`, not a question.
 \`graph_metric=retrieval_wire_without_instructions\` estimates the MCP content wrapper
-around retrieval, including \`next\`, but excludes MCP instructions metadata. It is not
+around retrieval, including \`next\`, but excludes the wrapper staleness fields
+\`instructions_stale\`, \`instructions_version\`, and \`server_version\`. It is not
 exactly the default MCP response or whole-task cost; \`economy_status=not_measured\`.
 Use dataset \`expected_outcome\`, \`expect_nodes\`, \`quality_contract\` and TE oracles:
 only complete correct live results enter \`quality_ratio_te\`; raw ratios are separate.
@@ -170,11 +172,17 @@ const READONLY_SECTION = `
 ## Read-only commands
 
 \`megamemory export\`, \`eval\` and \`conflicts\` open the database READ-ONLY: they never
-write, never migrate, and leave the file byte-identical (so does the scripted
-\`stats --funnel --json\` snapshot and \`migrate --dry-run\`). On an outdated schema
-they fail with a ready-made fix — \`megamemory migrate --apply --db "<path>"\` —
-instead of migrating silently. \`MEGAMEMORY_ALLOW_AUTO_MIGRATE=1\` restores the old
-in-place migration for one invocation.
+write, never migrate, and leave the file byte-identical (so do the scripted
+\`stats --funnel --json\` snapshot, \`expire\` without \`--apply\`, \`repair-ids --dry-run\`,
+and \`migrate --dry-run\`). Expire dry-run reads the original directly; repair/migrate
+compute their plans on a coherent temporary snapshot and fingerprint the original before/after,
+so a concurrent change is reported instead of claiming “nothing written”. On an outdated schema
+the direct read-only commands fail with a ready-made fix —
+\`megamemory migrate --apply --db "<path>"\` — instead of migrating silently.
+
+\`MEGAMEMORY_ALLOW_AUTO_MIGRATE=1\` is an escape hatch only for \`export\`, \`eval\`, and
+\`conflicts\`: it restores their old read-write open and possible auto-migration for one
+invocation. It does not change expire dry-run or the repair/migrate snapshot semantics.
 
 \`stats\`, \`bench\` and \`doctor\` still open the database for writing, on purpose:
 the read paths of \`stats\`/\`bench\` record usage telemetry, \`stats --prune\` writes

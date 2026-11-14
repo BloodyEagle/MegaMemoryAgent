@@ -13,15 +13,24 @@ import * as types from "../types.js";
 function publicCreateSchema() {
   const source = fs.readFileSync(new URL("../index.ts", import.meta.url), "utf8");
   const ast = ts.createSourceFile("index.ts", source, ts.ScriptTarget.Latest, true);
-  let kindExpression = "", createExpression = "";
+  let kindExpression = "", expectExpression = "", whyExpression = "", itemExpression = "", createExpression = "";
   function visit(node: ts.Node) {
-    if (ts.isVariableDeclaration(node) && node.name.getText(ast) === "NodeKindEnum") kindExpression = node.initializer!.getText(ast);
+    if (ts.isVariableDeclaration(node)) {
+      const name = node.name.getText(ast);
+      if (name === "NodeKindEnum") kindExpression = node.initializer!.getText(ast);
+      if (name === "EvidenceExpectSchema") expectExpression = node.initializer!.getText(ast);
+      if (name === "EvidenceWhySchema") whyExpression = node.initializer!.getText(ast);
+      if (name === "EvidenceItemSchema") itemExpression = node.initializer!.getText(ast);
+    }
     if (ts.isCallExpression(node) && node.expression.getText(ast) === "server.tool" && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === "create_concept") createExpression = node.arguments[2].getText(ast);
     ts.forEachChild(node, visit);
   }
   visit(ast);
   const NodeKindEnum = vm.runInNewContext(kindExpression, { z, ...types });
-  return z.object(vm.runInNewContext(`(${createExpression})`, { z, NodeKindEnum, RelationEnum: z.enum(["connects_to", "informed_by"]) }));
+  const EvidenceExpectSchema = vm.runInNewContext(expectExpression, { z });
+  const EvidenceWhySchema = vm.runInNewContext(whyExpression, { z });
+  const EvidenceItemSchema = vm.runInNewContext(itemExpression, { z, EvidenceExpectSchema, EvidenceWhySchema });
+  return z.object(vm.runInNewContext(`(${createExpression})`, { z, NodeKindEnum, RelationEnum: z.enum(["connects_to", "informed_by"]), EvidenceItemSchema }));
 }
 
 describe("I-01 generated record schema roundtrip", () => {

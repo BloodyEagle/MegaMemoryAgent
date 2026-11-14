@@ -102,23 +102,34 @@ export interface CreateConceptInput {
   valid_until?: string;
 }
 
-/** Plan 3 §4.1.1: one evidence item — exactly one of `ref` / `node`, plus `why`. */
-export interface EvidenceInput {
-  /** File path (+ optional line range) to resolve or create as a file-fact node. */
-  ref?: string;
-  /** Existing node id to lean on. */
-  node?: string;
-  /** Mandatory: what exactly in this support backs the new node. */
-  why: string;
-  expect?: {
-    claim_digest?: string;
-    status_digest?: string;
-    edge_key?: string;
-    edge_digest?: string;
-    artifacts_digest?: string | null;
-    artifact_rows?: Array<{ kind: string; ref: string; digest: string | null; repo_path: string | null }>;
-  };
+/** Plan 3 §4.1.1: one evidence item — exactly one of `ref` / `node`, plus a non-empty `why`. */
+interface EvidenceExpectation {
+  /** Version of a reused support's summary as the agent read it. */
+  claim_digest?: string;
+  /** Version of a reused support's status axes as the agent read them. */
+  status_digest?: string;
+  /** Combined active artifact-observation digest as the agent read it. */
+  artifacts_digest?: string | null;
 }
+
+interface EvidenceBase {
+  /** Mandatory and non-empty on the public wire. */
+  why: string;
+  /** Only versions createConcept actually validates. */
+  expect?: EvidenceExpectation;
+}
+
+export type EvidenceInput =
+  | (EvidenceBase & {
+      /** File path (+ optional line range) to resolve or create as a file-fact node. */
+      ref: string;
+      node?: never;
+    })
+  | (EvidenceBase & {
+      ref?: never;
+      /** Existing node id to lean on. */
+      node: string;
+    });
 
 export interface UpdateConceptInput {
   id: string;
@@ -731,6 +742,7 @@ export interface ListConflictsOutput {
 
 export interface ResolveConflictInput {
   merge_group: string;
+  /** Required on the wire; ignored when the group contains edge conflicts only. */
   resolved: {
     summary: string;
     why?: string;
@@ -738,8 +750,8 @@ export interface ResolveConflictInput {
   };
   reason: string;
   /**
-   * F-03.1 (план 03): какой вариант выживает при «keep left/right» из CLI.
-   * MCP-вызов не задаёт его — базой становится первая живая копия группы.
+   * F-03.1 (план 03): verified left/right source selection. CLI uses it for
+   * keep left/right; MCP exposes it and requires it for edge-only groups.
    */
   prefer?: "left" | "right";
 }
@@ -781,7 +793,7 @@ export interface ProvenanceTraceInput {
   node_id: string;
   /** ancestry = what supports this; impact = what relies on this. */
   direction?: "ancestry" | "impact";
-  /** Traversal depth cap (default 6, plan 3 §10 decision 4). */
+  /** Traversal depth cap, 0–20 (default 6); 0 returns only the root. */
   depth?: number;
   /** Node cap (default 200); the root does not occupy a slot. */
   max_nodes?: number;
@@ -935,11 +947,7 @@ export interface NodeArtifactRow {
   changed_at: string | null;
   /** 'agent' | 'cli'. */
   checked_by: string;
-  /**
-   * 2.1.12 F2: репозиторий, в котором git:-ref резолвился в первый раз.
-   * Записывается при разрешении, чтобы повторные проверки не зависели от
-   * cwd сервера. Для file/git_blob всегда null.
-   */
+  /** Repository root persisted for every artifact kind once it is resolved. */
   repo_path?: string | null;
 }
 
@@ -948,13 +956,18 @@ export interface CheckArtifactsInput {
   node_ids: string[];
   /** Cap on checked (node, ref) pairs; more => truncated: true. Default 50. */
   max_files?: number;
-  /** Base dir for relative refs and the git working tree (default cwd). */
+  /**
+   * Internal API override for relative file/git-blob refs. Resolution order is
+   * explicit cwd → persisted repo_path pin → process cwd. The public MCP tool
+   * does not expose a per-call cwd.
+   */
   cwd?: string;
   /**
-   * 2.1.12 F2: репозиторий для разрешения git:tag/commit/branch (по
-   * умолчанию — каталог базы). При первом разрешении путь пишется в
-   * node_artifacts.repo_path, последующие проверки идут в него даже из
-   * другого cwd.
+   * Internal API/startup repository for git:tag/commit/branch. The public MCP
+   * call passes startup `--repo` (default: database directory) as an explicit
+   * repository on every check, so it takes precedence over a persisted pin.
+   * Direct callers that omit repo fall back to the persisted pin, then the
+   * database directory.
    */
   repo?: string;
 }
@@ -1046,8 +1059,9 @@ export interface SupportHistoryPair {
 
 export interface ProvenanceHistoryOutput {
   decision_id: string;
+  /** Up to 50 pairs when support_id is omitted; one pair when it is supplied. */
   pairs: SupportHistoryPair[];
-  /** true when more pairs carry history than fit the response. */
+  /** true when more than 50 pairs carry history and the remainder was omitted. */
   pairs_truncated?: boolean;
 }
 
@@ -1125,12 +1139,11 @@ export interface ConfirmSupportsItem {
   /** The support's summary digest as the agent read it. */
   expected_claim_digest: string;
   /**
-   * The support's status-axes digest as the agent read it. plan-4-fixes-6 F3:
-   * mandatory in practice — a confirmation without it (or with a stale one)
-   * is refused with version_conflict; an agent must never confirm a status
-   * it has not seen.
+   * The support's status-axes digest as the agent read it. Mandatory: a
+   * confirmation with a stale value is refused with version_conflict; an
+   * agent must never confirm a status it has not seen.
    */
-  expected_status_digest?: string;
+  expected_status_digest: string;
   /** The rationale digest as the agent read it. */
   expected_edge_digest: string;
   expected_edge_key?: string;
@@ -1283,12 +1296,11 @@ export interface ProvenanceTraceOutput {
    */
   current_digests?: CurrentDigestsView | null;
   /**
-   * 2.1.7 F1: the root's live supports with their FULL current digests —
-   * what confirm_supports items[] expects, no previews and no hand hashing.
-   * Sorted by support_id; capped like the other digest lists, the honest
-   * total travels in supports_count when the cap cut anything.
+   * Live root supports with full digests, sorted by support_id and capped at
+   * 50. When capped, supports_count carries the total live-support count.
    */
   supports?: ProvenanceSupportDigest[];
+  /** Total live-support count; present when `supports` was capped at 50. */
   supports_count?: number;
   /**
    * plan-4-fixes-6 F11: inner (non-root) nodes of any kind whose own support

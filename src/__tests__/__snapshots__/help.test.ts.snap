@@ -4,61 +4,84 @@ exports[`buildHelp — --db как глобальная опция (2.1.4) > с�
 "megamemory v2.1.4 — persistent project knowledge graph for coding agents
 
 Commands:
-  (no command)    Start the MCP stdio server (invoked by your editor)
-  install         Configure editor/agent integration (interactive)
-  serve           Start the web graph explorer — loopback only (--db PATH; --host 127.0.0.1|::1)
-                Local interface for a human, not a network service: it listens on 127.0.0.1, cross-origin and foreign-Host requests are refused (earlier releases listened on all interfaces — behavior changed).
-  stats           Show knowledge graph statistics (--prune trims the call journal; --db PATH)
-  merge           Merge two knowledge.db files
-  conflicts       List unresolved merge conflicts (--db PATH)
-  resolve         Resolve a merge conflict (--db PATH)
-  repair-ids      Fix legacy empty/trailing-slash node ids (default: dry-run; --db PATH)
-  migrate         Upgrade an upstream v1.6.2 database to the fork schema (default: dry-run; --db PATH)
-  reembed         Reindex node embeddings with the current model (--batch N; --db PATH)
-  consolidate     Find and merge near-duplicate nodes (default: dry-run; --db PATH)
-  digest          Rebuild module digest nodes (default: dry-run; --db PATH)
-  export --md <dir> Export the graph to markdown files (--check for CI; --db PATH)
-  doctor          Health check of the current database (exit 1 on problems; --db PATH)
-  eval            Measure search recall@k on the eval set (fixtures/eval.jsonl; --db PATH)
-  guide           Print the agent onboarding text (the same constant install writes to AGENTS.md)
-  bench           Measure orientation savings: graph vs baseline in tokens (--baseline files|te|both; hit_rate@1 next to hit_rate; --db PATH)
-  expire          Set valid_until on journal/state-claim nodes (default: dry-run; --ids a,b | --report FILE; --until DATE|past; --apply; --db PATH)
+  (no command)    Start the MCP stdio server (invoked by your editor; global database/repository options apply)
+  install         Configure integrations [--target NAME[,NAME...]]; default: interactive
+  serve           Start the loopback-only web explorer [--port PORT] [--host HOST]; --db PATH
+  stats           Show graph statistics [--prune] [--funnel] [--json]; --db PATH
+  merge           Merge databases <FILE1> <FILE2> [--into FILE] [--left-label NAME] [--right-label NAME]
+  conflicts       List unresolved merge conflicts [--json]; --db PATH
+  resolve         Resolve a merge conflict <GROUP_ID> --keep left|right|both; --db PATH
+  repair-ids      Fix legacy empty/trailing-slash node ids [--dry-run|--apply]; default: dry-run; --db PATH
+  migrate         Upgrade an upstream v1.6.2 database [--dry-run|--apply]; default: dry-run; --db PATH
+  reembed         Reindex node embeddings [--batch N]; default: 16; --db PATH
+  consolidate     Find and merge near-duplicate nodes [--threshold RATIO] [--limit N] [--dry-run|--apply]; --db PATH
+  digest          Rebuild derived digest nodes [--module ID] [--apply]; default: dry-run; --db PATH
+  export          Export graph nodes to Markdown --md DIR [--check]; --db PATH
+  doctor          Run database health checks (RW open; may migrate; exit 1 on problems; --db PATH)
+  eval            Measure search recall@k [--file FILE] [--k N] [--min RATIO]; --db PATH
+  guide           Print agent onboarding and worked-session guidance
+  bench           Measure graph orientation cost against files/TE --questions FILE [options]; --db PATH
+  expire          Set valid_until on selected nodes (--ids IDS|--report FILE) --until DATE|past [--apply]; --db PATH
 
-Options:
-  --target NAME    Install target (opencode, claudecode, antigravity, codex)
-  --port PORT     Port for the web explorer (default: 4321)
-  --host HOST     Address for the web explorer (127.0.0.1 by default, ::1 for IPv6; wildcard is not accepted)
-  --into FILE     Output path for merge (default: overwrites file1)
-  --left-label    Label for left side in merge (default: left)
-  --right-label   Label for right side in merge (default: right)
-  --keep          Resolution strategy: left, right, or both
-  --json          Machine-readable output for conflicts
-  --questions FILE  bench: jsonl with questions ({"id","query","expect_nodes"?})
-  --baseline      bench: what the graph is measured against (files | te | both; default files)
-  --te-exec PROG  bench: structured te runner, literal argv without a shell;
-                the query goes where an --te-arg contains {query} (default arg: {query})
-  --te-cmd CMD    bench: trusted shell template for te/both, {query} is substituted —
-                the string is parsed by cmd.exe/sh, so %VARS% and quotes are shell semantics
-  --file-limit KB bench: files over the limit are counted by size (default 200)
-  --ref-root PATH  bench: extra root for relative file_refs, repeatable (first hit wins; try git root, then cwd)
-  --files-top N   bench: files baseline over the first N unique files in output order (default 0 = all; 3 is the honest live-agent number)
-  --db PATH       Path to knowledge.db for every command that opens the
-                database (sources: --db, MEGAMEMORY_DB_PATH, ./.megamemory/knowledge.db)
-  --repo PATH     Repository for resolving git:tag/commit/branch supports
-                (MCP server; --repo=PATH is equivalent; default: the database directory, pinned per ref on first use)
+Global and MCP options:
+  --db PATH       Path to knowledge.db (--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)
+  --repo PATH     MCP startup repository for git:tag/commit/branch refs
+                (--repo=PATH also accepted; default: database directory; repins git refs for this server)
   --help, -h      Show this help
   --version, -v   Show version
 
+Command options:
+  --target NAME[,NAME...]  install target(s), repeatable
+                (opencode | claudecode | antigravity | codex; absent: interactive selection)
+  --port PORT     serve port (default: 4321)
+  --host HOST     serve address (default: 127.0.0.1; allowed: 127.0.0.1 or ::1)
+  --prune         stats: apply timeline retention cleanup before reporting
+  --funnel        stats: append the understand → follow-up → write funnel
+  --json          stats --funnel: JSON-only without --prune; conflicts: machine-readable output
+  --into FILE     merge output (default: overwrite FILE1 via a temporary file)
+  --left-label NAME  merge source label (default: left)
+  --right-label NAME merge source label (default: right)
+  --keep SIDE     resolve strategy (required: left | right | both)
+  --dry-run       repair-ids/migrate/consolidate: report without writing (default)
+  --apply         repair-ids/migrate/consolidate: write changes; digest: build; expire: set dates
+  --batch N       reembed batch size (leading positive base-10 integer; default: 16)
+  --threshold RATIO consolidate cosine threshold (0..1; default: 0.95)
+  --limit N       consolidate global output/apply pair cap (positive integer; default: 100; large groups also cap 50 pairs per node)
+  --module ID     digest one parent id (default: every parent with at least 5 eligible children)
+  --md DIR        export destination (required)
+  --check         export: compare DIR with the current render and exit 1 on drift
+  --file FILE     eval JSONL set (default: fixtures/eval.jsonl)
+  --k N           eval recall cutoff (positive integer; default: 10)
+  --min RATIO     eval pass threshold (0..1; default: 0.8)
+
+Bench options:
+  --questions FILE  JSONL questions (required; {"id"?,"query","expect_nodes"?,...})
+  --baseline MODE baseline (files | te | both; default: files)
+  --te-exec PROG  structured runner executable, spawned without a shell
+  --te-arg ARG    structured runner argument, repeatable; one argument must contain {query}
+                (requires --te-exec; default argv when omitted: {query})
+  --te-cmd CMD    trusted shell template containing {query}; mutually exclusive with --te-exec
+                (parsed by cmd.exe/sh, so shell quoting and environment expansion apply)
+  --file-limit KB files over this size are token-estimated (default: 200)
+  --ref-root PATH  extra root for relative file_refs, repeatable
+                (first hit wins; order: question roots, --ref-root, git root, cwd)
+  --files-top N   files baseline over the first N unique output files
+                (default: 0 = all; 3 approximates a live agent; compare hit_rate@1 with hit_rate)
+
+Expire options:
+  --ids IDS       comma-separated node ids (mutually exclusive with --report)
+  --report FILE   JSON report; use candidates whose expire field is true
+  --until DATE|past parseable expiry date or yesterday (required)
+  --apply         write expiry dates (default: dry-run)
+
 Examples:
-  $ megamemory install                                   Interactive editor integration setup
-  $ megamemory install --target claudecode              Non-interactive Claude Code setup
-  $ megamemory serve                                     Open graph explorer at http://localhost:4321
-  $ megamemory serve --port 8080                         Custom port
-  $ megamemory serve --host ::1                          IPv6 loopback (default is 127.0.0.1)
-  $ megamemory merge main.db feature.db --into merged.db Merge two knowledge DBs
-  $ megamemory conflicts                                 View unresolved conflicts
-  $ megamemory resolve <group-id> --keep left            Resolve a conflict
-  $ megamemory doctor --db /path/to/knowledge.db         Check a specific database
-  $ megamemory repair-ids --apply                        Rename broken ids after backup
-  $ megamemory expire --ids a,b --until past --apply     Expire nodes as of yesterday (dry-run without --apply)"
+  $ megamemory install --target claudecode
+  $ megamemory serve --port 8080 --host ::1
+  $ megamemory stats --funnel --json --db ./knowledge.db
+  $ megamemory merge main.db feature.db --into merged.db
+  $ megamemory resolve <group-id> --keep left
+  $ megamemory consolidate --threshold 0.95 --limit 100 --apply
+  $ megamemory eval --file fixtures/eval.jsonl --k 10 --min 0.8
+  $ megamemory bench --questions questions.jsonl --baseline files
+  $ megamemory expire --ids a,b --until past --apply"
 `;

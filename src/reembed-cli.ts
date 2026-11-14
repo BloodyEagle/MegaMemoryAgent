@@ -11,8 +11,10 @@ import { resolveDbPathOrExit } from "./db-path.js";
  * Recomputes every node embedding with the current model (default
  * multilingual-e5-small, override with MEGAMEMORY_EMBED_MODEL). Long on CPU
  * — that is why it is a separate command. Resumable: interrupted runs
- * continue from meta.reembed_cursor. Until it finishes, search works
- * without vectors (FTS/LIKE), so the graph stays usable.
+ * continue from meta.reembed_cursor. Before the first valid row is published,
+ * search works without vectors (FTS/LIKE); after that, only rows already
+ * published in the current generation are vector-searchable while FTS covers
+ * the rest.
  */
 export async function runReembed(args: string[]): Promise<void> {
   const batchFlag = args.indexOf("--batch");
@@ -31,7 +33,7 @@ export async function runReembed(args: string[]): Promise<void> {
     } else {
       const current = db.getMetaValue("embed_model") ?? "(none recorded)";
       warn(`model changed: ${current} -> ${MODEL_NAME}`);
-      info("vector search is disabled until reembed finishes");
+      info("vector search starts after the first valid row is published; FTS covers remaining nodes");
     }
 
     const result = await reembed(db, {

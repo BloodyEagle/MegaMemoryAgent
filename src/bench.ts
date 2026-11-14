@@ -666,8 +666,9 @@ function summarize(
 /**
  * Run the bench over the questions. Understand is called with top_k 10 — the
  * hit_rate contract — and the default 1500-token budget. The estimator wraps
- * retrieval as MCP content but excludes runtime instructions metadata; this is
- * not exactly the default MCP response or a whole-task cost measurement.
+ * retrieval as MCP content but excludes the wrapper staleness fields
+ * (instructions_stale, instructions_version, server_version); this is not
+ * exactly the default MCP response or a whole-task cost measurement.
  */
 export async function runBench(
   db: KnowledgeDB,
@@ -701,7 +702,7 @@ export async function runBench(
   const results: QuestionResult[] = [];
 
   for (const q of questions) {
-    // Retrieval wire estimator without the MCP instructions metadata.
+    // Retrieval wire estimator without the wrapper staleness fields.
     const t0 = performance.now();
     let graphError: string | null = null;
     let r: Awaited<ReturnType<typeof understand>>;

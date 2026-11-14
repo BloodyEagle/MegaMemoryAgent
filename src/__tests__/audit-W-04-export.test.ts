@@ -19,7 +19,7 @@ describe("W-04 — explorer export action", () => {
       ui.dispatch(ui.element("#consolidate-btn"), "click");
       await ui.settle();
       expect(ui.requests.some((request) => request.url === "/api/consolidate" && request.method === "GET")).toBe(true);
-      expect(ui.element("#stats").textContent).toContain("no duplicates found");
+      expect(ui.element("#stats").textContent).toContain("no duplicate candidates returned");
       expect(ui.errors).toEqual([]);
     } finally { ui.close(); }
   });
