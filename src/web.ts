@@ -88,6 +88,15 @@ function notFound(res: http.ServerResponse): void {
   res.end("Not found");
 }
 
+function parseHistoricalTimestamp(raw: string): string | null {
+  const text = raw.trim();
+  // Explicit full date-time only. Date.parse accepts implementation-dependent
+  // shortcuts ("0", "2020-01") that SQLite interprets differently.
+  if (!/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})?$/.test(text)) return null;
+  const millis = Date.parse(text.includes("T") || /(?:Z|[+-]\d{2}:\d{2})$/.test(text) ? text : `${text.replace(" ", "T")}Z`);
+  return Number.isFinite(millis) ? new Date(millis).toISOString() : null;
+}
+
 function parseFileRefs(raw: string | null): string[] | null {
   if (!raw) return null;
   try {
@@ -255,7 +264,11 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
   }
   let sseClients: http.ServerResponse[] = [];
   let lastKnownNodeIds = new Set<string>();
-  let lastKnownNodeUpdates = new Map<string, string>(); // id → updated_at
+  // B-03 (аудит 2026-11-12): id → fingerprint значимого состояния узла, а не
+  // updated_at — timestamp пишется с секундной точностью, и второе изменение
+  // в той же секунде детектор пропускал навсегда. Один helper строит
+  // fingerprint и для начального snapshot-а, и для каждого poll-а.
+  let lastKnownNodeStates = new Map<string, string>();
   let lastKnownEdgeKeys = new Set<string>(); // "from|to|relation"
 
   function buildGraphPayload(): {
@@ -312,6 +325,29 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
 
   function parseBooleanParam(value: string | null): boolean {
     return value === "true" || value === "1";
+  }
+
+  /** Общая карточка для /api/node/:id и участников consolidate preview. */
+  function nodeCardPayload(node: NodeRow): Record<string, unknown> {
+    const ctx = buildNodeWithContext(db, node);
+    // U4: digests expose their source concepts and staleness.
+    if (node.kind === "digest") {
+      const info = digestSourceChildren(db, node.id);
+      (ctx as unknown as Record<string, unknown>).digest_children = info.children;
+      (ctx as unknown as Record<string, unknown>).stale = info.stale;
+    }
+    // Add timestamps
+    const result: Record<string, unknown> = {
+      ...ctx,
+      created_at: node.created_at,
+      updated_at: node.updated_at,
+      created_by_task: node.created_by_task,
+    };
+    // UX-01 (план 07): карточка explorer несёт дайджесты формулировки, как
+    // get_concept, — подтверждённая версия видна при сравнении перед
+    // слиянием (те же поля планов 04, не своя структура).
+    result.current_digests = currentDigestsOf(node);
+    return result;
   }
 
   function clampInt(value: string | null, defaultValue: number, min: number, max: number): number {
@@ -554,8 +590,30 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     const edges = db.getAllEdges();
 
     lastKnownNodeIds = new Set(nodes.map((n) => n.id));
-    lastKnownNodeUpdates = new Map(nodes.map((n) => [n.id, n.updated_at]));
+    lastKnownNodeStates = new Map(nodes.map((n) => [n.id, nodeStateFingerprint(n)]));
     lastKnownEdgeKeys = new Set(edges.map((e) => `${e.from_id}|${e.to_id}|${e.relation}`));
+  }
+
+  /**
+   * B-03 (аудит 2026-11-12): стабильный fingerprint значимого состояния узла.
+   * Сериализуются только явные поля, от которых зависят граф/карточка/preview
+   * (порядок ключей фиксирован); updated_at и embedding исключены — timestamp
+   * не определяет содержимое, а embedding не читается ради каждой UI-проверки
+   * (строки getAllActiveNodes его и не содержат).
+   */
+  const SSE_NODE_STATE_FIELDS = [
+    "id", "name", "kind", "summary", "why", "file_refs", "parent_id",
+    "status", "valid_from", "valid_until", "epistemic_status", "status_scope",
+    "task_state", "due_at", "created_by_task", "created_at", "created_via",
+    "claim_digest", "claim_digest_at", "validation_claim_digest", "validation_scope_digest",
+    "merge_group", "needs_merge", "source_branch", "merge_timestamp",
+  ] as const;
+
+  function nodeStateFingerprint(node: Record<string, unknown>): string {
+    const shape = SSE_NODE_STATE_FIELDS
+      .map((field) => `${field}=${JSON.stringify(node[field] ?? null)}`)
+      .join("\n");
+    return createHash("sha256").update(shape, "utf8").digest("hex");
   }
 
   function broadcast(event: { type: string; data: unknown }): void {
@@ -576,7 +634,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       const edges = db.getAllEdges();
 
       const currentNodeIds = new Set(nodes.map((n) => n.id));
-      const currentNodeUpdates = new Map(nodes.map((n) => [n.id, n.updated_at]));
+      const currentNodeStates = new Map(nodes.map((n) => [n.id, nodeStateFingerprint(n)]));
       const currentEdgeKeys = new Set(edges.map((e) => `${e.from_id}|${e.to_id}|${e.relation}`));
 
       const nodeById = new Map(nodes.map((n) => [n.id, n]));
@@ -613,9 +671,11 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
         }
       }
 
-      for (const [id, updatedAt] of currentNodeUpdates) {
+      // B-03: сравнение по fingerprint значимого состояния — секундный
+      // updated_at больше не является условием доставки.
+      for (const [id, state] of currentNodeStates) {
         if (!lastKnownNodeIds.has(id)) continue;
-        if ((lastKnownNodeUpdates.get(id) ?? "") !== updatedAt) {
+        if ((lastKnownNodeStates.get(id) ?? "") !== state) {
           const node = nodeById.get(id);
           if (!node) continue;
           // План 06 (W-06): update несёт ВСЕ поля модели — без status и
@@ -676,7 +736,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       }
 
       lastKnownNodeIds = currentNodeIds;
-      lastKnownNodeUpdates = currentNodeUpdates;
+      lastKnownNodeStates = currentNodeStates;
       lastKnownEdgeKeys = currentEdgeKeys;
 
       if (hasChanges) {
@@ -892,10 +952,17 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     if (pathname.startsWith("/api/node/") && pathname.endsWith("/history") && req.method === "GET") {
       const raw = decodeURIComponent(pathname.slice("/api/node/".length, -"/history".length));
       const id = db.getAliasTarget(raw) ?? raw;
-      if (!db.getNode(id)) {
+      const rawAt = url.searchParams.get("at");
+      const at = rawAt === null ? null : parseHistoricalTimestamp(rawAt);
+      if (rawAt !== null && at === null) {
+        json(res, { error: "at must be a valid timestamp" }, 400);
+        return;
+      }
+      if (!(at ? db.getNodeAtTime(id, at) : db.getNode(id))) {
         json(res, { error: `Concept "${raw}" not found` }, 404);
         return;
       }
+      // Saved transitions, not reconstructed text revisions.
       json(res, { id, history: db.getStatusHistory(id, 20) });
       return;
     }
@@ -948,29 +1015,42 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     if (pathname.startsWith("/api/node/") && req.method === "GET") {
       const id = decodeURIComponent(pathname.slice("/api/node/".length));
       // Б12: resolve ids renamed by repair-ids.
-      const node = db.getNode(db.getAliasTarget(id) ?? id);
+      const resolvedId = db.getAliasTarget(id) ?? id;
+      // B-04 (аудит 2026-11-12): ?at=<timestamp> — историческое чтение,
+      // согласованное с /api/graph/at (узел существовал на момент t).
+      // Только чтение: ни usage, ни timeline не пишутся. Карточка строится
+      // от сохранённой строки — это текущее содержимое узла с честной
+      // маркировкой, не восстановленная историческая ревизия.
+      const rawAt = url.searchParams.get("at");
+      const at = rawAt === null ? null : parseHistoricalTimestamp(rawAt);
+      if (rawAt !== null && at === null) {
+        json(res, { error: "at must be a valid timestamp" }, 400);
+        return;
+      }
+      if (at) {
+        const row = db.getNodeAtTime(resolvedId, at);
+        if (!row) {
+          json(res, { error: `Concept "${id}" did not exist at ${at}` }, 404);
+          return;
+        }
+        const result = nodeCardPayload(row);
+        result.historical = true;
+        result.at = at;
+        const now = db.getNodeIncludingRemoved(resolvedId);
+        if (now?.removed_at) {
+          result.removed_now = true;
+          result.removed_at = now.removed_at;
+          result.removed_reason = now.removed_reason ?? null;
+        }
+        json(res, result);
+        return;
+      }
+      const node = db.getNode(resolvedId);
       if (!node) {
         json(res, { error: `Concept "${id}" not found` }, 404);
         return;
       }
-      const ctx = buildNodeWithContext(db, node);
-      // U4: digests expose their source concepts and staleness.
-      if (node.kind === "digest") {
-        const info = digestSourceChildren(db, node.id);
-        (ctx as unknown as Record<string, unknown>).digest_children = info.children;
-        (ctx as unknown as Record<string, unknown>).stale = info.stale;
-      }
-      // Add timestamps
-      const result = {
-        ...ctx,
-        created_at: node.created_at,
-        updated_at: node.updated_at,
-        created_by_task: node.created_by_task,
-      };
-      // UX-01 (план 07): карточка explorer несёт дайджесты формулировки, как
-      // get_concept, — подтверждённая версия видна при сравнении перед
-      // слиянием (те же поля планов 04, не своя структура).
-      result.current_digests = currentDigestsOf(node);
+      const result = nodeCardPayload(node);
       json(res, result);
       return;
     }
@@ -1001,7 +1081,18 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
         json(res, { error: "survivor and other query params are required" }, 400);
         return;
       }
-      json(res, describeConsolidation(db, survivor, other));
+      // B-02: внешний transaction удерживает один снимок до сборки обеих
+      // карточек. Иначе describeConsolidation уже завершил COMMIT, и чужой
+      // writer успевает изменить карточки при прежнем digest плана.
+      const bundle = db.runInTransaction(() => {
+        const plan = describeConsolidation(db, survivor, other);
+        const card = (id: string): Record<string, unknown> | null => {
+          const row = db.getNode(db.getAliasTarget(id) ?? id);
+          return row ? nodeCardPayload(row) : null;
+        };
+        return { ...plan, cards: { survivor: card(survivor), other: card(other) } };
+      });
+      json(res, bundle);
       return;
     }
 
@@ -1264,9 +1355,14 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     }
 
     if (pathname === "/api/graph/at" && req.method === "GET") {
-      const t = (url.searchParams.get("t") ?? "").trim();
-      if (!t) {
+      const rawT = url.searchParams.get("t");
+      if (rawT === null || rawT.trim() === "") {
         json(res, { error: "Missing required query parameter: t" }, 400);
+        return;
+      }
+      const t = parseHistoricalTimestamp(rawT);
+      if (t === null) {
+        json(res, { error: "t must be a valid timestamp" }, 400);
         return;
       }
 

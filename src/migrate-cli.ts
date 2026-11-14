@@ -70,6 +70,9 @@ function printRepairPlan(plan: ReturnType<typeof planIdRepair>): void {
   for (const entry of plan.conflicts) {
     skip(`conflict: "${entry.newId}" already exists — "${entry.oldId}" (${entry.name}) left as is`);
   }
+  if ((plan.unresolvedDescendants ?? 0) > 0) {
+    warn(`${plan.unresolvedDescendants} descendant(s) left unresolved — repair missing or conflicting parents, then rerun repair-ids.`);
+  }
   if (plan.dataLossEmptyIds > 0) {
     info(
       `data loss suspected: ${plan.dataLossEmptyIds} node(s) with empty id — only one such row could ever be stored (PK), earlier ones were lost upstream, not by this migration`
@@ -267,7 +270,11 @@ export async function runRepairIds(args: string[], deps: DryRunDeps = {}): Promi
     printRepairPlan(plan);
 
     if (plan.entries.length === 0) {
-      success("nothing to repair.");
+      if (plan.conflicts.length > 0 || (plan.unresolvedDescendants ?? 0) > 0) {
+        warn("no safe renames: unresolved ids remain; nothing written.");
+      } else {
+        success("nothing to repair.");
+      }
       return;
     }
 

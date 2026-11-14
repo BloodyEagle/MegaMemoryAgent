@@ -82,6 +82,11 @@ export function nodesAreIdentical(left: NodeRow, right: NodeRow): boolean {
     if ((left[field] ?? null) !== (right[field] ?? null)) return false;
   }
 
+  // Validation digests bind the verdict to wording and scope, not a clock.
+  // Keep divergent evidence as separate versions instead of choosing a keeper.
+  if ((left.validation_claim_digest ?? null) !== (right.validation_claim_digest ?? null)) return false;
+  if ((left.validation_scope_digest ?? null) !== (right.validation_scope_digest ?? null)) return false;
+
   return true;
 }
 
@@ -900,6 +905,11 @@ export class MergeEngine {
       // carried-over snapshot keeps pointing at the wording it confirmed.
       claim_digest: node.claim_digest ?? null,
       claim_digest_at: node.claim_digest_at ?? null,
+      // Frozen 14 (B-01): структурная привязка подтверждения едет вербатим —
+      // merge переносит факт прошлой проверки, а не выдаёт новый. summary не
+      // меняется, поэтому current/stale/unknown сохраняются как в источнике.
+      validation_claim_digest: node.validation_claim_digest ?? null,
+      validation_scope_digest: node.validation_scope_digest ?? null,
       // 2.1.10 (v12): the origin travels with the row (undefined on sources
       // without the column — honestly unknown, never incriminating).
       created_via: node.created_via ?? null,
@@ -945,6 +955,10 @@ export class MergeEngine {
       // Plan 4 (v8): confirmed wording digest travels with the row.
       claim_digest: node.claim_digest ?? null,
       claim_digest_at: node.claim_digest_at ?? null,
+      // Frozen 14 (B-01): каждый вариант конфликта несёт свою привязку
+      // подтверждения вербатим — копия не становится неподтверждённой.
+      validation_claim_digest: node.validation_claim_digest ?? null,
+      validation_scope_digest: node.validation_scope_digest ?? null,
       // Keep source origin: a conflict copy is not evidence of a new origin.
       created_via: node.created_via ?? null,
       // F-02 (S-03): состояние задачи каждого варианта едет со своей копией.
@@ -1111,39 +1125,57 @@ export class MergeEngine {
     }
 
     // История статусов: один и тот же переход на обеих сторонах не дублируется.
+    // Frozen 14 (B-01): содержание подтверждения (claim_digest/scope_digest/
+    // status_scope) едет со строкой, если источник его хранит. Дедупликация
+    // учитывает его — две проверки с разными digest не склеиваются. Источник
+    // без новых колонок честно переносится с null — ничего не достраивается.
     if (hasTable("status_history")) {
-      const historyHasField = (sourceDb.pragma("table_info(status_history)") as Array<{ name: string }>)
-        .some((c) => c.name === "field");
+      const columns = new Set(
+        (sourceDb.pragma("table_info(status_history)") as Array<{ name: string }>).map((c) => c.name)
+      );
+      const hasField = columns.has("field");
+      const select = ["node_id", "from_status", "to_status", "reason", "at"];
+      if (hasField) select.push("field");
+      for (const extra of ["claim_digest", "scope_digest", "status_scope"]) {
+        if (columns.has(extra)) select.push(extra);
+      }
       const rows = sourceDb.execSqlAll(
-        historyHasField
-          ? "SELECT node_id, from_status, to_status, reason, field, at FROM status_history"
-          : "SELECT node_id, from_status, to_status, reason, at FROM status_history"
+        `SELECT ${select.join(", ")} FROM status_history`
       ) as Array<Record<string, unknown>>;
       const seen = new Set<string>();
       for (const row of rows) {
         const nodeId = resolveNodeId(String(row.node_id));
-        const field = historyHasField ? String(row.field ?? "status") : "status";
-        const key = JSON.stringify([nodeId, row.from_status, row.to_status, row.reason, field, row.at]);
+        const field = hasField ? String(row.field ?? "status") : "status";
+        const claimDigest = columns.has("claim_digest") ? (row.claim_digest ?? null) : null;
+        const scopeDigest = columns.has("scope_digest") ? (row.scope_digest ?? null) : null;
+        const statusScope = columns.has("status_scope") ? (row.status_scope ?? null) : null;
+        const key = JSON.stringify([nodeId, row.from_status, row.to_status, row.reason, field, row.at, claimDigest, scopeDigest, statusScope]);
         if (seen.has(key)) continue;
         seen.add(key);
         const duplicate = outputDb.execSqlFirst(
-          "SELECT 1 FROM status_history WHERE node_id = ? AND from_status IS ? AND to_status = ? AND reason IS ? AND field = ? AND at = ?",
+          "SELECT 1 FROM status_history WHERE node_id = ? AND from_status IS ? AND to_status = ? AND reason IS ? AND field = ? AND at = ? AND claim_digest IS ? AND scope_digest IS ? AND status_scope IS ?",
           nodeId,
           row.from_status ?? null,
           row.to_status,
           row.reason ?? null,
           field,
-          row.at
+          row.at,
+          claimDigest,
+          scopeDigest,
+          statusScope
         );
         if (duplicate) continue;
         outputDb.execSqlRun(
-          "INSERT INTO status_history (node_id, from_status, to_status, reason, field, at) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT INTO status_history (node_id, from_status, to_status, reason, field, at, claim_digest, scope_digest, status_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
           nodeId,
           row.from_status ?? null,
           row.to_status,
           row.reason ?? null,
           field,
-          row.at
+          row.at,
+          claimDigest,
+          scopeDigest,
+          statusScope
         );
         carried++;
       }

@@ -54,7 +54,7 @@ describe("B-03 complete technical identity remap", () => {
     try {
       ensureSchema(db);
       addNode(db, "old/"); addNode(db, "support"); aggregate(db, "old/");
-      const result = applyIdRepair(db, { entries: [{ oldId: "old/", newId: "new", name: "old" }], conflicts: [], dataLossEmptyIds: 0 });
+      const result = applyIdRepair(db, { entries: [{ oldId: "old/", newId: "new", name: "old" }], conflicts: [], dataLossEmptyIds: 0, unresolvedDescendants: 0 });
       expect(result.renamed).toBe(1);
       expect(db.getAliasTarget("old/")).toBe("new");
       expect(db.getNodeArtifacts("new")).toHaveLength(1);

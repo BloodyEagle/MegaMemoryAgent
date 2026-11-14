@@ -8,10 +8,13 @@ const normalId = "normal-child";
 
 /** Консервативный план последствий (planConsolidation) для preview-reply. */
 function consolidatePlanFixture(survivor: string, other: string) {
+  // B-02 (аудит 2026-11-12): preview отвечает планом вместе с карточками
+  // участников; карточка иностранного id остаётся данными и в cards.
   return {
     survivor,
     other,
     base: { digest: "a".repeat(64), survivor_updated_at: "2026-11-07 10:00:00", other_updated_at: "2026-11-07 10:00:00" },
+    cards: { survivor: graphNode(survivor), other: graphNode(other) },
     summaryCombines: true,
     finalSummary: "combined summary",
     whySource: "survivor",

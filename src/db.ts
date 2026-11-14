@@ -504,6 +504,7 @@ export class KnowledgeDB {
   private invalidateReadiness(): void {
     this._hasStatusColumn = undefined;
     this._hasNameNormColumn = undefined;
+    this._hasTaskColumns = undefined;
     this.statusHistoryReady = false;
     this.usageReady = false;
     this.provenanceAuditReady = false;
@@ -2923,10 +2924,12 @@ export class KnowledgeDB {
   // ---- Web API query methods ----
 
   getAllActiveNodes(): Array<Omit<NodeRow, "embedding">> {
+    // Lightweight UI rows: include card/validation fields, never embeddings.
     return this.db
       .prepare(
         `SELECT id, name, kind, summary, why, file_refs, parent_id,
-                created_by_task, created_at, updated_at, removed_at, removed_reason${this.hasStatusColumn ? ", status, valid_from, valid_until" : ""}${this.hasEpistemicColumns ? ", epistemic_status, status_scope" : ""}
+                created_by_task, created_at, updated_at, removed_at, removed_reason,
+                merge_group, needs_merge, source_branch, merge_timestamp${this.hasStatusColumn ? ", status, valid_from, valid_until" : ""}${this.hasEpistemicColumns ? ", epistemic_status, status_scope" : ""}${this.hasTaskColumns ? ", task_state, due_at" : ""}${this.hasClaimColumns ? ", claim_digest, claim_digest_at" : ""}${this.hasCreatedViaColumn ? ", created_via" : ""}${this.getUserVersion() === 14 ? ", validation_claim_digest, validation_scope_digest" : ""}
          FROM nodes WHERE removed_at IS NULL ORDER BY name`
       )
       .all() as Array<Omit<NodeRow, "embedding">>;
@@ -3958,11 +3961,27 @@ export class KnowledgeDB {
     }>;
   }
 
+  /**
+   * B-04 (аудит 2026-11-12): историческое чтение одной карточки,
+   * согласованное с getNodesAtTime: узел существовал на момент @timestamp
+   * (создан до него и ещё не удалён). Только чтение — ни usage, ни timeline.
+   */
+  getNodeAtTime(id: string, timestamp: string): NodeRow | undefined {
+    return this.cleanRow(
+      this.db
+        .prepare(
+          "SELECT * FROM nodes WHERE id = @id AND julianday(created_at) <= julianday(@timestamp) " +
+          "AND (removed_at IS NULL OR julianday(removed_at) > julianday(@timestamp))"
+        )
+        .get({ id, timestamp }) as NodeRow | undefined
+    );
+  }
+
   getNodesAtTime(timestamp: string): NodeRow[] {
     const stmt = this.db.prepare(`
       SELECT * FROM nodes
-      WHERE created_at <= @timestamp
-        AND (removed_at IS NULL OR removed_at > @timestamp)
+      WHERE julianday(created_at) <= julianday(@timestamp)
+        AND (removed_at IS NULL OR julianday(removed_at) > julianday(@timestamp))
     `);
     return stmt.all({ timestamp }) as NodeRow[];
   }
@@ -3974,12 +3993,12 @@ export class KnowledgeDB {
       SELECT e.* FROM edges e
       INNER JOIN nodes nf ON e.from_id = nf.id
       INNER JOIN nodes nt ON e.to_id = nt.id
-      WHERE e.created_at <= @timestamp
-        AND (e.removed_at IS NULL OR e.removed_at > @timestamp)
-        AND nf.created_at <= @timestamp
-        AND nt.created_at <= @timestamp
-        AND (nf.removed_at IS NULL OR nf.removed_at > @timestamp)
-        AND (nt.removed_at IS NULL OR nt.removed_at > @timestamp)
+      WHERE julianday(e.created_at) <= julianday(@timestamp)
+        AND (e.removed_at IS NULL OR julianday(e.removed_at) > julianday(@timestamp))
+        AND julianday(nf.created_at) <= julianday(@timestamp)
+        AND julianday(nt.created_at) <= julianday(@timestamp)
+        AND (nf.removed_at IS NULL OR julianday(nf.removed_at) > julianday(@timestamp))
+        AND (nt.removed_at IS NULL OR julianday(nt.removed_at) > julianday(@timestamp))
     `);
     return stmt.all({ timestamp }) as EdgeRow[];
   }

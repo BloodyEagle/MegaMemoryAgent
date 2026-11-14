@@ -21,19 +21,56 @@ export interface EvalResult {
   misses: Array<{ query: string; expected_id: string; lang: string }>;
 }
 
+/**
+ * B-06 (аудит 2026-11-12): fail-closed разбор eval-набора.
+ *
+ * Политика пробелов явная: каждая строка обрезается по краям (trim); пустая
+ * после trim — пропуск, поэтому пустые строки и `//`-комментарии (в том
+ * числе с ведущими пробелами) поддерживаются как раньше. Значения полей НЕ
+ * обрезаются — запрос уходит в поиск дословно.
+ *
+ * Каждая непустая некомментарная строка обязана быть JSON-объектом с
+ * непустыми строками query и expected_id; опциональный lang, если задан, —
+ * непустая строка (по умолчанию "unknown"). Любое другое отклонение —
+ * исключение с номером строки (нумерация с 1): молчаливый пропуск неполной
+ * пары уменьшал знаменатель recall и давал ложный success quality gate.
+ */
 export function loadEvalPairs(jsonl: string): EvalPair[] {
   const pairs: EvalPair[] = [];
-  for (const line of jsonl.split("\n")) {
-    const trimmed = line.trim();
+  const lines = jsonl.split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    const lineNo = i + 1;
+    const trimmed = lines[i].trim();
     if (!trimmed || trimmed.startsWith("//")) continue;
-    const parsed = JSON.parse(trimmed) as Partial<EvalPair>;
-    if (parsed.query && parsed.expected_id) {
-      pairs.push({
-        query: parsed.query,
-        expected_id: parsed.expected_id,
-        lang: parsed.lang ?? "unknown",
-      });
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(
+        `eval: строка ${lineNo} — не разбирается как JSON: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(
+        `eval: строка ${lineNo} — ожидается JSON-объект с полями "query" и "expected_id"`
+      );
+    }
+    const obj = parsed as Record<string, unknown>;
+    if (typeof obj.query !== "string" || obj.query.trim() === "") {
+      throw new Error(`eval: строка ${lineNo} — поле "query" обязано быть непустой строкой`);
+    }
+    if (typeof obj.expected_id !== "string" || obj.expected_id.trim() === "") {
+      throw new Error(`eval: строка ${lineNo} — поле "expected_id" обязано быть непустой строкой`);
+    }
+    if (obj.lang !== undefined && (typeof obj.lang !== "string" || obj.lang.trim() === "")) {
+      throw new Error(`eval: строка ${lineNo} — поле "lang", если задано, обязано быть непустой строкой`);
+    }
+    pairs.push({
+      query: obj.query,
+      expected_id: obj.expected_id,
+      lang: obj.lang === undefined ? "unknown" : obj.lang,
+    });
   }
   return pairs;
 }

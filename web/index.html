@@ -656,6 +656,10 @@ let searchRequestId = 0;
 let evtSource = null;
 let sseConnected = false;
 let timelineMode = false;
+// B-04 (аудит 2026-11-12): момент исторического снимка (шаг timeline) —
+// null в Live-позиции; navigateTo читает карточку на этот момент (?at=).
+let timelineAt = null;
+let timelineLoading = false;
 let timelineSteps = [];
 let timelineSource = 'none';
 let timelineFetchId = 0;
@@ -689,12 +693,23 @@ const isCard = value => isObject(value) && typeof value.id === 'string' && typeo
 const isGraph = value => isObject(value) && Array.isArray(value.nodes) && value.nodes.every(isCard) && Array.isArray(value.edges);
 const isStats = value => isObject(value) && Number.isFinite(value.nodes) && Number.isFinite(value.edges);
 const isTimeline = value => isObject(value) && Array.isArray(value.entries) && value.entries.every(e => isObject(e) && typeof e.timestamp === 'string');
+// B-02 (аудит 2026-11-12): план приходит вместе с карточками участников —
+// slots cards обязательны (null честно означает «карточки нет»).
+const isCardSlot = value => value === null || isCard(value);
 const isPlan = value => isObject(value) && typeof value.survivor === 'string' && typeof value.other === 'string' && isObject(value.base) &&
   typeof value.base.digest === 'string' && /^[0-9a-f]{64}$/.test(value.base.digest) &&
-  ['refsAdded', 'edgesToMove', 'children', 'slots'].every(key => Array.isArray(value[key]));
+  ['refsAdded', 'edgesToMove', 'children', 'slots'].every(key => Array.isArray(value[key])) &&
+  isObject(value.cards) && isCardSlot(value.cards.survivor) && isCardSlot(value.cards.other);
 
 async function checkedJson(url, shape, options) {
-  const response = await fetch(url, options);
+  let response;
+  try { response = await fetch(url, options); }
+  catch (cause) {
+    if (cause && cause.name === 'AbortError') throw cause;
+    const error = new Error(cause && cause.message ? cause.message : String(cause));
+    error.network = true;
+    throw error;
+  }
   let data;
   try { data = await response.json(); }
   catch { throw new Error('Invalid JSON response (HTTP ' + response.status + ')'); }
@@ -707,7 +722,10 @@ async function checkedJson(url, shape, options) {
   return data;
 }
 async function fetchGraph(signal) { return checkedJson('/api/graph', isGraph, { signal }); }
-async function fetchNode(id, signal) { return checkedJson('/api/node/' + encodeURIComponent(id), isCard, { signal }); }
+async function fetchNode(id, signal, at) {
+  const suffix = at ? '?at=' + encodeURIComponent(at) : '';
+  return checkedJson('/api/node/' + encodeURIComponent(id) + suffix, isCard, { signal });
+}
 async function fetchStats(signal) { return checkedJson('/api/stats', isStats, { signal }); }
 async function fetchSemanticSearch(query, topK, signal) {
   const params = new URLSearchParams({ q: query, top_k: String(topK) });
@@ -837,6 +855,8 @@ function handleSseInit(data) {
   // Сохраняются только координаты выживших узлов, содержимое и рёбра свежие.
   const savedCoords = new Map(nodes.map((node) => [node.id, { x: node.x, y: node.y }]));
   buildGraphData({ nodes: data.nodes, edges: data.edges });
+  timelineLoading = false;
+  timelineAt = null;
   for (const node of nodes) {
     const saved = savedCoords.get(node.id);
     if (saved) {
@@ -1133,7 +1153,7 @@ function renderStats(stats) {
   parts.push(`<span class="stat"><span class="dot" style="background:#ef4444"></span>deprecated</span>`);
   parts.push(`<label class="stat" style="cursor:pointer"><input type="checkbox" id="toggle-outdated" ${hideOutdated ? '' : 'checked'}> show outdated</label>`);
   // T5: consolidation tab.
-  parts.push(`<button class="stat" id="consolidate-btn" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">consolidate…</button>`);
+  parts.push(`<button class="stat" id="consolidate-btn" ${timelineMode ? 'disabled title="Switch to Live to consolidate"' : ''} style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">consolidate…</button>`);
   // U2: whole-graph export download.
   parts.push(`<button class="stat" id="export-bundle-btn" style="cursor:pointer;background:#1e2333;border:1px solid #64748b55;border-radius:10px;color:#94a3b8">export bundle</button>`);
   // U3: health chip (async — fetches /api/health once per stats render).
@@ -1212,6 +1232,7 @@ function renderTokensPanel(usage) {
 }
 
 async function openConsolidate() {
+  if (timelineMode || timelineLoading) return;
   const request = beginRequest(scanRequest);
   const el = document.getElementById('stats');
   el.innerHTML = '<span class="stat">scanning for duplicates…</span>';
@@ -1267,8 +1288,7 @@ function ccNoteNodeChange(id) {
 
 function closeConsolidatePreview() {
   if (ccState) {
-    cancelRequest(ccState.cardRequest);
-    cancelRequest(ccState.planRequest);
+    cancelRequest(ccState.bundleRequest);
   }
   ccState = null;
   const panel = document.getElementById('consolidate-preview');
@@ -1283,18 +1303,24 @@ function markConsolidateStale() {
   renderConsolidatePreview();
 }
 
-// Открытие preview: обе карточки и последствия грузятся GET-ами; merge
-// остаётся disabled, пока не загружены обе карточки, план выбранной
-// ориентации и не выбран survivor.
+// Открытие preview: карточки и план грузятся ОДНИМ bundle-GET (B-02,
+// аудит 2026-11-12) — до явного выбора survivor в рекомендованной
+// ориентации (older), чтобы карточки были видны сразу; после выбора —
+// в выбранной. Отдельные карточки из /api/node/:id основанием для
+// confirm не служат. Merge остаётся disabled, пока bundle не загружен
+// и survivor не выбран.
 function openConsolidatePreview(a, b, meta) {
+  if (timelineMode || timelineLoading) return;
   closeConsolidatePreview();
   ccState = {
     a, b,
     older: (meta && meta.older) || '',
     similarity: meta && meta.similarity !== undefined ? meta.similarity : null,
     survivor: null,            // нет скрытого автовыбора: выбор явный
-    cards: { A: null, B: null },
-    plan: null,                // { ok, data } для ориентации (survivorId → otherId)
+    // { ok:true, side:'A'|'B', data:<план>, cards:{A,B} } — план и карточки
+    // одного ответа; ok:false — ошибка загрузки. Confirm разрешён только
+    // когда bundle.side === survivor.
+    bundle: null,
     planLoading: false,
     stale: false,
     sawSseError: false,
@@ -1306,8 +1332,7 @@ function openConsolidatePreview(a, b, meta) {
     loadError: null,
     gen: 0,
     invalidation: 0,
-    cardRequest: { gen: 0, controller: null },
-    planRequest: { gen: 0, controller: null },
+    bundleRequest: { gen: 0, controller: null },
     refreshing: false,
     refreshInvalidation: 0,
   };
@@ -1347,63 +1372,52 @@ function openConsolidatePreview(a, b, meta) {
   loadConsolidatePreview();
 }
 
-// (Пере)загрузка карточек и последствий. Всё — GET.
+// (Пере)загрузка bundle: план и карточки участников приходят атомарно одним
+// GET-ответом (B-02). Ориентация — выбранный survivor; до выбора —
+// рекомендованная (older), чтобы карточки были видны сразу. Всё — GET.
 async function loadConsolidatePreview() {
   const state = ccState;
   if (!state || state.busy || state.merged) return;
   const gen = ++state.gen;
-  const request = beginRequest(state.cardRequest);
-  cancelRequest(state.planRequest);
+  const request = beginRequest(state.bundleRequest);
   state.refreshInvalidation = state.invalidation;
   state.refreshing = true;
   state.confirmOpen = false;
   state.loadError = null;
-  state.cards = { A: null, B: null };
-  state.plan = null;
-  state.planLoading = Boolean(state.survivor);
-  renderConsolidatePreview();
-
-  const loadCard = async (side, id) => {
-    try {
-      const data = await fetchNode(id, request.signal);
-      if (ccState !== state || !request.current()) return;
-      state.cards[side] = { ok: true, data };
-    } catch (err) {
-      if (ccState !== state || !request.current()) return;
-      state.cards[side] = { ok: false, error: String(err) };
-    }
-    renderConsolidatePreview();
-  };
-  await Promise.all([loadCard('A', state.a), loadCard('B', state.b)]);
-  if (ccState !== state || !request.current()) return;
-  state.refreshing = false;
-  await loadConsolidatePlan(gen);
-}
-
-// Independent orientation generation also protects A→B→A.
-async function loadConsolidatePlan(gen) {
-  const state = ccState;
-  if (!state || state.gen !== gen || !state.survivor || state.refreshing) return;
-  const request = beginRequest(state.planRequest);
-  const { survivorId, otherId } = ccSurivorIds(state);
-  const invalidation = state.invalidation;
+  state.bundle = null;
   state.planLoading = true;
   renderConsolidatePreview();
+
+  const orientation = state.survivor
+    ? ccSurivorIds(state)
+    : { survivorId: state.older || state.a, otherId: state.older === state.a ? state.b : state.a };
+  const side = orientation.survivorId === state.a ? 'A' : 'B';
+  const invalidation = state.invalidation;
   try {
-    const url = '/api/consolidate/preview?survivor=' + encodeURIComponent(survivorId) + '&other=' + encodeURIComponent(otherId);
+    const url = '/api/consolidate/preview?survivor=' + encodeURIComponent(orientation.survivorId) + '&other=' + encodeURIComponent(orientation.otherId);
     const data = await checkedJson(url, isPlan, { signal: request.signal });
     if (ccState !== state || state.gen !== gen || !request.current()) return;
-    if (data.survivor !== survivorId || data.other !== otherId) throw new Error('Preview orientation mismatch');
-    state.plan = { ok: true, data };
-    const bothCards = state.cards.A && state.cards.A.ok && state.cards.B && state.cards.B.ok;
-    // Never clear an invalidation newer than the card snapshot.
-    if (bothCards && state.refreshInvalidation === invalidation && state.invalidation === invalidation) state.stale = false;
+    if (data.survivor !== orientation.survivorId || data.other !== orientation.otherId) throw new Error('Preview orientation mismatch');
+    // Слоты сервера (survivor/other) отображаются в стороны A/B один раз,
+    // вместе с планом — дальше карточки и план живут только в bundle.
+    const bundleCards = side === 'A'
+      ? { A: bundleCardSlot(data.cards.survivor), B: bundleCardSlot(data.cards.other) }
+      : { A: bundleCardSlot(data.cards.other), B: bundleCardSlot(data.cards.survivor) };
+    state.bundle = { ok: true, side, data, cards: bundleCards };
+    // Never clear an invalidation newer than this snapshot.
+    if (state.refreshInvalidation === invalidation && state.invalidation === invalidation) state.stale = false;
   } catch (err) {
     if (ccState !== state || state.gen !== gen || !request.current()) return;
-    state.plan = { ok: false, error: String(err) };
+    state.bundle = { ok: false, side, error: String(err) };
   }
+  state.refreshing = false;
   state.planLoading = false;
   renderConsolidatePreview();
+}
+
+// null-слот (узла нет) честно превращается в ошибку карточки в панели.
+function bundleCardSlot(slot) {
+  return slot ? { ok: true, data: slot } : { ok: false, error: 'card unavailable for this node' };
 }
 
 function chooseConsolidateSurvivor(side) {
@@ -1412,26 +1426,30 @@ function chooseConsolidateSurvivor(side) {
   if (state.survivor === side) return;
   state.survivor = side;
   state.confirmOpen = false;
-  state.plan = null;
-  // План перечитывается для новой ориентации — чтение, не мутация.
-  void loadConsolidatePlan(state.gen);
+  // Смена survivor — новое чтение ВСЕГО bundle (план+карточки атомарно),
+  // не только плана: пока чтение не завершено, confirm закрыт.
+  void loadConsolidatePreview();
 }
 
 // Финальное подтверждение — единственный POST. Повторный клик блокируется
 // флагом busy; ошибка не теряется: панель остаётся открыта с текстом.
+// B-02: подтверждение разрешено только когда показанные карточки и план —
+// один bundle (state.bundle), сориентированный на выбранного survivor.
 async function submitConsolidateMerge() {
+  if (timelineMode || timelineLoading) return;
   const state = ccState;
   if (!state || state.busy || state.merged) return;
   const { survivorId, otherId } = ccSurivorIds(state);
-  const planOk = state.plan && state.plan.ok && !state.plan.data.rejection &&
-    state.plan.data.survivor === survivorId;
-  const bothCards = state.cards.A && state.cards.A.ok && state.cards.B && state.cards.B.ok;
-  if (!planOk || !state.survivor || state.stale || state.planLoading || state.refreshing || !bothCards || !state.confirmOpen) return;
+  const bundle = state.bundle;
+  const bundleOk = Boolean(bundle && bundle.ok && bundle.side === state.survivor);
+  const planOk = bundleOk && !bundle.data.rejection && bundle.data.survivor === survivorId;
+  const bothCards = bundleOk && bundle.cards.A && bundle.cards.A.ok && bundle.cards.B && bundle.cards.B.ok;
+  if (!planOk || !bothCards || !state.survivor || state.stale || state.planLoading || state.refreshing || !state.confirmOpen) return;
   state.busy = true;
   state.confirmOpen = false;
   state.postError = null;
   renderConsolidatePreview();
-  const base = state.plan.data.base || {};
+  const base = bundle.data.base || {};
   try {
       const res = await checkedJson('/api/consolidate', value => isObject(value) && value.survivor === survivorId && value.removed === otherId, {
       method: 'POST',
@@ -1575,11 +1593,11 @@ function ccEffectsHtml(state, survivorId, otherId) {
     return `<div class="cc-effects"><span class="cc-hint">choose the survivor to compute the consequences — nothing happens until the final confirmation</span></div>`;
   }
   if (state.planLoading) return `<div class="cc-effects"><span class="cc-hint">computing consequences…</span></div>`;
-  if (!state.plan) return `<div class="cc-effects"><span class="cc-hint">consequences not loaded</span></div>`;
-  if (!state.plan.ok) {
-    return `<div class="cc-effects"><span class="cc-error">consequences failed: ${esc(state.plan.error)}</span></div>`;
+  if (!state.bundle) return `<div class="cc-effects"><span class="cc-hint">consequences not loaded</span></div>`;
+  if (!state.bundle.ok) {
+    return `<div class="cc-effects"><span class="cc-error">consequences failed: ${esc(state.bundle.error)}</span></div>`;
   }
-  const plan = state.plan.data;
+  const plan = state.bundle.data;
   if (plan.rejection) {
     return `<div class="cc-effects"><span class="cc-error">merge is rejected: ${esc(plan.rejection)}</span></div>`;
   }
@@ -1626,9 +1644,15 @@ function renderConsolidatePreview() {
   if (state.stale) h += `<span class="cc-stale">preview stale — graph changed, re-read before merging</span>`;
   h += `<button class="cc-close" data-action="consolidate-close" title="close (Escape)">×</button></div>`;
 
+  // Карточки — только из bundle (B-02): null/ошибка bundle показывается
+  // честной ошибкой карточки, отдельные /api/node/:id для preview нет.
+  const cards = state.bundle
+    ? (state.bundle.ok ? state.bundle.cards
+      : { A: { ok: false, error: state.bundle.error }, B: { ok: false, error: state.bundle.error } })
+    : { A: null, B: null };
   h += `<div class="cc-columns">` +
-    ccCardHtml('A', state.a, state.cards.A, state.older) +
-    ccCardHtml('B', state.b, state.cards.B, state.older) +
+    ccCardHtml('A', state.a, cards.A, state.older) +
+    ccCardHtml('B', state.b, cards.B, state.older) +
     `</div>`;
 
   // Явный выбор survivor: рекомендация видна, автовыбора нет.
@@ -1640,9 +1664,11 @@ function renderConsolidatePreview() {
 
   h += ccEffectsHtml(state, survivorId, otherId);
 
-  const bothCards = state.cards.A && state.cards.A.ok && state.cards.B && state.cards.B.ok;
-  const planReady = state.plan && state.plan.ok && !state.plan.data.rejection &&
-    state.plan.data.survivor === survivorId && state.plan.data.other === otherId;
+  const bundleOk = Boolean(state.bundle && state.bundle.ok);
+  const bothCards = bundleOk && state.bundle.cards.A.ok && state.bundle.cards.B.ok;
+  const planReady = bundleOk && !state.bundle.data.rejection &&
+    state.bundle.data.survivor === survivorId && state.bundle.data.other === otherId &&
+    state.bundle.side === state.survivor;
   const mergeReady = !state.merged && !state.stale && !state.busy && bothCards && planReady && Boolean(state.survivor);
 
   h += `<div class="cc-status">`;
@@ -1653,7 +1679,7 @@ function renderConsolidatePreview() {
   h += `</div>`;
 
   h += `<div class="cc-actions">`;
-  const needsRetry = state.stale || (!bothCards) || (state.plan && !state.plan.ok);
+  const needsRetry = state.stale || (!bothCards) || (state.bundle && !state.bundle.ok);
   if (needsRetry && !state.busy && !state.merged) {
     h += `<button class="cc-btn" data-action="consolidate-retry">${state.stale ? 'refresh preview' : 'retry load'}</button>`;
   }
@@ -2302,9 +2328,22 @@ function showPanel(d) {
   if (d.valid_until) h += `<div class="meta">valid until ${esc(String(d.valid_until))}${nodeExpired(d) ? ' — expired' : ''}</div>`;
   if (d.refuted_reason) h += `<div class="meta">${esc(d.refuted_reason)}</div>`;
 
+  // B-04 (аудит 2026-11-12): честная маркировка исторической карточки — это
+  // сохранённая карточка текущего содержимого узла, а не точная историческая
+  // ревизия; прежние summary/status/relationships не восстанавливаются.
+  if (d.historical) {
+    h += `<div class="panel-section"><div class="panel-body" style="border:1px solid #64748b55;border-radius:8px;padding:8px">` +
+      `<b>historical view</b> (at ${esc(String(d.at))}) — saved card as stored now, not an exact historical revision; former summary/status/relationships are not restored.`;
+    if (d.removed_now) {
+      h += `<br/><span style="color:#ef4444">removed now: ${esc(String(d.removed_at))}${d.removed_reason ? ' — ' + esc(String(d.removed_reason)) : ''}</span>`;
+    }
+    h += `</div></div>`;
+  }
+
   // History has its own generation and container; never rewrite the card.
   if (d.id) {
-    checkedJson('/api/node/' + encodeURIComponent(d.id) + '/history', value => isObject(value) && Array.isArray(value.history) &&
+    const historyAt = d.historical ? '?at=' + encodeURIComponent(d.at) : '';
+    checkedJson('/api/node/' + encodeURIComponent(d.id) + '/history' + historyAt, value => isObject(value) && Array.isArray(value.history) &&
       value.history.every(entry => isObject(entry) && typeof entry.to_status === 'string'), { signal: history.signal })
       .then((payload) => {
         if (!history.current() || panelIdentity !== d.id) return;
@@ -2328,8 +2367,11 @@ function showPanel(d) {
   }
   h += '<div class="panel-section" id="panel-history">History loading…</div>';
 
-  // U2: single-node markdown download.
-  h += `<a class="stat" href="/api/node/${encodeURIComponent(d.id)}.md" style="font-size:10px;color:#38bdf8;margin-left:8px">download .md</a>`;
+  // U2: single-node markdown download. B-04: в историческом режиме
+  // (в т.ч. для удалённого сейчас узла) экспорт текущего .md не предлагается.
+  if (!d.historical) {
+    h += `<a class="stat" href="/api/node/${encodeURIComponent(d.id)}.md" style="font-size:10px;color:#38bdf8;margin-left:8px">download .md</a>`;
+  }
 
   // Parent breadcrumb. W-01 (plan 05): the id is a data attribute for the
   // delegated click handler, never an inline-JS string.
@@ -2427,19 +2469,46 @@ function closePanel() {
   for (const n of nodes) n.selected = false;
 }
 
+// B-04 (аудит 2026-11-12): честное разделение ошибок карточки. 404 и прочие
+// HTTP-ошибки показываются в панели («узел не найден»), Server unreachable —
+// только отказ fetch до получения HTTP-ответа.
+function showPanelMessage(id, html) {
+  const panel = document.getElementById('panel');
+  const content = document.getElementById('panel-content');
+  if (!panel || !content) return;
+  content.innerHTML = `<button id="panel-close">&times;</button>` +
+    `<div class="panel-name">${esc(id)}</div>` +
+    `<div class="panel-section"><div class="panel-body">${html}</div></div>`;
+  panel.classList.add('open');
+}
+
 function navigateTo(id) {
+  if (timelineLoading) return;
   const node = nodes.find(n => n.id === id);
-  if (!node) return;
   closePanel();
   const request = beginRequest(panelRequest);
   panelIdentity = id;
-  node.selected = true;
-  animateTo(node.x, node.y, 2.5, 300);
-  fetchNode(id, request.signal).then(d => {
+  if (node) {
+    node.selected = true;
+    animateTo(node.x, node.y, 2.5, 300);
+  }
+  // B-04: в историческом режиме карточка читается на момент шага timeline —
+  // тот же снимок, что у открытого /api/graph/at.
+  const at = timelineMode ? timelineAt : null;
+  fetchNode(id, request.signal, at).then(d => {
     if (!request.current() || panelIdentity !== id) return;
     showPanel(d);
-    spawnFloatingLabel(node.kind, node, node.color);
-  }).catch(err => { if (request.current()) showTransportError('node panel', err); });
+    if (node) spawnFloatingLabel(node.kind, node, node.color);
+  }).catch(err => {
+    if (!request.current()) return;
+    if (err && err.status === 404) {
+      showPanelMessage(id, `Node "${esc(id)}" not found (404). It may have been deleted, or it did not exist at the selected timeline date.`);
+      return;
+    }
+    if (err && err.network) { showTransportError('node panel', err); return; }
+    // HTTP-ошибка/невалидный ответ сервера — не транспортный сбой.
+    showPanelMessage(id, `Node panel request failed: ${esc(String(err && err.message || err))}`);
+  });
 }
 
 // ---- Search ----
@@ -2641,7 +2710,7 @@ function setupSearch() {
     } catch (err) {
       if (!request.current() || timelineMode) return;
       // Only transport/service unavailability permits a qualified local view.
-      const fallback = err.status === 503 || err instanceof TypeError ? localFallbackMatches(query, 10) : [];
+      const fallback = err.status === 503 || err.network ? localFallbackMatches(query, 10) : [];
       if (fallback.length) {
         searchResults = fallback;
         renderSearchResults(query, searchResults, 'keyword-fallback');
@@ -2776,6 +2845,10 @@ function updateTimelineDisplay(stepIndex) {
 async function scrubToStep(stepIndex) {
   if (!timelineMode) return;
 
+  const previousAt = timelineAt;
+  // Commit the card timestamp together with the graph, never before its GET.
+  const at = stepIndex >= timelineSteps.length ? null : timelineSteps[stepIndex].timestamp;
+  timelineLoading = true;
   updateTimelineDisplay(stepIndex);
   const requestId = ++timelineFetchId;
   const request = beginRequest(scrubRequest);
@@ -2798,13 +2871,22 @@ async function scrubToStep(stepIndex) {
       data = await fetchGraphAt(timelineSteps[stepIndex].timestamp, request.signal);
     }
   } catch (err) {
-    if (request.current() && timelineMode) showTransportError('timeline scrub', err);
+    if (request.current() && timelineMode) {
+      timelineLoading = false;
+      const previousIndex = previousAt === null
+        ? timelineSteps.length
+        : timelineSteps.findIndex(step => step.timestamp === previousAt);
+      updateTimelineDisplay(previousIndex >= 0 ? previousIndex : timelineSteps.length);
+      showTransportError('timeline scrub', err);
+    }
     return;
   }
 
   if (!timelineMode || requestId !== timelineFetchId || !request.current()) return;
 
   buildGraphData(data);
+  timelineAt = at;
+  timelineLoading = false;
   const now = performance.now();
   for (const node of nodes) {
     const prev = prevPositions.get(node.id);
@@ -2893,6 +2975,8 @@ function startTimelinePlayback() {
 async function enterTimelineMode() {
   if (timelineMode) return;
   timelineMode = true;
+  timelineAt = null; // старт в Live-позиции слайдера
+  timelineLoading = false;
   const request = beginRequest(timelineRequest);
   cancelRequest(scrubRequest);
   cancelRequest(searchRequest);
@@ -2947,6 +3031,11 @@ async function enterTimelineMode() {
   toggle.classList.remove('live');
   toggle.textContent = kind === 'status' ? '◷ Status' : '◷ Timeline';
   toggle.title = `Timeline source: ${timelineSource}`;
+  const consolidateButton = document.getElementById('consolidate-btn');
+  if (consolidateButton) {
+    consolidateButton.setAttribute('disabled', '');
+    consolidateButton.title = 'Switch to Live to consolidate';
+  }
 
   if (evtSource) {
     evtSource.close();
@@ -2960,6 +3049,8 @@ async function enterTimelineMode() {
 async function exitTimelineMode() {
   if (!timelineMode) return;
   timelineMode = false;
+  timelineAt = null;
+  timelineLoading = true;
   const request = beginRequest(timelineRequest);
   cancelRequest(scrubRequest);
   closePanel();
@@ -3010,6 +3101,7 @@ async function exitTimelineMode() {
   }
   if (!request.current() || timelineMode) return;
   buildGraphData(graphData);
+  timelineLoading = false;
   const now = performance.now();
   for (const node of nodes) {
     const prev = prevPositions.get(node.id);

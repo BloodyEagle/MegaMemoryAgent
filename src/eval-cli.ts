@@ -80,7 +80,17 @@ export async function runEvalCli(args: string[]): Promise<void> {
   }
   const p = resolveDbPathOrExit(args);
 
-  const pairs = loadEvalPairs(fs.readFileSync(file, "utf8"));
+  // B-06 (аудит 2026-11-12): неполный набор — контролируемый отказ до
+  // открытия БД и измерения. Раньше truthy-проверка loadEvalPairs молча
+  // пропускала некорректные строки, recall завышался, и quality gate
+  // проходил ложно.
+  let pairs: ReturnType<typeof loadEvalPairs>;
+  try {
+    pairs = loadEvalPairs(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    errorBold(`Eval set parse failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
   if (pairs.length === 0) {
     errorBold("Eval set is empty.");
     process.exit(1);

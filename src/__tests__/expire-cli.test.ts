@@ -155,3 +155,113 @@ describe("после expire на копии — фильтр выдачи (те�
     expect(returned).toContain("знание-формат");
   });
 });
+
+// B-08 (аудит 2026-11-12): batch expire атомарен. Раньше UPDATE-ы шли вне
+// транзакции: отказ второго UPDATE оставлял первый применённым, а журнальная
+// запись не выполнялась вовсе. Ошибки инъецируются настоящими SQLite-
+// триггерами (RAISE ABORT), как в доказательстве аудита.
+describe("B-08: атомарный batch expire", () => {
+  const UNTIL = "2026-01-01T00:00:00.000Z";
+
+  function validUntil(id: string): string | null {
+    return db.getNode(id)!.valid_until ?? null;
+  }
+
+  it("отказ второго UPDATE откатывает весь batch: первый узел не просрочен, журнала нет", () => {
+    insert("alpha", "первый узел пакета");
+    insert("beta", "второй узел пакета");
+    db.execSql(`CREATE TRIGGER block_beta
+      BEFORE UPDATE OF valid_until ON nodes
+      WHEN NEW.id = 'beta'
+      BEGIN SELECT RAISE(ABORT, 'second-node write failure'); END`);
+
+    expect(() =>
+      expireNodes(db, ["alpha", "beta"], UNTIL, true)
+    ).toThrow(/second-node write failure/);
+
+    expect(
+      validUntil("alpha"),
+      "B-08: отказ записи второго узла обязан откатить первый"
+    ).toBeNull();
+    expect(validUntil("beta")).toBeNull();
+    expect(db.getTimelineEntries({ tool: "expire" })).toHaveLength(0);
+  });
+
+  it("ошибка журнального append внутри транзакции откатывает уже проставленные сроки", () => {
+    insert("alpha", "узел пакета при отказе журнала");
+    db.execSql(`CREATE TRIGGER block_expire_journal
+      BEFORE INSERT ON timeline
+      WHEN NEW.tool = 'expire'
+      BEGIN SELECT RAISE(ABORT, 'journal append failure'); END`);
+
+    expect(() =>
+      expireNodes(db, ["alpha"], UNTIL, true)
+    ).toThrow(/journal append failure/);
+
+    expect(
+      validUntil("alpha"),
+      "B-08: ошибка журнала обязана откатить применённые сроки"
+    ).toBeNull();
+    expect(db.getTimelineEntries({ tool: "expire" })).toHaveLength(0);
+  });
+
+  it("перезапись существующего срока разрешена (совместимое «было → станет»)", () => {
+    insert("уже-со-сроком", "срок выставлен ранее", "2025-06-01T00:00:00.000Z");
+    insert("свежий", "узел без срока");
+
+    const result = expireNodes(db, ["уже-со-сроком", "свежий"], UNTIL, true);
+
+    expect(result.applied).toBe(true);
+    expect(result.rows[0].was).toBe("2025-06-01T00:00:00.000Z");
+    expect(validUntil("уже-со-сроком")).toBe(UNTIL);
+    expect(validUntil("свежий")).toBe(UNTIL);
+    expect(db.getTimelineEntries({ tool: "expire" })).toHaveLength(1);
+  });
+
+  it("изменение срока триггером между обновлениями отказывает весь batch", () => {
+    insert("alpha", "остаётся без изменений при гонке");
+    insert("beta", "срок меняется между проверкой и UPDATE");
+    // Триггер внутри того же apply меняет beta после первоначального чтения.
+    // Это не CAS между отдельными CLI-вызовами dry-run и --apply.
+    db.execSql(`CREATE TRIGGER race_beta
+      BEFORE UPDATE OF valid_until ON nodes
+      WHEN NEW.id = 'alpha'
+      BEGIN UPDATE nodes SET valid_until = '2030-01-01T00:00:00.000Z' WHERE id = 'beta'; END`);
+
+    expect(() =>
+      expireNodes(db, ["alpha", "beta"], UNTIL, true)
+    ).toThrow(/изменился между проверкой и применением/);
+
+    expect(validUntil("alpha"), "B-08: гонка обязана откатить batch").toBeNull();
+    expect(validUntil("beta")).toBeNull();
+    expect(db.getTimelineEntries({ tool: "expire" })).toHaveLength(0);
+  });
+
+  it("нормальный batch: оба узла просрочены и РОВНО одна запись expire с полным списком", () => {
+    insert("alpha", "нормальный пакет 1");
+    insert("beta", "нормальный пакет 2");
+
+    const result = expireNodes(db, ["alpha", "beta"], UNTIL, true);
+
+    expect(result.applied).toBe(true);
+    expect(validUntil("alpha")).toBe(UNTIL);
+    expect(validUntil("beta")).toBe(UNTIL);
+    const timeline = db.getTimelineEntries({ tool: "expire" });
+    expect(timeline).toHaveLength(1);
+    expect(JSON.parse(timeline[0].params)).toEqual({ until: UNTIL, ids: ["alpha", "beta"] });
+    expect(timeline[0].affected_ids && JSON.parse(timeline[0].affected_ids)).toEqual(["alpha", "beta"]);
+  });
+
+  it("удалённый (tombstone) id — контролируемая ошибка без частичного применения", () => {
+    insert("alpha", "остаётся без изменений");
+    insert("удалён-1", "узел удалён до пакета");
+    db.softDeleteNode("удалён-1", "тест B-08");
+
+    expect(() =>
+      expireNodes(db, ["alpha", "удалён-1"], UNTIL, true)
+    ).toThrow(/удалён-1/);
+
+    expect(validUntil("alpha")).toBeNull();
+    expect(db.getTimelineEntries({ tool: "expire" })).toHaveLength(0);
+  });
+});

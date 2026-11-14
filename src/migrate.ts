@@ -24,6 +24,11 @@ export interface RepairPlan {
   conflicts: RepairPlanEntry[];
   /** Nodes with empty id — PK means only one such row ever survived upstream. */
   dataLossEmptyIds: number;
+  /** B-09: потомки нерешённого сломанного родителя (его target занят либо
+   * родитель вообще не существует в итоговом пространстве плана) остаются
+   * без плана и будут починены повторным repair после разрешения родителя.
+   * Молча превращать их в корневые id нельзя — это стёрло бы иерархию. */
+  unresolvedDescendants?: number;
 }
 
 export function isBrokenId(id: string): boolean {
@@ -37,7 +42,7 @@ export function planIdRepair(db: KnowledgeDB): RepairPlan {
     .map((n) => ({
       oldId: n.id,
       name: n.name,
-      parentId: n.parent_id || undefined,
+      parentId: n.parent_id ?? undefined,
     }));
 
   const dataLossEmptyIds = rows.filter((r) => r.oldId === "").length;
@@ -45,6 +50,13 @@ export function planIdRepair(db: KnowledgeDB): RepairPlan {
   const entries: RepairPlanEntry[] = [];
   const conflicts: RepairPlanEntry[] = [];
   const idMap = new Map<string, string>(); // old parent id → new parent id
+  // B-09: итоговое пространство имён — занятые сейчас в БД плюс уже
+  // запланированные target id. Планируемый родитель ещё НЕ записан в базу,
+  // поэтому проверка занятости только по db.nodeExists отвергла бы его и
+  // лишила ребёнка префикса.
+  const planned = new Set<string>();
+  const targetTaken = (id: string): boolean =>
+    db.getNodeIncludingRemoved(id) !== undefined || planned.has(id);
 
   // Repair parents before children so nested slugs build on fresh parent ids.
   // Loop until fixpoint: chains like "" ← "/a" need multiple passes.
@@ -53,32 +65,38 @@ export function planIdRepair(db: KnowledgeDB): RepairPlan {
   while (progressed && pending.size > 0) {
     progressed = false;
     for (const row of [...pending]) {
-      if (
-        row.parentId !== undefined &&
-        isBrokenId(row.parentId) &&
-        !idMap.has(row.parentId)
-      ) {
-        continue; // parent not resolved yet
+      // B-09: ребёнок строит id от уже разрешённого БУДУЩЕГО id родителя.
+      // Сломанный родитель обязан быть разрешён в idMap (план ничего не
+      // пишет, db.nodeExists увидел бы лишь его ещё сломанную строку);
+      // обычный родитель должен существовать в итоговом пространстве плана —
+      // в базе либо среди запланированных target id. «Висящий» parent_id без
+      // строки не разрешается молча в корень: потомок остаётся без плана
+      // (unresolvedDescendants) до следующего repair после починки родителя.
+      let parentResolved: string | undefined;
+      if (row.parentId !== undefined) {
+        if (isBrokenId(row.parentId)) {
+          if (!idMap.has(row.parentId)) {
+            continue; // parent not resolved yet
+          }
+          parentResolved = idMap.get(row.parentId);
+        } else if (!db.nodeExists(row.parentId) && !planned.has(row.parentId)) {
+          continue; // dangling parent — rooted silently would lose the hierarchy
+        } else {
+          parentResolved = row.parentId;
+        }
       }
-      const parentResolved =
-        row.parentId !== undefined
-          ? (idMap.get(row.parentId) ?? row.parentId)
-          : undefined;
-      const parentId =
-        parentResolved && db.nodeExists(parentResolved)
-          ? parentResolved
-          : undefined;
-      const newId = makeId(row.name, parentId);
+      const newId = makeId(row.name, parentResolved);
       if (newId !== row.oldId) {
         const entry: RepairPlanEntry = {
           oldId: row.oldId,
           newId,
           name: row.name,
         };
-        if (db.nodeExists(newId)) {
+        if (targetTaken(newId)) {
           conflicts.push(entry);
         } else {
           entries.push(entry);
+          planned.add(newId);
           idMap.set(row.oldId, newId);
         }
       }
@@ -103,12 +121,20 @@ export function planIdRepair(db: KnowledgeDB): RepairPlan {
       const tail = row.id.slice(hit[0].length);
       const newId = hit[1] + (tail.startsWith("/") ? tail : "/" + tail);
       if (newId !== row.id) {
-        entries.push({ oldId: row.id, newId, name: row.name });
+        const entry: RepairPlanEntry = { oldId: row.id, newId, name: row.name };
+        if (targetTaken(newId)) {
+          conflicts.push(entry);
+        } else {
+          entries.push(entry);
+          planned.add(newId);
+        }
       }
     }
   }
 
-  return { entries, conflicts, dataLossEmptyIds };
+  // Остаток pending — потомки нерешённых родителей: застряли на
+  // «parent not resolved yet» и никогда не получат план в этом прогоне.
+  return { entries, conflicts, dataLossEmptyIds, unresolvedDescendants: pending.size };
 }
 
 export interface RepairResult {
@@ -120,30 +146,25 @@ export function applyIdRepair(
   db: KnowledgeDB,
   plan: RepairPlan
 ): RepairResult {
-  let renamed = 0;
-  let skipped = plan.conflicts.length;
-  const claimed = new Set<string>();
-  for (const entry of plan.entries) {
-    // Two broken rows may plan the same target; second one must not clobber.
-    if (db.nodeExists(entry.newId) || claimed.has(entry.newId)) {
-      skipped += 1;
-      console.error(
-        `  repair-ids: conflict, "${entry.newId}" already exists — skipped "${entry.oldId}"`
-      );
-      continue;
-    }
-    if (db.renameNodeId(entry.oldId, entry.newId)) {
+  return db.runInTransaction(() => {
+    let renamed = 0;
+    const skipped = plan.conflicts.length;
+    const claimed = new Set<string>();
+    for (const entry of plan.entries) {
+      // The plan is advisory; apply is fail-closed and atomic if state changed.
+      if (db.getNodeIncludingRemoved(entry.newId) || claimed.has(entry.newId)) {
+        throw new Error(`repair-ids: conflict, "${entry.newId}" already exists — batch cancelled.`);
+      }
+      if (!db.renameNodeId(entry.oldId, entry.newId)) {
+        throw new Error(`repair-ids: rename failed for "${entry.oldId}" -> "${entry.newId}" — batch cancelled.`);
+      }
       claimed.add(entry.newId);
       // Б12.3: old ids stay resolvable through the aliases table.
       db.recordAlias(entry.oldId, entry.newId);
       renamed += 1;
-    } else {
-      console.error(
-        `  repair-ids: rename failed for "${entry.oldId}" -> "${entry.newId}"`
-      );
     }
-  }
-  return { renamed, skipped };
+    return { renamed, skipped };
+  });
 }
 
 /**

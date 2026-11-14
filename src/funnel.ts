@@ -124,7 +124,8 @@ export function computeFunnel(db: KnowledgeDB): FunnelReport {
     if (after.some((e) => e.is_write === 1 && !e.is_error)) {
       sessionsWithRecord += 1;
     }
-    for (const e of s.entries) {
+    for (let i = 0; i < s.entries.length; i += 1) {
+      const e = s.entries[i];
       if (e.tool !== "understand") continue;
       let p: Record<string, unknown> = {};
       try {
@@ -134,12 +135,16 @@ export function computeFunnel(db: KnowledgeDB): FunnelReport {
       }
       const ids = Array.isArray(p.must_read_ids) ? p.must_read_ids : [];
       mustReadIssued += Array.isArray(p.must_read) ? p.must_read.length : 0;
+      // B-07 (аудит 2026-11-12): открытие должно быть ПОСЛЕ конкретной
+      // выдачи рекомендации. Поиск по всей сессии засчитывал чтение,
+      // случившееся до understand; timestamps секундные, поэтому порядок —
+      // по позиции записи в журнале (seq), не по времени. Каждая выдача
+      // ищет своё чтение только среди последующих записей; повторные
+      // выдачи считаются независимо. Без фильтра is_error — как в эталоне.
       for (const id of ids) {
-        // Косвенный, но честный показатель: узел из must_read позже открыт
-        // get_concept в той же сессии. Без фильтра is_error — как в эталоне.
-        const opened = s.entries.some(
-          (o) => o.tool === "get_concept" && parseIds(o.affected_ids).includes(String(id))
-        );
+        const opened = s.entries
+          .slice(i + 1)
+          .some((o) => o.tool === "get_concept" && parseIds(o.affected_ids).includes(String(id)));
         if (opened) mustReadOpened += 1;
       }
     }

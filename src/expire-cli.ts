@@ -2,7 +2,6 @@ import pc from "picocolors";
 import fs from "node:fs";
 import { KnowledgeDB } from "./db.js";
 import { resolveDbPathOrExit } from "./db-path.js";
-import { createTimelineLogger } from "./timeline.js";
 
 /**
  * 2.1.13 F5: `megamemory expire` — проставить valid_until журнальным узлам
@@ -119,20 +118,39 @@ export function expireNodes(
   });
   if (!apply) return { rows, applied: false };
 
-  for (const id of unique) {
-    const updated = db.updateNode(id, { valid_until: untilIso });
-    if (!updated) {
-      throw new Error(`expire: не удалось проставить срок узлу "${id}".`);
+  // B-08: проверка участников, UPDATE-ы и строгий append журнала — одна
+  // транзакция. Существующий срок можно заменить; здесь проверяется лишь
+  // расхождение с первым чтением В ЭТОМ вызове apply, не с отдельным dry-run.
+  // createTimelineLogger глотает ошибки, поэтому для batch используем
+  // insertTimelineEntry: ошибка записи журнала тоже откатывает все сроки.
+  db.runInTransaction(() => {
+    for (let i = 0; i < unique.length; i += 1) {
+      const id = unique[i];
+      const node = db.getNode(id);
+      if (!node) {
+        throw new Error(
+          `expire: узел "${id}" исчез между проверкой и применением (удалён) — batch отменён.`
+        );
+      }
+      if ((node.valid_until ?? null) !== rows[i].was) {
+        throw new Error(
+          `expire: срок узла "${id}" изменился между проверкой и применением ` +
+            `(${rows[i].was} → ${node.valid_until ?? null}) — batch отменён.`
+        );
+      }
+      const updated = db.updateNode(id, { valid_until: untilIso });
+      if (!updated) {
+        throw new Error(`expire: не удалось проставить срок узлу "${id}".`);
+      }
     }
-  }
-  const timeline = createTimelineLogger(db);
-  timeline.log({
-    tool: "expire",
-    params: { until: untilIso, ids: unique },
-    result_summary: `expired ${unique.length} nodes until ${untilIso}`,
-    is_write: true,
-    is_error: false,
-    affected_ids: unique,
+    db.insertTimelineEntry({
+      tool: "expire",
+      params: JSON.stringify({ until: untilIso, ids: unique }),
+      result_summary: `expired ${unique.length} nodes until ${untilIso}`,
+      is_write: true,
+      is_error: false,
+      affected_ids: unique,
+    });
   });
   return { rows, applied: true };
 }

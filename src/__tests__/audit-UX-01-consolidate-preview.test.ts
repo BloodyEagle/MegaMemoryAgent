@@ -15,6 +15,10 @@ function planFixture(
 }
 
 function planBase(survivor: string, other: string) {
+  // B-02 (аудит 2026-11-12): preview отвечает планом ВМЕСТЕ с карточками
+  // участников (cards.survivor/other, null — узла нет). Содержимое карточек
+  // совпадает с прежними отдельными ответами /api/node/:id.
+  const member = (id: string) => cardFixture(id, id === NEWER ? { status: "deprecated", file_refs: ["src/b.ts"] } : {});
   return {
     survivor,
     other,
@@ -23,6 +27,7 @@ function planBase(survivor: string, other: string) {
       survivor_updated_at: "2026-11-07 10:00:00",
       other_updated_at: "2026-11-07 10:00:00",
     },
+    cards: { survivor: member(survivor), other: member(other) },
     summaryCombines: true,
     finalSummary: "объединённое описание",
     whySource: "survivor" as const,
@@ -64,8 +69,15 @@ function makeReplies(options: {
 } = {}) {
   const state = {
     merged: false,
+    // B-02: недоступный узел в bundle — null-слот карточки (бывший 404
+    // отдельного /api/node/:id).
     cardBStatus: options.cardBStatus ?? 200,
     postCount: 0,
+  };
+  const previewBody = (survivor: string, other: string) => {
+    const plan = planFixture(survivor, other, options.planOverride);
+    if (state.cardBStatus !== 200) return { ...plan, cards: { ...plan.cards, other: null } };
+    return plan;
   };
   const reply = ({ url, method }: AuditDomRequest): AuditDomReply | undefined => {
     if (url === "/api/consolidate" && method === "GET") {
@@ -82,10 +94,10 @@ function makeReplies(options: {
       return { body: { ok: true, survivor: OLDER, removed: NEWER } };
     }
     if (url === previewUrl(OLDER, NEWER)) {
-      return { body: planFixture(OLDER, NEWER, options.planOverride) };
+      return { body: previewBody(OLDER, NEWER) };
     }
     if (url === previewUrl(NEWER, OLDER)) {
-      return { body: planFixture(NEWER, OLDER, options.planOverride) };
+      return { body: previewBody(NEWER, OLDER) };
     }
     if (url === `/api/node/${encodeURIComponent(OLDER)}`) {
       return { body: cardFixture(OLDER) };
@@ -194,7 +206,7 @@ describe("UX-01 — сравнение двух нод перед Consolidate", 
     } finally { ui.close(); }
   });
 
-  it("merge остаётся disabled, пока обе карточки и последствия не загружены; 404 карточки даёт retry без POST", async () => {
+  it("merge остаётся disabled, пока карточки bundle не загружены; недоступная карточка даёт retry без POST", async () => {
     const { reply, state } = makeReplies({ cardBStatus: 404 });
     const ui = await auditDom({ reply });
     try {
@@ -204,15 +216,15 @@ describe("UX-01 — сравнение двух нод перед Consolidate", 
       const merge = panel.querySelectorAll("button")
         .find((button) => button.getAttribute("data-action") === "consolidate-merge");
       expect(merge!.hasAttribute("disabled")).toBe(true);
-      // retry перечитывает (GET), ошибки POST нет.
-      const cardGets = () => ui.requests.filter((request) => request.url.startsWith("/api/node/")).length;
-      const before = cardGets();
+      // retry перечитывает bundle (GET), ошибки POST нет.
+      const previewGets = () => ui.requests.filter((request) => request.url.startsWith("/api/consolidate/preview")).length;
+      const before = previewGets();
       const retry = ui.element("#consolidate-preview").querySelectorAll("button")
         .find((button) => button.getAttribute("data-action") === "consolidate-retry");
       expect(retry).toBeDefined();
       ui.dispatch(retry!, "click");
       await ui.settle();
-      expect(cardGets()).toBeGreaterThan(before);
+      expect(previewGets()).toBeGreaterThan(before);
       expect(ui.element("#consolidate-preview").textContent).toContain("card failed");
       expect(state.postCount).toBe(0);
       // Данные починились — retry доводит панель до готовности.
@@ -259,7 +271,7 @@ describe("UX-01 — сравнение двух нод перед Consolidate", 
     } finally { ui.close(); }
   });
 
-  it("409 version_conflict: ноль записей, карточки перечитаны, подтверждение запрошено заново", async () => {
+  it("409 version_conflict: ноль записей, bundle перечитан, подтверждение запрошено заново", async () => {
     const { reply, state } = makeReplies({
       postReply: { body: { error: "version_conflict", detail: "the merge inputs changed" }, status: 409 },
     });
@@ -268,7 +280,7 @@ describe("UX-01 — сравнение двух нод перед Consolidate", 
       const panel = await openPreview(ui);
       ui.dispatch(chooseSurvivor(panel, "A"), "click");
       await ui.settle();
-      const cardGetsBefore = ui.requests.filter((request) => request.url.startsWith("/api/node/")).length;
+      const bundleReadsBefore = ui.requests.filter((request) => request.url.startsWith("/api/consolidate/preview")).length;
       const merge = ui.element("#consolidate-preview").querySelectorAll("button")
         .find((button) => button.getAttribute("data-action") === "consolidate-merge");
       ui.dispatch(merge!, "click");
@@ -278,9 +290,9 @@ describe("UX-01 — сравнение двух нод перед Consolidate", 
       ui.dispatch(confirm!, "click");
       await ui.settle();
       expect(state.postCount).toBe(1);
-      // Перечитывание: новые GET карточек и плана после отказа.
-      const cardGetsAfter = ui.requests.filter((request) => request.url.startsWith("/api/node/")).length;
-      expect(cardGetsAfter).toBeGreaterThan(cardGetsBefore);
+      // Перечитывание: новый GET bundle (план+карточки) после отказа.
+      const bundleReadsAfter = ui.requests.filter((request) => request.url.startsWith("/api/consolidate/preview")).length;
+      expect(bundleReadsAfter).toBeGreaterThan(bundleReadsBefore);
       // Подтверждение сброшено: заново просят merge → confirm, сам merge не выполнен.
       expect(ui.element("#consolidate-preview").querySelectorAll("button")
         .find((button) => button.getAttribute("data-action") === "consolidate-confirm")).toBeUndefined();

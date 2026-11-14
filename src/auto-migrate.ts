@@ -236,6 +236,10 @@ export async function autoMigrateIfNeeded(
 
       // Id repair is automatic here (top-down, aliases recorded).
       const plan = planIdRepair(db);
+      if ((plan.unresolvedDescendants ?? 0) > 0) {
+        rollbackReason = `id repair has ${plan.unresolvedDescendants} unresolved descendant(s); repair missing or conflicting parents first`;
+        throw new Error(rollbackReason);
+      }
       const repair = applyIdRepair(db, plan);
       result.ids_repaired = plan.entries.map((e) => ({
         old: e.oldId,

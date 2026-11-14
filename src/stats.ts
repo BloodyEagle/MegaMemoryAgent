@@ -9,11 +9,6 @@ import { computeFunnel, formatFunnel } from "./funnel.js";
 
 const KIND_ORDER = ["feature", "module", "component", "pattern", "config", "decision"];
 
-function getFlag(args: string[], flag: string): string | undefined {
-  const idx = args.indexOf(flag);
-  return idx !== -1 && args[idx + 1] ? args[idx + 1] : undefined;
-}
-
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
 
@@ -68,7 +63,12 @@ export async function runStats(args: string[]): Promise<void> {
   // если это единственное, что попросили (--prune требует записи).
   const funnelMode = args.includes("--funnel");
   const jsonMode = args.includes("--json");
-  const pruneRequested = getFlag(args, "--prune") !== undefined;
+  // B-05 (аудит 2026-11-12): --prune — boolean-флаг. getFlag требовал
+  // следующий аргумент argv, поэтому голый `stats --prune` в конце списка
+  // видел undefined и очистка журнала молча не запускалась (а с соседним
+  // аргументом — запускалась): результат зависел от позиции флага.
+  // Наличие флага — само по себе значение, порядок argv не важен.
+  const pruneRequested = args.includes("--prune");
   if (funnelMode && jsonMode && !pruneRequested) {
     const readonlyDb = new KnowledgeDB(dbPath, { readonly: true });
     try {

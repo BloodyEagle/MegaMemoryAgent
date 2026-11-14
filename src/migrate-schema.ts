@@ -309,6 +309,9 @@ export async function runMigration(
   if (!opts.apply) {
     // Dry-run: nothing written. Surface what apply WOULD do.
     report.warnings.push(`dry run: ${repairPlan.entries.length} id(s) would be renamed`);
+    if ((repairPlan.unresolvedDescendants ?? 0) > 0) {
+      report.warnings.push(`dry run: ${repairPlan.unresolvedDescendants} unresolved descendant id(s) require parent repair`);
+    }
     const stamped = db.getMetaValue("embed_model");
     const unknownVectors =
       stamped === undefined
@@ -352,6 +355,9 @@ export async function runMigration(
   }
 
   // Step 7: repair legacy ids.
+  if ((repairPlan.unresolvedDescendants ?? 0) > 0) {
+    throw new Error(`id repair has ${repairPlan.unresolvedDescendants} unresolved descendant(s); repair missing or conflicting parents first`);
+  }
   if (repairPlan.entries.length > 0 || repairPlan.conflicts.length > 0) {
     const result = applyIdRepair(db, repairPlan);
     report.repairedIds = result.renamed;

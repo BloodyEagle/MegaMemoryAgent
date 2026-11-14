@@ -23,6 +23,11 @@ beforeEach(() => {
   const { home } = fixture.isolateHome();
   vi.stubEnv("OPENCODE_CONFIG_DIR", path.join(home, "opencode"));
   vi.stubEnv("XDG_CONFIG_HOME", path.join(home, ".config"));
+  // B-10: постоянный профиль Codex — активный CODEX_HOME. isolateHome не
+  // изолирует переменную, а installer теперь её читает: без явной заглушки
+  // непустой CODEX_HOME из окружения запускающего привёл бы установщик в
+  // реальный профиль.
+  vi.stubEnv("CODEX_HOME", path.join(home, ".codex"));
   config = path.join(home, ".codex", "config.toml");
   fs.mkdirSync(path.dirname(config), { recursive: true });
   boundary.unexpected.length = 0;
