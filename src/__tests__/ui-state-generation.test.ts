@@ -35,7 +35,7 @@ describe("E08 authoritative search", () => {
       ui.dispatch(ui.element("#search"), "keydown", { key: "Enter" });
       await ui.settle();
       expect(ui.element("#search-results").querySelectorAll(".search-result")).toHaveLength(0);
-      expect(ui.element("#search-results").textContent).toContain("No semantic matches");
+      expect(ui.element("#search-results").textContent).toContain("No matches found");
     } finally { ui.close(); }
   });
   it("HTTP503 fallback keeps current qualification visible and excludes abandoned/expired", async () => {
