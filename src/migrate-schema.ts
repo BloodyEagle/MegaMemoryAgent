@@ -371,7 +371,7 @@ export async function runMigration(
     // embed:false — migration must not trigger a model download; reembed covers vectors later.
     const { built } = await rebuildDigests(db, undefined, { embed: false });
     if (built.length > 0) {
-      report.applied.push(`built ${built.length} module digest(s)`);
+      report.applied.push(`built ${built.length} digest(s)`);
     }
   } catch (err) {
     report.warnings.push(

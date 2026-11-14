@@ -177,7 +177,12 @@ describe("§9.4 version_conflict", () => {
       confirmSupports(db, {
         decision_id: "d",
         expected_claim_digest: claimDigestOf(db.getNode("d")!.summary),
-        items: [{ support_id: "f", expected_claim_digest: stale, expected_edge_digest: staleEdge }],
+        items: [{
+          support_id: "f",
+          expected_claim_digest: stale,
+          expected_status_digest: statusDigestOf(db.getNode("f")!.status, db.getNode("f")!.epistemic_status),
+          expected_edge_digest: staleEdge,
+        }],
       });
     } catch (err) {
       message = err instanceof Error ? err.message : String(err);
@@ -960,7 +965,7 @@ describe("F3: the status axes are confirmed like every other field", () => {
             support_id: "f",
             expected_claim_digest: claimDigestOf(support.summary),
             expected_edge_digest: edgeDigestOf(edge.description),
-          },
+          } as unknown as import("../types.js").ConfirmSupportsItem,
         ],
       });
     } catch (err) {

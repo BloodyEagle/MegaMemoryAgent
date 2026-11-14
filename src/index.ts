@@ -249,8 +249,8 @@ async function startMcpServer() {
   // MCP-режим, как и serve, законно создаёт базу при первой установке.
   const DB_PATH = resolveDbPathOrExit(process.argv.slice(2), { allowCreate: true });
   // 2.1.12 F2: репозиторий для разрешения git:tag/commit/branch-опор
-  // (--repo PATH; по умолчанию — каталог базы). Дальше путь закрепляется
-  // в node_artifacts.repo_path при первом разрешении каждого ref'а.
+  // (--repo PATH; по умолчанию — каталог базы). MCP передаёт его как явный
+  // repo в каждый check_artifacts: смена startup-пути перезакрепляет git-ref.
   const REPO_PATH = resolveRepoPath(process.argv.slice(2), DB_PATH);
 
   const db = new KnowledgeDB(DB_PATH);
@@ -320,16 +320,38 @@ async function startMcpServer() {
   const RelationEnum = z.enum([
     "connects_to", "depends_on", "implements", "calls", "configured_by", "supersedes", "contradicts", "informed_by",
   ]);
+  const EvidenceExpectSchema = z.object({
+    claim_digest: z.string().optional(),
+    status_digest: z.string().optional(),
+    artifacts_digest: z.string().nullable().optional(),
+  });
+  const EvidenceWhySchema = z.string().trim().min(1).describe(
+    "Рационал: что именно в этой опоре поддерживает вывод — непустая строка обязательна"
+  );
+  const EvidenceItemSchema = z.union([
+    z.object({
+      ref: z.string().describe("Файл (+ строка), на котором держится вывод; узел-факт создастся, если файл ещё никто не цитирует"),
+      node: z.never().optional(),
+      why: EvidenceWhySchema,
+      expect: EvidenceExpectSchema.optional().describe("Прочитанные claim/status/artifacts digest переиспользуемой опоры; без них связь создаётся без подтверждения"),
+    }),
+    z.object({
+      ref: z.never().optional(),
+      node: z.string().describe("Существующий узел-опора"),
+      why: EvidenceWhySchema,
+      expect: EvidenceExpectSchema.optional().describe("Прочитанные claim/status/artifacts digest переиспользуемой опоры; без них связь создаётся без подтверждения"),
+    }),
+  ]);
 
   // ---- Register tools ----
 
   server.tool(
     "understand",
-    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node. Ответ несёт блок next — исполняй его дословно: must_read (до 3 ссылок) прочитай перед правками; skip сейчас пуст, refs и summary не доказывают покрытия всего файла; followups выполни как написаны (аргументы готовые), после правки запиши знание по строке record. mode:'brief' — до 8 строк текста плюс next, без карточек, для быстрой ориентации.",
+    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node. Every result mode carries next: execute must_read (up to 3 refs) before editing, treat skip as an empty legacy field, run followups with the supplied args, and use record after the work; refs and summaries never prove whole-file coverage. mode:'brief' returns up to 8 text lines plus the same next contract, without cards. The MCP wrapper also adds the top-level staleness fields instructions_stale, instructions_version, and server_version; they are included in max_tokens.",
     {
       query: z.string().describe("Natural language query describing what you want to understand about the project"),
       top_k: z.number().int().min(1).max(50).optional().describe("Number of top results to return (default: 10)"),
-      max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the actual MCP content envelope, including instructions; refuses when required instructions cannot fit (default: 1500)"),
+      max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the actual MCP content envelope, including next and the wrapper staleness fields instructions_stale/instructions_version/server_version; refuses when the required envelope cannot fit (default: 1500)"),
       mode: z.enum(["compact", "full", "brief"]).optional().describe("compact (default) trims each node to essentials under the budget; full returns legacy verbose output; brief returns up to 8 lines of text plus the next block, no cards"),
       include_inactive: z.boolean().optional().describe("Include superseded/deprecated nodes (default: false)"),
       include_stale: z.boolean().optional().describe("Вернуть и просроченные факты (valid_until в прошлом) — с пометкой expired: true (по умолчанию исключены, meta.stale_excluded считает исключённых)"),
@@ -431,26 +453,16 @@ async function startMcpServer() {
 
   server.tool(
     "create_concept",
-    "Add a new concept to the knowledge graph. Call this after completing a task to record new features, components, patterns, or decisions you built. Include specific details: parameter names, defaults, file locations, and rationale. У decision/pattern передавай evidence — список {ref | node, why}: файл или уже существующий узел, на котором держится вывод, плюс рационал. Опоры создаются в том же вызове, отдельный link потом не нужен; снимок обоснования пишется только по evidence — рёбра из edges создаются, но подтверждением не считаются (plan-4-fixes-6 F1). Если evidence нет, а file_refs и why заполнены — опоры будут выведены автоматически по файлам. Факт без informed_by на источник (файл, тест, лог, диалог) помечается ungrounded и выпадает из замыкания провенанса. Если включён строгий режим (provenance.require_support), decision без опоры отклоняется — передавай evidence в том же вызове.",
+    "Add an agent-authored concept to the knowledge graph. The usual agent-authored kinds are feature, module, pattern, config, decision, and component; digest remains accepted for compatibility but is normally generated by the digest command, while task nodes are created by task_add. Call this after completing work and include parameter names, defaults, file locations, and rationale. For a decision/pattern pass evidence items with exactly one of ref or node and a non-empty why; supports and their informed_by edges are created atomically, while input.edges never confirms a support snapshot. Reused evidence is confirmed only when expect supplies the versions actually read (claim_digest and status_digest; artifacts_digest may also be pinned); a newly created ref anchor can be confirmed immediately. Automatic grounding applies only to kind=decision, only when provenance.auto_ground is explicitly enabled (default off), and only from non-empty why + file_refs when neither evidence nor an informed_by input edge was supplied; auto-derived supports are not confirmed. A node is ungrounded exactly when it has no live outgoing informed_by edge, no non-empty file_refs array, and no current validated status_scope with an artifact. With provenance.require_support enabled, an unsupported decision is rejected.",
     {
       name: z.string().describe("Human-readable name for the concept"),
-      kind: NodeKindEnum.describe("Type of concept: feature, module, pattern, config, decision, component"),
+      kind: NodeKindEnum.describe("Concept kind. feature, module, pattern, config, decision, and component are the usual agent-authored values; digest is accepted for compatibility but normally generated by the digest command. Tasks are created with task_add."),
       summary: z.string().describe("What this concept is. Be specific: include parameter names, defaults, file paths, behavior details."),
       why: z.string().optional().describe("Why this exists or was built this way"),
       parent_id: z.string().optional().describe("Parent concept ID for nesting; empty string is treated as omitted"),
       file_refs: z.array(z.string()).optional().describe("Relevant file paths + optional line ranges"),
       supersedes: z.array(z.string()).optional().describe("Concept IDs this one replaces — creates supersedes edges and marks the old nodes superseded (T4)"),
-      evidence: z.array(z.object({
-        ref: z.string().optional().describe("Файл (+ строка), на котором держится вывод; узел-факт создастся, если файл ещё никто не цитирует"),
-        node: z.string().optional().describe("Существующий узел-опора"),
-        why: z.string().describe("Рационал: что именно в этой опоре поддерживает вывод — обязателен"),
-        expect: z.object({
-          claim_digest: z.string().optional(), status_digest: z.string().optional(),
-          edge_key: z.string().optional(), edge_digest: z.string().optional(),
-          artifacts_digest: z.string().nullable().optional(),
-          artifact_rows: z.array(z.object({ kind: z.string(), ref: z.string(), digest: z.string().nullable(), repo_path: z.string().nullable() })).optional(),
-        }).optional().describe("Прочитанные версии переиспользуемой опоры; без них связь создаётся без подтверждения"),
-      })).optional().describe("Опоры для decision/pattern — {ref | node, why}: файл или существующий узел плюс рационал. Создаются в том же вызове; ровно одно из ref/node на элемент"),
+      evidence: z.array(EvidenceItemSchema).optional().describe("Опоры для decision/pattern. Каждый элемент содержит ровно одно из ref/node и непустой why; создаётся в том же вызове."),
       edges: z.array(z.object({
         to: z.string().describe("Target concept ID"),
         relation: RelationEnum.describe("Relationship type"),
@@ -641,7 +653,7 @@ async function startMcpServer() {
 
   server.tool(
     "list_roots",
-    "List all top-level concepts in the knowledge graph. Budgeted overview: id, name, kind and child count per root (roots_compact), no summaries — pass max_tokens to control the budget.",
+    "Return the budgeted startup overview. The payload is always compact: roots is an empty compatibility field; roots_compact contains id/name/kind/child_count/valid_until, slots contains current role holders, and board_top contains up to five open tasks by rot. Under max_tokens the priority is slots, then board_top, then roots; meta reports returned/dropped roots and every truncated section. Unlike understand, this tool has no next block. The MCP wrapper adds stats plus the top-level staleness fields instructions_stale, instructions_version, and server_version, and all of them count toward max_tokens.",
     {
       max_tokens: z.number().int().min(100).max(20000).optional().describe("Token budget for the overview (default: 1500)"),
     },
@@ -717,7 +729,7 @@ async function startMcpServer() {
 
   server.tool(
     "resolve_conflict",
-    "Resolve a merge conflict by providing the correct resolved content. Read both conflict versions, verify against the current codebase, then provide the accurate resolved summary. Do NOT just pick a side — write the truth.",
+    "Resolve a merge conflict after verifying it against the current codebase. The resolved object is required by the wire schema. For concept conflicts its summary/why/file_refs are written; for edge-only groups resolved is ignored and prefer=left|right is required. Do not blindly pick a concept side: resolved content must state the verified current truth.",
     {
       merge_group: z.string().describe("The merge_group UUID of the conflict to resolve"),
       resolved: z.object({
@@ -763,11 +775,11 @@ async function startMcpServer() {
 
   server.tool(
     "provenance_trace",
-    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: depth (0–20), max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false); тот же бюджет ограничивает проверку опор решений — проверяются первые по id, запись support_check_truncated сообщает checked/total. Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами — такие записи несут числовые count и sample (первые ≤5 id), note не длиннее 300 символов. weak_links целиком не превышают 8 КБ: при превышении записи режутся по приоритету и добавляется маркер weak_links_truncated (shown/total). completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated. Снимок обоснования: решение несёт блок support_check — сверку живых опор с подтверждённым снимком; состояния unchanged/changed (причины per опоры: summary|status|rationale|removed; отдельный сигнал artifact_changed — наблюдённое состояние внешних артефактов опоры, записанное check_artifacts, разошлось с подтверждённым снимком: саммари могло остаться прежним, изменился источник; снимается повторным подтверждением после проверки)/unknown/incomplete, unknown и incomplete чистотой не считаются; изменение опоры не стирается добавлением новых рёбер; цепочка версий подтверждённых опор — provenance_history. Подтверждение — отдельный вызов confirm_supports с digest'ами прочитанных формулировок: трассировка несёт их сама — current_digests у корня (claim решения — всегда ТЕКУЩАЯ формулировка: после правки перечитай и подтверждай новым digest'ом, подтверждённая ранее версия видна в confirmed_claim) и supports[] (полные claim/status/edge digest'ы каждой живой опоры, без превью); в компактном understand дайджестов нет. Ни одна мутация (link/update/merge) снимок не пишет и не обновляет. Контракт «чтение не пишет» (plan-4-fixes-6 F12): provenance_trace и get_concept не пишут ничего в граф и снимки; служебная телеметрия вызовов (timeline) ведётся отдельно и на провенанс не влияет; проверка опор ограничена бюджетом max_check_edges/max_check_bytes, inner-узлы с оборванной проверкой видны в inner_nodes_incomplete, а completeness деградирует до truncated.",
+    "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) depth=0 возвращает только корень, допустимый диапазон 0–20; total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false); тот же бюджет ограничивает проверку опор решений — проверяются первые по id, запись support_check_truncated сообщает checked/total. Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами — такие записи несут числовые count и sample (первые ≤5 id), note не длиннее 300 символов. weak_links целиком не превышают 8 КБ: при превышении записи режутся по приоритету и добавляется маркер weak_links_truncated (shown/total). completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated. Снимок обоснования: решение несёт блок support_check — сверку живых опор с подтверждённым снимком; состояния unchanged/changed (причины per опоры: summary|status|rationale|removed; отдельный сигнал artifact_changed — наблюдённое состояние внешних артефактов опоры, записанное check_artifacts, разошлось с подтверждённым снимком: саммари могло остаться прежним, изменился источник; снимается повторным подтверждением после проверки)/unknown/incomplete, unknown и incomplete чистотой не считаются; изменение опоры не стирается добавлением новых рёбер; цепочка версий подтверждённых опор — provenance_history. Подтверждение — отдельный вызов confirm_supports с digest'ами прочитанных формулировок: трассировка несёт их сама — current_digests у корня (claim решения — всегда ТЕКУЩАЯ формулировка: после правки перечитай и подтверждай новым digest'ом, подтверждённая ранее версия видна в confirmed_claim) и supports[] (полные claim/status/edge digest'ы живых опор, максимум 50; supports_count при усечении — полное число опор); в компактном understand дайджестов нет. Ни одна мутация (link/update/merge) снимок не пишет и не обновляет. Контракт «чтение не пишет» (plan-4-fixes-6 F12): provenance_trace и get_concept не пишут ничего в граф и снимки; служебная телеметрия вызовов (timeline) ведётся отдельно и на провенанс не влияет; проверка опор ограничена бюджетом max_check_edges/max_check_bytes, inner-узлы с оборванной проверкой видны в inner_nodes_incomplete, а completeness деградирует до truncated.",
     {
       node_id: z.string().describe("Узел, с которого начинается обход"),
       direction: z.enum(["ancestry", "impact"]).optional().describe("ancestry (по умолчанию) — что поддерживает узел; impact — что на него опирается"),
-      depth: z.number().int().min(1).max(20).optional().describe("Глубина обхода (по умолчанию 6)"),
+      depth: z.number().int().min(0).max(20).optional().describe("Глубина обхода 0–20 (по умолчанию 6); 0 возвращает только корень"),
       max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов сверх корня (по умолчанию 200)"),
       max_scan_nodes: z.number().int().min(1).max(100000).optional().describe("Бюджет сканирования — сколько узлов разворачивать (по умолчанию 5000); при срабатывании total_exact: false"),
       max_check_edges: z.number().int().min(1).max(1000000).optional().describe("Бюджет проверки снимка опор — сколько пар «решение—опора» сверять за вызов (по умолчанию 5000); при исчерпании support_check.state = incomplete, а не unchanged"),
@@ -811,12 +823,12 @@ async function startMcpServer() {
 
   server.tool(
     "provenance_audit",
-    "«Что рассыплется, если это неверно»: обратный обход (impact) по informed_by с подсветкой узлов, у которых epistemic_status != validated (поле at_risk). Каждый прогон пишется в provenance_audit_runs с ретеншном — последние 200 на узел, не старше 90 дней, чтобы ретроспектива «что мы знали тогда» не врала после того, как граф уехал. Контракт записи: этот журнал — единственное, что audit пишет; граф, узлы и снимки опор он не трогает (plan-4-fixes-6 F12).",
+    "«Что рассыплется, если это неверно»: обратный обход (impact) по informed_by с подсветкой узлов, у которых epistemic_status != validated (поле at_risk). depth допускает 0–20; 0 возвращает только корень. Каждый прогон пишется в provenance_audit_runs с ретеншном — последние 200 на узел, не старше 90 дней, чтобы ретроспектива «что мы знали тогда» не врала после того, как граф уехал. Контракт записи: этот журнал — единственное, что audit пишет; граф, узлы и снимки опор он не трогает (plan-4-fixes-6 F12).",
     {
       node_id: z.string().describe("Узел, корректность которого проверяется"),
       direction: z.enum(["ancestry", "impact"]).optional().describe("impact (по умолчанию) — что рассыплется; ancestry — на чём стоит"),
-      depth: z.number().int().min(1).max(20).optional().describe("Глубина обхода (по умолчанию 6)"),
-      max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов (по умолчанию 200)"),
+      depth: z.number().int().min(0).max(20).optional().describe("Глубина обхода 0–20 (по умолчанию 6); 0 возвращает только корень"),
+      max_nodes: z.number().int().min(1).max(2000).optional().describe("Лимит узлов сверх корня (по умолчанию 200)"),
       max_scan_nodes: z.number().int().min(1).max(100000).optional().describe("Бюджет сканирования (по умолчанию 5000); при срабатывании total_exact: false"),
       max_check_edges: z.number().int().min(1).max(1000000).optional().describe("Бюджет проверки снимка опор (по умолчанию 5000)"),
       max_check_bytes: z.number().int().min(1).max(20000000).optional().describe("Байтовый бюджет проверки снимка (по умолчанию 2 МБ)"),
@@ -868,7 +880,7 @@ async function startMcpServer() {
       items: z.array(z.object({
         support_id: z.string().describe("ID узла-опоры"),
         expected_claim_digest: z.string().describe("claim_digest саммари опоры, который агент читал (provenance_trace.supports[] отдаёт его целиком)"),
-        expected_status_digest: z.string().optional().describe("status_digest опоры (оси статуса), который агент читал; без него подтверждение отказывает"),
+        expected_status_digest: z.string().describe("status_digest опоры (оси статуса), который агент читал; обязателен, несовпадение даёт version_conflict"),
         expected_edge_digest: z.string().describe("edge_digest рационала ребра, который агент читал"),
         expected_edge_key: z.string().optional().describe("Точный edge_key прочитанного экземпляра связи"),
         expected_artifacts_digest: z.string().nullable().optional().describe("combined digest активных наблюдений артефактов опоры, который агент читал (provenance_trace.supports[].artifacts_digest); при передаче расхождение — version_conflict: чужой check_artifacts между чтением и подтверждением не подтверждает непрочитанную версию"),
@@ -910,7 +922,7 @@ async function startMcpServer() {
 
   server.tool(
     "provenance_history",
-    "Цепочка версий подтверждённых опор решения: какую версию агент подтверждал, какая была до неё, какая после — для разбора инцидента задним числом. По каждой паре «решение—опора»: confirmed_at, source (agent — первое подтверждение / import — перенос при merge / superseded — версия вытеснена повторным подтверждением или удалением), reason (confirmed/reconfirmed/removed/edge_relinked), превью digest'ов (12 символов) и признак «это текущая версия». Тел узлов нет — только версии. Чтение не пишет ничего.",
+    "Цепочка версий подтверждённых опор решения: какую версию агент подтверждал, какая была до неё, какая после — для разбора инцидента задним числом. По каждой паре «решение—опора»: confirmed_at, source (agent — первое подтверждение / import — перенос при merge / superseded — версия вытеснена повторным подтверждением или удалением), reason (confirmed/reconfirmed/removed/edge_relinked), превью digest'ов (12 символов) и признак «это текущая версия». Без support_id возвращается максимум 50 пар в детерминированном порядке; pairs_truncated=true означает, что пары за пределом скрыты. limit ограничивает ревизии отдельно для каждой пары (по умолчанию 20, максимум 100), revisions_truncated помечает усечение. Тел узлов нет — только версии. Чтение не пишет ничего.",
     {
       decision_id: z.string().describe("ID решения, чья история версий запрашивается"),
       support_id: z.string().optional().describe("Опора — вернуть цепочку только этой пары; без неё — по всем парам решения"),
@@ -950,7 +962,7 @@ async function startMcpServer() {
 
   server.tool(
     "check_artifacts",
-    "Проверить внешние артефакты узлов (файлы, git-blob'ы и git:-ссылки из file_refs): посчитать sha256 содержимого или разрешить git:tag|commit|branch в sha коммита и записать наблюдение. ЯВНЫЙ вызов — ничего не читается и не хешируется само: ни чтение узла, ни трассировка файлы не трогают. Расхождение «наблюдение vs подтверждённый снимок» всплывает в support_check как artifact_changed и в weak_links отдельным типом — это НЕ support_changed: саммари опоры могло остаться прежним, изменился источник. ВАЖНО: unchanged в support_check означает «совпадает с подтверждённым снимком», а не «файл только что прочитан» — файлы читает только явный check_artifacts. Порядок работы для снимка: check_artifacts по опорам → прочитать digest'ы → confirm_supports (он сохранит текущее состояние артефактов в снимок; передача expected_artifacts_digest из supports[] защищает от чужого check_artifacts между чтением и подтверждением — расхождение даст version_conflict). Отсутствующий файл или неразрешившийся ref — запись missing, не падение. Ссылки, снятые с узла (file_refs), из digest'а выпадают как история — состав наблюдений часть версии. Корень для относительных путей и репозиторий git:-ссылок закрепляются в repo_path при первом разрешении и меняются только явным cwd/repo в вызове — один raw ref не переключается между файлами и репозиториями. kind=url не поддерживается: сетевые запросы из MCP-сервера — отдельное решение.",
+    "Проверить внешние артефакты узлов (файлы, git-blob'ы и git:-ссылки из file_refs): посчитать sha256 содержимого или разрешить git:tag|commit|branch в sha коммита и записать наблюдение. MCP-вызов не принимает cwd/repo на каждый call. Относительные file/git-blob refs сначала разрешаются от закреплённого repo_path наблюдения, иначе от cwd запущенного сервера. Для git:-refs startup --repo (по умолчанию каталог базы) передаётся как явный корень на каждом MCP-вызове, поэтому он имеет приоритет над сохранённым pin и записывается обратно в repo_path. ЯВНЫЙ вызов — ничего не читается и не хешируется само: ни чтение узла, ни трассировка файлы не трогают. Расхождение «наблюдение vs подтверждённый снимок» всплывает в support_check как artifact_changed и в weak_links отдельным типом — это НЕ support_changed: саммари опоры могло остаться прежним, изменился источник. ВАЖНО: unchanged в support_check означает «совпадает с подтверждённым снимком», а не «файл только что прочитан» — файлы читает только явный check_artifacts. Порядок работы для снимка: check_artifacts по опорам → прочитать digest'ы → confirm_supports (он сохранит текущее состояние артефактов в снимок; передача expected_artifacts_digest из supports[] защищает от чужого check_artifacts между чтением и подтверждением — расхождение даст version_conflict). Отсутствующий файл или неразрешившийся ref — запись missing, не падение. Ссылки, снятые с узла (file_refs), из digest'а выпадают как история — состав наблюдений часть версии. kind=url не поддерживается: сетевые запросы из MCP-сервера — отдельное решение.",
     {
       node_ids: z.array(z.string()).min(1).describe("Узлы, чьи артефакты проверить (refs берутся из file_refs)"),
       max_files: z.number().int().min(1).max(10000).optional().describe("Лимит пар «узел—ref» за вызов (по умолчанию 50); лишние — truncated: true"),
@@ -1120,7 +1132,7 @@ async function startMcpServer() {
 
   server.tool(
     "slot_set",
-    "Take a named role slot (handoff, entrypoint, queue, ...) with a node — the role's single live pointer. Taking a role held by another node writes a supersedes edge and demotes the previous holder; re-taking by the same node is a no-op. Slots are scoped per project.",
+    "Take a named role slot (handoff, entrypoint, queue, ...) with a node — the role's single live pointer. If another node held it, that old holder loses only the slot and a new-holder → old-holder supersedes edge records the handoff; the old node's lifecycle/status is not changed. Re-taking by the same node is a no-op. Slots are scoped per project.",
     {
       role: z.string().describe("Role name, e.g. 'handoff', 'entrypoint'"),
       node_id: z.string().describe("Concept id that now holds the role"),

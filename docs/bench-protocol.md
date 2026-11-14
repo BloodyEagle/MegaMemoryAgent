@@ -71,11 +71,15 @@ or link the review verbatim.
 
 ## Quality and completeness
 
-This retrieval metric is `graph_metric=retrieval_wire_without_instructions`: the
-estimator includes the MCP content wrapper, pretty JSON and `next`, but **excludes
-MCP instructions metadata**. It is not exactly the default MCP response. There is
-no magic fixed token offset. TE counts stdout only, not skill instructions or
-follow-up file reads. Whole-task economy remains `economy_status=not_measured`.
+This retrieval metric is `graph_metric=retrieval_wire_without_instructions`. The
+estimator includes the actual MCP content envelope used by retrieval — pretty JSON
+inside `{content:[{type:"text",text:...}]}` — plus `next` and the self-referential
+`tokens_estimated` field. The bench path calls `understand` directly, so it **excludes
+the runtime wrapper staleness fields** `instructions_stale`,
+`instructions_version`, and `server_version` that the MCP handler adds. Those are ordinary response payload
+fields, not protocol initialization data. It is therefore not exactly the default MCP response. There is no magic fixed token offset. TE counts
+stdout only, not skill instructions or follow-up file reads. Whole-task economy
+remains `economy_status=not_measured`.
 
 ### Additive dataset contract
 

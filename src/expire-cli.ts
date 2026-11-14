@@ -42,7 +42,7 @@ export function resolveUntil(value: string): string {
   }
   if (text === "" || Number.isNaN(Date.parse(text))) {
     throw new Error(
-      `--until: "${value}" не разбирается как дата (ISO-8601) и не является "past".`
+      `--until: "${value}" не разбирается как дата и не является "past".`
     );
   }
   return text;
@@ -201,7 +201,7 @@ export async function runExpire(argv: string[]): Promise<void> {
     throw new Error("expire: нужен источник id — --ids a,b или --report <json>.");
   }
   if (!untilArg) {
-    throw new Error("expire: нужен срок — --until <ISO-дата> или --until past (вчера).");
+    throw new Error("expire: нужен срок — --until <дата, принимаемая Date.parse> или --until past (вчера).");
   }
   const untilIso = resolveUntil(untilArg);
 

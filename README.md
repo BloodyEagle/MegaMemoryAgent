@@ -34,15 +34,15 @@ database at `.megamemory/knowledge.db`.
 | Area | Upstream 1.6.2 | This fork |
 |---|---|---|
 | Node IDs | slug strips everything outside `[a-z0-9-]`; Cyrillic, CJK, Greek, emoji names collapse to `""` and the second such node is lost | Unicode-safe slug: letters of any script, diacritics stripped only after Latin/Cyrillic/Greek/Hebrew bases (katakana dakuten and Hangul jamo are preserved), `/` becomes `-`, NFC output, hash fallback for emoji-only names, `-<hash8>` on collisions |
-| Embeddings | `all-MiniLM-L6-v2`, English-only, dimension hardcoded | `Xenova/multilingual-e5-small` by default (`MEGAMEMORY_EMBED_MODEL`), e5 `passage:`/`query:` prefixes, dimension read from the model, vector search disabled on model mismatch until `megamemory reembed` |
-| Search | cosine similarity only | hybrid: FTS5 + vector fused with RRF, per-hit `via: vector \| fts \| both`, query sanitization for `MATCH`, short-CJK routing, optional trigram index, `name_norm` LIKE fallback |
+| Embeddings | `all-MiniLM-L6-v2`, English-only, dimension hardcoded | `Xenova/multilingual-e5-small` by default (`MEGAMEMORY_EMBED_MODEL`), e5 `passage:`/`query:` prefixes, dimension learned from the first vector in an explicit, resumable `megamemory reembed` generation; only matching current-generation rows are searchable |
+| Search | cosine similarity only | hybrid by default: FTS5 + vector fused with RRF, per-hit `via: vector \| fts \| both`, query sanitization for `MATCH`, short-CJK routing, optional trigram index, `name_norm` LIKE fallback; unavailable/mismatched vectors and hybrid vector-inference failures degrade to FTS. Explicit `MEGAMEMORY_SEARCH=vector` remains strict and reports inference errors. |
 | Context | `understand` returns everything it found | `mode: "compact"` by default, bounded by `max_tokens` (1500), summaries trimmed to 240 chars, edges between returned nodes only, `meta.returned / dropped / tokens_estimated`; the answer ends with a `next` action block (`must_read` / `skip` / `followups` / `record`) |
 | Freshness | delete or nothing | node `status` (`active`/`superseded`/`deprecated`), `supersedes` and `contradicts` edges, outdated nodes hidden from answers but visible in the graph; facts expire: `valid_until` drops state claims out of answers after their date |
 | Duplicates | manual merge | `megamemory consolidate` finds embedding-similar pairs (≥ 0.95) and merges them with edge transfer |
-| Long modules | every child read separately | `digest` nodes: one per module, rebuilt after the 5th child, lower search weight |
-| Portability | DB only | `megamemory export --md <dir>` writes one markdown file per node (frontmatter + wiki-links), `--check` for CI |
+| Long parent groups | every child read separately | `digest` nodes: one derived sibling for any parent after the 5th eligible child, search weight 0.8; source siblings remain independently searchable, and content-based staleness says when `megamemory digest --apply` must refresh the digest |
+| Portability | DB only | `megamemory export --md <dir>` writes one markdown file per node (frontmatter + wiki-links); `--check` reports missing/differing/extra markdown for CI and never deletes files |
 | Cost visibility | none | every `understand` / `list_roots` / `get_concept` is measured; 7-day aggregates in `megamemory stats`, `/api/stats` and the explorer's **Tokens** panel; `megamemory stats --funnel` measures the understand → follow-up → record funnel over the `timeline` journal (`--json` for scripts) |
-| Migration | — | `megamemory migrate --dry-run/--apply` upgrades an upstream database in place, additively, with backups and a downgrade-safe schema |
+| Migration | — | explicit `megamemory migrate --apply` upgrades raw upstream v1.6.2 in place, additively, with coherent backups; dry-run executes the migration on a temporary SQLite snapshot and leaves the source untouched |
 
 ---
 
@@ -97,8 +97,11 @@ repository is `--repo PATH` at server start (default: the database directory).
 Start MCP without a subcommand: `megamemory --db PATH --repo REPO`;
 `--db=PATH` and `--repo=REPO` are equivalent, missing or repeated values fail
 before opening the database. CLI subcommands may follow these global flags.
-The path is pinned into `node_artifacts.repo_path` at the first resolution, so
-later checks do not depend on the server's cwd. Auto-deriving supports from
+The startup `--repo` is passed explicitly on every MCP `check_artifacts` call and
+therefore repins git refs if the server is restarted with a different repository.
+Direct internal checks that omit `repo` reuse `node_artifacts.repo_path`; relative file
+and git-blob refs likewise reuse their pinned root unless an explicit `cwd` overrides it.
+Auto-deriving supports from
 `why` + `file_refs` exists
 but is **off by default** (`provenance.auto_ground` in `megamemory.config.json`
 next to the database) — server-invented supports must not masquerade as
@@ -240,9 +243,13 @@ script from the source/staging package or an explicitly updated installation.
 A complete expected no-match is valid; errors, absent payloads and truncation are
 not proof of quality or a measurable advantage.
 
-`graph_metric=retrieval_wire_without_instructions` estimates the MCP content wrapper
-around retrieval (including `next`), **without MCP instructions metadata**. It is not
-exactly the default MCP response and not whole-task telemetry (`economy_status=not_measured`).
+`graph_metric=retrieval_wire_without_instructions` estimates the actual retrieval
+MCP content envelope: pretty JSON inside `{content:[{type:"text",text:...}]}` and
+`next`. The bench path calls `understand` directly, so it **excludes the runtime
+wrapper staleness fields** `instructions_stale`, `instructions_version`, and
+`server_version` that the MCP handler adds; these are ordinary response payload
+fields, not protocol initialization data. It is therefore not exactly the default
+MCP response and not whole-task telemetry (`economy_status=not_measured`).
 No fixed token correction is applied. `ratio > 1` means the graph is cheaper;
 `ratio < 1` means the baseline is cheaper: 200 / 100 = 2, 100 / 200 = 0.5.
 
@@ -307,8 +314,8 @@ agent A/B comparison, see [docs/bench-protocol.md](docs/bench-protocol.md).
 
 ## Install
 
-Requires Node.js >= 20.10 (raised from 18: sharp, pulled in by the embedding pipeline, uses `import ... with { type: "json" }`, which Node 20.9 cannot parse; dev toolchain — vite/vitest — needs >= 20.19). For Russian-only projects a much smaller model (`cointegrated/rubert-tiny2`, 312-dim) works after an ONNX conversion; the model unloads after 5 minutes idle (`MEGAMEMORY_EMBED_IDLE_MS=0` disables that), and `MEGAMEMORY_SEARCH=fts` avoids loading it at all. The embedding model (~120 MB, multilingual) downloads on first use and is
-cached in `~/.cache/huggingface`.
+Requires Node.js >= 20.10 (raised from 18: sharp, pulled in by the embedding pipeline, uses `import ... with { type: "json" }`, which Node 20.9 cannot parse). Building or testing a checkout uses the Vite/Vitest development toolchain and the repository gate accepts **Node 20.19+, 22.12+, or 24+** (Node 21 and 23 are not supported dev runtimes).
+ For Russian-only projects a much smaller model (`cointegrated/rubert-tiny2`, 312-dim) works after an ONNX conversion; the model unloads after 5 minutes idle (`MEGAMEMORY_EMBED_IDLE_MS=0` disables that), and `MEGAMEMORY_SEARCH=fts` avoids loading it at all. The embedding model (~120 MB, multilingual) downloads on first use. With the shipped `@huggingface/transformers` runtime, its default filesystem cache is the package's own `.cache` directory; MegaMemory does not configure a stable user cache path, so inspect/configure the Transformers.js environment for nonstandard deployments rather than assuming a home-level Hugging Face cache.
 
 Install globally from npm:
 
@@ -316,12 +323,13 @@ Install globally from npm:
 npm install -g @bloodyeagle/megamemory
 ```
 
-
-Or download the tarball from GitHub Releases (no build needed):
+Or download the package asset from the matching GitHub Release (npm names a scoped
+package tarball `bloodyeagle-megamemory-<version>.tgz`; for this release):
 
 ```bash
-npm install -g ./megamemory-1.7.0-fork.1.tgz
+npm install -g ./bloodyeagle-megamemory-2.5.1.tgz
 ```
+
 Or build from a checkout (for development):
 
 ```bash
@@ -329,55 +337,98 @@ git clone https://github.com/BloodyEagle/MegaMemoryAgent.git
 cd MegaMemoryAgent
 npm ci
 npm run build
-npm pack                      # bloodyeagle-megamemory-1.7.0-fork.1.tgz
-npm install -g ./bloodyeagle-megamemory-1.7.0-fork.1.tgz
+npm pack                      # prints the exact generated .tgz filename
+npm install -g ./bloodyeagle-megamemory-2.5.1.tgz
 ```
 
-Then either run the installer or register the MCP server by hand:
+Register the integration with the installer:
 
 ```bash
-megamemory install            # interactive: opencode / [CC] / Codex / Antigravity
+megamemory install
+# Non-interactive; comma-separated targets are also accepted:
+megamemory install --target opencode
+megamemory install --target claudecode
+megamemory install --target antigravity
+megamemory install --target codex
 ```
 
-```json
-{
-  "megamemory": {
-    "type": "local",
-    "command": ["megamemory"],
-    "enabled": true
-  }
-}
-```
+There is deliberately no universal manual JSON snippet: the clients use different
+schemas. OpenCode stores a `type: "local"` entry whose `command` is an argv array;
+Claude Code uses `mcpServers` with `type: "stdio"`, `command`, and `args`;
+Antigravity uses a workspace `mcp_config.json` entry with `command` and `args`;
+Codex uses `[mcp_servers.megamemory]` TOML. `install` writes the correct form and the
+client-specific workflow files. If configuring by hand, register the stdio command
+`megamemory` **without a subcommand**, translate argv into that client's form, and
+manage its workflow instructions separately.
 
-The server reads `.megamemory/knowledge.db` relative to the working directory; override with
-`MEGAMEMORY_DB_PATH`.
+The server resolves `.megamemory/knowledge.db` from the MCP process working directory;
+`--db PATH` / `--db=PATH` in server argv takes precedence over
+`MEGAMEMORY_DB_PATH`. For Codex, `install` writes `config.toml` and `AGENTS.md` to a
+non-empty `CODEX_HOME`, otherwise to `~/.codex`; OpenCode and Claude Code use their
+client-specific profile paths shown in the installer output.
 
-**Keeping prompts fresh.** `install` stamps every file it generates with
-`<!-- megamemory:instructions vX.Y.Z -->`. The server compares that stamp with
-its own version on every `list_roots` / `understand` call and returns
-`instructions_stale` / `instructions_version` / `server_version` right in the
-response — after `npm update -g`, re-run `megamemory install` when the flag
-comes back `true` (an agent cannot see stderr, so the signal travels in the
-payload it already reads).
+**Workflow-wrapper freshness.** `install` puts
+`<!-- megamemory:instructions vX.Y.Z -->` on the managed block in `AGENTS.md` or
+`CLAUDE.md` and on installed command markdown. It does not stamp MCP config or the
+OpenCode plugin. On every `list_roots` and `understand`, the server freshly scans the
+first stamped/legacy managed **instruction file** in this order: project `AGENTS.md`,
+project `CLAUDE.md`, OpenCode `AGENTS.md`, `~/.claude/CLAUDE.md`, then
+`~/.codex/AGENTS.md`. Command files are stamped for ownership/update but are not part
+of this scan; in 2.5.1 a custom `CODEX_HOME` is installed correctly but is not an
+additional scan candidate. The response carries the runtime wrapper staleness fields
+`instructions_stale`, `instructions_version`, and `server_version`. No managed
+instruction file means `false / null`; a version mismatch means re-run `install` for
+the relevant target after updating the package.
 
 ### Upgrading an existing upstream database
 
+A raw upstream v1.6.2 database has `PRAGMA user_version = 0` and an existing `nodes`
+table. Normal MCP, `serve`, and ordinary RW command opens reject that shape with
+`UPSTREAM_SCHEMA_V0`; they cannot reach startup auto-migration. Upgrade it explicitly:
+
 ```bash
-megamemory migrate --dry-run    # prints the plan, changes nothing
-megamemory migrate --apply      # backs up knowledge.db.bak-<ts>, applies the additive schema
-megamemory reembed              # only needed if the embedding model changed
+megamemory migrate --dry-run    # migrate a temporary coherent snapshot; source is unchanged
+megamemory migrate --apply      # coherent backup, then additive migration of the source
+megamemory reembed              # establish/rebuild the current vector generation
 megamemory doctor               # health check, exit code 1 on problems
 ```
 
-The migration never drops or renames a column, so upstream v1.6.2 still opens a migrated database.
-Nodes lost upstream to the empty-ID bug cannot be recovered; `--dry-run` reports them explicitly.
+`migrate --dry-run` is the default without `--apply`. It takes a coherent SQLite
+`VACUUM INTO` snapshot (including committed WAL frames), runs the real apply path on
+that disposable copy, and fingerprints the source main file plus `-wal` before and
+after. It reports “nothing written” only if that fingerprint stayed stable; a
+concurrent source change gets a warning. `repair-ids` has the same temporary-snapshot
+and fingerprint semantics. A dry-run plan is advisory: neither command emits a token
+that a later invocation consumes. `migrate --apply` recomputes against current state;
+`repair-ids --apply` recomputes its plan and applies it atomically, failing closed if a
+target became occupied, a rename became stale, or descendants still cannot be resolved.
+Full and automatic migration likewise refuse/roll back instead of stamping success while
+unresolved descendants remain. Backups are coherent snapshots named
+`knowledge.db.bak-<UTC timestamp>`; only the three newest files matching MegaMemory's
+strict name and SQLite-header checks are retained.
 
-Dry-run boundaries (R-05): a `--dry-run` command never writes graph data, but **opening a legacy
-database converts it on open** — backup, one transaction (schema, id repair, FTS rebuild,
-`name_norm`/embed meta backfill), report next to the file. This is deliberate and separate from
-the dry-run promise: the conversion touches schema and hygiene fields, not your claims. The
-exporter owns only the files it renders: `export --check` reports extra `.md` files in the
-directory and never deletes them — prune manually, the exporter has no ownership of the folder.
+Schema numbers have two separate meanings. **`PRAGMA user_version = 14` is the actual
+current database schema and compatibility guard.** `meta.schema_version` is only the
+fork-conversion marker used by the upstream hygiene path (`"1"` while conversion is
+pending, `"3"` after it ran); it is not schema 3 and must not be used to decide whether
+a v14 database is current. Migration is additive and does not drop or rename upstream
+columns, but older fork builds that predate the v14 future-version guard are not a safe
+downgrade path—restore the pre-upgrade backup instead.
+
+Migration and ordinary schema upgrades never run the embedding model. `reembed`
+starts (or resumes) an explicit vector generation identified by model, preprocessing
+profile, learned dimension, and generation number. Switching generation atomically
+invalidates both the node blobs and native `nodes_vec` projection; each eligible
+active, non-expired, non-refuted/non-abandoned node is then published to both
+projections with generation and node-input checks. An interrupted run resumes missing
+rows. Once the first valid row establishes the dimension, search may use only rows
+already published in that current generation while FTS covers the rest; old, NULL,
+wrong-dimension, or wrong-generation vectors never become hits. Run `reembed` after a
+model/preprocessing change and after migrating vectors of unknown origin.
+
+The exporter owns no directory: `export --check` only reports differing, missing and
+extra `.md` files and exits nonzero on drift; it never deletes them. Remove confirmed
+extras manually.
 
 ---
 
@@ -385,22 +436,35 @@ directory and never deletes them — prune manually, the exporter has no ownersh
 
 | Tool | Description |
 |---|---|
-| `understand` | Hybrid search over the graph. `top_k`, `max_tokens`, `mode: "compact" \| "full" \| "brief"`, `include_inactive`, `include_stale` (expired facts). Every answer ends with the `next` block: `must_read` refs to read, `skip` never substitutes for checking current sources, ready-to-run `followups`, and the `record` line. |
-| `get_concept` | Exact-ID lookup with children, edges, incoming edges, parent. |
-| `create_concept` | Add a concept with edges, file refs and `supersedes`; `valid_until` sets the fact's expiry. |
-| `update_concept` | Update fields; embeddings are regenerated. `valid_until: null` clears the expiry. |
-| `link` | Typed relationship between concepts. |
-| `remove_concept` | Soft-delete with a reason; history kept, status set to `deprecated`. |
-| `list_roots` | Top-level concepts with direct children (budgeted). |
-| `list_conflicts` | Unresolved merge conflicts, plus `contradicts` pairs. |
-| `resolve_conflict` | Resolve a conflict with verified content. |
-| `provenance_trace` | Walk `informed_by` (`ancestry` / `impact`) with honest completeness and weak links first. |
-| `provenance_audit` | Graph-wide provenance audit: weak links, ungrounded decisions, retention of past audits. |
-| `check_artifacts` | Hash a node's file/git-blob artifacts (file refs may carry line locators — the whole file is hashed), resolve `git:tag/commit/branch` refs to a sha; divergences surface as `artifact_changed`. |
-| `board` | Task board; done has total `count`, `returned`, `has_more`, `next_cursor`. Continue with `done_cursor`, optionally `done_limit` (1–100, default 20). |
-| `trail_refresh` | Refresh fingerprints and return actual fresh/stale state and reasons; a broken chain is refused without writes. |
+| `understand` | Budgeted hybrid retrieval in `compact` (default), `full`, or `brief`; filters inactive/expired facts and always returns the `next` action contract. |
+| `get_concept` | Exact-ID full context: parent, children, edges, trails/slots, support check, and current digests for confirmation. |
+| `create_concept` | Atomically create a node and optional edges/evidence; supports `supersedes`, `valid_until`, duplicate refusal, and same-call evidence snapshots. |
+| `update_concept` | Patch content or expiry and perform reasoned epistemic transitions; relevant text changes republish a current-generation vector or invalidate the old one. |
+| `link` | Add one of the eight typed relationships; `informed_by` requires a non-empty rationale and cannot close a provenance cycle. |
+| `remove_concept` | Soft-delete with a reason and tombstones; refuses live dependents unless `force` is explicit. |
+| `list_roots` | Budgeted startup payload: `roots_compact` rows (`id`, `name`, `kind`, `child_count`, `valid_until`), `slots`, `board_top`, truncation `meta`, graph `stats`, and wrapper staleness fields; legacy `roots` is empty. |
+| `list_conflicts` | List unresolved concept/edge merge groups and live `contradicts` pairs. |
+| `resolve_conflict` | Write verified resolved concept content, or explicitly choose a verified side for an edge-only conflict. |
+| `provenance_trace` | Rooted `informed_by` traversal from `node_id` in `ancestry` or `impact` direction, with completeness, weak links, support checks, and current digests. |
+| `provenance_audit` | Rooted audit from required `node_id` (`impact` by default): marks `at_risk` nodes and stores one bounded audit-run record; it is not a graph-wide scan. |
+| `confirm_supports` | Atomically snapshot exactly the listed support versions after expected decision/support/status/edge digests pass; an empty list explicitly confirms no supports. |
+| `provenance_history` | Read the revision chain of confirmed decision–support pairs, optionally for one support. |
+| `check_artifacts` | Explicitly hash local file refs or resolve local `git:tag/commit/branch` refs and record current/changed/missing observations; no network or URL checks. |
+| `trail_save` | Save an ordered reasoning chain with a mandatory rationale summary and fingerprints of member meaning. |
+| `trail_get` | Read a trail and its per-member and aggregate `fresh` / `stale` / `broken` verdict. |
+| `trail_refresh` | Re-snapshot eligible members after verification; broken or epistemically/temporally invalid members are not rehabilitated. |
+| `trail_extend` | Append members to an existing trail and fingerprint their current meaning. |
+| `slot_set` | Point one project role at a live node; reassignment adds a `supersedes` handoff edge, same-node retry is a no-op. |
+| `slot_get` | Read the current live holder of one named role. |
+| `slot_release` | Remove a role pointer without changing or deleting the former holder. |
+| `slot_list` | List all project roles and their current live holders. |
+| `task_add` | Create an open task concept with an optional parseable due date. |
+| `task_done` | Move a task to terminal `done` and clear its due date. |
+| `board` | Return open tasks sorted by rot and the done column with `count`, `returned`, `has_more`, and keyset `next_cursor` pagination. |
 
-**Kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest`
+**Stored kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest` · `task`
+
+`create_concept` accepts the first seven values (`digest` remains for compatibility but is normally generated); `task` is created only by `task_add`.
 
 **Relations:** `connects_to` · `depends_on` · `implements` · `calls` · `configured_by` · `supersedes` · `contradicts` · `informed_by`
 
@@ -412,9 +476,9 @@ directory and never deletes them — prune manually, the exporter has no ownersh
 |---|---|
 | `megamemory install` | Configure an MCP client |
 | `megamemory serve [--port N]` | Web explorer (graph, search, node cards, Tokens panel, consolidate tab). **Loopback only** (`127.0.0.1`, IPv6: `--host ::1`) — a local tool for a human, not a network service; earlier releases listened on all interfaces — behavior changed |
-| `megamemory migrate [--dry-run\|--apply]` | Upgrade an upstream database |
-| `megamemory repair-ids [--apply]` | Rebuild empty / trailing-slash IDs from names |
-| `megamemory reembed` | Recompute embeddings (resumable, batched) |
+| `megamemory migrate [--dry-run\|--apply]` | Upgrade raw upstream v1.6.2 or repair fork migration objects; dry-run uses a disposable coherent snapshot, apply backs up and writes |
+| `megamemory repair-ids [--dry-run\|--apply]` | Rebuild empty/trailing-slash and affected descendant IDs; dry-run uses a disposable snapshot, apply is atomic |
+| `megamemory reembed [--batch N]` | Start/resume a model+preprocessing vector generation and republish eligible nodes into canonical/native projections |
 | `megamemory doctor` | Health check: schema, model, FTS, IDs, vectors, orphans, digests |
 | `megamemory stats` | Graph and token statistics |
 | `megamemory eval` | recall@10 over `fixtures/eval.jsonl` |
@@ -422,39 +486,77 @@ directory and never deletes them — prune manually, the exporter has no ownersh
 | `megamemory bench --questions q.jsonl` | Orientation savings in tokens: graph vs `--baseline files\|te\|both` |
 | `megamemory consolidate [--dry-run\|--apply]` | Find and merge near-duplicate nodes |
 | `megamemory digest [--apply]` | Build or rebuild digest nodes |
-| `megamemory export --md <dir> [--check]` | Markdown export, CI-friendly drift check |
-| `megamemory expire --ids a,b --until D[\|--past]` | Set `valid_until` on journal/state-claim nodes (dry-run by default, `--apply` to write) |
+| `megamemory export --md <dir> [--check]` | Markdown export; `--check` reports drift for CI and never deletes files |
+| `megamemory expire --ids a,b --until <DATE\|past> [--apply]` | Set/replace `valid_until` atomically (dry-run by default; `DATE` is any nonempty value accepted by `Date.parse`, `past` means yesterday); `--report <json>` is the alternate ID source |
 | `megamemory merge`, `conflicts`, `resolve` | Two-way merge of graphs across branches |
 
 ### Which commands never write to the database
 
-`export`, `eval` and `conflicts` — plus the scripted `stats --funnel --json`
-snapshot and `migrate --dry-run` — open the database READ-ONLY: no WAL, no
-in-place migration, the file's bytes stay untouched. On a schema mismatch the
-command fails with a ready-made fix — `megamemory migrate --apply --db "<path>"`
-for an older database, an upgrade-the-package hint (with the file's
-`user_version`) for a newer one. `MEGAMEMORY_ALLOW_AUTO_MIGRATE=1` restores
-the old behavior for one invocation: a read-write open with auto-migration.
+`export`, `eval` and `conflicts` are the three direct protected read-only commands;
+additional non-writing paths and snapshot dry-runs are listed below.
 
-`stats`, `bench` and `doctor` still open the database for writing —
-deliberately: the read paths of `stats`/`bench` record usage telemetry
-(`list_roots`/`understand` bookkeeping), `stats --prune` writes by design,
-and `doctor` migrates in place. `serve` and the MCP server write usage and
-timeline too. That is why the reference demo database `fixtures/demo.db`
-opens read-only; make a copy to work with it.
+| Command/path | Source-database mode | Notes |
+|---|---|---|
+| `export` (including `--check`) | read-only | No WAL or migration; `--check` also never deletes export files. |
+| `eval` | read-only | Parses/validates JSONL before opening the database. |
+| `conflicts` | read-only | Inspection only; `merge` and `resolve` are separate writing commands. |
+| `stats --funnel --json` without `--prune` | read-only | The exact scripted snapshot only; plain `stats`, non-JSON funnel, and any `--prune` path are RW. |
+| `expire` without `--apply` | read-only | Dry-run validates IDs and reports the replacement expiry; `--apply` is atomic RW. |
+| `migrate --dry-run` | unchanged source | Runs the actual migration on a disposable coherent snapshot and fingerprints source main+WAL. |
+| `repair-ids --dry-run` | unchanged source | Plans against the same kind of disposable snapshot and fingerprints source main+WAL. |
+| test access under `MEGAMEMORY_FIXTURES_DIR` | read-only only | A test guard rejects RW opens of pinned fixtures. |
+
+`MEGAMEMORY_ALLOW_AUTO_MIGRATE=1` has a deliberately narrow scope: it changes only
+the `openReadonlyOrExplain` paths used by **`export`, `eval`, and `conflicts`** into an
+ordinary RW open for that process. It does not affect `stats --funnel --json`,
+`expire` dry-run, either snapshot dry-run, fixtures, or any other command. On a
+read-only schema mismatch, an older database reports
+`SCHEMA_TOO_OLD_READONLY` with `megamemory migrate --apply --db "<path>"`; a newer
+one reports `SCHEMA_TOO_NEW_READONLY` with its `PRAGMA user_version` and an
+upgrade-package hint. Missing and corrupt files have distinct errors; corruption is
+not given a migration hint.
+
+Every other database command is RW even when its high-level operation sounds like a
+plan: `stats`, `bench` and `doctor` open the database for writing; plain `stats` and
+`bench` write usage telemetry, `stats --prune` writes by design, and `doctor` may
+migrate an old fork schema. `consolidate` and `digest` dry-runs also construct RW
+design; `doctor` migrates on open; `consolidate` and `digest` dry-runs currently use an
+RW `KnowledgeDB`; `serve` and MCP write usage/timeline and may perform startup hygiene.
+`merge`, `resolve`, all apply modes, and write tools mutate their documented targets.
+Therefore copy `fixtures/demo.db` before using it outside the guarded read-only paths.
 
 ---
 
 ## Environment
 
+Runtime controls read by MegaMemory itself:
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Database location |
-| `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Embedding model (any transformers.js ONNX model) |
-| `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid` / `fts` / `vector` |
-| `MEGAMEMORY_FTS_TOKENIZER` | — | `trigram` adds a second index for CJK |
-| `MEGAMEMORY_AUTO_DIGEST` | on | `0` disables auto-digest after the 5th child |
-| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | D3 source for the explorer UI. The vendored `web/vendor/d3.min.js` ships with the package and works offline; set this to a URL to use your own mirror. When the vendored file is missing, serve falls back to the jsDelivr CDN and prints a note |
+| `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Database fallback after `--db`; resolved from the process cwd. |
+| `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Transformers.js ONNX model identity; changing it requires `reembed`. |
+| `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid`, `fts`, or `vector`; vector mode falls back to FTS when no valid current generation exists. |
+| `MEGAMEMORY_FTS_TOKENIZER` | unset | Exact value `trigram` requests the companion CJK FTS table/triggers. |
+| `MEGAMEMORY_EMBED_IDLE_MS` | `300000` | Idle milliseconds before unloading the model; `0` disables unload. Read when the module starts. |
+| `MEGAMEMORY_EMBED_THREADS` | `1` | ONNX intra-op thread count; inter-op remains 1. Read when the module starts. |
+| `MEGAMEMORY_AUTO_DIGEST` | on | Exact value `0` disables automatic first digest creation after the 5th eligible child. |
+| `MEGAMEMORY_DEDUPE_THRESHOLD` | `0.92` | Valid `(0,1]` cosine threshold for semantic duplicate refusal; overrides `dedupe.threshold` in the adjacent config. |
+| `MEGAMEMORY_PROVENANCE_REQUIRE_SUPPORT` | config / off | Per-call strict-decision override; boolean forms `1/0`, `true/false`, `on/off`, `yes/no`. |
+| `MEGAMEMORY_REQUIRE_SUPPORT` | config / off | Short fallback alias for the preceding variable. |
+| `MEGAMEMORY_PROVENANCE_AUTO_GROUND` | config / off | Per-call override for deriving decision supports from `why` + `file_refs`; same boolean forms. |
+| `MEGAMEMORY_TIMELINE_RETENTION_DAYS` | `90` | Timeline age retention; integer `0` disables the age rule. |
+| `MEGAMEMORY_TIMELINE_MAX_ENTRIES` | `50000` | Timeline count retention; integer `0` disables the count rule. |
+| `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | Explorer D3 source override. Without it, the vendored file is used; if missing, serve warns and falls back to jsDelivr. |
+| `MEGAMEMORY_AUTO_MIGRATE` | on | MCP-startup hygiene only: exact `0` skips the full upstream conversion/ID-repair path and runs additive schema setup instead. It is not the read-only-command escape hatch and `serve` does not consult it. |
+| `MEGAMEMORY_ALLOW_AUTO_MIGRATE` | off | Only `export`, `eval`, and `conflicts`: exact `1` replaces their protected readonly open with ordinary RW opening for that process. |
+| `MEGAMEMORY_FIXTURES_DIR` | unset | Test/fixture safety boundary: RW opens below this directory are rejected. Not normally set in production. |
+
+Installer/profile location controls are `OPENCODE_CONFIG_DIR` (otherwise
+`XDG_CONFIG_HOME/opencode`, with `~/.config` as the XDG fallback), `CODEX_HOME`
+(otherwise `~/.codex`), and `HOME`. These choose files written by `install`; they do
+not change the graph runtime. The adjacent `megamemory.config.json` additionally
+supports `provenance.require_support`, `provenance.auto_ground`, and
+`dedupe.threshold`.
 
 ---
 
@@ -472,7 +574,7 @@ megamemory serve --port 8080
 - **Consolidate** tab: duplicate candidates with apply
 - per-kind filter checkboxes (persisted), visible/total counter, **export bundle** button and per-node `download .md`
 - **Health** chip: vectors, FTS sync, digests, empty ids, orphans, memory — with remedy hints
-- digest cards list source concepts with a `stale` badge and a **focus** toggle
+- digest cards list the digest's eligible source **siblings** in the parent module (not children of the digest), with a content-derived `stale` badge and a **focus** toggle
 - timeline **status changes** mode; node cards show recent status transitions with reasons
 - d3 ships with the package (`web/vendor/d3.min.js`) — the explorer renders offline; a missing file falls back to the jsDelivr CDN with a printed note, `MEGAMEMORY_D3_URL` overrides both, `/api/health` reports `d3_source`
 

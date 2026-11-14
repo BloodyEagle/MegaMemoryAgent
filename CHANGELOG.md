@@ -16,6 +16,16 @@
 - `eval`, `funnel` и установщик больше не теряют данные на граничных входах.
 - Веб-интерфейс читает исторические версии узла без гонки с SSE-обновлением.
 
+### Documentation
+
+- README, FORK/readonly/bench reference, CLI help, OpenCode skill and installed
+  agent commands are synchronized with the 2.5.1 runtime and all 25 MCP tools.
+- MCP `tools/list` schemas now expose the runtime contracts for evidence XOR,
+  mandatory `expected_status_digest`, `depth: 0`, bounded provenance lists and
+  artifact-root precedence.
+- Removed stale acceptance captures (`wf-at-d633b72.yml`, `runs.json`,
+  `jobs.json`) that looked like active release metadata.
+
 ## 2.5.0 (2026-11-10)
 
 Схема БД: **13 → 14** (`user_version`). Миграция атомарная — `ALTER` + backfill

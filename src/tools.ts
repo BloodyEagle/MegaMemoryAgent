@@ -712,7 +712,7 @@ export async function understand(
       if (via) ctx.via = via;
       return ctx;
     });
-    // Full preserves every selected card and instruction, refusing budgets that cannot fit.
+    // Full preserves every selected card and next action, refusing budgets that cannot fit.
     const fullNext = buildNextHints({
       db,
       cards: matches.map((m) => ({
@@ -737,7 +737,7 @@ export async function understand(
     };
     const tokensEstimated = measureMcpPayload({ ...output, ...input.extra_payload });
     if (tokensEstimated > maxTokens) {
-      throw new Error(`understand: max_tokens=${maxTokens} cannot fit the full response and required instructions (minimum ${tokensEstimated}); increase the budget or use compact mode.`);
+      throw new Error(`understand: max_tokens=${maxTokens} cannot fit the full response, next actions, and wrapper fields (minimum ${tokensEstimated}); increase the budget or use compact mode.`);
     }
     output.meta!.tokens_estimated = tokensEstimated;
     const payload = JSON.stringify(output);

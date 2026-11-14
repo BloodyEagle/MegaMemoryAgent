@@ -324,8 +324,8 @@ export function runDoctor(db: KnowledgeDB): {
     "digests",
     true, // informational
     digestPending === 0
-      ? "all large modules have digests"
-      : `${digestPending} module(s) without digest — run 'megamemory digest --apply'`
+      ? "all large parent groups have digests"
+      : `${digestPending} parent group(s) without digest — run 'megamemory digest --apply'`
   );
 
   // ---- 2.1.3 F1/F2: revision journal and artifact observations ----

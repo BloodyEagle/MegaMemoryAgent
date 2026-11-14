@@ -371,7 +371,7 @@ describe("UX-01 — сравнение двух нод перед Consolidate", 
       const text = ui.element("#consolidate-preview").textContent;
       expect(text).toContain("merged");
       expect(text).toContain(OLDER);
-      expect(text).toContain('origin "unknown"');
+      expect(text).toContain("edge rows were redirected to the survivor, preserving identity, created_via, and accepted_at");
       // Граф перечитан: поглощённая нода исчезла.
       const graphIds = ui.graphState().nodes.map((node) => node.id).sort();
       expect(graphIds).toContain(OLDER);

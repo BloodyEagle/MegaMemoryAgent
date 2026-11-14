@@ -6,7 +6,7 @@ export function assertDevRuntime() {
   const [major, minor] = process.versions.node.split(".").map(Number);
   // Vite (the Vitest toolchain) requires a newer engine than the product CLI.
   if (!((major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major >= 24)) {
-    throw new Error(`DEV_NODE_UNSUPPORTED ${process.version}; Vitest needs Node 20.19+, 22.12+, or 24+. The product runtime minimum stays 20.9 (engines).`);
+    throw new Error(`DEV_NODE_UNSUPPORTED ${process.version}; Vitest needs Node 20.19+, 22.12+, or 24+. The product runtime minimum stays 20.10 (engines).`);
   }
 }
 
