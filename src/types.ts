@@ -19,7 +19,7 @@ export interface Node {
   merge_timestamp: string | null;
 }
 
-export const NODE_KINDS = ["feature", "module", "pattern", "config", "decision", "component", "digest"] as const;
+export const NODE_KINDS = ["feature", "module", "pattern", "config", "decision", "component", "digest", "journal"] as const;
 export type NodeKind = (typeof NODE_KINDS)[number];
 
 export interface Edge {
@@ -98,8 +98,11 @@ export interface CreateConceptInput {
    * "2026-12-31T23:59:59Z"). Обязателен для утверждений о состоянии
    * («смержено», «PR открыт») — без него запись о состоянии со временем
    * тихо врёт. Сервер срок не придумывает: не передал — узел бессрочный.
+   * M2 B2: для kind=journal опущенное поле означает автопростановку по
+   * политике expiry (env/конфиг/default 90 дней); явный null отказывается
+   * от автопростановки (диагностика без срока остаётся).
    */
-  valid_until?: string;
+  valid_until?: string | null;
 }
 
 /** Plan 3 §4.1.1: one evidence item — exactly one of `ref` / `node`, plus a non-empty `why`. */

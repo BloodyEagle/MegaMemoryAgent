@@ -45,8 +45,14 @@ export const STUB_REJECTION_MESSAGE =
  * (created_via = 'agent', значение по умолчанию — вызов на этапе создания
  * узла, когда строки ещё нет). Якоря (created_via = 'file_ref') не считаются
  * заглушками никогда — их шаблонное саммари так задумано; прочие происхождения
- * (import/auto/null) заглушками не называются: неизвестное происхождение не
- * имеет права изобличать узел.
+ * (import/auto/null) заглушками не называются: неизвестное происхождение
+ * не имеет права изобличать узел.
+ *
+ * M2 B1 (план 20+21 v3 §7): kind=journal не проверяется заглушечным
+ * предикатом — это оперативная запись о состоянии («PR открыт»), не
+ * утверждение о поведении; её честность держится expiry-политикой (§7 B2),
+ * а не проверкой формулировки. Отказ update_concept короткому journal-саммари
+ * был бы ложным.
  */
 export function isStubSummary(
   summary: string | null | undefined,
@@ -54,7 +60,7 @@ export function isStubSummary(
   createdVia: string | null | undefined = "agent"
 ): boolean {
   if (createdVia !== "agent") return false;
-  if (kind && (kind === "module" || kind === "digest")) return false;
+  if (kind && (kind === "module" || kind === "digest" || kind === "journal")) return false;
   const text = (summary ?? "").trim();
   if (!text) return true;
   if (STUB_SUMMARY_PATTERN.test(text)) return true;
