@@ -60,6 +60,7 @@ import {
 import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary } from "./stub.js";
 import { validationState } from "./validation.js";
+import { readExpiryConfig, journalDefaultExpiry } from "./expiry.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
   const errorMsg = err instanceof Error ? err.message : String(err);
@@ -442,10 +443,18 @@ const STATE_CLAIM_HINT =
 const EXPIRED_HINT =
   "valid_until уже в прошлом — узел создан, но сразу выпадет из выдачи. Проверь дату или сними срок (null).";
 
+const JOURNAL_NULL_HINT =
+  "Journal — изменчивая запись о состоянии. По умолчанию срок ставится автоматически " +
+  "(expiry.journal_days / MEGAMEMORY_EXPIRY_JOURNAL_DAYS, fallback 90 дней); явный null " +
+  "автопростановку отключает. Запись без срока не объявляется безопасной: передай valid_until " +
+  "или верни автопростановку.";
+
 /**
  * Предупреждения записи узла: срок в прошлом — всегда; утверждение о
  * состоянии без срока — когда effective expiry отсутствует (undefined или
- * null = бессрочно).
+ * null = бессрочно). M2 B2: kind=journal — по определению изменчивая запись
+ * о состоянии, диагностика без срока не требует regex-совпадения; явный null
+ * запрещает автопростановку, но не делает запись безопасной (R08).
  */
 export function conceptWarnings(
   summary: string,
@@ -458,12 +467,12 @@ export function conceptWarnings(
       warnings.push({ code: "expired_on_create", hint: EXPIRED_HINT });
     }
   }
-  if (
-    opts.kind !== "digest" &&
-    looksLikeStateClaim(summary) &&
-    opts.validUntil == null
-  ) {
-    warnings.push({ code: "state_claim_without_expiry", hint: STATE_CLAIM_HINT });
+  if (opts.validUntil == null) {
+    if (opts.kind === "journal") {
+      warnings.push({ code: "state_claim_without_expiry", hint: JOURNAL_NULL_HINT });
+    } else if (opts.kind !== "digest" && looksLikeStateClaim(summary)) {
+      warnings.push({ code: "state_claim_without_expiry", hint: STATE_CLAIM_HINT });
+    }
   }
   return warnings;
 }
@@ -1299,7 +1308,17 @@ export async function createConcept(
   // written with epistemic_status = "stub" and stays visible as a weak link.
   // 2.1.12 F1: срок годности валидируется ещё раньше — мусорная дата отказывает
   // записи, не превращаясь в молчаливый «бессрочный».
-  const validUntil = normalizeValidUntil(input.valid_until);
+  const explicitValidUntil = normalizeValidUntil(input.valid_until);
+  // M2 B2 (план 20+21 v3 §7): автопростановка срока journal — только когда
+  // поле ОТСУТСТВУЕТ. Явный null и пустая строка (снятый срок) автопростановку
+  // запрещают. Политика читается свежей для операции, один раз; невалидный
+  // конфиг/env — явная ошибка до записи.
+  const nowAtCall = new Date();
+  let validUntil: string | null | undefined = explicitValidUntil;
+  if (explicitValidUntil === undefined && input.kind === "journal") {
+    const expiryConfig = readExpiryConfig(db.dbPath);
+    validUntil = journalDefaultExpiry(expiryConfig, nowAtCall) ?? undefined;
+  }
   // 2.1.13 F4: «вечное» утверждение о состоянии без срока — предупреждение,
   // не блокировка. digest — серверная сводка, проверка её не касается.
   const warnings = conceptWarnings(input.summary, { kind: input.kind, validUntil });
@@ -1717,6 +1736,9 @@ export async function updateConcept(
   // снимает срок. setNodeStatus (supersede) пишет свою дату поверх — это
   // разные оси: статусная остаётся жизненным циклом узла.
   const validUntil = normalizeValidUntil(input.changes.valid_until);
+  // M2 B2: время операции фиксируется один раз; применённая дата автопростановки
+  // (явная смена kind на journal) используется последовательно во всей транзакции.
+  const nowAtUpdate = new Date();
 
   // Plan 1 §5.2: epistemic transitions are validated here, at the MCP tool
   // boundary (not inside setNodeStatus/setEpistemicStatus — internal callers
@@ -1754,6 +1776,11 @@ export async function updateConcept(
 
   let epistemicNote = "";
   let noChanges = false;
+  // M2 B2: эффективный срок и признак смены kind на journal объявлены снаружи
+  // транзакции — post-транзакционные предупреждения и сообщение читают
+  // фактический результат правки, а не снапшот до неё.
+  let effectiveValidUntil: string | null | undefined = validUntil;
+  let kindChangedToJournal = false;
   db.runInTransaction(() => {
     // K-07: validation and writes read the SAME state — the fresh read inside
     // BEGIN IMMEDIATE keeps a concurrent update from carrying out a banned
@@ -1793,6 +1820,21 @@ export async function updateConcept(
       }
     }
 
+    // M2 B2: явная смена kind на journal — часть явной смены вида. Заданный
+    // ранее срок сохраняется (и истёкший тоже); если срока нет и поле не
+    // передано — применяется default политики. Остальные случаи срок не
+    // трогают: update без поля не продлевает и не омолаживает (скользящего
+    // TTL нет), явный null/пустая строка снимают срок как раньше.
+    kindChangedToJournal =
+      input.changes.kind !== undefined &&
+      input.changes.kind !== current.kind &&
+      input.changes.kind === "journal";
+    if (kindChangedToJournal && validUntil === undefined && (current.valid_until ?? null) === null) {
+      const expiryConfig = readExpiryConfig(db.dbPath);
+      const auto = journalDefaultExpiry(expiryConfig, nowAtUpdate);
+      if (auto !== null) effectiveValidUntil = auto;
+    }
+
     // K-06: epistemic axis. A repeat of the SAME status without a new scope is
     // a true no-op — the stored scope and the history stay untouched (the old
     // code wrote status_scope = NULL over the artifact here). A same-status
@@ -1829,8 +1871,9 @@ export async function updateConcept(
       embedding,
       // 2.1.12 F1: undefined (поле не передано) не трогает колонку, null
       // снимает срок, строка выставляет. spread выше уже несёт значение —
-      // здесь только нормализованная форма.
-      valid_until: validUntil,
+      // здесь только нормализованная форма. M2 B2: автопростановка при смене
+      // kind на journal подставляется как явное значение.
+      valid_until: effectiveValidUntil,
     });
 
     // Plan 1: the epistemic write happens after the content update; both run
@@ -1878,23 +1921,23 @@ export async function updateConcept(
   }
 
   const validNote =
-    validUntil === undefined
+    effectiveValidUntil === undefined
       ? ""
-      : validUntil === null
+      : effectiveValidUntil === null
         ? " Срок годности снят — узел снова бессрочный."
-        : ` Срок годности: ${validUntil} — после этой даты узел выпадет из выдачи.`;
+        : ` Срок годности: ${effectiveValidUntil} — после этой даты узел выпадет из выдачи.`;
 
-  // 2.1.13 F4: та же проверка при смене саммари. Эффективный срок — тот,
-  // что будет у узла после правки: переданный, а если не передан — прежний
-  // (снятый null считается «бессрочно»).
+  // 2.1.13 F4: та же проверка при смене саммари. Эффективный срок — фактическое
+  // состояние узла после транзакции: переданный срок, автопростановка смены
+  // kind на journal или прежний/снятый срок (M2 B2 — по свежему состоянию,
+  // а не по снапшоту до правки).
   let warnings: ConceptWarning[] = [];
-  if (input.changes.summary !== undefined) {
-    const effectiveExpiry =
-      input.changes.valid_until === undefined ? existing.valid_until : validUntil;
-    warnings = conceptWarnings(input.changes.summary, {
-      kind: input.changes.kind ?? existing.kind,
-      validUntil: effectiveExpiry,
-    });
+  if (input.changes.summary !== undefined || kindChangedToJournal) {
+    const after = db.getNode(input.id)!;
+    warnings = conceptWarnings(
+      input.changes.summary ?? after.summary,
+      { kind: after.kind, validUntil: after.valid_until ?? null }
+    );
   }
 
   return {
