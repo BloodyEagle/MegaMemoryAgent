@@ -10,3 +10,6 @@ fixtures/** -text
 fixtures/sha256sums.txt text eol=lf
 # Снапшоты vitest сравниваются с эталоном побайтово — LF на всех платформах.
 *.snap text eol=lf
+# Workflow-договор печатается CLI байт в байт (ровно один завершающий LF) — LF
+# на всех платформах, независимо от core.autocrlf.
+docs/agent-workflow.md text eol=lf
