@@ -190,6 +190,65 @@ by design, and \`doctor\` migrates in place. \`serve\` and the MCP server write 
 `;
 
 /**
+ * W2 (план 20+21 v3): полный договор workflow поставляется файлом
+ * docs/agent-workflow.md внутри пакета (каталог docs уже в files package.json).
+ * Путь считается от каталога модуля, а не от cwd: работает и из checkout, и из
+ * установленного пакета вне него. Отсутствие файла — явная ошибка упаковки,
+ * а не повод подставить старый текст.
+ */
+export class WorkflowDocError extends Error {}
+
+const WORKFLOW_DOC_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "docs",
+  "agent-workflow.md"
+);
+
+/**
+ * W1/W2: текст полного workflow-договора. Читается свежим на каждый вызов,
+ * UTF-8; печатается CLI как есть — документ заканчивается ровно одним LF
+ * (закреплено в .gitattributes и проверено тестом «байт в байт»).
+ */
+export function buildWorkflowText(): string {
+  let text: string;
+  try {
+    text = fs.readFileSync(WORKFLOW_DOC_PATH, "utf-8");
+  } catch {
+    throw new WorkflowDocError(
+      `Документ workflow отсутствует в пакете: ${WORKFLOW_DOC_PATH}. Это ошибка упаковки: docs/agent-workflow.md должен поставляться с пакетом (files в package.json).`
+    );
+  }
+  return text;
+}
+
+/**
+ * W2: разбор аргументов `megamemory guide`. Поддержан единственный флаг
+ * `--workflow`; любой другой аргумент и повтор флага — явная ошибка, не
+ * молчаливое игнорирование. Обычный `guide` без аргументов сохраняет прежний
+ * смысл.
+ */
+export type GuideMode = "guide" | "workflow";
+
+export function resolveGuideMode(args: string[]): GuideMode {
+  const unexpected: string[] = [];
+  let workflow = false;
+  for (const token of args) {
+    if (token === "--workflow" && !workflow) {
+      workflow = true;
+    } else {
+      unexpected.push(token);
+    }
+  }
+  if (unexpected.length > 0) {
+    throw new WorkflowDocError(
+      `Неизвестные аргументы команды guide: ${unexpected.join(", ")}. Поддержан только флаг --workflow; обычный guide вызывается без аргументов.`
+    );
+  }
+  return workflow ? "workflow" : "guide";
+}
+
+/**
  * F2: the full `megamemory guide` text — exactly the snippet that install
  * writes (one source), plus the session example, the measuring section and
  * the read-only commands note.
