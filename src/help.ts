@@ -28,7 +28,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("guide")}           Print agent onboarding and worked-session guidance
                 ${pc.dim("guide --workflow prints the full workflow contract (docs/agent-workflow.md, UTF-8, no database)")}
   ${pc.cyan("bench")}           Measure graph orientation cost against files/TE ${pc.dim("--questions FILE [options]; --db PATH")}
-  ${pc.cyan("expire")}          Set valid_until on selected nodes ${pc.dim("(--ids IDS|--report FILE) --until DATE|past [--apply]; --db PATH")}
+  ${pc.cyan("expire")}          Set valid_until on selected nodes ${pc.dim("(--ids IDS|--report FILE) --until DATE|past [--apply]; --scan [--json] reviews candidates; --db PATH")}
 
 ${pc.bold("Global and MCP options:")}
   ${pc.cyan("--db")} ${pc.dim("PATH")}       Path to knowledge.db ${pc.dim("(--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)")}
@@ -80,9 +80,12 @@ ${pc.bold("Bench options:")}
                 ${pc.dim("(default: 0 = all; 3 approximates a live agent; compare hit_rate@1 with hit_rate)")}
 
 ${pc.bold("Expire options:")}
+  ${pc.cyan("--scan")}          review-only candidate scan ${pc.dim("(readonly, never writes; --scan --apply is refused)")}
+  ${pc.cyan("--json")}          scan: print the versioned report JSON ${pc.dim("(format_version 2, compatible with --report)")}
+  ${pc.cyan("--repo")} ${pc.dim("PATH")}     scan: repository for advisory tag checks ${pc.dim("(a tag never auto-refutes a claim)")}
   ${pc.cyan("--ids")} ${pc.dim("IDS")}       comma-separated node ids ${pc.dim("(mutually exclusive with --report)")}
-  ${pc.cyan("--report")} ${pc.dim("FILE")}   JSON report; use candidates whose expire field is true
-  ${pc.cyan("--until")} ${pc.dim("DATE|past")} parseable expiry date or yesterday ${pc.dim("(required)")}
+  ${pc.cyan("--report")} ${pc.dim("FILE")}   JSON report; use candidates whose expire field is true ${pc.dim("(versioned reports pin the snapshot date and field versions; legacy reports apply with an explicit warning)")}
+  ${pc.cyan("--until")} ${pc.dim("DATE|past")} parseable expiry date or yesterday ${pc.dim("(required for --ids and legacy reports; versioned reports carry their own snapshot date)")}
   ${pc.cyan("--apply")}         write expiry dates ${pc.dim("(default: dry-run)")}
 
 ${pc.bold("Examples:")}
@@ -95,5 +98,6 @@ ${pc.bold("Examples:")}
   ${pc.dim("$")} megamemory eval --file fixtures/eval.jsonl --k 10 --min 0.8
   ${pc.dim("$")} megamemory bench --questions questions.jsonl --baseline files
   ${pc.dim("$")} megamemory expire --ids a,b --until past --apply
+  ${pc.dim("$")} megamemory expire --scan --json > scan.json   # review, set expire:true, then: expire --report scan.json --apply
 `.trim();
 }

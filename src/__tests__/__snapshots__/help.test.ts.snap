@@ -22,7 +22,7 @@ Commands:
   guide           Print agent onboarding and worked-session guidance
                 guide --workflow prints the full workflow contract (docs/agent-workflow.md, UTF-8, no database)
   bench           Measure graph orientation cost against files/TE --questions FILE [options]; --db PATH
-  expire          Set valid_until on selected nodes (--ids IDS|--report FILE) --until DATE|past [--apply]; --db PATH
+  expire          Set valid_until on selected nodes (--ids IDS|--report FILE) --until DATE|past [--apply]; --scan [--json] reviews candidates; --db PATH
 
 Global and MCP options:
   --db PATH       Path to knowledge.db (--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)
@@ -74,9 +74,12 @@ Bench options:
                 (default: 0 = all; 3 approximates a live agent; compare hit_rate@1 with hit_rate)
 
 Expire options:
+  --scan          review-only candidate scan (readonly, never writes; --scan --apply is refused)
+  --json          scan: print the versioned report JSON (format_version 2, compatible with --report)
+  --repo PATH     scan: repository for advisory tag checks (a tag never auto-refutes a claim)
   --ids IDS       comma-separated node ids (mutually exclusive with --report)
-  --report FILE   JSON report; use candidates whose expire field is true
-  --until DATE|past parseable expiry date or yesterday (required)
+  --report FILE   JSON report; use candidates whose expire field is true (versioned reports pin the snapshot date and field versions; legacy reports apply with an explicit warning)
+  --until DATE|past parseable expiry date or yesterday (required for --ids and legacy reports; versioned reports carry their own snapshot date)
   --apply         write expiry dates (default: dry-run)
 
 Examples:
@@ -88,5 +91,6 @@ Examples:
   $ megamemory consolidate --threshold 0.95 --limit 100 --apply
   $ megamemory eval --file fixtures/eval.jsonl --k 10 --min 0.8
   $ megamemory bench --questions questions.jsonl --baseline files
-  $ megamemory expire --ids a,b --until past --apply"
+  $ megamemory expire --ids a,b --until past --apply
+  $ megamemory expire --scan --json > scan.json   # review, set expire:true, then: expire --report scan.json --apply"
 `;
