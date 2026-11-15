@@ -460,7 +460,7 @@ extras manually.
 
 | Tool | Description |
 |---|---|
-| `understand` | Budgeted hybrid retrieval in `compact` (default), `full`, or `brief`; filters inactive/expired facts and always returns the `next` action contract. |
+| `understand` | Budgeted hybrid retrieval in `compact` (default), `full`, or `brief`; filters inactive/expired facts and always returns the `next` action contract. Opt-in (default off): `include_evidence: true` attaches confirm-ready versions to each match — `current_digests` (current and confirmed travel separately) plus `support_evidence` listing ALL live supports with full wording, edge rationale and claim/status/edge/artifacts digests; `collapse_ref_anchors: true` demotes template ref-anchors from the top level (folded compactly with rationale, or collapsed locators with their dependents; `meta.anchor_collapsed`; id/path resolution and provenance unaffected). |
 | `get_concept` | Exact-ID full context: parent, children, edges, trails/slots, support check, and current digests for confirmation. Budgeted profiles (`orientation`/`evidence`/`full`), batch `ids` (up to 25, one shared budget, per-id status/errors), capped neighbor disclosure with `continuation` — an old plain `{id}` call returns the exact previous response. |
 | `create_concept` | Atomically create a node and optional edges/evidence; supports `supersedes`, `valid_until`, duplicate refusal, and same-call evidence snapshots. |
 | `update_concept` | Patch content or expiry and perform reasoned epistemic transitions; relevant text changes republish a current-generation vector or invalidate the old one. |
