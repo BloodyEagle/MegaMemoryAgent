@@ -22,6 +22,7 @@ The original task labels are retained for historical traceability.
 | T7 | Deterministic, contained Markdown export with frontmatter, wiki-links, informed-by rationales, and collision/path checks. `export --check` reports missing/differing/extra `.md` files and exits nonzero on drift; it **never deletes files** or owns the directory. | `export --md … [--check]` |
 | T8 | Usage/token accounting for `understand`, `list_roots`, and `get_concept`; seven-day aggregates plus the ordered understand → follow-up → record funnel. | `stats`, `stats --funnel`, Tokens panel |
 | T9 | Health checks for schema, FTS, vectors, IDs, orphans, digests, expiry, D3, and memory; nonzero status on problems. | `doctor`, `/api/health` |
+| W | Offline agent workflow contract: the single editable full version lives in `docs/agent-workflow.md`, printed verbatim by `megamemory guide --workflow` (UTF-8, one trailing LF, no database, no network); the per-operation cost/limits registry is `docs/capabilities.md`. | `guide --workflow`, `docs/` |
 
 Native vector search mirrors current-generation embeddings into `nodes_vec`
 (`F32_BLOB`) and uses `vector_distance_cos`. If native capability or projection

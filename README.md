@@ -54,6 +54,7 @@ database at `.megamemory/knowledge.db`.
 2. **Before a task** — `understand` with a natural-language query, or `get_concept` for an exact ID.
 3. **Follow relevant `next` instructions** — read `must_read` refs, run ready-made `followups`, and record per `record` after the change. Refs and a brief without the claim do not prove whole-file coverage; `skip` does not replace checking current code. All modes use the actual MCP wire budget and refuse an impossible required envelope.
 4. **After a task** — `create_concept` / `update_concept`, then `link` for relationships.
+5. **Full contract** — the complete agent workflow lives in `docs/agent-workflow.md` (`megamemory guide --workflow` prints it verbatim); the per-operation cost and limits registry is `docs/capabilities.md`.
 
 ---
 
@@ -482,7 +483,7 @@ extras manually.
 | `megamemory doctor` | Health check: schema, model, FTS, IDs, vectors, orphans, digests |
 | `megamemory stats` | Graph and token statistics |
 | `megamemory eval` | recall@10 over `fixtures/eval.jsonl` |
-| `megamemory guide` | Print the agent onboarding text (what install writes to AGENTS.md, plus a session example) |
+| `megamemory guide` | Print the agent onboarding text (what install writes to AGENTS.md, plus a session example); `guide --workflow` prints the full workflow contract (`docs/agent-workflow.md`) verbatim — UTF-8, no database, no network |
 | `megamemory bench --questions q.jsonl` | Orientation savings in tokens: graph vs `--baseline files\|te\|both` |
 | `megamemory consolidate [--dry-run\|--apply]` | Find and merge near-duplicate nodes |
 | `megamemory digest [--apply]` | Build or rebuild digest nodes |

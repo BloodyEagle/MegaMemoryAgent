@@ -54,6 +54,7 @@
 2. **Перед задачей** — `understand` с запросом на естественном языке или `get_concept` по точному id.
 3. **Исполняй релевантные инструкции `next`** — читай `must_read`, выполняй готовые `followups`, после правки записывай по `record`. Ссылки и brief без утверждения не доказывают полного покрытия файла; `skip` не заменяет проверку актуального кода. Все режимы учитывают настоящий MCP wire-бюджет и отказывают, если обязательный конверт не помещается.
 4. **После задачи** — `create_concept` / `update_concept`, затем `link` для связей.
+5. **Полный договор** — весь порядок работы агента живёт в `docs/agent-workflow.md` (`megamemory guide --workflow` печатает его дословно); реестр стоимости и ограничений операций — `docs/capabilities.md`.
 
 ---
 
@@ -481,7 +482,7 @@ FTS; старые, NULL-, неверной размерности или чуж�
 | `megamemory doctor` | Проверка: схема, модель, FTS, id, векторы, осиротевшие рёбра, digest |
 | `megamemory stats` | Статистика графа и токенов |
 | `megamemory eval` | recall@10 по `fixtures/eval.jsonl` |
-| `megamemory guide` | Печатает онбординг-текст агента (что install пишет в AGENTS.md, плюс пример сессии) |
+| `megamemory guide` | Печатает онбординг-текст агента (что install пишет в AGENTS.md, плюс пример сессии); `guide --workflow` печатает полный договор workflow (`docs/agent-workflow.md`) дословно — UTF-8, без базы и сети |
 | `megamemory bench --questions q.jsonl` | Экономия ориентации в токенах: граф против `--baseline files\|te\|both` |
 | `megamemory consolidate [--dry-run\|--apply]` | Поиск и слияние почти одинаковых узлов |
 | `megamemory digest [--apply]` | Сборка и пересборка digest-узлов |

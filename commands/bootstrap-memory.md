@@ -34,9 +34,11 @@ Think in terms of:
 For each major module, query `megamemory:understand` first. It is compact by
 default; `mode:"full"` returns verbose cards and `mode:"brief"` returns at most
 8 orientation lines without cards. Every mode returns a mandatory `next` block:
-read all `must_read` refs before editing/recording, execute every `followup` exactly
-with its supplied args, and follow `record`. `skip` is currently empty;
-`file_refs` and summaries do not prove whole-file coverage.
+read all `must_read` refs (mandatory sources, not proof of whole-file coverage)
+before editing/recording and execute every `followup` exactly with its supplied
+args. `record` is the ready-made write form — record conclusions and rationale,
+not a node per file. `skip` is currently empty; `file_refs` and summaries do not
+prove whole-file coverage.
 
 Read the module's key files, then call `megamemory:create_concept` with a specific,
 detailed summary. Include parameter names, defaults, file paths, and behavior
@@ -83,3 +85,6 @@ you actually read. Compact `understand` does not contain confirmation digests.
 - Give time-bound state claims (`PR open`, `merged`, `release shipped`) an ISO-8601
   `valid_until`; keep durable architecture and conventions dateless.
 - Do not create digest nodes manually — they are built from children automatically.
+- The graph records conclusions and rationale, not per-file inventory; read files
+  directly when that is enough. Full workflow contract: `megamemory guide --workflow`
+  (docs/agent-workflow.md).
