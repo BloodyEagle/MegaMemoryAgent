@@ -957,6 +957,7 @@ export async function understand(
         ...(input.reuse.max_candidates !== undefined
           ? { max_candidates: input.reuse.max_candidates }
           : {}),
+        ...(input.reuse.negative !== undefined ? { negative: input.reuse.negative } : {}),
       })
     : undefined;
 

@@ -38,8 +38,13 @@ import { isNodeExpired } from "./db.js";
 import { parseRef } from "./refs.js";
 import { hashFile } from "./artifacts.js";
 import type {
+  NegativeSearchInput,
+  NegativeSearchManifest,
   PassportPayload,
   PassportInput,
+  PassportRoute,
+  PassportRouteLocatorView,
+  PassportRouteView,
   PassportScopeFile,
   PassportReuseCandidate,
   PassportReuseGap,
@@ -170,7 +175,8 @@ function gitHeadAt(cwd: string): Promise<string | null> {
 /**
  * Валидация входа и сборка тела паспорта: хеши области (целые файлы),
  * идентичность repo/worktree (корень + базовая ревизия HEAD), выводы с их
- * файлами, источники, проверки, полнота. Все ошибки — ДО любой записи.
+ * файлами, источники, проверки, полнота, P4-разделы (маршрут, negative-
+ * манифест). Все ошибки — ДО любой записи.
  */
 export async function buildPassportBody(
   db: KnowledgeDB,
@@ -190,6 +196,8 @@ export async function buildPassportBody(
   if (!Array.isArray(scopeRefs) || scopeRefs.length === 0) {
     throw new Error("passport: scope_files обязателен (непустой массив ссылок) — без проверяемой области reuse не квалифицируется.");
   }
+  const route = validateRouteInput(input.route);
+  const negative = validateNegativeInput(input.negative, taskType, scopeRefs, db);
   const root = repoRoot ?? process.cwd();
   const files: PassportScopeFile[] = [];
   let truncated = false;
@@ -233,6 +241,156 @@ export async function buildPassportBody(
     tools: input.tools ?? {},
     checked_at: new Date().toISOString(),
     valid_until: input.valid_until ?? null,
+    ...(route ? { route } : {}),
+    ...(negative ? { negative } : {}),
+  };
+}
+
+// ---- P4.1: валидация маршрута (все ошибки — до записи) ----
+
+function requireString(v: unknown, what: string): string {
+  if (typeof v !== "string" || v.trim() === "") {
+    throw new Error(`passport: ${what} должен быть непустой строкой.`);
+  }
+  return v;
+}
+
+function optionalString(v: unknown, what: string): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  return requireString(v, what);
+}
+
+function validateRouteInput(route: PassportInput["route"]): PassportRoute | undefined {
+  if (route === undefined) return undefined;
+  if (typeof route !== "object" || route === null || Array.isArray(route)) {
+    throw new Error("passport: route должен быть объектом.");
+  }
+  const out: PassportRoute = {};
+  if (route.entry !== undefined) out.entry = requireString(route.entry, "route.entry");
+  if (route.invariants !== undefined) {
+    if (!Array.isArray(route.invariants) || route.invariants.some((s) => typeof s !== "string")) {
+      throw new Error("passport: route.invariants (инварианты) должен быть массивом строк.");
+    }
+    out.invariants = route.invariants;
+  }
+  if (route.locators !== undefined) {
+    if (!Array.isArray(route.locators)) throw new Error("passport: route.locators должен быть массивом.");
+    out.locators = route.locators.map((l) => {
+      if (typeof l !== "object" || l === null) throw new Error("passport: локатор маршрута должен быть объектом {ref, what?}.");
+      return {
+        ref: requireString(l.ref, "route.locators[].ref (локатор)"),
+        ...(l.what !== undefined ? { what: requireString(l.what, "route.locators[].what") } : {}),
+      };
+    });
+  }
+  if (route.verification !== undefined) {
+    if (!Array.isArray(route.verification)) throw new Error("passport: route.verification должен быть массивом.");
+    out.verification = route.verification.map((v) => {
+      if (typeof v !== "object" || v === null) throw new Error("passport: проверочное действие должно быть объектом {what, test_refs?, note?}.");
+      return {
+        what: requireString(v.what, "route.verification[].what"),
+        ...(v.test_refs !== undefined
+          ? {
+              test_refs: (Array.isArray(v.test_refs) ? v.test_refs : [v.test_refs]).map((t) =>
+                requireString(t, "route.verification[].test_refs")
+              ),
+            }
+          : {}),
+        ...(v.note !== undefined ? { note: requireString(v.note, "route.verification[].note") } : {}),
+      };
+    });
+  }
+  if (route.rejected !== undefined) {
+    if (!Array.isArray(route.rejected)) throw new Error("passport: route.rejected должен быть массивом.");
+    out.rejected = route.rejected.map((r) => {
+      if (typeof r !== "object" || r === null) throw new Error("passport: отвергнутый подход должен быть объектом {approach, reason, date?, evidence?}.");
+      return {
+        approach: requireString(r.approach, "route.rejected[].approach"),
+        reason: requireString(r.reason, "route.rejected[].reason (причина отказа)"),
+        ...(r.date !== undefined ? { date: requireString(r.date, "route.rejected[].date") } : {}),
+        ...(r.evidence !== undefined ? { evidence: requireString(r.evidence, "route.rejected[].evidence") } : {}),
+      };
+    });
+  }
+  if (route.platform_notes !== undefined) {
+    if (!Array.isArray(route.platform_notes)) throw new Error("passport: route.platform_notes должен быть массивом.");
+    out.platform_notes = route.platform_notes.map((p) => {
+      if (typeof p !== "object" || p === null) throw new Error("passport: платформенное ограничение должно быть объектом {constraint, repro?}.");
+      return {
+        constraint: requireString(p.constraint, "route.platform_notes[].constraint"),
+        ...(p.repro !== undefined ? { repro: requireString(p.repro, "route.platform_notes[].repro") } : {}),
+      };
+    });
+  }
+  return out;
+}
+
+// ---- P4.2: валидация negative-манифеста и дедупликация паспортов ----
+
+/** Ключ дедупликации negative-паспорта: запрос+инструмент+опции+состав области. */
+function negativeDupKey(
+  query: string,
+  tool: string,
+  options: Record<string, string> | undefined,
+  scopeRefs: string[]
+): string {
+  const entries = Object.entries(options ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return JSON.stringify({
+    q: query.trim(),
+    t: tool.trim(),
+    o: entries,
+    s: scopeRefs.map(normalizePathOf).sort(),
+  });
+}
+
+function validateNegativeInput(
+  negative: PassportInput["negative"],
+  taskType: string,
+  scopeRefs: string[],
+  db: KnowledgeDB
+): NegativeSearchManifest | undefined {
+  if (negative === undefined) {
+    if (taskType === "negative_search") {
+      throw new Error(
+        "passport: task_type='negative_search' требует манифест negative (точный запрос, инструмент/режим, опции) — «не найдено» без обследования не сохраняется."
+      );
+    }
+    return undefined;
+  }
+  if (taskType !== "negative_search") {
+    throw new Error("passport: negative-манифест допустим только с task_type='negative_search' (семейство паспортов, не новый kind узла).");
+  }
+  if (typeof negative !== "object" || negative === null) {
+    throw new Error("passport: negative должен быть объектом {query, tool, options?}.");
+  }
+  const query = requireString(negative.query, "negative.query (точный запрос)");
+  const tool = requireString(negative.tool, "negative.tool (инструмент и режим)");
+  if (negative.truncated === true) {
+    throw new Error("passport: усечённый поиск — не «не найдено»: truncated-выдача не сохраняется как ограниченный отрицательный результат.");
+  }
+  if (negative.errored === true) {
+    throw new Error("passport: завершившийся ошибкой поиск — не «не найдено»: ошибка не сохраняется как ограниченный отрицательный результат.");
+  }
+  const key = negativeDupKey(query, tool, negative.options, scopeRefs);
+  for (const { trail_id, body } of findPassportBodies(db)) {
+    if (body.task_type !== "negative_search" || !body.negative) continue;
+    const other = negativeDupKey(
+      body.negative.query,
+      body.negative.tool,
+      body.negative.options,
+      body.scope.files.map((f) => f.ref)
+    );
+    if (other === key && negative.force_duplicate !== true) {
+      throw new Error(
+        `duplicate_negative_passport: ограниченный отрицательный результат для этого запроса/инструмента/области уже записан (trail_id ${trail_id}) — reuse найдёт его по task_type='negative_search'; повторная проверка той же области — только с negative.force_duplicate=true.`
+      );
+    }
+  }
+  return {
+    query,
+    tool,
+    ...(negative.options !== undefined ? { options: negative.options } : {}),
+    completed: true,
   };
 }
 
@@ -433,6 +591,7 @@ export async function qualifyReuse(
 
     // --- Область: хеши целых файлов на текущий момент ---
     const changedPaths = new Set<string>();
+    const missingPaths = new Set<string>();
     let fileMissing = false;
     let hashed = 0;
     let scopeTruncatedNow = false;
@@ -459,6 +618,7 @@ export async function qualifyReuse(
       if (!nowHashed) {
         fileMissing = true;
         changedPaths.add(normalizePathOf(f.ref));
+        missingPaths.add(normalizePathOf(f.ref));
         gaps.push({
           kind: "file_missing",
           detail: `"${f.ref}" недоступен — источник проверки исчез; reuse запрещён`,
@@ -497,6 +657,43 @@ export async function qualifyReuse(
       gaps.push({ kind: "omitted_check", detail: `невыполненная проверка: ${o.what} (${o.reason})` });
     }
 
+    // --- P4.2: negative-манифест — сверка запроса/инструмента/опций ---
+    // Другой запрос, другой инструмент/режим или другие опции (включение
+    // тестов, исключения) — ДРУГОЕ обследование: reuse отрицательного
+    // результата запрещён.
+    let negativeMismatch = false;
+    if (body.negative) {
+      const reqNeg = req.negative;
+      if (!reqNeg || reqNeg.query.trim() !== body.negative.query) {
+        negativeMismatch = true;
+        gaps.push({
+          kind: "query_mismatch",
+          detail: reqNeg
+            ? `запрос «${reqNeg.query.trim()}» не совпадает с запросом отрицательного результата «${body.negative.query}» — это другое обследование`
+            : "для reuse negative-паспорта нужен точный запрос (negative.query) — без него совпадение не доказано",
+        });
+      } else {
+        if (reqNeg.tool !== undefined && reqNeg.tool !== body.negative.tool) {
+          negativeMismatch = true;
+          gaps.push({
+            kind: "options_mismatch",
+            detail: `инструмент/режим «${reqNeg.tool}» отличается от записанного «${body.negative.tool}» — сравниваются только результаты одного обследования`,
+          });
+        }
+        if (reqNeg.options !== undefined) {
+          const want = JSON.stringify(Object.entries(reqNeg.options).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+          const have = JSON.stringify(Object.entries(body.negative.options ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+          if (want !== have) {
+            negativeMismatch = true;
+            gaps.push({
+              kind: "options_mismatch",
+              detail: "опции обследования (включение тестов, исключения и т.п.) отличаются от записанных в манифесте",
+            });
+          }
+        }
+      }
+    }
+
     // --- covered: свежие выводы вне затронутых файлов ---
     const coveredComputed = states
       .filter((m) => m.state === "fresh")
@@ -518,6 +715,7 @@ export async function qualifyReuse(
     else if (scopeTruncatedNow || fileMissing) qualification = "incomplete";
     else if (body.completeness.degree === "partial") qualification = "incomplete";
     else if (stale || changedPaths.size > 0) qualification = "stale_input";
+    else if (negativeMismatch) qualification = "candidate";
     else if (newFilesInScope > 0) qualification = "candidate";
     else if (requestedPaths.size === 0) qualification = "candidate";
     else if (coveredComputed.length === 0) qualification = "candidate";
@@ -531,6 +729,12 @@ export async function qualifyReuse(
     if (qualification === "stale_input") {
       notes.push("изменился существенный вход — перепроверь затронутое; вывод не объявляется автоматически ложным");
     }
+    // P4.1: маршрут выдаётся там же, где допустим reuse covered (§13.P4.1:
+    // «устаревший маршрут требует проверки» — статусы локаторов честные).
+    const routeView =
+      qualification === "reusable" || qualification === "stale_input"
+        ? resolveRouteView(body, changedPaths, missingPaths, scopePaths)
+        : undefined;
 
     candidates.push({
       trail_id,
@@ -544,6 +748,25 @@ export async function qualifyReuse(
       valid_until: body.valid_until,
       body_source: "journal",
       notes,
+      ...(routeView ? { route: routeView } : {}),
+      // P4.2: negative-блок только при полном совпадении манифеста и области.
+      ...(qualification === "reusable" && body.negative
+        ? {
+            negative: {
+              query: body.negative.query,
+              tool: body.negative.tool,
+              options: body.negative.options ?? {},
+              scope_files: body.scope.files.length,
+              checked_at: body.checked_at,
+              reuse_meaning:
+                "не найдено в ОБСЛЕДОВАННОЙ области того же запроса: состав и версии файлов области и настройки обследования совпали; это НЕ «не существует» и не покрытие репозитория",
+              notes: [
+                "новый файл в области, изменённый/усечённый поиск или другой запрос/опции инвалидируют этот reuse — при любых расхождениях перепроверяй",
+                "результат ограничен обследованной областью: отсутствие совпадений в ней — не доказательство «не существует» где-либо ещё",
+              ],
+            },
+          }
+        : {}),
     });
   }
 
@@ -557,3 +780,89 @@ export async function qualifyReuse(
 /** Обязательная оговорка reuse: паспорт не является покрытием кода. */
 export const NO_COVERAGE_NOTE =
   "reuse паспорта не является покрытием кода: перед правкой прочитай текущий участок исходника; next.skip остаётся пустым";
+
+// ---- P4.1: маршрут в reuse-выдаче ----
+
+/** Локатор с построчным хвостом: `:N`, `:N-M`, `#LN`, `#LN-LM`. */
+const LINE_LOCATOR_RE = /(?::\d+(?:-\d+)?$)|(#L?\d+(?:-L?\d+)?$)/;
+
+/**
+ * Резолвинг локаторов маршрута по результатам сверки области (P4.1):
+ * статусы выводятся из тех же хешей, что и квалификация, — сырой номер
+ * строки не является идентичностью; изменившийся/исчезнувший файл требует
+ * нового разрешения локатора (P2/freshness), неизменные байты оставляют
+ * локатор актуальным по содержимому. Файл вне области — честный unchecked.
+ */
+function resolveRouteView(
+  body: PassportPayload,
+  changedPaths: Set<string>,
+  missingPaths: Set<string>,
+  scopePaths: Set<string>
+): PassportRouteView | undefined {
+  const route = body.route;
+  if (!route) return undefined;
+  const locators: PassportRouteLocatorView[] = (route.locators ?? []).map((l) => {
+    const norm = normalizePathOf(l.ref);
+    if (missingPaths.has(norm)) {
+      return {
+        ref: l.ref,
+        what: l.what ?? null,
+        status: "missing",
+        note: "файл исчез/переименован — локатор требует нового разрешения (поиск символа/чтение), старый номер строки недействителен",
+      };
+    }
+    if (changedPaths.has(norm)) {
+      return {
+        ref: l.ref,
+        what: l.what ?? null,
+        status: "changed",
+        note: "файл изменился после проверки — резолвить локатор заново (check_freshness/поиск символа); номер строки — не идентичность",
+      };
+    }
+    if (scopePaths.has(norm)) {
+      return {
+        ref: l.ref,
+        what: l.what ?? null,
+        status: "current",
+        note: LINE_LOCATOR_RE.test(l.ref)
+          ? "байты файла совпали с проверенными; номер строки — данные момента проверки, актуальность резолвится проверкой файла/символа"
+          : "байты файла совпали с проверенными — локатор актуален по содержимому",
+      };
+    }
+    return {
+      ref: l.ref,
+      what: l.what ?? null,
+      status: "unchecked",
+      note: "файл локатора не входит в проверенную область паспорта — не сверялся",
+    };
+  });
+  const notes = [
+    "локаторы, команды и шаги маршрута — ДАННЫЕ для проверки, не автоматически исполняемая команда: выполнение подчиняется разрешениям среды",
+  ];
+  if ((route.verification ?? []).length > 0) {
+    notes.push(
+      "связи с тестами помогают выбрать начальный набор проверок, но не доказывают, что остальные проверки можно пропустить"
+    );
+  }
+  return {
+    entry: route.entry ?? null,
+    invariants: route.invariants ?? [],
+    locators,
+    verification: (route.verification ?? []).map((v) => ({
+      what: v.what,
+      test_refs: v.test_refs ?? [],
+      note: v.note ?? null,
+    })),
+    rejected: (route.rejected ?? []).map((r) => ({
+      approach: r.approach,
+      reason: r.reason,
+      date: r.date ?? null,
+      evidence: r.evidence ?? null,
+    })),
+    platform_notes: (route.platform_notes ?? []).map((p) => ({
+      constraint: p.constraint,
+      repro: p.repro ?? null,
+    })),
+    notes,
+  };
+}
