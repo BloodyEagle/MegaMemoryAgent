@@ -379,6 +379,16 @@ export interface UnderstandInput {
     repo_root?: string;
     max_candidates?: number;
   };
+  /**
+   * P3 (план 20+21 v3 §12): opt-in контекст под задачу. Явная цель и тип
+   * задачи → детерминированные правила отбора: обязательные категории
+   * источников (решения, инварианты, отрицательные результаты, тесты),
+   * удаление смысловых повторов БЕЗ удаления противоречий/refuted/неполноты,
+   * оценочная полная цена и минимальный план чтения. Встраивается в ответ
+   * understand (§12.10) — не отдельный обязательный вызов. Поддержан только
+   * в mode=compact; с full/brief — явная ошибка.
+   */
+  task?: UnderstandTaskInput;
 }
 
 /**
@@ -581,6 +591,13 @@ export interface UnderstandOutput {
    * молча; reusable не является покрытием кода.
    */
   passport_reuse?: PassportReuseView;
+  /**
+   * P3 (opt-in task): контекст под задачу — обязательные категории, скрытые
+   * зависимости, план чтения и оценочная полная цена. Без task-параметра
+   * секции нет; не подменяет must_read, не заполняет next.skip и не
+   * утверждает whole-file coverage.
+   */
+  task_context?: TaskContextView;
   meta?: UnderstandMeta;
   /**
    * План 13 §2.1: машинно-исполнимый контракт действия, завершающий каждый
@@ -1874,4 +1891,284 @@ export interface ProvenanceTraceOutput {
 export interface ProvenanceAuditOutput extends ProvenanceTraceOutput {
   /** Run persisted in provenance_audit_runs (plan 3 §10 decision 7). */
   audit_run_id: number;
+}
+
+// ---- P2 (план 20+21 v3 §11): инкрементальная актуальность и adapter к коду ----
+//
+// Границы (P2.3): проверка — ЯВНОЕ opt-in действие (инструмент check_freshness),
+// обычный поиск её не запускает; проверка только читает — НЕ пишет в БД
+// (наблюдения пишет только check_artifacts) и НЕ вызывает confirm_supports;
+// изменение входов во время проверки → не стабильный снимок (unstable/conflict);
+// вывод привязан к наблюдавшемуся состоянию — отчёт несёт expected_versions для
+// повторной проверки перед правкой; обновление индекса не повышает доверие.
+
+/** Откуда запись попала в обратный индекс «источник → использующие записи». */
+export type FreshnessIndexOrigin = "node_file_ref" | "passport_scope" | "artifact";
+
+/** Одна запись обратного индекса: кто цитирует источник. */
+export interface FreshnessIndexEntry {
+  /** "node" — узел (id); "passport" — паспорт (trail_id). */
+  record: "node" | "passport";
+  /** id узла или trail_id паспорта. */
+  id: string;
+  via: FreshnessIndexOrigin;
+  /** Сырая ссылка, как записана в записи (может нести локатор строк). */
+  ref: string;
+}
+
+/**
+ * Восстановимый кэш обратного индекса (НЕ источник знания, схема БД не
+ * трогается). Хранится файлом рядом с БД (<dir>/freshness-index.json);
+ * валиден только при совпадении формата и отпечатка исходных данных, иначе
+ * молча перестраивается из БД (rebuild — единственный источник истины).
+ */
+export interface FreshnessIndex {
+  /** Версия формата файла кэша; несовпадение → rebuild. */
+  index_format: 1;
+  built_at: string;
+  /** Отпечаток исходных данных БД (узлы/edges-file_refs, timeline, артефакты). */
+  source_fingerprint: string;
+  /** Ключ — нормализованный путь источника (slash, без локатора строк). */
+  entries: Record<string, FreshnessIndexEntry[]>;
+}
+
+/** Статус проверки одного источника (P2.1). */
+export type FreshnessSourceStatus =
+  | "unchanged"      // дайджест совпал с записанной версией (наблюдение/паспорт)
+  | "changed"        // дайджест разошёлся — связанные записи затронуты
+  | "missing"        // источника больше нет (удалён/переименован)
+  | "unobserved"     // проверили, но записанной версии для сравнения нет
+  | "unstable"       // вход изменился ВО ВРЕМЯ проверки — снимок не объявляется
+  | "skipped"        // не влез в бюджет проверки (truncated, порядок детерминирован)
+  | "other_repo"     // закреплённый repo_path записи — другой worktree
+  | "unknown";       // причина в note (ошибка чтения, неподдержанный вид)
+
+/** Результат проверки одного источника в отчёте. */
+export interface FreshnessSourceCheck {
+  /** Сырой ref, как он записан в связанной записи. */
+  source: string;
+  kind: "file" | "git_blob" | "git_ref";
+  status: FreshnessSourceStatus;
+  /** Текущий дайджест наблюдения (для expected_versions). */
+  current_digest: string | null;
+  current_size: number | null;
+  /** Записанная версия, с которой сравнивали (наблюдение/паспорт), если была. */
+  compared_to: { origin: FreshnessIndexOrigin; digest: string | null; where: string } | null;
+  /** Связанные записи этого источника (id + происхождение). */
+  affected_records: Array<{ record: "node" | "passport"; id: string; via: FreshnessIndexOrigin }>;
+  /** git-состояние пути в working tree (staged/unstaged/untracked/rename/delete). */
+  git_state?: string | null;
+  note: string | null;
+}
+
+/** Квалификация одной связанной записи после проверки. */
+export interface FreshnessRecordCheck {
+  record: "node" | "passport";
+  id: string;
+  name: string | null;
+  /**
+   * fresh — все процитированные этим выводом источники проверены и не изменились;
+   * stale_input — проверенные источники изменились (вывод не объявляется ложным);
+   * partial — у записи есть источники вне проверенного набора (проверен только
+   * префикс — это НЕ весь граф);
+   * unknown — проверка источника unstable/skipped/unknown.
+   */
+  state: "fresh" | "stale_input" | "partial" | "unknown";
+  /** Источники записи, попавшие в проверку, со статусами. */
+  checked_sources: Array<{ source: string; status: FreshnessSourceStatus }>;
+  /** Источники записи вне проверенного набора (префикс ≠ весь граф). */
+  unchecked_sources: string[];
+  reasons: string[];
+}
+
+/** Статическое разрешение символа через adapter (P2.2, пилот). */
+export interface FreshnessSymbolResolution {
+  locator: { name: string; in?: string; file?: string };
+  /** unique — одно определение; ambiguous/missing — требуется чтение, не выбор первого. */
+  status: "unique" | "ambiguous" | "missing" | "adapter_error";
+  candidates: Array<{
+    file: string;
+    kind?: string;
+    owner?: string;
+    /** Текущий результат разрешения; НЕ постоянная идентичность символа. */
+    line?: number;
+    start_line?: number;
+    end_line?: number;
+    body_start_line?: number;
+    body_end_line?: number;
+  }>;
+  /** Связанные записи, чьи локаторы ссылаются на тот же файл с диапазоном строк. */
+  matched_locators: Array<{ record: "node" | "passport"; id: string; ref: string; range: string }>;
+  /** Диапазон разошёлся с записанным локатором (строки — не идентичность). */
+  locator_moved: boolean;
+  note: string | null;
+}
+
+/** Ожидаемая версия источника для повторной проверки перед правкой (P2.3). */
+export interface FreshnessExpectedVersion {
+  source: string;
+  kind: "file" | "git_blob" | "git_ref";
+  sha256: string | null;
+  size_bytes: number | null;
+  checked_at: string;
+}
+
+/** Отчёт адресной перепроверки (P2.1.6): затронутое / проверенное / неизвестное / причины. */
+export interface FreshnessReport {
+  repo: {
+    root: string;
+    /** HEAD на момент проверки; НЕ доказательство неизменности working tree. */
+    head_at_check: string | null;
+    /** git-состояние working tree; пустые массивы — состояние не наблюдалось/ошибка. */
+    dirty: { staged: string[]; unstaged: string[]; untracked: string[]; renamed: string[]; truncated: boolean };
+    git_error: string | null;
+  };
+  sources: FreshnessSourceCheck[];
+  records: FreshnessRecordCheck[];
+  /** Обход зависимостей источника (import-граф adapter), если доступен и запрошен. */
+  dependencies: Array<{
+    source: string;
+    dependents: string[];
+    complete: boolean;
+    scope: string | null;
+  }> | null;
+  symbols: FreshnessSymbolResolution[];
+  adapter: {
+    configured: boolean;
+    available: boolean;
+    mode: "file" | "symbol";
+    version: string | null;
+    error: string | null;
+    /** Объявленный scope adapter; статическая полнота — только он. */
+    static_scope: string | null;
+  };
+  summary: {
+    affected: number;
+    checked: number;
+    unknown: number;
+    truncated: boolean;
+    truncated_by: "max_files" | "max_deps" | null;
+    limitations: string[];
+  };
+  /** Текущие наблюдения — вход для повторной проверки перед применением правки. */
+  expected_versions: FreshnessExpectedVersion[];
+}
+
+export interface CheckFreshnessInput {
+  /** Источники, которые изменились (или свежесть которых проверяется): пути/refs. */
+  sources?: string[];
+  /** Проверить связанные записи конкретных узлов (их file_refs). */
+  node_ids?: string[];
+  /** Проверить паспорта (области) конкретных trail. */
+  trail_ids?: string[];
+  /** Корень repo/worktree (default: cwd сервера). Закрепления наблюдений не переписываются. */
+  repo_root?: string;
+  /** Бюджет проверки: максимум источников (default 50). Превышение — truncated. */
+  max_files?: number;
+  /** Бюджет обхода зависимостей (default 20); превышение — truncated_by=max_deps. */
+  max_deps?: number;
+  /** Обходить import-граф изменённых источников через adapter (default false). */
+  with_dependencies?: boolean;
+  /** P2.2 (пилот): разрешить символы через adapter token-economy-ts. */
+  symbols?: Array<{ name: string; in?: string; file?: string }>;
+  /** P2.2: конфиг-точка adapter (путь к scripts каталогу скилла или graph-tool.js). */
+  adapter?: { graph_tool?: string };
+  /**
+   * Детерминированная инъекция изменения между фазами проверки (§17.2: для
+   * snapshot/TOCTOU-тестов, не случайный sleep). Боевые вызовы не передают.
+   */
+  fault_injection?: (phase: "after_first_pass") => void | Promise<void>;
+}
+
+// ---- P2.2: adapter token-economy-ts (пилот) ----
+
+/** Конфиг adapter: путь к scripts каталогу скилла либо к самому graph-tool.js. */
+export interface CodeAdapterConfig {
+  /** Абсолютный путь к graph-tool.js. */
+  graph_tool: string;
+  /** Рабочий cwd вызова = корень анализируемого repo (изоляция cwd). */
+  repo_root: string;
+  /** Таймаут вызова, мс (default 10_000). */
+  timeout_ms: number;
+  source: "param" | "env";
+}
+
+export interface CodeAdapterCapability {
+  available: boolean;
+  project_type: string | null;
+  version: string | null;
+  /** op=info ответил, но обязательных полей нет / ответ не JSON. */
+  reason: string | null;
+}
+
+// ---- P3 (план 20+21 v3 §12): контекст под задачу и минимальный план чтения ----
+
+/** Явный тип задачи — детерминированное правило отбора обязательных категорий. */
+export type TaskKind = "find_definition" | "explain_decision" | "prepare_edit" | "assess_impact";
+
+export interface UnderstandTaskInput {
+  /** Явная цель (что делает агент: найти определение, объяснить решение…). */
+  goal: string;
+  kind: TaskKind;
+  /** Явная область (файлы/refs) — сужает mandatory-набор и план чтения. */
+  files?: string[];
+  /**
+   * Явное состояние клиента (§12.9): эпоха контекста. Если в этой эпохе клиент
+   * уже получал обзор (идентичность проекта сверена по отпечатку), повторная
+   * выдача не дублирует уже отданные карточки целиком — уже выданные
+   * немандаторные матчи едут компактной формой served_earlier. Без epoch —
+   * поведение прежнее. Никогда не скрывает решения, refuted, противоречия и
+   * обязательные категории.
+   */
+  context_epoch?: string;
+}
+
+/** Категории источников, обязательные для типа задачи (§12.3, детерминированные правила). */
+export interface TaskContextCoverage {
+  mandatory: string[];
+  covered: string[];
+  /** Обязательная категория не представлена в ответе (кандидатов не было/не влезли). */
+  uncovered: Array<{ category: string; reason: "no_candidates" | "budget"; ids?: string[] }>;
+}
+
+/** Оценочная полная цена (§12.5): карточки + вызовы + чтение + проверка. Эвристика. */
+export interface TaskContextCostEstimate {
+  cards_tokens: number;
+  followup_calls: number;
+  reading: Array<{ ref: string; size_bytes: number | null }>;
+  reading_bytes_total: number;
+  /** Явно оценочная величина (bytes/3), не токены провайдера. */
+  note: string;
+}
+
+/** Карточка, уже выданная в этой эпохе контекста (компактная форма повтора). */
+export interface TaskContextServedEarlier {
+  id: string;
+  name: string;
+  kind: string;
+  note: string;
+}
+
+/** Секция контекста под задачу в understand-ответе (opt-in task). */
+export interface TaskContextView {
+  goal: string;
+  kind: TaskKind;
+  scope_files: string[];
+  coverage: TaskContextCoverage;
+  /** Живые опоры размещённых решений, включая не найденные поиском (скрытые зависимости). */
+  supports_included: Array<{
+    node_id: string;
+    support_id: string;
+    support_name: string;
+    rationale: string | null;
+    weak?: boolean;
+  }>;
+  /** Минимальный план чтения: обязательные источники (§12.7), не покрытие файла. */
+  reading_plan: Array<{ ref: string; why: string; node_id: string }>;
+  cost_estimate: TaskContextCostEstimate;
+  /** Повторы эпохи (§12.9) — только с явным context_epoch. */
+  served_earlier: TaskContextServedEarlier[];
+  /** Смысловые повторы, снятые с верхнего уровня (§12.4). */
+  duplicates_dropped: Array<{ id: string; name: string; kind: string; same_summary_as: string }>;
+  notes: string[];
 }
