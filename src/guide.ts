@@ -30,6 +30,11 @@ export const AGENTS_MD_END = "<!-- /megamemory-snippet -->";
  *
  * Volume cap: the whole block must stay <= 60 lines (it lives in the context
  * of every session; a bloated block gets ignored). Guarded by a test.
+ *
+ * План 20+21 v3 (W1): пункты workflow согласованы с полным договором
+ * docs/agent-workflow.md (печатается `megamemory guide --workflow`): память
+ * даёт проверенные решения, структурный инструмент и исходники — актуальное
+ * поведение; чистое чтение и успешный reuse не обязаны ничего записывать.
  */
 export const AGENTS_MD_SNIPPET = `
 ${AGENTS_MD_STAMP}
@@ -37,11 +42,11 @@ ${AGENTS_MD_STAMP}
 
 You have access to a project knowledge graph via the \`megamemory\` MCP server and skill tool. You have no implicit memory of this project between sessions, so this graph is your only continuity for concepts, architecture, decisions, and relationships. A decision recorded without supports is, a month later, indistinguishable from a guess — record the evidence with it.
 
-**Workflow: understand → work → update**
+**Workflow: one relevant query → structural reading → verified record. Full contract: \`megamemory guide --workflow\`.**
 
-1. **Session start:** You must call \`megamemory\` with action \`overview\` (or \`megamemory:list_roots\` directly) before you begin work. Its \`roots_compact\` index carries \`child_count\`, not children; also inspect slots, board, meta/stats and staleness fields.
-2. **Before each task:** You must call \`megamemory\` with action \`query\` (or \`megamemory:understand\` directly) before reading source files for project understanding. \`compact\` is default, \`full\` is verbose, \`brief\` is ≤8 lines without cards. Every mode ends with \`next\`: read every \`must_read\`, run every \`followup\` exactly, then follow \`record\`. \`skip\` is empty; refs/summaries never prove coverage.
-3. **After each task:** You must call \`megamemory\` with action \`record\` to create/update/link concepts for what you built.
+1. **Available memory:** start with one short relevant \`understand\` (action \`query\`) for the task; qualify it — supports/\`support_check\`, \`valid_until\`/expired, \`refuted_reason\`, status/scope. \`list_roots\` is an on-demand graph overview, not a mandatory ritual. If MegaMemory is unavailable, continue with your usual navigation — never invent remembered facts or retry connecting in a loop.
+2. **Current code:** verify structure and behavior with the structural skill and fresh sources; read small files whole, large files by outline then exact ranges — an analysis is not one line around a hit. Don't run the same search through both tools as a ritual. \`compact\` is default, \`full\` is verbose, \`brief\` is ≤8 lines. \`next\`: read every \`must_read\` (mandatory sources, not whole-file coverage), run every \`followup\` exactly; \`skip\` is empty; refs/summaries never prove coverage.
+3. **After work:** record only new verified knowledge, a fix of an old node, or needed history (action \`record\`); pure reading and successful reuse lawfully record nothing — \`record\` is an action form, not a must-create. On code/memory divergence investigate first (scope, versions, rationale): current code is the fact of implementation, not an automatic refutation of the decision.
 
 Be specific in summaries: parameters, defaults, files, rationale. One idea — one node; update instead of duplicating. Replacement = new \`create_concept\` with \`supersedes: [old_id]\`; disproved = \`update_concept\` → \`refuted\`; \`remove_concept\` = truly gone and no longer needed. Max 3 levels.
 
