@@ -35,6 +35,10 @@ import type {
   NextHints,
   NodeRow,
   RelationType,
+  ConceptEvidenceSupport,
+  CollapsedAnchorView,
+  NodeKind,
+  EdgeRow,
 } from "./types.js";
 import { buildNextHints, type NextHintsCard } from "./next-hints.js";
 import { renderBrief, type BriefNodeInfo } from "./brief.js";
@@ -58,7 +62,7 @@ import {
   statusDigestOf,
 } from "./support-baselines.js";
 import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
-import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary } from "./stub.js";
+import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary, isTechnicalRefAnchor } from "./stub.js";
 import { validationState } from "./validation.js";
 import { readExpiryConfig, journalDefaultExpiry } from "./expiry.js";
 
@@ -491,7 +495,14 @@ export function conceptWarnings(
 function compactMatch(
   db: KnowledgeDB,
   node: NodeRow,
-  opts: { score?: number; via?: SearchVia; withContext: boolean; expired?: boolean }
+  opts: {
+    score?: number;
+    via?: SearchVia;
+    withContext: boolean;
+    expired?: boolean;
+    /** E3: с флагом include_evidence матч несёт подтверждаемые версии. */
+    withEvidence?: boolean;
+  }
 ): CompactMatch {
   const fileRefs = parseFileRefs(node.file_refs);
   const match: CompactMatch = {
@@ -531,7 +542,60 @@ function compactMatch(
         relation: e.relation as RelationType,
       }));
   }
+  // E3 (план 20+21 v3 §8.3): evidence-дополнение строится здесь, а не в
+  // placeLoop — граница размещения (контракт D-01) не должна знать о новых
+  // идентификаторах. Флаг передаётся с кандидатом (withEvidence), мера
+  // фактической формы учитывает добавку до принятия кандидата.
+  if (opts.withEvidence) {
+    match.current_digests = currentDigestsOf(node);
+    match.support_evidence = liveEvidenceSupports(db, node);
+  }
   return match;
+}
+
+/**
+ * E3 (план 20+21 v3 §8.3): одна сборка evidence-опоры — та же механика, что
+ * evidence-профиль get_concept (M3-1, concept-profile.ts), не дубль: полная
+ * формулировка (никогда не обрезается), rationale ребра, квалификация,
+ * weak/quality и готовые дайджесты confirm_supports общими экспортами.
+ * Криптографические значения едут полными hex — display-префиксы живут
+ * только в диагностических сообщениях, не в подтверждаемой форме.
+ */
+export function evidenceSupportOf(
+  db: KnowledgeDB,
+  row: NodeRow,
+  rationale: string | null
+): ConceptEvidenceSupport {
+  return {
+    to: row.id,
+    to_name: row.name,
+    rationale,
+    claim: row.summary,
+    ...nodeQualification(db, row),
+    ...(row.epistemic_status === "abandoned" ||
+    row.epistemic_status === "refuted" ||
+    isUngrounded(db, row)
+      ? { weak: true }
+      : {}),
+    quality: isStubSummary(row.summary, row.kind, row.created_via) ? "stub" : "claim",
+    digests: {
+      claim_digest: claimDigestOf(row.summary),
+      status_digest: statusDigestOf(row.status, row.epistemic_status),
+      edge_digest: edgeDigestOf(rationale),
+      artifacts_digest: artifactsDigestOf(
+        activeArtifactRows(row, db.getNodeArtifacts(row.id))
+      ),
+    },
+  };
+}
+
+/** E3: все живые опоры узла с rationale ребра — полный набор для подтверждения. */
+function liveEvidenceSupports(db: KnowledgeDB, node: NodeRow): ConceptEvidenceSupport[] {
+  return db
+    .getInformedByEdges(node.id, "ancestry", false)
+    .map((e) => ({ edge: e, row: db.getNode(e.to_id) }))
+    .filter((x): x is { edge: EdgeRow & { other_id: string }; row: NodeRow } => x.row !== undefined)
+    .map((x) => evidenceSupportOf(db, x.row, x.edge.description ?? null));
 }
 
 export async function understand(
@@ -541,6 +605,20 @@ export async function understand(
   const topK = input.top_k ?? 10;
   const maxTokens = input.max_tokens ?? 1500;
   const outputMode = input.mode ?? "compact";
+  // E3/D0: opt-in режимы поддержаны только в compact — full/brief отвечают
+  // прежней формой; молчаливое игнорирование флага скрыло бы его отсутствие.
+  if (input.include_evidence && outputMode !== "compact") {
+    throw new Error(
+      "understand: include_evidence поддержан только в mode=compact — full/brief не несут дайджестов подтверждения."
+    );
+  }
+  if (input.collapse_ref_anchors && outputMode !== "compact") {
+    throw new Error(
+      "understand: collapse_ref_anchors поддержан только в mode=compact — верхний уровень full/brief не изменяется."
+    );
+  }
+  const includeEvidence = input.include_evidence ?? false;
+  const collapseAnchors = input.collapse_ref_anchors ?? false;
 
   // План 06 (K-01): пул кандидатов шире top_k — фильтр актуальности
   // применяется ДО финальной нарезки. Раньше top_k резал выдачу поиска, и
@@ -592,7 +670,14 @@ export async function understand(
   let staleExcluded = 0;
   let inactiveExcluded = 0;
   // План 06 (K-01): фильтр идёт по всему пулу, нарезка top_k — после него.
-  const eligible: Array<{ node: NodeRow; score: number; via?: SearchVia; expired: boolean }> = [];
+  const eligible: Array<{
+    node: NodeRow;
+    score: number;
+    via?: SearchVia;
+    expired: boolean;
+    /** E3: флаг едет с кандидатом — placeLoop не ссылается на новые идентификаторы. */
+    evidence?: boolean;
+  }> = [];
   const refutedNodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
   for (const match of topMatches) {
     const node = db.getNode(match.id);
@@ -611,7 +696,13 @@ export async function understand(
       staleExcluded += 1;
       continue;
     }
-    eligible.push({ node, score: match.similarity, via: viaById.get(match.id), expired });
+    eligible.push({
+      node,
+      score: match.similarity,
+      via: viaById.get(match.id),
+      expired,
+      ...(includeEvidence ? { evidence: true } : {}),
+    });
   }
   // top_k — это верхний уровень compact-выдачи; вложенные опоры слотов не
   // занимают, поэтому нарезка применяется к размещению (placeLoop), а не к
@@ -846,6 +937,32 @@ export async function understand(
   const top: CompactMatch[] = [];
   let nestedByHost = new Map<string, NestedSupportView[]>();
   let foldedIds = new Set<string>();
+  // D0: секция свёрнутых технических якорей — заполняется проходом якорей
+  // после размещения осмысленных карточек; секция участвует в той же
+  // бюджетной мере (K-03) и присутствует в ответе явно при включённом флаге.
+  let collapsedAnchors: CollapsedAnchorView[] = [];
+
+  // ---- D0: технические якоря не занимают верхний уровень (opt-in) ----
+  //
+  // Технический якорь — по происхождению И текущей структуре (stub.ts
+  // isTechnicalRefAnchor: created_via='file_ref' + шаблонное саммари + имя =
+  // file_refs[0]); отредактированная осмысленная карточка не прячется.
+  // Якоря изымаются из пула размещения ДО placeLoop: граница размещения
+  // `while (idx < eligible.length)` (контракт D-01, compact-progress) не
+  // меняется, placeLoop продолжает размещать осмысленные карточки в ранговом
+  // порядке; изъятые якоря разбираются отдельным проходом ниже — вложение в
+  // размещённый зависимый вывод либо collapsed-локатор в секции anchors.
+  // Изъятие — после построения supportIdsOf/candidateIds: fold-логика и
+  // обнаружение зависимых выводов видят якорей как кандидатов.
+  const anchorEligible = collapseAnchors
+    ? eligible.filter((e) => isTechnicalRefAnchor(e.node))
+    : [];
+  if (collapseAnchors && anchorEligible.length > 0) {
+    const anchorIds = new Set(anchorEligible.map((e) => e.node.id));
+    for (let i = eligible.length - 1; i >= 0; i -= 1) {
+      if (anchorIds.has(eligible[i].node.id)) eligible.splice(i, 1);
+    }
+  }
 
   /** The answer's top level: placed candidates minus the folded ones. */
   const displayList = (): CompactMatch[] => top.filter((m) => !foldedIds.has(m.id));
@@ -869,11 +986,28 @@ export async function understand(
     stale_excluded: staleExcluded,
     inactive_excluded: inactiveExcluded,
     truncated,
+    // E3: счётчики считаются из реально выданного набора (верхний уровень);
+    // вложенные опоры сами попадают в support_evidence своего решения.
+    ...(includeEvidence
+      ? {
+          evidence_matches: displayList().filter((m) => m.support_evidence !== undefined).length,
+          evidence_supports: displayList().reduce(
+            (s, m) => s + (m.support_evidence?.length ?? 0),
+            0
+          ),
+        }
+      : {}),
+    // D0: честное число свёрнутых якорей этой выдачи.
+    ...(collapseAnchors ? { anchor_collapsed: collapsedAnchors.length } : {}),
     // Пустой ответ при непустом поиске — это не «ничего не нашлось»:
     // причина называется, чтобы агент поднял бюджет или взял brief.
     // Условие не зависит от truncated: иначе бюджет мерился бы без поля,
-    // которое реально уйдёт по проводу.
-    ...(displayList().length === 0 && eligible.length > 0 ? { reason: "budget" as const } : {}),
+    // которое реально уйдёт по проводу. D0: collapsed-якоря — содержимое
+    // ответа, поэтому пустой compact при непустой секции якорей не читается
+    // как no-match и причину budget не получает.
+    ...(displayList().length === 0 && eligible.length > 0 && collapsedAnchors.length === 0
+      ? { reason: "budget" as const }
+      : {}),
   });
 
   /** Тот объект, который уйдёт по проводу (со всеми секциями, extra и next). */
@@ -886,6 +1020,9 @@ export async function understand(
     matches: [],
     compact: compactList,
     refuted: refutedList,
+    // D0: секция якорей — только в opt-in режиме; пустой список присутствует
+    // явно, чтобы отсутствие секции не читалось как «якорей нет».
+    ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
     edges_between: edgesFor(compactList),
     meta,
     next: next ?? buildNextHints({
@@ -1004,6 +1141,12 @@ export async function understand(
         via: eligible[idx].via,
         withContext: displayList().length < 3,
         expired: eligible[idx].expired,
+        // E3: флаг едет с кандидатом (см. eligible) — граница размещения
+        // (контракт D-01) не ссылается на новые идентификаторы; enrichment
+        // выполняет compactMatch, мера видит добавку ДО принятия кандидата:
+        // матч размещается целиком или снимается целиком, частичный набор
+        // доказательств не выдаётся.
+        withEvidence: eligible[idx].evidence === true,
       });
       top.push(candidate);
       const projected = measureWith(refutedShown);
@@ -1035,12 +1178,97 @@ export async function understand(
   // Освободившиеся токены — ограниченный добор матчей.
   placeLoop();
 
+  // ---- D0: проход технических якорей (opt-in) ----
+  //
+  // Якорь с размещённым зависимым выводом вкладывается в него компактно:
+  // без шаблонного саммари (шум), с rationale ребра и квалификацией/weak —
+  // состояние опоры видно вместе с якорем. Якорь без размещённого зависимого
+  // вывода едет в секцию anchors компактным локатором ВМЕСТЕ со своими живыми
+  // зависимыми выводами (входящие informed_by), rationale и weak-состоянием.
+  // Ни один якорь не исчезает молча: не поместившиеся в бюджет — dropped с
+  // truncated; если найдены только якоря, секция остаётся содержимым ответа,
+  // а не ложным no-match. Прямой запрос по id (get_concept) и
+  // provenance_trace разрешают якорь независимо от этого режима.
+  let anchorFolded = 0;
+  if (collapseAnchors) {
+    for (const { node } of anchorEligible) {
+      const host = top.find(
+        (h) => !foldedIds.has(h.id) && (supportIdsOf.get(h.id) ?? []).includes(node.id)
+      );
+      if (host) {
+        const bucket = nestedByHost.get(host.id) ?? [];
+        const edge = db
+          .getInformedByEdges(host.id, "ancestry", false)
+          .find((e) => e.to_id === node.id);
+        bucket.push({
+          id: node.id,
+          name: node.name,
+          collapsed_anchor: true,
+          rationale: edge?.description ?? null,
+          ...nodeQualification(db, node),
+          file_refs: parseFileRefs(node.file_refs),
+          ...(node.epistemic_status === "abandoned" ||
+          node.epistemic_status === "refuted" ||
+          isUngrounded(db, node)
+            ? { weak: true }
+            : {}),
+        });
+        nestedByHost.set(host.id, bucket);
+        foldedIds.add(node.id);
+        anchorFolded += 1;
+        continue;
+      }
+      const dependents = db
+        .getEdgeRefsIn(node.id)
+        .filter((e) => e.relation === "informed_by")
+        .map((e) => ({ edge: e, row: db.getNode(e.from_id) }))
+        .filter(
+          (
+            x
+          ): x is {
+            edge: { from_id: string; relation: string; description: string | null };
+            row: NodeRow;
+          } => x.row !== undefined
+        )
+        .map((x) => ({
+          from: x.row.id,
+          from_name: x.row.name,
+          rationale: x.edge.description ?? null,
+          ...(x.row.epistemic_status === "abandoned" ||
+          x.row.epistemic_status === "refuted" ||
+          isUngrounded(db, x.row)
+            ? { weak: true }
+            : {}),
+        }));
+      collapsedAnchors.push({
+        id: node.id,
+        name: node.name,
+        kind: node.kind as NodeKind,
+        file_refs: parseFileRefs(node.file_refs),
+        collapsed_anchor: true,
+        ...nodeQualification(db, node),
+        ...(dependents.length > 0 ? { informed_by_incoming: dependents } : {}),
+      });
+      if (measureWith(refutedShown) > target) {
+        collapsedAnchors.pop();
+        truncated = true;
+        break;
+      }
+    }
+  }
+
   let compact = withNested(displayList());
   // План 06 (K-01): счётчики не смешиваются — dropped считает усечённых
-  // (top_k/бюджет, включая порезанных refuted), фильтрованные живут в
-  // stale_excluded/inactive_excluded.
-  let dropped = eligible.length - top.length + refutedCut;
-  const supportsInlined = foldedIds.size;
+  // (top_k/бюджет, включая порезанных refuted и не поместившиеся collapsed-
+  // якоря), фильтрованные живут в stale_excluded/inactive_excluded.
+  // eligible к этому моменту — осмысленные кандидаты (якоря изъяты сплайсом),
+  // поэтому база dropped не меняется; якорный термин добавляет не показанных
+  // (не вложенных и не свернутых) якорей.
+  let dropped =
+    eligible.length -
+    top.length +
+    refutedCut +
+    (collapseAnchors ? anchorEligible.length - anchorFolded - collapsedAnchors.length : 0);
 
   // Build final instructions from the placed top-level cards and nested supports.
   // Placement measured this same next block before accepting each candidate.
@@ -1071,6 +1299,7 @@ export async function understand(
     matches: [],
     compact,
     refuted: refutedShown,
+    ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
     edges_between: edgesBetween,
     meta: metaFor(0, dropped, truncated),
     next,
@@ -1084,6 +1313,7 @@ export async function understand(
     matches: [],
     compact,
     refuted: refutedShown,
+    ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
     edges_between: edgesBetween,
     meta: payloadMeta,
     next,
@@ -1102,6 +1332,7 @@ export async function understand(
     matches: [],
     compact,
     refuted: refutedShown,
+    ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
     edges_between: edgesBetween,
     meta: payloadMeta,
     next,

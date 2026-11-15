@@ -45,7 +45,7 @@ You have access to a project knowledge graph via the \`megamemory\` MCP server a
 **Workflow: one relevant query → structural reading → verified record. Full contract: \`megamemory guide --workflow\`.**
 
 1. **Available memory:** start with one short relevant \`understand\` (action \`query\`) for the task; qualify it — supports/\`support_check\`, \`valid_until\`/expired, \`refuted_reason\`, status/scope. \`list_roots\` is an on-demand graph overview, not a mandatory ritual. If MegaMemory is unavailable, continue with your usual navigation — never invent remembered facts or retry connecting in a loop.
-2. **Current code:** verify structure and behavior with the structural skill and fresh sources; read small files whole, large files by outline then exact ranges — an analysis is not one line around a hit. Don't run the same search through both tools as a ritual. \`compact\` is default, \`full\` is verbose, \`brief\` is ≤8 lines. \`next\`: read every \`must_read\` (mandatory sources, not whole-file coverage), run every \`followup\` exactly; \`skip\` is empty; refs/summaries never prove coverage.
+2. **Current code:** verify structure and behavior with the structural skill and fresh sources; read small files whole, large files by outline then exact ranges — an analysis is not one line around a hit. Don't run the same search through both tools as a ritual. \`compact\` is default, \`full\` is verbose, \`brief\` is ≤8 lines. \`next\`: read every \`must_read\` (mandatory sources, not whole-file coverage), run every \`followup\` exactly; \`skip\` is empty; refs/summaries never prove coverage. Opt-in noise control: \`collapse_ref_anchors: true\` demotes template ref-anchors to compact locators (with their dependents and rationale) — direct id/path lookups and provenance still resolve them.
 3. **After work:** record only new verified knowledge, a fix of an old node, or needed history (action \`record\`); pure reading and successful reuse lawfully record nothing — \`record\` is an action form, not a must-create. On code/memory divergence investigate first (scope, versions, rationale): current code is the fact of implementation, not an automatic refutation of the decision.
 
 Be specific in summaries: parameters, defaults, files, rationale. One idea — one node; update instead of duplicating. Replacement = new \`create_concept\` with \`supersedes: [old_id]\`; disproved = \`update_concept\` → \`refuted\`; \`remove_concept\` = truly gone and no longer needed. Max 3 levels.
@@ -58,8 +58,7 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
 6. **Freshness:** when a decision replaces an older one, pass \`supersedes: [old_id]\` to
    \`create_concept\` instead of deleting. If a search finds nothing, retry with
    \`include_inactive: true\` — the concept may be marked superseded.
-7. **Digests:** \`digest\` nodes summarize any parent with 5+ eligible children. Read the digest first,
-   source siblings second; generation is automatic/CLI, while manual digest is compatibility-only.
+7. **Digests:** \`digest\` nodes summarize any parent with 5+ eligible children — read the digest first, siblings second; generation is automatic/CLI, manual digest is compatibility-only.
 8. **Embedding model changed?** Run \`megamemory reembed\`: vector search starts with the first valid current-generation row; FTS covers nodes not published yet.
 9. **Supports:** for a decision/solution pass \`evidence: [{node | ref, why}]\` in the same call
    that creates it; \`why\` names what exactly in the support backs the conclusion — not a
@@ -73,22 +72,22 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
    \`check_artifacts\` to \`changed\`.
    Relations (full enum): \`connects_to | depends_on | implements | calls | configured_by | supersedes | contradicts | informed_by\`; \`informed_by\` requires a rationale saying what in the target supports the source.
 10. **Confirm versions:** after reading a support, confirm it: \`confirm_supports(decision_id,
-   expected_claim_digest, items:[{support_id, expected_claim_digest, expected_status_digest,
-   expected_edge_digest}])\` — the decision's digest is \`get_concept.current_digests.claim\`, the
-   supports' digests travel in \`provenance_trace.supports[]\` — never computed by hand, and
-   compact \`understand\` carries no digests. \`support_check.state\`: \`unchanged\` = same as you confirmed
-   (it does NOT mean the file was just read back — only an explicit \`check_artifacts\` reads
-   artifacts; \`unchanged\` compares observations against the confirmed snapshot);
-   \`changed\` = diverged (see \`reasons\`); \`unknown\` = never checked; \`incomplete\` = the check hit
-   its budget. \`unknown\` and \`incomplete\` are NOT "all good". On \`changed\`: re-read the support,
-   confirm again, or mark the decision \`refuted\` via \`update_concept\` / replace it via
-   \`create_concept.supersedes\` — never leave it hanging. \`truncated_by: depth|nodes|scan\` in a
-   trace means the traversal was partial — never conclude "no more supports exist".
+    expected_claim_digest, items:[{support_id, expected_claim_digest, expected_status_digest,
+    expected_edge_digest}])\` — digests travel in server answers (\`get_concept.current_digests\`,
+    \`provenance_trace.supports[]\`; compact \`understand\` adds them only with \`include_evidence: true\`,
+    which also lists every live support with its full wording) — never computed by hand.
+    \`support_check.state\`: \`unchanged\` = same as you confirmed
+    (it does NOT mean the file was just read back — only an explicit \`check_artifacts\` reads
+    artifacts; \`unchanged\` compares observations against the confirmed snapshot);
+    \`changed\` = diverged (see \`reasons\`); \`unknown\` = never checked; \`incomplete\` = the check hit
+    its budget. \`unknown\` and \`incomplete\` are NOT "all good". On \`changed\`: re-read the support,
+    confirm again, or mark the decision \`refuted\` via \`update_concept\` / replace it via
+    \`create_concept.supersedes\` — never leave it hanging. \`truncated_by: depth|nodes|scan\` in a
+    trace means the traversal was partial — never conclude "no more supports exist".
 11. **Stale instructions:** if \`list_roots\`/\`understand\` returns \`instructions_stale: true\`, run
     \`megamemory install\` (it refreshes this block) and treat in-project instructions as possibly outdated.
-12. **Asked "does this memory help?"** — don't argue, measure: \`megamemory bench\`
-    (\`--baseline files\` vs reading files, \`te\` vs an external structural tool, \`both\`).
-    Read \`ratio\` together with \`hit_rate\`: a cheap but wrong answer is not savings.
+12. **Asked "does this memory help?"** — don't argue, measure: \`megamemory bench\` (\`--baseline files\`/\`te\`/\`both\`);
+    read \`ratio\` with \`hit_rate\` — cheap but wrong is not savings. Rare procedures: \`megamemory guide --workflow\`, \`docs/capabilities.md\`.
 13. **State claims expire:** a statement about the world AS IT WAS ("merged", "PR open",
     "release shipped") MUST carry \`valid_until\` (ISO date) — it drops out of answers after
     that date (\`include_stale: true\` returns it marked \`expired\`). Architecture and

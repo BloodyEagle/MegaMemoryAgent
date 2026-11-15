@@ -1,8 +1,9 @@
 import fs from "fs";
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
+import type { NodeRow } from "./types.js";
 import { errorBold } from "./cli-utils.js";
-import { listRoots } from "./tools.js";
+import { estimateTokens, listRoots } from "./tools.js";
 import { resolveDbPathOrExit } from "./db-path.js";
 import { valueFlag } from "./cli-flags.js";
 import { supportQualityBreakdown } from "./stub.js";
@@ -10,6 +11,53 @@ import { computeFunnel, formatFunnel } from "./funnel.js";
 import { computeHealth, formatHealth, type HealthWindowKind } from "./health.js";
 
 const KIND_ORDER = ["feature", "module", "component", "pattern", "config", "decision"];
+
+/**
+ * E5 (план 20+21 v3 §8.5): единый estimator размера/токенов. Раньше здесь
+ * был второй способ оценки (символы/4), расходившийся с estimateTokens
+ * (байты/3) из tools.ts — на кириллице/CJK расхождение кратно. Один способ:
+ * обе поверхности считают estimateTokens; число — ОЦЕНКА (поле/строка помечены
+ * "~"), не гарантия токенов провайдера.
+ */
+
+/** Per-node size payload — the fields the size analysis measures. */
+type SizeNode = Pick<NodeRow, "name" | "summary" | "why" | "file_refs">;
+
+export interface SizeStats {
+  totalChars: number;
+  totalBytes: number;
+  totalTokens: number;
+  avgTokens: number;
+  largest: { name: string; tokens: number } | null;
+  smallest: { name: string; tokens: number } | null;
+}
+
+/** Size analysis of the node set by the shared estimator (E5). */
+export function computeSizeStats(nodes: SizeNode[]): SizeStats {
+  let totalChars = 0;
+  let totalBytes = 0;
+  let totalTokens = 0;
+  let largest: { name: string; tokens: number } | null = null;
+  let smallest: { name: string; tokens: number } | null = null;
+  for (const node of nodes) {
+    const payload = JSON.stringify({
+      name: node.name,
+      summary: node.summary,
+      why: node.why ?? "",
+      file_refs: node.file_refs ?? "",
+    });
+    const chars = payload.length;
+    const bytes = Buffer.byteLength(payload, "utf8");
+    const tokens = estimateTokens(payload);
+    totalChars += chars;
+    totalBytes += bytes;
+    totalTokens += tokens;
+    if (!largest || tokens > largest.tokens) largest = { name: node.name, tokens };
+    if (!smallest || tokens < smallest.tokens) smallest = { name: node.name, tokens };
+  }
+  const avgTokens = nodes.length > 0 ? Math.ceil(totalTokens / nodes.length) : 0;
+  return { totalChars, totalBytes, totalTokens, avgTokens, largest, smallest };
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -155,44 +203,17 @@ export async function runStats(args: string[]): Promise<void> {
 
     const childCount = nodes.filter((node) => node.parent_id !== null).length;
 
-    // Per-node size analysis
-    let totalChars = 0;
-    let totalBytes = 0;
-    let totalTokens = 0;
-    let largest: { name: string; tokens: number } | null = null;
-    let smallest: { name: string; tokens: number } | null = null;
-
-    for (const node of nodes) {
-      const payload = JSON.stringify({
-        name: node.name,
-        summary: node.summary,
-        why: node.why ?? "",
-        file_refs: node.file_refs ?? "",
-      });
-      const chars = payload.length;
-      const bytes = Buffer.byteLength(payload, "utf8");
-      const tokens = Math.ceil(chars / 4);
-
-      totalChars += chars;
-      totalBytes += bytes;
-      totalTokens += tokens;
-
-      if (!largest || tokens > largest.tokens) {
-        largest = { name: node.name, tokens };
-      }
-      if (!smallest || tokens < smallest.tokens) {
-        smallest = { name: node.name, tokens };
-      }
-    }
-
-    const avgTokens = nodes.length > 0 ? Math.ceil(totalTokens / nodes.length) : 0;
+    // Per-node size analysis — by the shared estimator (E5).
+    const size = computeSizeStats(nodes);
+    const { totalChars, totalBytes, totalTokens, avgTokens, largest, smallest } = size;
 
     // list_roots payload analysis (matches what MCP server actually sends)
     // 2.1.13 F3: ответ всегда компактный — счётчики из roots_compact.
     const listRootsResult = listRoots(db);
     const listRootsPayload = JSON.stringify({ ...listRootsResult, stats: db.getStats() }, null, 2);
     const listRootsChars = listRootsPayload.length;
-    const listRootsTokens = Math.ceil(listRootsChars / 4);
+    // E5: тот же estimator, что и у выдачи (байты/3), не отдельный chars/4.
+    const listRootsTokens = estimateTokens(listRootsPayload);
     const listRootsNodeCount = (listRootsResult.roots_compact ?? []).reduce(
       (sum, r) => sum + 1 + r.child_count,
       0
