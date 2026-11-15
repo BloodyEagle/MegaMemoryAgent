@@ -333,17 +333,48 @@ export interface UnderstandInput {
    * объект не попадает: обработчик добавляет сам.
    */
   extra_payload?: Record<string, unknown>;
+  /**
+   * E3 (план 20+21 v3 §8.3): opt-in evidence-дополнение compact-выдачи.
+   * По умолчанию выключено — прежний ответ байт-в-байт. С флагом каждый
+   * размещённый матч несёт current_digests (текущие версии; подтверждённая
+   * ранее — отдельным полем confirmed_claim) и support_evidence — полный
+   * набор живых опор (включая не найденные поиском): полная формулировка
+   * (не обрезается), rationale ребра и готовые дайджесты confirm_supports той
+   * же механики, что evidence-профиль get_concept. Один claim digest
+   * недостаточен для подтверждения — нужны версии claim/status/edge/artifacts;
+   * полную формулировку агент всё равно читает до подтверждения (§4.1).
+   * Поддержан только в mode=compact; с full/brief — явная ошибка.
+   */
+  include_evidence?: boolean;
+  /**
+   * D0 (план 20+21 v3 §9): opt-in режим уменьшения доли технических
+   * ref-якорей на верхнем уровне compact-выдачи. Технический якорь — по
+   * происхождению И текущей структуре (created_via='file_ref' + шаблонное
+   * саммари + имя = file_refs[0]); отредактированная осмысленная карточка не
+   * прячется. Якорь с найденным зависимым выводом показывается компактно
+   * (вложение с rationale или collapsed-вид с зависимыми выводами), без
+   * зависимых — компактный локатор; если найдены только якоря, результат не
+   * превращается в ложный no-match. Счётчик — meta.anchor_collapsed; хранение
+   * не меняется (без hidden_from_search): get_concept/provenance_trace
+   * разрешают опору во всех режимах. Поддержан только в mode=compact.
+   */
+  collapse_ref_anchors?: boolean;
 }
 
 /**
  * План 06 (K-02): вложенная опора сохраняет квалификацию знания — статус
  * жизненного цикла, эпистемическую ось, пометку просрочки и признак
  * слабости. Отсутствие поля в проекции — дефект, а не «нет данных».
+ *
+ * D0: collapsed-вложение технического якоря (collapse_ref_anchors: true)
+ * опускает шаблонное саммари (шум) и несёт rationale ребра: summary тогда
+ * отсутствует, а collapsed_anchor: true помечает свёрнутую форму.
  */
 export interface NestedSupportView {
   id: string;
   name: string;
-  summary: string;
+  /** Обычное вложение — усечённое саммари; collapsed-якорь едет без него. */
+  summary?: string;
   /** Lifecycle status (active/superseded/deprecated). */
   status: string;
   /** Epistemic axis (null = не оценивалось). */
@@ -356,6 +387,41 @@ export interface NestedSupportView {
   expired?: boolean;
   /** refuted/abandoned/ungrounded — цитировать как знание нельзя. */
   weak?: boolean;
+  /** D0: свёрнутый технический якорь — компактная форма без шаблонного текста. */
+  collapsed_anchor?: boolean;
+  /** D0: rationale informed_by-ребра решения к этому якорю. */
+  rationale?: string | null;
+}
+
+/**
+ * D0: collapsed-вид технического ref-якоря — компактный локатор вместо
+ * карточки с шаблонным саммари. Хранение не меняется: get_concept по id и
+ * provenance_trace разрешают якорь во всех режимах.
+ */
+export interface CollapsedAnchorView {
+  id: string;
+  name: string;
+  kind: NodeKind;
+  /** Локатор опоры: путь/диапазоны — полезны даже без карточки. */
+  file_refs: string[] | null;
+  collapsed_anchor: true;
+  status?: string;
+  epistemic_status?: string | null;
+  valid_until?: string | null;
+  refuted_reason?: string | null;
+  /** past valid_until — при include_stale: true. */
+  expired?: boolean;
+  /**
+   * Живые зависимые выводы (входящие informed_by) с rationale ребра — якорь
+   * показывается вместе с тем, кто на него опирается и почему; weak —
+   * состояние зависимого вывода.
+   */
+  informed_by_incoming?: Array<{
+    from: string;
+    from_name: string;
+    rationale: string | null;
+    weak?: boolean;
+  }>;
 }
 
 /** One node in compact understand output — everything optional is dropped. */
@@ -398,6 +464,22 @@ export interface CompactMatch {
    * caller asked include_stale: true.
    */
   expired?: boolean;
+  /**
+   * E3 (include_evidence: true): текущие дайджесты узла — та же форма, что у
+   * get_concept: claim — ВСЕГДА текущая формулировка (подтверждаемое значение
+   * для expected_claim_digest), confirmed_claim/confirmed_at — документация
+   * снимка, а не подтверждаемое значение; current и confirmed не смешиваются.
+   */
+  current_digests?: CurrentDigestsView;
+  /**
+   * E3 (include_evidence: true): полный набор живых опор узла (включая не
+   * найденные поиском) — полная формулировка (никогда не обрезается),
+   * rationale ребра, квалификация, weak/quality и готовые дайджесты
+   * claim/status/edge/artifacts той же механики, что evidence-профиль
+   * get_concept. Криптографические значения едут полными hex, не
+   * display-префиксами.
+   */
+  support_evidence?: ConceptEvidenceSupport[];
 }
 
 export interface UnderstandMeta {
@@ -436,6 +518,16 @@ export interface UnderstandMeta {
    * как «ничего не нашлось» — подними max_tokens или используй brief.
    */
   reason?: "budget";
+  /** E3 (include_evidence: true): сколько размещённых матчей несут дополнение. */
+  evidence_matches?: number;
+  /** E3 (include_evidence: true): суммарное число опор в дополнении (все живые informed_by). */
+  evidence_supports?: number;
+  /**
+   * D0 (collapse_ref_anchors: true): сколько технических якорей свернуто в
+   * collapsed-форму (секция anchors). Физическое число узлов в stats не
+   * подменяется: считаются только свёрнутые в этой выдаче.
+   */
+  anchor_collapsed?: number;
 }
 
 export interface UnderstandOutput {
@@ -456,6 +548,12 @@ export interface UnderstandOutput {
    * pulling every node's full context.
    */
   edges_between?: Array<{ from: string; to: string; relation: string }>;
+  /**
+   * D0 (collapse_ref_anchors: true): свёрнутые технические ref-якоря —
+   * компактные локаторы вместо карточек с шаблонным саммари. Только opt-in;
+   * без флага секции нет.
+   */
+  anchors?: CollapsedAnchorView[];
   meta?: UnderstandMeta;
   /**
    * План 13 §2.1: машинно-исполнимый контракт действия, завершающий каждый

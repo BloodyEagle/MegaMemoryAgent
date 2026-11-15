@@ -98,6 +98,37 @@ export function looksLikeFileRefAnchor(
   return looksLikeFilePath(name);
 }
 
+/**
+ * D0 (план 20+21 v3 §9): технический ref-якорь определяется по происхождению
+ * И текущей структуре. Отредактированную осмысленную карточку нельзя прятать
+ * только из-за старого created_via='file_ref' — поэтому проверяется и
+ * шаблонность саммари, и совпадение имени с первым file_ref (путь): тот же
+ * предикат looksLikeFileRefAnchor, что у миграции v12, не ослаблен и не
+ * расширен. Якорь ≠ дефектная заглушка: серверные якоря (created_via =
+ * 'file_ref') не считаются заглушками никогда (isStubSummary).
+ */
+export function isTechnicalRefAnchor(node: {
+  created_via?: string | null;
+  summary?: string | null;
+  name: string;
+  file_refs?: string | null;
+}): boolean {
+  if (node.created_via !== "file_ref") return false;
+  let refs: string[] | null = null;
+  if (node.file_refs) {
+    try {
+      const parsed = JSON.parse(node.file_refs) as unknown;
+      if (Array.isArray(parsed)) {
+        refs = parsed.filter((r): r is string => typeof r === "string");
+      }
+    } catch {
+      // unparseable refs: structure check fails, the node is not collapsed
+      refs = null;
+    }
+  }
+  return looksLikeFileRefAnchor(node.summary, node.name, refs);
+}
+
 export interface SupportQualityBreakdown {
   total: number;
   anchors: number;

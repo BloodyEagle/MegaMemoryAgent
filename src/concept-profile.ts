@@ -54,6 +54,7 @@ import {
   buildNodeWithContext,
   currentDigestsOf,
   estimateTokens,
+  evidenceSupportOf,
   measureMcpPayload,
   parseFileRefs,
   parseStatusScope,
@@ -66,12 +67,9 @@ import {
   DEFAULT_MAX_CHECK_EDGES,
   claimDigestOf,
   computeSupportCheck,
-  edgeDigestOf,
   statusDigestOf,
 } from "./support-baselines.js";
-import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import { isUngrounded } from "./provenance.js";
-import { isStubSummary } from "./stub.js";
 
 // ---- Пределы (константы + явные dropped/truncated, E2) ----
 
@@ -317,25 +315,10 @@ function projectListItem(
 
   if (profile === "evidence" && list === "informed_by") {
     // Полное доказательство: формулировка, rationale и версии для
-    // confirm_supports — клиент не вычисляет хеши сам.
-    const support: ConceptEvidenceSupport = {
-      to: row.id,
-      to_name: row.name,
-      rationale: ref.description,
-      claim: row.summary,
-      ...qualificationOf(db, row),
-      ...(supportIsWeak(db, row) ? { weak: true } : {}),
-      quality: isStubSummary(row.summary, row.kind, row.created_via) ? "stub" : "claim",
-      digests: {
-        claim_digest: claimDigestOf(row.summary),
-        status_digest: statusDigestOf(row.status, row.epistemic_status),
-        edge_digest: edgeDigestOf(ref.description),
-        artifacts_digest: artifactsDigestOf(
-          activeArtifactRows(row, db.getNodeArtifacts(row.id))
-        ),
-      },
-    };
-    return support as unknown as Record<string, unknown>;
+    // confirm_supports — клиент не вычисляет хеши сам. Сборка — общий
+    // экспорт evidenceSupportOf (та же механика, что E3 в compact understand,
+    // план 20+21 v3 §8.3): одна сборка, не дубль.
+    return evidenceSupportOf(db, row, ref.description) as unknown as Record<string, unknown>;
   }
 
   switch (list) {
