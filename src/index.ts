@@ -254,6 +254,9 @@ async function startMcpServer() {
   const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
   const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
+  const { branchConceptToolArgs, getConceptBatch, getConceptProfile } = await import(
+    "./concept-profile.js"
+  );
   const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
   const { checkArtifacts } = await import("./artifacts.js");
 
@@ -463,16 +466,52 @@ async function startMcpServer() {
 
   server.tool(
     "get_concept",
-    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry NO digests. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12).",
+    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry NO digests. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12). E1/E2: a plain single-id call returns the same card as before. profile=evidence returns full wording, rationales and confirm_supports-ready digests (never a trimmed claim — what did not fit is marked incomplete with the next step); profile=orientation returns identity, qualification and pointers under the budget; profile=full is the legacy card. max_tokens bounds the serialized answer in ESTIMATED tokens (tokens_estimated — оценка встроенного estimator'а, не гарантия провайдера); neighbor disclosure is capped (max_neighbors) with continuation tokens; a continuation pins the sample version — changed data yields version_conflict and a full re-read. Batch: pass ids (up to 25) for one call with ONE shared budget — per-id status/error/incompleteness are always visible, an unresolved id never disappears silently, budget_skipped items list the continuation. Old single-id calls without new parameters keep the exact previous response.",
     {
-      id: z.string().describe("Exact concept ID to look up (e.g., 'auth-module' or 'database-config')"),
+      id: z.string().optional().describe("Exact concept ID to look up (e.g., 'auth-module' or 'database-config'). Обязателен для одиночного вызова; с ids/continuation не смешивается"),
+      ids: z.array(z.string()).max(25).optional().describe("Пакетное чтение (E2): до 25 id одним вызовом с ОДНИМ общим бюджетом max_tokens; каждый элемент несёт статус ok/error/budget_skipped и свою ошибку/неполноту — неразрешённый id не исчезает молча, ошибка одного не маскирует соседей. Продолжение — meta.continuation (передай только continuation без ids)"),
+      profile: z.enum(["orientation", "evidence", "full"]).optional().describe("Проекция карточки (E1): orientation — идентичность + квалификация + краткий summary + указатели; evidence — полные формулировки, rationale и готовые дайджесты confirm_supports (не заставляет считать хеши; непоместившиеся доказательства — явная неполнота, не обрезка); full — прежняя полная карточка. Без параметра — full"),
+      max_tokens: z.number().int().min(100).max(200000).optional().describe("Бюджет СЕРИАЛИЗОВАННОГО ответа в оценочных токенах (tokens_estimated — оценка estimator'а ~байты/3, не гарантия токенов провайдера). Минимум конверта и обязательное ядро (идентичность, квалификация, expiry, причины refuted, weak_support) не режутся: ниже минимума — отказ"),
+      max_neighbors: z.number().int().min(0).max(200).optional().describe("Лимит раскрытых соседей на список (дети, рёбра, опоры, трейлы; по умолчанию 20). Остаток виден в meta.dropped с токеном continuation"),
+      continuation: z.string().optional().describe("Opaque-токен продолжения из прошлого ответа (списка опор/соседей или остатка пакета). Продолжение фиксирует версию выборки: если состав или состояния изменились — version_conflict и повторное чтение целиком, а не склейка страниц разных состояний"),
     },
     async (params) => {
       try {
-        const result = getConcept(db, { id: params.id });
+        const mode = branchConceptToolArgs(params);
+        if (mode.mode === "batch") {
+          const result = getConceptBatch(db, mode.input);
+          const okIds = result.batch.filter((i) => i.status === "ok").map((i) => i.resolved_id ?? i.id);
+          timeline.log({
+            tool: "get_concept",
+            params: { ids: mode.input.ids },
+            result_summary: `batch ${result.meta.ok} ok / ${result.meta.failed} failed / ${result.meta.budget_skipped} budget_skipped`,
+            is_write: false,
+            is_error: false,
+            affected_ids: okIds,
+          });
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        }
+        if (mode.mode === "profile") {
+          const result = getConceptProfile(db, mode.input);
+          const resolvedId =
+            "id" in result ? result.id : mode.input.id;
+          timeline.log({
+            tool: "get_concept",
+            params: { id: mode.input.id, profile: mode.input.profile },
+            result_summary:
+              "meta" in result
+                ? `profile ${result.meta.profile} of ${resolvedId}${result.meta.truncated ? " (truncated)" : ""}`
+                : `full card of ${resolvedId}`,
+            is_write: false,
+            is_error: false,
+            affected_ids: resolvedId ? [resolvedId] : [],
+          });
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        }
+        const result = getConcept(db, { id: mode.id });
         timeline.log({
           tool: "get_concept",
-          params: { id: params.id },
+          params: { id: mode.id },
           result_summary: `found ${result.id}`,
           is_write: false,
           is_error: false,
@@ -482,7 +521,7 @@ async function startMcpServer() {
       } catch (err) {
         timeline.log({
           tool: "get_concept",
-          params: { id: params.id },
+          params: { id: params.id, ids: params.ids },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: false,
           is_error: true,

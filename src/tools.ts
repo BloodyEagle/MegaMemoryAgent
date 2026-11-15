@@ -110,9 +110,10 @@ export function disambiguateId(id: string, name: string): string {
 }
 
 /**
- * Parse file_refs from JSON string to array.
+ * Parse file_refs from JSON string to array. Exported for the E1 profile
+ * module — single source of the card's parsing rules.
  */
-function parseFileRefs(raw: string | null): string[] | null {
+export function parseFileRefs(raw: string | null): string[] | null {
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -121,8 +122,12 @@ function parseFileRefs(raw: string | null): string[] | null {
   }
 }
 
-/** Plan 1: status_scope is stored as a JSON string; unparseable = no scope. */
-function parseStatusScope(raw: string | null | undefined): Record<string, unknown> | null {
+/**
+ * Plan 1: status_scope is stored as a JSON string; unparseable = no scope.
+ * Exported for the E1 profile module — single source of the card's parsing
+ * rules.
+ */
+export function parseStatusScope(raw: string | null | undefined): Record<string, unknown> | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
@@ -365,8 +370,13 @@ export function estimateTokens(text: string): number {
   return Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 }
 
-/** Actual MCP content wrapper, including pretty JSON escaping and its own estimate. */
-function measureMcpPayload(payload: unknown): number {
+/**
+ * Actual MCP content wrapper, including pretty JSON escaping and its own
+ * estimate. Exported for the E1/E2 budget modules (concept-profile.ts): the
+ * profile and batch budgets are measured over the same serialized wire shape
+ * the handler really sends (§4.3).
+ */
+export function measureMcpPayload(payload: unknown): number {
   const value = payload as { meta?: { tokens_estimated: number } };
   let tokens = 0;
   for (;;) {

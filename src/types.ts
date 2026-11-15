@@ -525,6 +525,211 @@ export interface GetConceptInput {
   id: string;
 }
 
+// ---- E1/E2 (план 20+21 v3 §8): профили get_concept, бюджет, продолжение, пакет ----
+//
+// Старый одиночный вызов {id} сохраняет прежний контракт байт-в-байт (до
+// отдельного решения о default). Профили — ограниченный набор разделов, а не
+// произвольный язык проекций; бюджет считается по фактически сериализованному
+// wire-ответу существующим estimator'ом (оценка, не гарантия токенов
+// провайдера).
+
+export type GetConceptProfile = "orientation" | "evidence" | "full";
+
+export interface ConceptProfileInput {
+  id?: string;
+  profile?: GetConceptProfile;
+  /** Бюджет wire-ответа в оценочных токенах (estimateTokens ~ байты/3). */
+  max_tokens?: number;
+  /** Лимит раскрытия соседей на один список (default 20). */
+  max_neighbors?: number;
+  /** Opaque-токен продолжения из предыдущего бюджетного ответа. */
+  continuation?: string;
+}
+
+/** Полные числа соседей узла — как показала бы полная карточка. */
+export interface ConceptProfileNeighborCount {
+  children: number;
+  edges: number;
+  incoming_edges: number;
+  informed_by: number;
+  informed_by_incoming: number;
+  trails: number;
+}
+
+/** Существенная неполнота с следующим шагом — не молчаливая порезка. */
+export interface ConceptProfileIncomplete {
+  section: string;
+  reason: "budget" | "cap";
+  count: number;
+  next_step: string;
+  sample_ids?: string[];
+}
+
+export interface ConceptProfileMeta {
+  profile: GetConceptProfile;
+  /** Версия формы выдачи; изменение состава полей меняет это число. */
+  form_version: 1;
+  /**
+   * Оценка токенов ФАКТИЧЕСКОГО wire-ответа (pretty-JSON в MCP-конверте) по
+   * существующему estimator'у — оценка, не гарантия числа токенов провайдера.
+   */
+  tokens_estimated: number;
+  max_tokens?: number;
+  /** Что-то не поместилось в бюджет/лимит раскрытия (см. dropped/incomplete). */
+  truncated: boolean;
+  /** Полные числа соседей (у profile=full отсутствует — карточка несёт состав сама). */
+  counts?: ConceptProfileNeighborCount;
+  /** Сколько показано в этом ответе. */
+  returned?: ConceptProfileNeighborCount;
+  /** Не поместилось (только ненулевые списки). */
+  dropped?: Partial<ConceptProfileNeighborCount>;
+  /** Существенные формулировки/доказательства, не вошедшие в ответ. */
+  incomplete?: ConceptProfileIncomplete[];
+  /** Продолжения для порезанных списков: по одному токену на список. */
+  continuations?: Array<{ list: string; token: string }>;
+  /** Страница продолжения: какой список раскрыт и с какого места. */
+  continuation_used?: { list: string; offset: number };
+}
+
+export interface ConceptEvidenceSupportDigests {
+  claim_digest: string;
+  status_digest: string;
+  edge_digest: string;
+  /** Дайджест активных наблюдений артефактов опоры; null = не наблюдались. */
+  artifacts_digest: string | null;
+}
+
+/**
+ * Опора в evidence-профиле: полная существенная формулировка (никогда не
+ * обрезается — сокращённое чтение не выдаётся за достаточное для
+ * подтверждения), rationale ребра и версии, готовые для confirm_supports.
+ * Клиент не вычисляет хеши сам.
+ */
+export interface ConceptEvidenceSupport {
+  to: string;
+  to_name: string;
+  rationale: string | null;
+  /** Полный текст формулировки опоры. */
+  claim: string;
+  status: string;
+  epistemic_status?: string | null;
+  status_scope?: Record<string, unknown> | null;
+  valid_until?: string | null;
+  expired?: boolean;
+  refuted_reason?: string | null;
+  /** refuted/abandoned/ungrounded — цитировать как знание нельзя. */
+  weak?: boolean;
+  /** stub = формулировка-шаблон, подтверждать её нельзя. */
+  quality?: "stub" | "claim";
+  digests: ConceptEvidenceSupportDigests;
+}
+
+/**
+ * Проекция get_concept: обязательное ядро (идентичность, lifecycle/
+ * epistemic квалификация, expiry, причины refuted) есть всегда; остальное —
+ * ограниченное раскрытие соседей под бюджетом. Разделы совпадают с
+ * соответствующими разделами полной карточки байт-в-байт (контрактный тест).
+ */
+export interface ConceptProfileOutput {
+  id: string;
+  name: string;
+  kind: NodeKind;
+  parent: { id: string; name: string } | null;
+  status: string;
+  epistemic_status: string | null;
+  status_scope: Record<string, unknown> | null;
+  valid_until: string | null;
+  expired: boolean;
+  refuted_reason?: string | null;
+  created_via?: string | null;
+  /** orientation: существующее усечение ≤240; evidence: полная формулировка. */
+  summary: string;
+  file_refs: string[] | null;
+  /** Решение, все опоры которого слабые — предупреждение не режется бюджетом. */
+  weak_support?: boolean;
+  /** orientation: где брать остальное. */
+  where_next?: string;
+  /** Полный rationale узла (evidence). */
+  why?: string | null;
+  /** orientation: роле-слоты узла (как в полной карточке, без task_state). */
+  slots?: Array<{ project: string; role: string }>;
+  // Раскрытые соседи (ограниченно, кап + бюджет).
+  children?: Array<{
+    id: string;
+    name: string;
+    kind: NodeKind;
+    status?: string;
+    epistemic_status?: string | null;
+    status_scope?: Record<string, unknown> | null;
+    valid_until?: string | null;
+    expired?: boolean;
+    refuted_reason?: string | null;
+  }>;
+  edges?: Array<{ to: string; to_name: string; relation: RelationType }>;
+  incoming_edges?: Array<{ from: string; from_name: string; relation: RelationType }>;
+  /** orientation: карта опор без формулировок (полные — в evidence). */
+  informed_by?: Array<{ to: string; to_name: string; weak?: boolean }>;
+  informed_by_incoming?: Array<{ from: string; from_name: string }>;
+  trails?: Array<{ id: string; name: string; state: "fresh" | "stale" | "broken" }>;
+  // evidence: версии для подтверждения.
+  current_digests?: CurrentDigestsView;
+  support_check?: SupportCheckView;
+  supports?: ConceptEvidenceSupport[];
+  meta: ConceptProfileMeta;
+}
+
+export interface ConceptBatchInput {
+  ids?: string[];
+  profile?: GetConceptProfile;
+  max_tokens?: number;
+  max_neighbors?: number;
+  /** Opaque-токен продолжения пакета (ids/profile зашиты в токен). */
+  continuation?: string;
+}
+
+export interface ConceptBatchItem {
+  /** id, как передан в пакете. */
+  id: string;
+  /** Разрешённый id (после алиасов); отсутствует у error-элементов. */
+  resolved_id?: string;
+  status: "ok" | "error" | "budget_skipped";
+  /** Только для error: причина по элементу, соседи не маскируются. */
+  error?: string;
+  /** Полная карточка (profile=full) либо проекция профиля. */
+  card?: NodeWithContext | ConceptProfileOutput;
+  /** Кап вычислений support-check пакета исчерпан — проверка отложена явно. */
+  support_check_deferred?: boolean;
+  /** Только для budget_skipped. */
+  reason?: "budget";
+  /** Следующий шаг для budget_skipped. */
+  next_step?: string;
+}
+
+export interface ConceptBatchMeta {
+  total: number;
+  ok: number;
+  failed: number;
+  budget_skipped: number;
+  profile: GetConceptProfile;
+  /** Оценка токенов фактического wire-ответа — оценка, не гарантия. */
+  tokens_estimated: number;
+  max_tokens?: number;
+  /** Бюджет порезал пакет (budget_skipped > 0). */
+  truncated: boolean;
+  /** Продолжение пакета: остаток списка с фиксацией версии выданного. */
+  continuation?: string;
+  continuation_used?: { offset: number };
+}
+
+/**
+ * Пакетное чтение get_concept: один общий бюджет на весь пакет, статус/
+ * ошибка/неполнота видны по каждому id; неразрешённый id не исчезает молча.
+ */
+export interface ConceptBatchOutput {
+  batch: ConceptBatchItem[];
+  meta: ConceptBatchMeta;
+}
+
 export interface ListRootsInput {
   /** Token budget for the overview (default 1500). */
   max_tokens?: number;
