@@ -2742,6 +2742,56 @@ export class KnowledgeDB {
       .get(parentId) as NodeRow | undefined;
   }
 
+  // ---- E1 (план 20+21 v3 §8): лёгкие списки для бюджетного раскрытия ----
+  //
+  // Проекции get_concept обязаны бюджетировать раскрытие и вычисления, а не
+  // собирать гигантскую полную карточку ради последующего отбрасывания. Эти
+  // запросы возвращают только идентификаторы/ссылки (без summary, эмбеддингов
+  // и имён) — тот же состав, что у полных аналогов выше (те же WHERE/JOIN и
+  // порядок строк), поэтому счётчики и отпечаток состава выборки совпадают
+  // с полной карточкой.
+
+  /** Только id живых детей — состав списка для раскрытия с капом. */
+  getChildrenIds(parentId: string): string[] {
+    return (
+      this.db
+        .prepare("SELECT id FROM nodes WHERE parent_id = ? AND removed_at IS NULL")
+        .all(parentId) as Array<{ id: string }>
+    ).map((r) => r.id);
+  }
+
+  /** Исходящие рёбра без JOIN имён/саммари; живые цели, как getOutgoingEdges. */
+  getEdgeRefsOut(
+    nodeId: string
+  ): Array<{ to_id: string; relation: string; description: string | null }> {
+    return this.db
+      .prepare(
+        `
+      SELECT e.to_id, e.relation, e.description
+      FROM edges e
+      JOIN nodes n ON e.to_id = n.id
+      WHERE e.from_id = ? AND e.removed_at IS NULL AND n.removed_at IS NULL
+    `
+      )
+      .all(nodeId) as Array<{ to_id: string; relation: string; description: string | null }>;
+  }
+
+  /** Входящие рёбра без JOIN имён/саммари; живые источники, как getIncomingEdges. */
+  getEdgeRefsIn(
+    nodeId: string
+  ): Array<{ from_id: string; relation: string; description: string | null }> {
+    return this.db
+      .prepare(
+        `
+      SELECT e.from_id, e.relation, e.description
+      FROM edges e
+      JOIN nodes n ON e.from_id = n.id
+      WHERE e.to_id = ? AND e.removed_at IS NULL AND n.removed_at IS NULL
+    `
+      )
+      .all(nodeId) as Array<{ from_id: string; relation: string; description: string | null }>;
+  }
+
   getRootNodes(): NodeRow[] {
     return this.db
       .prepare(
