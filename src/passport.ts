@@ -273,8 +273,8 @@ export function findLatestPassportBody(
   return null;
 }
 
-/** Все сохранённые тела паспортов, последние сначала (для reuse-поиска). */
-function findPassportBodies(db: KnowledgeDB): Array<{ trail_id: string; body: PassportPayload }> {
+/** Все сохранённые тела паспортов, последние сначала (reuse-поиск, индекс P2). */
+export function findPassportBodies(db: KnowledgeDB): Array<{ trail_id: string; body: PassportPayload }> {
   const rows = db.execSqlAll(
     `SELECT seq, params FROM timeline
      WHERE tool = 'trail_save' AND params LIKE ?

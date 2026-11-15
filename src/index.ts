@@ -259,6 +259,7 @@ async function startMcpServer() {
   );
   const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
   const { checkArtifacts } = await import("./artifacts.js");
+  const { checkFreshness } = await import("./freshness.js");
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
@@ -1087,6 +1088,72 @@ async function startMcpServer() {
           params: { node_ids: params.node_ids },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  // ---- P2 (план 20+21 v3 §11): адресная перепроверка свежести ----
+  //
+  // ЯВНОЕ opt-in действие проверки: обычный поиск его не запускает. Только
+  // чтение: НЕ пишет наблюдения (это check_artifacts), НЕ подтверждает опоры
+  // (это confirm_supports), НЕ меняет граф. Отчёт несёт затронутое/проверенное/
+  // неизвестное, причины неполноты и expected_versions.
+  server.tool(
+    "check_freshness",
+    "Адресная перепроверка свежести: по изменившимся (или подозрительным) источникам — файлам, git-blob'ам, git:-ссылкам — проверить СВЯЗАННЫЕ записи через восстановимый обратный индекс (узлы с file_refs, наблюдения артефактов, паспорта trail_save), а не весь граф. Сравнение по sha256 содержимого с записанными версиями (наблюдения check_artifacts, хеши областей паспортов); mtime/size не являются доказательством; git-состояние working tree (staged/unstaged/untracked/rename) и HEAD едут в отчёте как наблюдение — прежний HEAD не доказывает неизменность working tree. Один физический источник хешируется один раз за проверку; источники, менявшиеся ВО ВРЕМЯ проверки, получают статус unstable — стабильный снимок не объявляется. Отчёт: sources (unchanged/changed/missing/unobserved/unstable/skipped/other_repo), records (fresh/stale_input/partial/unknown — префикс не выдаётся за весь граф), summary (affected/checked/unknown/truncated + limitations), expected_versions — сверь их повторно перед применением правки. НЕ пишет в БД и не подтверждает опоры: reuse-квалификация не поднимается. Опционально (P2.2, пилот): symbols — разрешение определений через adapter token-economy-ts (конфиг: adapter.graph_tool или env MEGAMEMORY_CODE_ADAPTER); неоднозначное/пропавшее определение даёт явный ambiguous/missing и требует чтения; with_dependencies — обход import-графа изменённых источников через adapter (ограничен max_deps, static scope объявлен явно).",
+    {
+      sources: z.array(z.string()).optional().describe("Источники для проверки: пути/refs (src/foo.ts, src/foo.ts:1-40, HEAD:src/foo.ts, git:tag:name)"),
+      node_ids: z.array(z.string()).optional().describe("Проверить записи конкретных узлов (их file_refs и наблюдения)"),
+      trail_ids: z.array(z.string()).optional().describe("Проверить области паспортов конкретных trail"),
+      repo_root: z.string().optional().describe("Корень repo/worktree (default: startup --repo или cwd); закрепления наблюдений не переписываются"),
+      max_files: z.number().int().min(1).max(10000).optional().describe("Бюджет проверки: максимум источников (default 50); лишние — skipped + truncated"),
+      max_deps: z.number().int().min(1).max(1000).optional().describe("Бюджет обхода зависимостей (default 20)"),
+      with_dependencies: z.boolean().optional().describe("Обойти import-граф изменённых источников через adapter (opt-in; без adapter — явное ограничение, не «зависимостей нет»)"),
+      symbols: z.array(z.object({
+        name: z.string().min(1).describe("Имя символа (функция/класс/метод)"),
+        in: z.string().optional().describe("Владелец для уточнения (класс/интерфейс)"),
+        file: z.string().optional().describe("Файл для проверки однозначности локатора"),
+      })).optional().describe("P2.2 (пилот): разрешить символы через adapter; номера строк — текущий результат разрешения, не идентичность"),
+      adapter: z.object({
+        graph_tool: z.string().min(1).describe("Путь к каталогу scripts скилла token-economy-ts или к graph-tool.js"),
+      }).optional().describe("Конфиг adapter (P2.2); без него — файловый режим явно. Альтернатива: env MEGAMEMORY_CODE_ADAPTER"),
+    },
+    async (params) => {
+      try {
+        const result = await checkFreshness(db, {
+          ...(params.sources !== undefined ? { sources: params.sources } : {}),
+          ...(params.node_ids !== undefined ? { node_ids: params.node_ids } : {}),
+          ...(params.trail_ids !== undefined ? { trail_ids: params.trail_ids } : {}),
+          ...(params.repo_root !== undefined ? { repo_root: params.repo_root } : { repo_root: REPO_PATH }),
+          ...(params.max_files !== undefined ? { max_files: params.max_files } : {}),
+          ...(params.max_deps !== undefined ? { max_deps: params.max_deps } : {}),
+          ...(params.with_dependencies !== undefined ? { with_dependencies: params.with_dependencies } : {}),
+          ...(params.symbols !== undefined ? { symbols: params.symbols } : {}),
+          ...(params.adapter !== undefined ? { adapter: params.adapter } : {}),
+        });
+        timeline.log({
+          tool: "check_freshness",
+          params: {
+            ...(params.sources !== undefined ? { sources: params.sources } : {}),
+            ...(params.node_ids !== undefined ? { node_ids: params.node_ids } : {}),
+            ...(params.trail_ids !== undefined ? { trail_ids: params.trail_ids } : {}),
+          },
+          result_summary: `checked ${result.summary.checked}, affected ${result.summary.affected}, unknown ${result.summary.unknown}${result.summary.truncated ? ", truncated" : ""}`,
+          is_write: false,
+          is_error: false,
+          affected_ids: params.node_ids ?? [],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "check_freshness",
+          params: {},
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
           is_error: true,
           affected_ids: [],
         });
