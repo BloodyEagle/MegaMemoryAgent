@@ -1,6 +1,10 @@
 /**
- * 2.1.12 F5: scripts/report-journals.mjs находит журнальные узлы и не пишет
- * в базу. Скрипт — глаза, не руки: решение по каждой строке за владельцем.
+ * 2.1.12 F5 / M2 B4: scripts/report-journals.mjs находит журнальные узлы и
+ * не пишет в базу. Скрипт — глаза, не руки: решение по каждой строке за
+ * владельцем. С M2 скрипт — тонкий adapter над src/scan-expiry.ts (dist):
+ * правила не дублируются, опоры считаются ИСХОДЯЩИЕ живые informed_by с
+ * живыми целями (R11), база открывается readonly (query_only), ошибка git —
+ * явная ошибка (B4.8).
  */
 import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs";
@@ -37,8 +41,15 @@ function dump(dbPath: string): string {
   }
 }
 
-describe("report-journals.mjs (2.1.12 F5)", () => {
-  it("21. находит 3 журнала на фикстуре и не пишет в базу", () => {
+/** Колонка таблицы скана по id (ячейки разделены двумя+ пробелами). */
+function rowCells(out: string, id: string): string[] {
+  const line = out.split("\n").find((l) => l.includes(id));
+  if (!line) return [];
+  return line.trim().split(/\s{2,}/);
+}
+
+describe("report-journals.mjs (2.1.12 F5, M2 B4 adapter)", () => {
+  it("21. находит 3 журнала на фикстуре, считает опоры ИСХОДЯЩИМИ и не пишет в базу", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-journals-"));
     const dbPath = path.join(tmpDir, "knowledge.db");
     db = new KnowledgeDB(dbPath);
@@ -62,12 +73,13 @@ describe("report-journals.mjs (2.1.12 F5)", () => {
       kind: "module",
       summary: "Миграция базы MODX не начата, план согласован 2026-10-30",
     });
-    // опора на один из журналов — колонка supports должна это показать
+    // опора: follower ОПИРАЕТСЯ на релиз (follower --informed_by--> release-2111).
+    // R11: релиз — цель опоры, его исходящих опор нет; у follower — одна.
     db.insertNode({
       id: "follower",
       name: "follower",
       kind: "feature",
-      summary: "Решение о релизе опирается на состояние PR",
+      summary: "Решение о выпуске 2.1.11 опирается на состояние публикации",
     });
     link(db, { from: "follower", to: "release-2111", relation: "informed_by", description: "релиз подтверждает решение" });
     // два не-журнала: поведение и соглашение без дат/PR/версий
@@ -95,17 +107,50 @@ describe("report-journals.mjs (2.1.12 F5)", () => {
     // логическое содержимое базы не изменилось
     expect(after).toBe(before);
 
-    // три кандидата, не-журналы не попали
+    // четыре кандидата (3 журнала + follower с маркером версии), не-журналы не попали
     expect(out).toContain("pr-19-state");
     expect(out).toContain("release-2111");
     expect(out).toContain("migration-status");
+    expect(out).toContain("follower");
     expect(out).not.toContain("behavior");
     expect(out).not.toContain("convention");
     // колонки таблицы на месте
     expect(out).toContain("valid_until");
     expect(out).toContain("нет valid_until при утверждении о состоянии");
-    // опоры посчитаны
-    const row = out.split("\n").find((l) => l.includes("release-2111"))!;
-    expect(row).toMatch(/1/);
+
+    // R11: направление опор — исходящие живые informed_by с живыми целями.
+    // release-2111 — ЦЕЛЬ опоры: у него 0 исходящих (старый скрипт насчитал 1).
+    expect(rowCells(out, "release-2111")[3]).toBe("0");
+    // follower опирается на релиз: у него 1 исходящая живая опора
+    expect(rowCells(out, "follower")[3]).toBe("1");
+  });
+
+  it("ошибка git (--repo вне репозитория) — явная ошибка, не «кандидатов нет» (B4.8)", () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-journals-git-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    db = new KnowledgeDB(dbPath);
+    db.insertNode({
+      id: "jr-git",
+      name: "jr-git",
+      kind: "journal",
+      summary: "PR #40 открыт, ждёт ревью",
+    });
+    const notARepo = path.join(tmpDir, "not-a-repo");
+    fs.mkdirSync(notARepo, { recursive: true });
+    const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+    let failed = false;
+    try {
+      execFileSync("node", ["scripts/report-journals.mjs", "--db", dbPath, "--repo", notARepo], {
+        cwd: projectRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      failed = true;
+      const message = String((err as { stderr?: Buffer }).stderr ?? err);
+      expect(message).toContain("git");
+    }
+    expect(failed).toBe(true);
   });
 });
