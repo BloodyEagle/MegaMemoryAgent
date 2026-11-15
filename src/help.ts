@@ -32,6 +32,8 @@ ${pc.bold("Commands:")}
 
 ${pc.bold("Global and MCP options:")}
   ${pc.cyan("--db")} ${pc.dim("PATH")}       Path to knowledge.db ${pc.dim("(--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)")}
+  ${pc.cyan("MEGAMEMORY_TELEMETRY_PATH")} ${pc.dim("FILE")}  opt-in local JSONL telemetry of MCP tool calls
+                ${pc.dim("(unset: off; local append-only file, never sent anywhere; docs/telemetry.md)")}
   ${pc.cyan("--repo")} ${pc.dim("PATH")}     MCP startup repository for git:tag/commit/branch refs
                 ${pc.dim("(--repo=PATH also accepted; default: database directory; repins git refs for this server)")}
   ${pc.cyan("--help, -h")}      Show this help

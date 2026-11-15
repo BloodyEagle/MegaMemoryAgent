@@ -26,6 +26,8 @@ Commands:
 
 Global and MCP options:
   --db PATH       Path to knowledge.db (--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)
+  MEGAMEMORY_TELEMETRY_PATH FILE  opt-in local JSONL telemetry of MCP tool calls
+                (unset: off; local append-only file, never sent anywhere; docs/telemetry.md)
   --repo PATH     MCP startup repository for git:tag/commit/branch refs
                 (--repo=PATH also accepted; default: database directory; repins git refs for this server)
   --help, -h      Show this help

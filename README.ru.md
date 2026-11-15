@@ -548,6 +548,7 @@ Runtime controls, которые читает сама MegaMemory:
 | `MEGAMEMORY_PROVENANCE_AUTO_GROUND` | config / выкл | Перевычисляемый override вывода опор решения из `why` + `file_refs`; те же boolean-формы. |
 | `MEGAMEMORY_TIMELINE_RETENTION_DAYS` | `90` | Ретеншн timeline по возрасту; целое `0` отключает правило возраста. |
 | `MEGAMEMORY_TIMELINE_MAX_ENTRIES` | `50000` | Ретеншн timeline по числу строк; целое `0` отключает правило количества. |
+| `MEGAMEMORY_TELEMETRY_PATH` | не задана | Opt-in локальная JSONL-телеметрия вызовов MCP-инструментов (исход/latency/объём ответа, без payload'ов, секреты зачищаются, никуда не отправляется). Не задана = выключено; файл растёт, чистит владелец — см. `docs/telemetry.md`. |
 | `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | Переопределение источника D3 explorer. Без него используется файл из поставки; при его отсутствии serve предупреждает и откатывается к jsDelivr. |
 | `MEGAMEMORY_AUTO_MIGRATE` | включено | Только startup-hygiene MCP: точное `0` пропускает полную upstream-конверсию/ремонт id и вместо неё выполняет аддитивную настройку схемы. Это не обход readonly-команд; `serve` переменную не читает. |
 | `MEGAMEMORY_ALLOW_AUTO_MIGRATE` | выкл | Только `export`, `eval`, `conflicts`: точное `1` заменяет защищённое readonly-открытие обычным RW в этом процессе. |

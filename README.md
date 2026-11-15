@@ -548,6 +548,7 @@ Runtime controls read by MegaMemory itself:
 | `MEGAMEMORY_PROVENANCE_AUTO_GROUND` | config / off | Per-call override for deriving decision supports from `why` + `file_refs`; same boolean forms. |
 | `MEGAMEMORY_TIMELINE_RETENTION_DAYS` | `90` | Timeline age retention; integer `0` disables the age rule. |
 | `MEGAMEMORY_TIMELINE_MAX_ENTRIES` | `50000` | Timeline count retention; integer `0` disables the count rule. |
+| `MEGAMEMORY_TELEMETRY_PATH` | unset | Opt-in local JSONL telemetry of MCP tool calls (outcome/latency/response size, no payloads, secrets redacted, never sent anywhere). Unset = off; file grows, owner cleans it — see `docs/telemetry.md`. |
 | `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | Explorer D3 source override. Without it, the vendored file is used; if missing, serve warns and falls back to jsDelivr. |
 | `MEGAMEMORY_AUTO_MIGRATE` | on | MCP-startup hygiene only: exact `0` skips the full upstream conversion/ID-repair path and runs additive schema setup instead. It is not the read-only-command escape hatch and `serve` does not consult it. |
 | `MEGAMEMORY_ALLOW_AUTO_MIGRATE` | off | Only `export`, `eval`, and `conflicts`: exact `1` replaces their protected readonly open with ordinary RW opening for that process. |
