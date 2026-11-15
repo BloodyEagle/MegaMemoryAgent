@@ -8,6 +8,7 @@ import { errorBold, validatePort } from "./cli-utils.js";
 import { resolveDbPathOrExit, resolveRepoPath } from "./db-path.js";
 import { buildHelp } from "./help.js";
 import { createTimelineLogger } from "./timeline.js";
+import { createTelemetryLogger, telemetryPathFromEnv, wrapToolHandler } from "./telemetry.js";
 import { instructionsStatus } from "./instructions.js";
 import { commandIndex } from "./cli-flags.js";
 import { NODE_KINDS } from "./types.js";
@@ -328,6 +329,33 @@ async function startMcpServer() {
     name: "megamemory",
     version: VERSION,
   });
+
+  // ---- J0 (план 20+21 v3 §15): локальная телеметрия на уровне ----
+  // диспетчеризации инструментов. Opt-in через MEGAMEMORY_TELEMETRY_PATH —
+  // локальный append-only JSONL, БД не трогает. Выключена по умолчанию:
+  // регистрация остаётся нетронутой, ноль накладных на каждый вызов.
+  // docs/telemetry.md — что собирается, срок хранения, как отключить.
+  const telemetry = createTelemetryLogger({ path: telemetryPathFromEnv() });
+  if (telemetry.enabled) {
+    const rawTool = server.tool.bind(server) as unknown as (...args: unknown[]) => unknown;
+    (server as unknown as { tool: (...args: unknown[]) => unknown }).tool = (
+      ...args: unknown[]
+    ) => {
+      // Обработчик — последний функциональный аргумент регистрации; имя
+      // инструмента — всегда первый.
+      for (let i = args.length - 1; i >= 0; i -= 1) {
+        if (typeof args[i] === "function") {
+          args[i] = wrapToolHandler(
+            String(args[0]),
+            args[i] as (...a: unknown[]) => Promise<unknown>,
+            telemetry
+          );
+          break;
+        }
+      }
+      return rawTool(...args);
+    };
+  }
 
   // ---- Zod schemas ----
   const NodeKindEnum = z.enum(NODE_KINDS);

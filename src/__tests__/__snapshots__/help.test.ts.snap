@@ -7,7 +7,7 @@ Commands:
   (no command)    Start the MCP stdio server (invoked by your editor; global database/repository options apply)
   install         Configure integrations [--target NAME[,NAME...]]; default: interactive
   serve           Start the loopback-only web explorer [--port PORT] [--host HOST]; --db PATH
-  stats           Show graph statistics [--prune] [--funnel] [--json]; --db PATH
+  stats           Show graph statistics [--prune] [--funnel] [--health] [--window 7d|30d|all] [--json]; --db PATH
   merge           Merge databases <FILE1> <FILE2> [--into FILE] [--left-label NAME] [--right-label NAME]
   conflicts       List unresolved merge conflicts [--json]; --db PATH
   resolve         Resolve a merge conflict <GROUP_ID> --keep left|right|both; --db PATH
@@ -26,6 +26,8 @@ Commands:
 
 Global and MCP options:
   --db PATH       Path to knowledge.db (--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)
+  MEGAMEMORY_TELEMETRY_PATH FILE  opt-in local JSONL telemetry of MCP tool calls
+                (unset: off; local append-only file, never sent anywhere; docs/telemetry.md)
   --repo PATH     MCP startup repository for git:tag/commit/branch refs
                 (--repo=PATH also accepted; default: database directory; repins git refs for this server)
   --help, -h      Show this help
@@ -38,7 +40,9 @@ Command options:
   --host HOST     serve address (default: 127.0.0.1; allowed: 127.0.0.1 or ::1)
   --prune         stats: apply timeline retention cleanup before reporting
   --funnel        stats: append the understand → follow-up → write funnel
-  --json          stats --funnel: JSON-only without --prune; conflicts: machine-readable output
+  --health        stats: append honest health metrics (state now / activity window / completeness; never affects exit code)
+  --window SPAN  stats --health/--funnel: same window for all requested sections (7d | 30d | all; default: 7d)
+  --json          stats --funnel/--health: JSON-only without --prune; conflicts: machine-readable output
   --into FILE     merge output (default: overwrite FILE1 via a temporary file)
   --left-label NAME  merge source label (default: left)
   --right-label NAME merge source label (default: right)

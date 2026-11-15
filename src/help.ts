@@ -13,7 +13,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("(no command)")}    Start the MCP stdio server ${pc.dim("(invoked by your editor; global database/repository options apply)")}
   ${pc.cyan("install")}         Configure integrations ${pc.dim("[--target NAME[,NAME...]]; default: interactive")}
   ${pc.cyan("serve")}           Start the loopback-only web explorer ${pc.dim("[--port PORT] [--host HOST]; --db PATH")}
-  ${pc.cyan("stats")}           Show graph statistics ${pc.dim("[--prune] [--funnel] [--json]; --db PATH")}
+  ${pc.cyan("stats")}           Show graph statistics ${pc.dim("[--prune] [--funnel] [--health] [--window 7d|30d|all] [--json]; --db PATH")}
   ${pc.cyan("merge")}           Merge databases ${pc.dim("<FILE1> <FILE2> [--into FILE] [--left-label NAME] [--right-label NAME]")}
   ${pc.cyan("conflicts")}       List unresolved merge conflicts ${pc.dim("[--json]; --db PATH")}
   ${pc.cyan("resolve")}         Resolve a merge conflict ${pc.dim("<GROUP_ID> --keep left|right|both; --db PATH")}
@@ -32,6 +32,8 @@ ${pc.bold("Commands:")}
 
 ${pc.bold("Global and MCP options:")}
   ${pc.cyan("--db")} ${pc.dim("PATH")}       Path to knowledge.db ${pc.dim("(--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)")}
+  ${pc.cyan("MEGAMEMORY_TELEMETRY_PATH")} ${pc.dim("FILE")}  opt-in local JSONL telemetry of MCP tool calls
+                ${pc.dim("(unset: off; local append-only file, never sent anywhere; docs/telemetry.md)")}
   ${pc.cyan("--repo")} ${pc.dim("PATH")}     MCP startup repository for git:tag/commit/branch refs
                 ${pc.dim("(--repo=PATH also accepted; default: database directory; repins git refs for this server)")}
   ${pc.cyan("--help, -h")}      Show this help
@@ -44,7 +46,9 @@ ${pc.bold("Command options:")}
   ${pc.cyan("--host")} ${pc.dim("HOST")}     serve address ${pc.dim("(default: 127.0.0.1; allowed: 127.0.0.1 or ::1)")}
   ${pc.cyan("--prune")}         stats: apply timeline retention cleanup before reporting
   ${pc.cyan("--funnel")}        stats: append the understand → follow-up → write funnel
-  ${pc.cyan("--json")}          stats --funnel: JSON-only without --prune; conflicts: machine-readable output
+  ${pc.cyan("--health")}        stats: append honest health metrics (state now / activity window / completeness; never affects exit code)
+  ${pc.cyan("--window")} ${pc.dim("SPAN")}  stats --health/--funnel: same window for all requested sections ${pc.dim("(7d | 30d | all; default: 7d)")}
+  ${pc.cyan("--json")}          stats --funnel/--health: JSON-only without --prune; conflicts: machine-readable output
   ${pc.cyan("--into")} ${pc.dim("FILE")}     merge output ${pc.dim("(default: overwrite FILE1 via a temporary file)")}
   ${pc.cyan("--left-label")} ${pc.dim("NAME")}  merge source label ${pc.dim("(default: left)")}
   ${pc.cyan("--right-label")} ${pc.dim("NAME")} merge source label ${pc.dim("(default: right)")}

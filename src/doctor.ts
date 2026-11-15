@@ -6,6 +6,7 @@ import { isBrokenId } from "./migrate.js";
 import { D3_CDN_FALLBACK_NOTE, d3Source } from "./d3-asset.js";
 import { countStubSupports } from "./stub.js";
 import { probeFtsHealth, type FtsHealth } from "./fts-health.js";
+import { computeHealth, formatHealthSummary } from "./health.js";
 
 /**
  * F13 helper: turn probe counts into a drift message. Exported for tests —
@@ -455,6 +456,22 @@ export function runDoctor(db: KnowledgeDB): {
       " MB, external " + Math.round(mem.external / (1024 * 1024)) +
       " MB, model loaded: " + (modelLoaded ? "yes" : "no")
   );
+
+  // ---- Этап A (план 20+21 v3 §6.A4): короткая информационная сводка ----
+  // Один расчёт с stats (health.ts — общий module). Отсутствие записей
+  // НИКОГДА не повышает problems и не меняет exit code: read-only задача и
+  // успешное переиспользование памяти законны. Сбой расчёта — тоже
+  // информационная строка, не проблема.
+  try {
+    const report = computeHealth(db, { window: "7d" });
+    add("memory activity", true, formatHealthSummary(report));
+  } catch (err) {
+    add(
+      "memory activity",
+      true,
+      `сводка активности недоступна: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 
   return { checks, problems: checks.filter((c) => !c.ok).length };
 }
