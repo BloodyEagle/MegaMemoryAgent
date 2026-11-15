@@ -12,9 +12,12 @@ const DOC = path.join(ROOT, "docs", "capabilities.md");
 const text = fs.readFileSync(DOC, "utf-8");
 
 describe("docs/capabilities.md — реестр возможностей (W5)", () => {
-  it("документ существует, UTF-8, без CR", () => {
+  it("документ существует, UTF-8, читается", () => {
+    // Байт-контракт (ровно один LF, без CR) закреплён только за
+    // docs/agent-workflow.md через .gitattributes; этот документ
+    // содержательных проверок по подстрокам и не зависит от перевода строк
+    // checkout'а (core.autocrlf).
     expect(text.length).toBeGreaterThan(0);
-    expect(text.includes("\r")).toBe(false);
     expect(text).toContain("Реестр возможностей");
   });
 
