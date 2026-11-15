@@ -199,6 +199,29 @@ gives every node an optional `valid_until` (ISO-8601, UTC):
   nodes; dry-run by default, one unknown id refuses the whole batch, every
   application writes a `timeline` entry. Cleanup candidates on a live base:
   run it on a copy, keep useful content by rewriting it instead of expiring.
+- **The `journal` kind (M2)** — an explicit kind for volatile state notes
+  ("PR #N open now"). It is not evidence and not a decision substitute: a
+  decision keeps its mandatory supports, and a historical event ("release
+  shipped on date X") does not become false with age — the term limits the
+  note's usefulness in the current context (delivery policy, not auto-refuted).
+  When `valid_until` is omitted on create, the server applies a default term:
+  `MEGAMEMORY_EXPIRY_JOURNAL_DAYS` env → `expiry.journal_days` in the config
+  next to the database (`megamemory.config.json`) → **90 days** (the plan's
+  starting fallback, not a measured truth). An explicit date wins; an explicit
+  `null` forbids auto-expiry, and the note still carries the
+  `state_claim_without_expiry` warning — a journal without a term is never
+  presented as safe; `journal_days: 0` turns auto-expiry off. Updates never
+  refresh a term (no sliding TTL; an expired term is preserved), a kind change
+  to `journal` applies the default only when no term exists and none was
+  passed, and import/merge never recompute or rejuvenate stored terms.
+- **`expire --scan` (M2)** — a read-only candidate review; `--json` prints a
+  versioned report (snapshot time, proposed concrete date, versions of each
+  candidate's essential fields). `--scan --apply` is refused: apply only
+  explicitly chosen ids (`--ids`) or a reviewed report (`--report`); a
+  versioned report is re-checked field-by-field inside one transaction — any
+  drift or vanished member cancels the whole batch with `version_conflict`.
+  A date, version or tag in the claim is a candidate sign only; an existing
+  git tag never proves a specific PR was merged.
 
 ---
 
@@ -463,9 +486,9 @@ extras manually.
 | `task_done` | Move a task to terminal `done` and clear its due date. |
 | `board` | Return open tasks sorted by rot and the done column with `count`, `returned`, `has_more`, and keyset `next_cursor` pagination. |
 
-**Stored kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest` · `task`
+**Stored kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest` · `task` · `journal`
 
-`create_concept` accepts the first seven values (`digest` remains for compatibility but is normally generated); `task` is created only by `task_add`.
+`create_concept` accepts the agent-authored values (`digest` remains for compatibility but is normally generated; `journal` is the explicit volatile-state kind with the default-term policy above); `task` is created only by `task_add`.
 
 **Relations:** `connects_to` · `depends_on` · `implements` · `calls` · `configured_by` · `supersedes` · `contradicts` · `informed_by`
 
@@ -489,6 +512,7 @@ extras manually.
 | `megamemory digest [--apply]` | Build or rebuild digest nodes |
 | `megamemory export --md <dir> [--check]` | Markdown export; `--check` reports drift for CI and never deletes files |
 | `megamemory expire --ids a,b --until <DATE\|past> [--apply]` | Set/replace `valid_until` atomically (dry-run by default; `DATE` is any nonempty value accepted by `Date.parse`, `past` means yesterday); `--report <json>` is the alternate ID source |
+| `megamemory expire --scan [--json] [--repo PATH]` | Read-only review of expiry candidates (`scripts/report-journals.mjs` is a thin adapter over the same module); `--json` prints the versioned report for the `--report` apply path; `--scan --apply` is refused |
 | `megamemory merge`, `conflicts`, `resolve` | Two-way merge of graphs across branches |
 
 ### Which commands never write to the database
@@ -548,6 +572,7 @@ Runtime controls read by MegaMemory itself:
 | `MEGAMEMORY_PROVENANCE_AUTO_GROUND` | config / off | Per-call override for deriving decision supports from `why` + `file_refs`; same boolean forms. |
 | `MEGAMEMORY_TIMELINE_RETENTION_DAYS` | `90` | Timeline age retention; integer `0` disables the age rule. |
 | `MEGAMEMORY_TIMELINE_MAX_ENTRIES` | `50000` | Timeline count retention; integer `0` disables the count rule. |
+| `MEGAMEMORY_EXPIRY_JOURNAL_DAYS` | config / `90` | Default term in days for a `journal` node created without `valid_until`; decimal digits only, `0` disables auto-expiry (the `state_claim_without_expiry` warning stays). Overrides `expiry.journal_days` in the config next to the database; an invalid value is an explicit error before the write. |
 | `MEGAMEMORY_TELEMETRY_PATH` | unset | Opt-in local JSONL telemetry of MCP tool calls (outcome/latency/response size, no payloads, secrets redacted, never sent anywhere). Unset = off; file grows, owner cleans it — see `docs/telemetry.md`. |
 | `MEGAMEMORY_D3_URL` | `/vendor/d3.min.js` | Explorer D3 source override. Without it, the vendored file is used; if missing, serve warns and falls back to jsDelivr. |
 | `MEGAMEMORY_AUTO_MIGRATE` | on | MCP-startup hygiene only: exact `0` skips the full upstream conversion/ID-repair path and runs additive schema setup instead. It is not the read-only-command escape hatch and `serve` does not consult it. |

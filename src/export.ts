@@ -115,6 +115,11 @@ export function renderNodeMarkdown(
     `name: ${frontmatterValue(node.name)}`,
     `kind: ${node.kind}`,
     `status: ${node.status ?? "active"}`,
+    // M2 B1 (план 20+21 v3 §7): срок — существенная квалификация journal и
+    // любого узла с valid_until; экспорт без него представляет изменчивое
+    // утверждение как вечное. Строка пишется только при наличии срока —
+    // экспорт бессрочных узлов не меняется.
+    ...(node.valid_until ? [`valid_until: ${frontmatterValue(node.valid_until)}`] : []),
     ...(parentLine ? [parentLine] : []),
     ...(edgesLine ? [edgesLine] : []),
     ...(informedByLine ? [informedByLine] : []),

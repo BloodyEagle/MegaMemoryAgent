@@ -623,6 +623,7 @@ const KIND_COLORS = {
   decision: '#ef4444',
   component: '#14b8a6',
   digest: '#eab308', // T6: derived compression node, distinct yellow
+  journal: '#f97316', // M2 B1: volatile state note, auto-expiring kind
 };
 
 let canvas = null;
@@ -1088,7 +1089,7 @@ function handleEdgeRemoved(data) {
 let hideOutdated = false;
 
 // U1: per-kind visibility filter, persisted across reloads.
-const KIND_ORDER = ['feature', 'module', 'pattern', 'config', 'decision', 'component', 'digest'];
+const KIND_ORDER = ['feature', 'module', 'pattern', 'config', 'decision', 'component', 'digest', 'journal'];
 let hiddenKinds = new Set(JSON.parse(localStorage.getItem('mm.hiddenKinds') || '[]'));
 
 function toggleKind(kind, on) {
