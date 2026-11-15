@@ -74,7 +74,7 @@ export async function hashFile(absPath: string): Promise<{ digest: string; size:
 }
 
 /** Run git, collect stdout (bounded by the blob size we are willing to read). */
-function runGit(args: string[], cwd: string, maxBuffer: number): Promise<Buffer> {
+export function runGit(args: string[], cwd: string, maxBuffer: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd });
     const chunks: Buffer[] = [];
@@ -111,7 +111,8 @@ function runGit(args: string[], cwd: string, maxBuffer: number): Promise<Buffer>
  * git at all), `git cat-file` streams the blob content. Any failure — not a
  * repo, bad rev, path not in the rev — reads as missing, never a crash.
  */
-async function hashGitBlob(
+/** P2 (freshness.ts) переиспользует ту же механику — один договор git-хеша. */
+export async function hashGitBlob(
   rev: string,
   ref: string,
   cwd: string
@@ -149,7 +150,8 @@ function rethrowGitMissing(err: unknown): never {
  * Явные refs/*-пути для tag/branch снимают неоднозначность «тег и ветка
  * с одним именем».
  */
-async function resolveGitRefSha(
+/** P2 (freshness.ts): разрешение git-ref для адресной проверки без дублей. */
+export async function resolveGitRefSha(
   scheme: "tag" | "commit" | "branch",
   name: string,
   cwd: string

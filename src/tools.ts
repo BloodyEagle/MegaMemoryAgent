@@ -65,6 +65,16 @@ import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary, isTechnicalRefAnchor } from "./stub.js";
 import { validationState } from "./validation.js";
 import { readExpiryConfig, journalDefaultExpiry } from "./expiry.js";
+import {
+  applyTaskEpoch,
+  buildTaskContext,
+  collectTaskBoost,
+  dedupeTaskDuplicates,
+  isTestRef,
+  parseTaskInput,
+  recordTaskEpoch,
+} from "./task-context.js";
+import type { TaskContextView } from "./types.js";
 
 export function formatError(err: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
   const errorMsg = err instanceof Error ? err.message : String(err);
@@ -622,6 +632,16 @@ export async function understand(
       "understand: reuse поддержан только в mode=compact — full/brief не несят секции паспортов."
     );
   }
+  if (input.task && outputMode !== "compact") {
+    throw new Error(
+      "understand: task поддержан только в mode=compact — full/brief отвечают прежней формой, task-профиль туда не встраивается."
+    );
+  }
+  // P3 (план 20+21 v3 §12): контекст под задачу. Валидация входа — ДО всякой
+  // работы; без task прежнее поведение байт-в-байт.
+  const taskPlan = input.task
+    ? parseTaskInput(input.task, process.cwd())
+    : null;
   const includeEvidence = input.include_evidence ?? false;
   const collapseAnchors = input.collapse_ref_anchors ?? false;
 
@@ -712,6 +732,53 @@ export async function understand(
   // top_k — это верхний уровень compact-выдачи; вложенные опоры слотов не
   // занимают, поэтому нарезка применяется к размещению (placeLoop), а не к
   // списку кандидатов.
+
+  // ---- P3 (план 20+21 v3 §12.3): task-профиль — добор и приоритет обязательных ----
+  //
+  // Детерминированные правила: решения/тесты по ЯВНОЙ области задачи добавляются
+  // в пул кандидатов (score 0 — явный добор по scope, не похожесть), а
+  // обязательные категории поднимаются в размещение (стабильная перестановка:
+  // mandatory в ранговом порядке среди себя, затем остальные в ранговом
+  // порядке). Без task-параметра этот блок не выполняется вовсе.
+  if (taskPlan) {
+    const boost = collectTaskBoost(
+      db,
+      taskPlan,
+      new Set([
+        ...eligible.map((e) => e.node.id),
+        ...refutedNodes.map((r) => r.node.id),
+      ])
+    );
+    for (const row of boost.decisions) {
+      eligible.push({ node: row, score: 0, expired: isNodeExpired(row) });
+    }
+    for (const row of boost.tests) {
+      eligible.push({ node: row, score: 0, expired: isNodeExpired(row) });
+    }
+    for (const row of boost.refuted) {
+      refutedNodes.push({ node: row, score: 0 });
+    }
+    // Обязательные категории — впереди, каждая группа в своём ранговом порядке.
+    const isMandatoryCandidate = (row: NodeRow): boolean => {
+      if (row.kind === "decision") return true;
+      if (row.epistemic_status === "refuted") return true;
+      try {
+        const parsed: unknown = JSON.parse(row.file_refs ?? "null");
+        if (Array.isArray(parsed)) {
+          return parsed.some(
+            (r) => typeof r === "string" && (taskPlan.kind === "prepare_edit" ? isTestRef(r) : false)
+          );
+        }
+      } catch {
+        return false;
+      }
+      return false;
+    };
+    const mandatoryPart = eligible.filter((e) => isMandatoryCandidate(e.node));
+    const restPart = eligible.filter((e) => !isMandatoryCandidate(e.node));
+    eligible.length = 0;
+    eligible.push(...mandatoryPart, ...restPart);
+  }
 
   // ---- План 13 §2.2: режим brief — до 8 строк текста плюс next, без карточек ----
   //
@@ -893,6 +960,11 @@ export async function understand(
       })
     : undefined;
 
+  // P3: секция контекста под задачу — строится ПОСЛЕ размещения и снятия
+  // повторов (см. ниже); объявления здесь, чтобы бюджетная мера buildPayload
+  // видела добавку на общих основаниях (K-03).
+  let taskContextView: TaskContextView | null = null;
+
   const edgesFor = (list: Array<{ id: string }>) =>
     list.length >= 2
       ? (db.execSqlAll(
@@ -1045,6 +1117,8 @@ export async function understand(
     ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
     // P1.3: секция reuse — только в opt-in запросе.
     ...(reuseView ? { passport_reuse: reuseView } : {}),
+    // P3: секция task_context — только в opt-in запросе.
+    ...(taskContextView ? { task_context: taskContextView } : {}),
     edges_between: edgesFor(compactList),
     meta,
     next: next ?? buildNextHints({
@@ -1292,6 +1366,30 @@ export async function understand(
     refutedCut +
     (collapseAnchors ? anchorEligible.length - anchorFolded - collapsedAnchors.length : 0);
 
+  // ---- P3 (§12.4/§12.9): снятие смысловых повторов и повторов эпохи ----
+  //
+  // Защищены от снятия: решения, refuted/abandoned, тесты, противоречия
+  // (contradicts) и карты со свёрнутыми опорами — противоречащие выводы,
+  // причины refuted и неполнота не убираются никогда. Повторы эпохи — только
+  // с ЯВНО переданным context_epoch клиента.
+  let taskDuplicates: TaskContextView["duplicates_dropped"] = [];
+  let taskServedEarlier: TaskContextView["served_earlier"] = [];
+  if (taskPlan) {
+    const dedup = dedupeTaskDuplicates(db, compact);
+    const epoch = applyTaskEpoch(db, taskPlan, compact);
+    const removeIds = [...new Set([...dedup.removeIds, ...epoch.removeIds])];
+    if (removeIds.length > 0) {
+      for (const id of removeIds) {
+        const ti = top.findIndex((m) => m.id === id);
+        if (ti >= 0) top.splice(ti, 1);
+      }
+      compact = withNested(displayList());
+      dropped += removeIds.length;
+    }
+    taskDuplicates = dedup.duplicates;
+    taskServedEarlier = epoch.servedEarlier;
+  }
+
   // Build final instructions from the placed top-level cards and nested supports.
   // Placement measured this same next block before accepting each candidate.
   const nextCards: NextHintsCard[] = [];
@@ -1308,6 +1406,17 @@ export async function understand(
   }));
   let next: NextHints = buildNextHints({ db, cards: nextCards, refuted: refutedForNext });
 
+  // ---- P3: сборка секции task_context (§12.3–§12.7) ----
+  //
+  // Покрытие обязательных категорий считается по фактически выданному набору
+  // и плану чтения; цена — оценочная полная (карточки + followups + чтение).
+  // Состояние эпохи записывается ПОСЛЕ финальной меры (см. ниже) — факт выдачи.
+  if (taskPlan) {
+    taskContextView = buildTaskContext(db, taskPlan, { compact, refuted: refutedShown, next });
+    taskContextView.duplicates_dropped = taskDuplicates;
+    taskContextView.served_earlier = taskServedEarlier;
+  }
+
   // Placement already includes next; only optional followups may be shortened.
   const measureWithNext = (): number =>
     measure(buildPayload(compact, refutedShown, metaFor(0, dropped, truncated), next));
@@ -1323,6 +1432,7 @@ export async function understand(
     refuted: refutedShown,
     ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
     ...(reuseView ? { passport_reuse: reuseView } : {}),
+    ...(taskContextView ? { task_context: taskContextView } : {}),
     edges_between: edgesBetween,
     meta: metaFor(0, dropped, truncated),
     next,
@@ -1331,6 +1441,9 @@ export async function understand(
   if (tokensEstimated > maxTokens) {
     throw new Error(`understand: max_tokens=${maxTokens} cannot fit the instructions and required references (minimum ${tokensEstimated}); increase the budget.`);
   }
+  // P3: факт выдачи записывается в состояние эпохи ПОСЛЕ финальной меры —
+  // не выданный ответ не считается «уже в контексте клиента».
+  if (taskPlan) recordTaskEpoch(db, taskPlan, compact);
   const payloadMeta = metaFor(tokensEstimated, dropped, truncated);
   const payload = JSON.stringify({
     matches: [],
@@ -1338,6 +1451,7 @@ export async function understand(
     refuted: refutedShown,
     ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
     ...(reuseView ? { passport_reuse: reuseView } : {}),
+    ...(taskContextView ? { task_context: taskContextView } : {}),
     edges_between: edgesBetween,
     meta: payloadMeta,
     next,
@@ -1358,6 +1472,7 @@ export async function understand(
     refuted: refutedShown,
     ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
     ...(reuseView ? { passport_reuse: reuseView } : {}),
+    ...(taskContextView ? { task_context: taskContextView } : {}),
     edges_between: edgesBetween,
     meta: payloadMeta,
     next,

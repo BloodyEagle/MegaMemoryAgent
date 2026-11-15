@@ -121,6 +121,9 @@ current understanding, accounting for `meta.truncated`. Report what you saved.
 - Reading without a meaningful new conclusion is a complete outcome — do not
   create nodes for pure reading or successful reuse. Full workflow contract:
   `megamemory guide --workflow` (docs/agent-workflow.md).
+- After code changes, targeted freshness re-verification of saved conclusions is
+  the explicit `check_freshness` call (related records via the reverse index, not
+  the whole graph; read-only — it never confirms supports or raises reuse trust).
 - Max 3 levels of nesting. Flat is better than deep.
 - Connect concepts — isolated nodes are less useful than a connected graph.
 - Give state claims such as `PR open`, `merged`, or `release shipped` an

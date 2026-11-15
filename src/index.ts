@@ -259,6 +259,7 @@ async function startMcpServer() {
   );
   const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
   const { checkArtifacts } = await import("./artifacts.js");
+  const { checkFreshness } = await import("./freshness.js");
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
@@ -392,7 +393,7 @@ async function startMcpServer() {
 
   server.tool(
     "understand",
-    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node. Every result mode carries next: execute must_read (up to 3 refs) before editing, treat skip as an empty legacy field, run followups with the supplied args, and use record after the work; refs and summaries never prove whole-file coverage. mode:'brief' returns up to 8 text lines plus the same next contract, without cards. Opt-in (default off): include_evidence attaches confirm-ready versions to every compact match — current_digests (claim is the CURRENT wording for expected_claim_digest; confirmed_claim/confirmed_at document the snapshot separately) plus support_evidence listing ALL live supports (even ones the query missed) with full wording, edge rationale and claim/status/edge/artifacts digests the server computed — a digest never replaces reading the full wording before confirming; a match is placed whole or dropped (meta.dropped/truncated). collapse_ref_anchors demotes technical ref-anchors from the top level (origin AND structure predicate; an edited meaningful card is never hidden): folded compactly next to their dependent conclusion with rationale, or as collapsed locators in the anchors section with their dependents; counts stay in meta.anchor_collapsed, resolution by id/path and provenance keep working, and an anchors-only result is never an empty no-match. The MCP wrapper also adds the top-level staleness fields instructions_stale, instructions_version, and server_version; they are included in max_tokens.",
+    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Returns matched concepts in a token-budgeted compact form (id, name, kind, summary trimmed to 240 chars, file_refs); pass mode:'full' for the legacy verbose output with why/children/edges on every node. Every result mode carries next: execute must_read (up to 3 refs) before editing, treat skip as an empty legacy field, run followups with the supplied args, and use record after the work; refs and summaries never prove whole-file coverage. mode:'brief' returns up to 8 text lines plus the same next contract, without cards. Opt-in (default off): include_evidence attaches confirm-ready versions to every compact match — current_digests (claim is the CURRENT wording for expected_claim_digest; confirmed_claim/confirmed_at document the snapshot separately) plus support_evidence listing ALL live supports (even ones the query missed) with full wording, edge rationale and claim/status/edge/artifacts digests the server computed — a digest never replaces reading the full wording before confirming; a match is placed whole or dropped (meta.dropped/truncated). collapse_ref_anchors demotes technical ref-anchors from the top level (origin AND structure predicate; an edited meaningful card is never hidden): folded compactly next to their dependent conclusion with rationale, or as collapsed locators in the anchors section with their dependents; counts stay in meta.anchor_collapsed, resolution by id/path and provenance keep working, and an anchors-only result is never an empty no-match. The MCP wrapper also adds the top-level staleness fields instructions_stale, instructions_version, and server_version; they are included in max_tokens. Opt-in task (P3, default off) embeds a task_context section into THIS answer — no extra mandatory call: deterministic rules pick mandatory source categories for the explicit task kind (decisions, supports, refuted, tests, dependents), boost decisions/tests citing the explicit file scope (score 0 — explicit scope pick, not similarity), drop semantic duplicates WITHOUT dropping refuted reasons/contradictions/incompleteness, include hidden supports of placed decisions, list uncovered mandatory sources with a next step when the budget cannot fit them, and estimate the approximate TOTAL cost (cards + followups + required reading, heuristic bytes/3 — not provider tokens). task_context never replaces must_read, never fills next.skip, never claims whole-file coverage; context_epoch is explicit client state (in-memory, per process) that only collapses already-served non-mandatory cards.",
     {
       query: z.string().describe("Natural language query describing what you want to understand about the project"),
       top_k: z.number().int().min(1).max(50).optional().describe("Number of top results to return (default: 10)"),
@@ -409,6 +410,12 @@ async function startMcpServer() {
         repo_root: z.string().optional().describe("Корень repo/worktree (default: cwd сервера)"),
         max_candidates: z.number().int().min(1).max(5).optional().describe("Лимит кандидатов в ответе (default 2)"),
       }).optional().describe("P1.3, opt-in (по умолчанию выключено): квалификация переиспользования проверенных разборов (паспортов trail_save). Ответ — секция passport_reuse с кандидатами {qualification: reusable|candidate|stale_input|incomplete|unknown|expired|refuted_support|broken|wrong_repo, covered[], gaps[], notes}: каждое состояние — явный статус, ни один случай не повышает доверие молча. reusable НЕ является покрытием кода и не заполняет next.skip — перед правкой читай текущий участок. Проверка только читает: не подтверждает опоры. Поддержан только в mode=compact"),
+      task: z.object({
+        goal: z.string().min(1).describe("Явная цель: что делает агент (найти определение, объяснить решение, подготовить правку, оценить последствия)"),
+        kind: z.enum(["find_definition", "explain_decision", "prepare_edit", "assess_impact"]).describe("Тип задачи — детерминированное правило обязательных категорий источников (решения, опоры/инварианты, refuted, тесты, зависимые)"),
+        files: z.array(z.string()).optional().describe("Явная область (файлы/refs): решения и тесты по области добавляются в выдачу даже без похожести запроса; обязательные для типа задачи поднимаются в размещение"),
+        context_epoch: z.string().optional().describe("Явное состояние клиента (эпоха контекста): карточки, уже выданные в этой эпохе с тем же смыслом, едут компактной формой served_earlier. Решения/refuted/противоречия не сворачиваются. Без epoch — прежний ответ"),
+      }).optional().describe("P3, opt-in (по умолчанию выключено): контекст под задачу и минимальный план чтения. Ответ — секция task_context: coverage обязательных категорий (covered/uncovered с причиной), supports_included (живые опоры размещённых решений, включая не найденные поиском — скрытые зависимости), reading_plan (обязательные источники вне выдачи), cost_estimate (оценочная ПОЛНАЯ цена: карточки + followups + чтение; эвристика bytes/3, не токены провайдера), notes. Детерминированные правила, без LLM-reranker; бюджет не покрывает обязательное — список непокрытого и продолжение. task_context не подменяет must_read, next.skip остаётся пустым, покрытие кода не утверждается. Встраивается в этот же ответ — отдельного обязательного вызова «за планом» нет. Поддержан только в mode=compact"),
     },
     async (params) => {
       try {
@@ -425,6 +432,7 @@ async function startMcpServer() {
           include_evidence: params.include_evidence,
           collapse_ref_anchors: params.collapse_ref_anchors,
           reuse: params.reuse,
+          task: params.task,
           include_stale: params.include_stale,
           extra_payload: { ...instructions },
         });
@@ -1087,6 +1095,72 @@ async function startMcpServer() {
           params: { node_ids: params.node_ids },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: true,
+          is_error: true,
+          affected_ids: [],
+        });
+        return formatError(err);
+      }
+    }
+  );
+
+  // ---- P2 (план 20+21 v3 §11): адресная перепроверка свежести ----
+  //
+  // ЯВНОЕ opt-in действие проверки: обычный поиск его не запускает. Только
+  // чтение: НЕ пишет наблюдения (это check_artifacts), НЕ подтверждает опоры
+  // (это confirm_supports), НЕ меняет граф. Отчёт несёт затронутое/проверенное/
+  // неизвестное, причины неполноты и expected_versions.
+  server.tool(
+    "check_freshness",
+    "Адресная перепроверка свежести: по изменившимся (или подозрительным) источникам — файлам, git-blob'ам, git:-ссылкам — проверить СВЯЗАННЫЕ записи через восстановимый обратный индекс (узлы с file_refs, наблюдения артефактов, паспорта trail_save), а не весь граф. Сравнение по sha256 содержимого с записанными версиями (наблюдения check_artifacts, хеши областей паспортов); mtime/size не являются доказательством; git-состояние working tree (staged/unstaged/untracked/rename) и HEAD едут в отчёте как наблюдение — прежний HEAD не доказывает неизменность working tree. Один физический источник хешируется один раз за проверку; источники, менявшиеся ВО ВРЕМЯ проверки, получают статус unstable — стабильный снимок не объявляется. Отчёт: sources (unchanged/changed/missing/unobserved/unstable/skipped/other_repo), records (fresh/stale_input/partial/unknown — префикс не выдаётся за весь граф), summary (affected/checked/unknown/truncated + limitations), expected_versions — сверь их повторно перед применением правки. НЕ пишет в БД и не подтверждает опоры: reuse-квалификация не поднимается. Опционально (P2.2, пилот): symbols — разрешение определений через adapter token-economy-ts (конфиг: adapter.graph_tool или env MEGAMEMORY_CODE_ADAPTER); неоднозначное/пропавшее определение даёт явный ambiguous/missing и требует чтения; with_dependencies — обход import-графа изменённых источников через adapter (ограничен max_deps, static scope объявлен явно).",
+    {
+      sources: z.array(z.string()).optional().describe("Источники для проверки: пути/refs (src/foo.ts, src/foo.ts:1-40, HEAD:src/foo.ts, git:tag:name)"),
+      node_ids: z.array(z.string()).optional().describe("Проверить записи конкретных узлов (их file_refs и наблюдения)"),
+      trail_ids: z.array(z.string()).optional().describe("Проверить области паспортов конкретных trail"),
+      repo_root: z.string().optional().describe("Корень repo/worktree (default: startup --repo или cwd); закрепления наблюдений не переписываются"),
+      max_files: z.number().int().min(1).max(10000).optional().describe("Бюджет проверки: максимум источников (default 50); лишние — skipped + truncated"),
+      max_deps: z.number().int().min(1).max(1000).optional().describe("Бюджет обхода зависимостей (default 20)"),
+      with_dependencies: z.boolean().optional().describe("Обойти import-граф изменённых источников через adapter (opt-in; без adapter — явное ограничение, не «зависимостей нет»)"),
+      symbols: z.array(z.object({
+        name: z.string().min(1).describe("Имя символа (функция/класс/метод)"),
+        in: z.string().optional().describe("Владелец для уточнения (класс/интерфейс)"),
+        file: z.string().optional().describe("Файл для проверки однозначности локатора"),
+      })).optional().describe("P2.2 (пилот): разрешить символы через adapter; номера строк — текущий результат разрешения, не идентичность"),
+      adapter: z.object({
+        graph_tool: z.string().min(1).describe("Путь к каталогу scripts скилла token-economy-ts или к graph-tool.js"),
+      }).optional().describe("Конфиг adapter (P2.2); без него — файловый режим явно. Альтернатива: env MEGAMEMORY_CODE_ADAPTER"),
+    },
+    async (params) => {
+      try {
+        const result = await checkFreshness(db, {
+          ...(params.sources !== undefined ? { sources: params.sources } : {}),
+          ...(params.node_ids !== undefined ? { node_ids: params.node_ids } : {}),
+          ...(params.trail_ids !== undefined ? { trail_ids: params.trail_ids } : {}),
+          ...(params.repo_root !== undefined ? { repo_root: params.repo_root } : { repo_root: REPO_PATH }),
+          ...(params.max_files !== undefined ? { max_files: params.max_files } : {}),
+          ...(params.max_deps !== undefined ? { max_deps: params.max_deps } : {}),
+          ...(params.with_dependencies !== undefined ? { with_dependencies: params.with_dependencies } : {}),
+          ...(params.symbols !== undefined ? { symbols: params.symbols } : {}),
+          ...(params.adapter !== undefined ? { adapter: params.adapter } : {}),
+        });
+        timeline.log({
+          tool: "check_freshness",
+          params: {
+            ...(params.sources !== undefined ? { sources: params.sources } : {}),
+            ...(params.node_ids !== undefined ? { node_ids: params.node_ids } : {}),
+            ...(params.trail_ids !== undefined ? { trail_ids: params.trail_ids } : {}),
+          },
+          result_summary: `checked ${result.summary.checked}, affected ${result.summary.affected}, unknown ${result.summary.unknown}${result.summary.truncated ? ", truncated" : ""}`,
+          is_write: false,
+          is_error: false,
+          affected_ids: params.node_ids ?? [],
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        timeline.log({
+          tool: "check_freshness",
+          params: {},
+          result_summary: err instanceof Error ? err.message : String(err),
+          is_write: false,
           is_error: true,
           affected_ids: [],
         });
