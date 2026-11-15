@@ -143,6 +143,20 @@ paired baseline/joint task costs, repeats clustered within tasks, paired median
 and predeclared 95% cluster-bootstrap interval. Savings require quality not worse
 and the lower ratio bound >1 for every claimed baseline; incomplete matrix is pilot.
 
+Experiment design and measurement tooling (J1–J3, W6 — plan 20+21 v3 §15–16):
+the pre-run freeze (modes, task set, oracle package, invalidation scenarios,
+versions/order/seed/limits, cold/warm repeat kinds, memory prepared only from
+then-available state) is specified in `plans/new7/j2-experiment-design.md`
+(outside this repository; J3 acceptance checklist lives there and does not
+relax the rules above). Server-side traces are collected by the opt-in local
+telemetry (`docs/telemetry.md`) and aggregated offline by
+`megamemory telemetry-report`: provider tokens and money are reported only
+from actually supplied client usage (otherwise explicitly `unavailable`, never
+zeros), estimated wire bytes are separate fields and are never merged with
+provider tokens, correctness is computed only against the predeclared oracle.
+Paid runs remain behind the separate owner gate; before that permission only
+local functional checks are valid, and `economy_status` stays `not_measured`.
+
 ## How to read the numbers
 
 - **`hit_rate` vs `hit_rate@1`.** `hit_rate` counts a hit when any expected node
