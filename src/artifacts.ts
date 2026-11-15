@@ -62,7 +62,7 @@ function hashStream(stream: NodeJS.ReadableStream): Promise<{ digest: string; si
 }
 
 /** Stream the file; null when it does not exist (missing is not a crash). */
-async function hashFile(absPath: string): Promise<{ digest: string; size: number } | null> {
+export async function hashFile(absPath: string): Promise<{ digest: string; size: number } | null> {
   let stat: fs.Stats;
   try {
     stat = await fs.promises.stat(absPath);

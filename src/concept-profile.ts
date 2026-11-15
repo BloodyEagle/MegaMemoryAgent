@@ -38,6 +38,7 @@ import type {
   ConceptBatchItem,
   ConceptBatchMeta,
   ConceptBatchOutput,
+  ConceptDeltaOutput,
   ConceptEvidenceSupport,
   ConceptProfileIncomplete,
   ConceptProfileInput,
@@ -61,6 +62,7 @@ import {
   trailState,
   trimSummary,
 } from "./tools.js";
+import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import {
   CheckBudget,
   DEFAULT_MAX_CHECK_BYTES,
@@ -226,6 +228,198 @@ function anchorStateOf(db: KnowledgeDB, node: NodeRow) {
     valid_until: node.valid_until ?? null,
     expired: isNodeExpired(node),
     refuted_reason: db.getLatestEpistemicReason(node.id, "refuted"),
+  };
+}
+
+// ---- E4 (план 20+21 v3 §8.4): delta-выдача — версия запрошенной проекции ----
+//
+// Та же механика, что continuation-токен M3-1: sha256 канонического JSON
+// (stableStringify с сортировкой ключей). Сравнивается версия ЗАПРОШЕННОЙ
+// проекции, а не только summary claim digest: состояние включает ВСЕ
+// существенные выдаваемые данные — статус, срок, ссылки, rationale, состав
+// опор (полные формулировки + дайджесты claim/status/edge/artifacts),
+// состояние артефактов, состав и выбранных соседей, support_check и версию
+// формата. Время входит в версию через expired (isNodeExpired) и valid_until:
+// истечение срока меняет версию даже без записи в БД. Сервер БЕЗ кэша:
+// версия каждый раз вычисляется из данных (stateless сравнение).
+
+const PROJECTION_VERSION_PREFIX = "m4ver-";
+
+/** Обязательная оговорка unchanged-ответа: delta не является покрытием кода. */
+const DELTA_NOTE =
+  "unchanged — версия запрошенной проекции совпала с подтверждённой клиентом; " +
+  "это НЕ покрытие кода: перед правкой прочитай текущий участок исходника";
+
+/**
+ * Существенное состояние проекции — вход вычисления версии. Для full — сама
+ * полная карточка (она и есть выдача); для orientation/evidence — данные,
+ * из которых строится проекция (состав списков + состояния выбранных
+ * соседей + полные доказательства опор + support_check).
+ */
+function projectionStateOf(
+  db: KnowledgeDB,
+  anchorId: string,
+  node: NodeRow,
+  profile: GetConceptProfile,
+  maxNeighbors: number,
+  now: Date
+): Record<string, unknown> {
+  if (profile === "full") {
+    const card = buildNodeWithContext(db, node, undefined, { withSupportCheck: true });
+    card.current_digests = currentDigestsOf(node);
+    // Состав опор — существенные данные и для full: версии формулировок,
+    // статусов и артефактов каждой живой опоры (самма карточка показывает
+    // рационалы, но не claim-версии опор; подтверждение опирается на них).
+    const supportsState = db
+      .getEdgeRefsOut(node.id)
+      .filter((e) => e.relation === "informed_by")
+      .map((ref) => {
+        const row = db.getNode(ref.to_id);
+        if (!row) return { id: ref.to_id, missing: true };
+        return {
+          id: row.id,
+          claim_digest: claimDigestOf(row.summary),
+          status_digest: statusDigestOf(row.status, row.epistemic_status),
+          artifacts_digest: artifactsDigestOf(activeArtifactRows(row, db.getNodeArtifacts(row.id))),
+        };
+      });
+    return { form: 1, profile: "full", card, supports_state: supportsState };
+  }
+
+  const sources = new Map<NeighborList, NeighborSource>();
+  for (const list of ORIENTATION_LISTS) {
+    sources.set(list, neighborSource(db, anchorId, list));
+  }
+  const informedByOut = sources.get("informed_by")!.refs;
+  const weakMap = new Map<string, boolean>();
+  for (const ref of informedByOut) {
+    const target = db.getNode(ref.id);
+    weakMap.set(ref.id, target ? supportIsWeak(db, target) : false);
+  }
+
+  // Опоры — полные доказательства: формулировка, rationale, квалификация и
+  // готовые дайджесты (claim/status/edge/artifacts) — ровно то, что едет в
+  // evidence-выдаче; изменение rationale или наблюдения артефактов меняет
+  // версию (E6: rationale/artifact инвалидируют delta).
+  const supports = informedByOut.map((ref) => {
+    const row = db.getNode(ref.id);
+    if (!row) return { to: ref.id, missing: true };
+    const support = evidenceSupportOf(db, row, ref.description);
+    return { ...support, weak: support.weak ?? false };
+  });
+
+  // Состав остальных списков + состояния выбранных соседей (окно раскрытия).
+  const lists: Record<string, unknown> = {};
+  for (const list of ORIENTATION_LISTS) {
+    if (list === "informed_by") continue; // полный состав — в supports выше
+    const src = sources.get(list)!;
+    const selected = src.refs.slice(0, maxNeighbors).map((ref) => {
+      if (list === "trails") {
+        return { id: ref.id, state: trailState(db, ref.id) };
+      }
+      const row = db.getNode(ref.id);
+      if (!row) return { id: ref.id, missing: true };
+      return {
+        id: ref.id,
+        relation: ref.relation,
+        description: ref.description,
+        name: row.name,
+        kind: row.kind,
+        status: row.status ?? "active",
+        epistemic_status: row.epistemic_status ?? null,
+        valid_until: row.valid_until ?? null,
+        expired: isNodeExpired(row, now),
+      };
+    });
+    lists[list] = { ids: src.ids, selected };
+  }
+
+  const supportCheck = computeSupportCheck(
+    db,
+    anchorId,
+    new CheckBudget(DEFAULT_MAX_CHECK_EDGES, DEFAULT_MAX_CHECK_BYTES)
+  );
+
+  return {
+    form: 1,
+    profile,
+    max_neighbors: maxNeighbors,
+    identity: {
+      id: node.id,
+      name: node.name,
+      kind: node.kind,
+      parent_id: node.parent_id ?? null,
+      created_via: node.created_via ?? null,
+      file_refs: parseFileRefs(node.file_refs),
+    },
+    qualification: {
+      status: node.status ?? "active",
+      epistemic_status: node.epistemic_status ?? null,
+      status_scope: parseStatusScope(node.status_scope),
+      valid_until: node.valid_until ?? null,
+      expired: isNodeExpired(node, now),
+      refuted_reason: db.getLatestEpistemicReason(node.id, "refuted"),
+    },
+    summary: node.summary,
+    why: node.why ?? null,
+    slots: db.getSlotsForNode(anchorId),
+    lists,
+    supports,
+    // Наблюдения артефактов самого узла (состав refs — тоже версионные данные).
+    anchor_artifacts: artifactsDigestOf(activeArtifactRows(node, db.getNodeArtifacts(anchorId))),
+    support_check: supportCheck,
+  };
+}
+
+/** Версия запрошенной проекции: m4ver- + sha256 канонического JSON состояния. */
+export function projectionVersion(
+  db: KnowledgeDB,
+  anchorId: string,
+  node: NodeRow,
+  profile: GetConceptProfile,
+  maxNeighbors: number,
+  now: Date = new Date()
+): string {
+  return PROJECTION_VERSION_PREFIX + fingerprint(projectionStateOf(db, anchorId, node, profile, maxNeighbors, now));
+}
+
+/** Компактный unchanged-ответ: квалификация-минимум без повторной передачи текста. */
+function buildDeltaOutput(
+  db: KnowledgeDB,
+  node: NodeRow,
+  profile: GetConceptProfile,
+  version: string,
+  epoch: string
+): ConceptDeltaOutput {
+  const informedByOut = db
+    .getEdgeRefsOut(node.id)
+    .filter((e) => e.relation === "informed_by");
+  const weakSupport =
+    node.kind === "decision" &&
+    informedByOut.length > 0 &&
+    informedByOut.every((e) => {
+      const target = db.getNode(e.to_id);
+      return target ? supportIsWeak(db, target) : false;
+    });
+  return {
+    unchanged: true,
+    id: node.id,
+    name: node.name,
+    kind: node.kind as NodeKind,
+    profile,
+    version,
+    context_epoch: epoch,
+    qualification: {
+      status: node.status ?? "active",
+      epistemic_status: node.epistemic_status ?? null,
+      valid_until: node.valid_until ?? null,
+      expired: isNodeExpired(node),
+      ...(node.epistemic_status === "refuted"
+        ? { refuted_reason: db.getLatestEpistemicReason(node.id, "refuted") }
+        : {}),
+    },
+    ...(weakSupport ? { weak_support: true } : {}),
+    note: DELTA_NOTE,
   };
 }
 
@@ -599,7 +793,7 @@ function validateMaxNeighbors(maxNeighbors: number | undefined): number {
 export function getConceptProfile(
   db: KnowledgeDB,
   input: ConceptProfileInput
-): NodeWithContext | ConceptProfileOutput {
+): NodeWithContext | ConceptProfileOutput | ConceptDeltaOutput {
   const maxTokens = validateBudget(input.max_tokens, "минимум конверта ответа");
   const maxNeighbors = validateMaxNeighbors(input.max_neighbors);
 
@@ -690,9 +884,53 @@ export function getConceptProfile(
   if (input.id === undefined) {
     throw new Error("get_concept: укажи id (или ids для пакетного чтения, или continuation).");
   }
+  if (input.known_versions !== undefined && input.context_epoch === undefined) {
+    throw new Error(
+      "get_concept: known_versions без context_epoch — протокол delta требует обе части " +
+        "(подтверждённые версии + идентификатор текущей эпохи контекста клиента)."
+    );
+  }
   const resolved = resolveNodeRow(db, input.id);
   if (!resolved) {
     throw new Error(`Concept "${input.id}" not found.`);
+  }
+
+  // --- E4: delta-выдача (только opt-in: нет параметров — нет delta) ---
+  if (input.context_epoch !== undefined) {
+    const version = projectionVersion(db, resolved.id, resolved.node, profile, maxNeighbors);
+    const known =
+      input.known_versions?.[input.id] ?? input.known_versions?.[resolved.id];
+    if (known !== undefined && known === version) {
+      return buildDeltaOutput(db, resolved.node, profile, version, input.context_epoch);
+    }
+    // Расхождение или неизвестная версия — полная выдача запрошенной
+    // проекции с текущей версией и эхом эпохи (клиент сверит и сохранит).
+    if (profile === "full") {
+      const ctx = buildNodeWithContext(db, resolved.node, undefined, { withSupportCheck: true });
+      ctx.current_digests = currentDigestsOf(resolved.node);
+      ctx.delta_version = { version, context_epoch: input.context_epoch };
+      recordUsage(db, input.id, ctx);
+      if (maxTokens === undefined) return ctx;
+      // Бюджет — те же ворота, что у недельта full: карточка не режется.
+      const measured = measureMcpPayload(ctx);
+      if (measured > maxTokens) {
+        throw new Error(
+          `get_concept: полная карточка не помещается в max_tokens=${maxTokens} (нужно ${measured}); ` +
+            `возьми профиль evidence/orientation или подними бюджет.`
+        );
+      }
+      return ctx;
+    }
+    const target =
+      maxTokens ?? (profile === "evidence" ? EVIDENCE_DEFAULT_TOKENS : ORIENTATION_DEFAULT_TOKENS);
+    const result = buildProfileProjection(db, resolved.id, resolved.node, profile, maxNeighbors, {
+      withSupportCheck: true,
+      target,
+    });
+    result.meta.version = version;
+    result.meta.context_epoch = input.context_epoch;
+    recordUsage(db, input.id, result);
+    return result;
   }
 
   if (profile === "full") {
@@ -949,6 +1187,8 @@ export interface ConceptToolArgs {
   max_tokens?: number;
   max_neighbors?: number;
   continuation?: string;
+  context_epoch?: string;
+  known_versions?: Record<string, string>;
 }
 
 export type ConceptToolMode =
@@ -966,7 +1206,21 @@ export function branchConceptToolArgs(args: ConceptToolArgs): ConceptToolMode {
     args.profile !== undefined ||
     args.max_tokens !== undefined ||
     args.max_neighbors !== undefined ||
-    args.continuation !== undefined;
+    args.continuation !== undefined ||
+    args.context_epoch !== undefined ||
+    args.known_versions !== undefined;
+  // E4: delta — только одиночное чтение одной проекции; пакет и продолжение
+  // не подтверждают наличие текста целой страницы — явный отказ.
+  if ((args.context_epoch !== undefined || args.known_versions !== undefined) && args.ids !== undefined) {
+    throw new Error(
+      "get_concept: delta (context_epoch/known_versions) поддержана только для одиночного чтения по id, не для пакета."
+    );
+  }
+  if ((args.context_epoch !== undefined || args.known_versions !== undefined) && args.continuation !== undefined) {
+    throw new Error(
+      "get_concept: delta (context_epoch/known_versions) и continuation вместе не задаются — продолжение уже фиксирует версию выборки."
+    );
+  }
   if (args.ids !== undefined) {
     if (args.id !== undefined) {
       throw new Error("get_concept: передай id ИЛИ ids, не оба — скрытого приоритета нет.");
@@ -1009,6 +1263,8 @@ export function branchConceptToolArgs(args: ConceptToolArgs): ConceptToolMode {
         profile: args.profile,
         max_tokens: args.max_tokens,
         max_neighbors: args.max_neighbors,
+        ...(args.context_epoch !== undefined ? { context_epoch: args.context_epoch } : {}),
+        ...(args.known_versions !== undefined ? { known_versions: args.known_versions } : {}),
       },
     };
   }

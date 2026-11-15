@@ -251,7 +251,7 @@ async function startMcpServer() {
   );
   const { z } = await import("zod");
   const { KnowledgeDB } = await import("./db.js");
-  const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
+  const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailSaveWithPassport, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
   const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
   const { branchConceptToolArgs, getConceptBatch, getConceptProfile } = await import(
@@ -402,6 +402,13 @@ async function startMcpServer() {
       include_stale: z.boolean().optional().describe("Вернуть и просроченные факты (valid_until в прошлом) — с пометкой expired: true (по умолчанию исключены, meta.stale_excluded считает исключённых)"),
       include_evidence: z.boolean().optional().describe("E3, opt-in (по умолчанию выключено): каждый компактный матч несёт current_digests (claim — текущая формулировка для expected_claim_digest; confirmed_claim/confirmed_at — документация снимка, отдельно) и support_evidence — ВСЕ живые опоры, включая не найденные поиском: полная формулировка (не обрезается), rationale ребра и готовые дайджесты confirm_supports (claim/status/edge/artifacts, полные hex — общие экспорты сервера, считать хеши самому не нужно). Полный digest не заменяет чтение полной формулировки и rationale перед подтверждением. Матч с доказательствами размещается целиком или не размещается (meta.dropped/truncated честные); счётчики — meta.evidence_matches/evidence_supports. Поддержан только в mode=compact"),
       collapse_ref_anchors: z.boolean().optional().describe("D0, opt-in (по умолчанию выключено): уменьшить долю технических ref-якорей на верхнем уровне. Технический якорь — по происхождению И текущей структуре (created_via='file_ref' + шаблонное саммари + имя = file_refs[0]); отредактированная осмысленная карточка не прячется. Якорь с найденным зависимым выводом показывается компактно вместе с rationale и состоянием опоры (вложение или секция anchors с informed_by_incoming); без зависимых — компактный локатор; если найдены только якоря — результат не пустой no-match. Счётчик — meta.anchor_collapsed; хранение не меняется: get_concept по id/пути и provenance_trace разрешают опору во всех режимах. Поддержан только в mode=compact"),
+      reuse: z.object({
+        task_type: z.string().min(1).describe("Явный тип задачи — тот же, что в passport у trail_save; reuse ищется по нему, не по похожести запроса"),
+        files: z.array(z.string()).optional().describe("Запрошенная область (файлы/ссылки) — сверяется с областью паспорта: хеши целых файлов, новые файлы в области дают gap"),
+        trail_id: z.string().optional().describe("Проверить конкретный паспорт"),
+        repo_root: z.string().optional().describe("Корень repo/worktree (default: cwd сервера)"),
+        max_candidates: z.number().int().min(1).max(5).optional().describe("Лимит кандидатов в ответе (default 2)"),
+      }).optional().describe("P1.3, opt-in (по умолчанию выключено): квалификация переиспользования проверенных разборов (паспортов trail_save). Ответ — секция passport_reuse с кандидатами {qualification: reusable|candidate|stale_input|incomplete|unknown|expired|refuted_support|broken|wrong_repo, covered[], gaps[], notes}: каждое состояние — явный статус, ни один случай не повышает доверие молча. reusable НЕ является покрытием кода и не заполняет next.skip — перед правкой читай текущий участок. Проверка только читает: не подтверждает опоры. Поддержан только в mode=compact"),
     },
     async (params) => {
       try {
@@ -417,6 +424,7 @@ async function startMcpServer() {
           include_inactive: params.include_inactive,
           include_evidence: params.include_evidence,
           collapse_ref_anchors: params.collapse_ref_anchors,
+          reuse: params.reuse,
           include_stale: params.include_stale,
           extra_payload: { ...instructions },
         });
@@ -470,7 +478,7 @@ async function startMcpServer() {
 
   server.tool(
     "get_concept",
-    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry no digests by default; include_evidence: true attaches current_digests and support_evidence (all live supports, confirm-ready) per match. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12). E1/E2: a plain single-id call returns the same card as before. profile=evidence returns full wording, rationales and confirm_supports-ready digests (never a trimmed claim — what did not fit is marked incomplete with the next step); profile=orientation returns identity, qualification and pointers under the budget; profile=full is the legacy card. max_tokens bounds the serialized answer in ESTIMATED tokens (tokens_estimated — оценка встроенного estimator'а, не гарантия провайдера); neighbor disclosure is capped (max_neighbors) with continuation tokens; a continuation pins the sample version — changed data yields version_conflict and a full re-read. Batch: pass ids (up to 25) for one call with ONE shared budget — per-id status/error/incompleteness are always visible, an unresolved id never disappears silently, budget_skipped items list the continuation. Old single-id calls without new parameters keep the exact previous response.",
+    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry no digests by default; include_evidence: true attaches current_digests and support_evidence (all live supports, confirm-ready) per match. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12). E1/E2: a plain single-id call returns the same card as before. profile=evidence returns full wording, rationales and confirm_supports-ready digests (never a trimmed claim — what did not fit is marked incomplete with the next step); profile=orientation returns identity, qualification and pointers under the budget; profile=full is the legacy card. max_tokens bounds the serialized answer in ESTIMATED tokens (tokens_estimated — оценка встроенного estimator'а, не гарантия провайдера); neighbor disclosure is capped (max_neighbors) with continuation tokens; a continuation pins the sample version — changed data yields version_conflict and a full re-read. Batch: pass ids (up to 25) for one call with ONE shared budget — per-id status/error/incompleteness are always visible, an unresolved id never disappears silently, budget_skipped items list the continuation. E4 delta (opt-in only): pass context_epoch + known_versions {id: version from meta.version} — ONLY if the client still holds that exact text in its context; a version match of the REQUESTED PROJECTION (all substantial state: status, expiry, refs, rationale, supports, artifacts, selected neighbors, format — never just the summary) returns a compact {unchanged, version, epoch, qualification-minimum} answer; a mismatch returns the full card with meta.version. Nothing (or a new epoch) means full issuance. unchanged is NOT code coverage: read the current source section before editing. Old single-id calls without new parameters keep the exact previous response.",
     {
       id: z.string().optional().describe("Exact concept ID to look up (e.g., 'auth-module' or 'database-config'). Обязателен для одиночного вызова; с ids/continuation не смешивается"),
       ids: z.array(z.string()).max(25).optional().describe("Пакетное чтение (E2): до 25 id одним вызовом с ОДНИМ общим бюджетом max_tokens; каждый элемент несёт статус ok/error/budget_skipped и свою ошибку/неполноту — неразрешённый id не исчезает молча, ошибка одного не маскирует соседей. Продолжение — meta.continuation (передай только continuation без ids)"),
@@ -478,6 +486,8 @@ async function startMcpServer() {
       max_tokens: z.number().int().min(100).max(200000).optional().describe("Бюджет СЕРИАЛИЗОВАННОГО ответа в оценочных токенах (tokens_estimated — оценка estimator'а ~байты/3, не гарантия токенов провайдера). Минимум конверта и обязательное ядро (идентичность, квалификация, expiry, причины refuted, weak_support) не режутся: ниже минимума — отказ"),
       max_neighbors: z.number().int().min(0).max(200).optional().describe("Лимит раскрытых соседей на список (дети, рёбра, опоры, трейлы; по умолчанию 20). Остаток виден в meta.dropped с токеном continuation"),
       continuation: z.string().optional().describe("Opaque-токен продолжения из прошлого ответа (списка опор/соседей или остатка пакета). Продолжение фиксирует версию выборки: если состав или состояния изменились — version_conflict и повторное чтение целиком, а не склейка страниц разных состояний"),
+      context_epoch: z.string().optional().describe("E4, opt-in: идентификатор ТЕКУЩЕЙ эпохи контекста клиента. После compaction/restart/смены проекта/восстановления БД используй НОВУЮ эпоху или не передавай параметры вовсе — это возвращает полную выдачу. Delta работает только парой с known_versions"),
+      known_versions: z.record(z.string()).optional().describe("E4, opt-in: подтверждённые клиентом версии проекций {id: version} из meta.version предыдущего ответа — передавай, только если текст той версии реально ЕСТЬ в твоём контексте. Совпадение версии запрошенной проекции (сравнивается всё существенное состояние: статус, срок, ссылки, rationale, опоры, артефакты, соседи, формат — не только summary) — компактный unchanged-ответ с квалификацией-минимумом; расхождение — полная выдача. unchanged НЕ является покрытием кода: чтение исходника перед правкой не отменяется. Без context_epoch — явная ошибка"),
     },
     async (params) => {
       try {
@@ -499,12 +509,15 @@ async function startMcpServer() {
           const result = getConceptProfile(db, mode.input);
           const resolvedId =
             "id" in result ? result.id : mode.input.id;
+          const deltaUnchanged =
+            "unchanged" in result && (result as { unchanged?: boolean }).unchanged === true;
           timeline.log({
             tool: "get_concept",
-            params: { id: mode.input.id, profile: mode.input.profile },
-            result_summary:
-              "meta" in result
-                ? `profile ${result.meta.profile} of ${resolvedId}${result.meta.truncated ? " (truncated)" : ""}`
+            params: { id: mode.input.id, profile: mode.input.profile, delta: deltaUnchanged || undefined },
+            result_summary: deltaUnchanged
+              ? `delta unchanged of ${resolvedId}`
+              : "meta" in result
+                ? `profile ${(result as { meta?: { profile?: string; truncated?: boolean } }).meta?.profile} of ${resolvedId}${(result as { meta?: { truncated?: boolean } }).meta?.truncated ? " (truncated)" : ""}`
                 : `full card of ${resolvedId}`,
             is_write: false,
             is_error: false,
@@ -1086,28 +1099,47 @@ async function startMcpServer() {
 
   server.tool(
     "trail_save",
-    "Save a reasoning chain: an ordered list of concept ids plus a mandatory author summary of WHY the conclusion follows. Member meaning is fingerprinted at save time; reads compare against the current state and mark the chain stale/broken when the ground shifted. Use after a non-trivial decision.",
+    "Save a reasoning chain: an ordered list of concept ids plus a mandatory author summary of WHY the conclusion follows. Member meaning is fingerprinted at save time; reads compare against the current state and mark the chain stale/broken when the ground shifted. Use after a non-trivial decision. P1 passport (opt-in): pass passport (task_type, goal, scope_files, checks, completeness) to record a versioned analysis passport alongside the chain — the durable core is the trail itself (member fingerprints + WHY), the versioned body is journaled with the save event; reuse later matches passports by EXPLICIT task_type and verified scope (never by query similarity). A passport is not code coverage: reuse answers carry covered[]/gaps[]/qualification and the agent still reads current code sections.",
     {
       node_ids: z.array(z.string()).min(1).describe("Ordered chain members: premises first, conclusion last"),
       summary: z.string().describe("Author summary of the reasoning — why this conclusion follows from these nodes"),
       name: z.string().optional().describe("Human-readable chain name (default: auto-generated)"),
+      passport: z.object({
+        task_type: z.string().min(1).describe("Явный тип задачи (пилот: implementation_analysis) — reuse ищется по нему, не по похожести запроса"),
+        goal: z.string().min(1).describe("Цель разбора одним-двумя предложениями (не стенограмма рассуждений)"),
+        scope_files: z.array(z.string()).min(1).describe("Область применимости: файлы/ссылки; хешируются ЦЕЛИКОМ при сохранении (консервативная актуальность)"),
+        sources: z.array(z.object({ ref: z.string(), role: z.string() })).optional().describe("Источники с ролями (implementation/config/tests/docs)"),
+        checks_performed: z.array(z.object({ what: z.string().min(1), result_ref: z.string().nullish() })).optional().describe("Реально выполненные проверки; result_ref — ссылка на результат (узел/артефакт)"),
+        checks_omitted: z.array(z.object({ what: z.string().min(1), reason: z.string().min(1) })).optional().describe("Невыполненные проверки — явно, с причиной"),
+        completeness_degree: z.enum(["full", "partial"]).optional().describe("Степень полноты обследования (default full)"),
+        completeness_gaps: z.array(z.string()).optional().describe("Непроверенные участки"),
+        completeness_limitations: z.array(z.string()).optional().describe("Известные ограничения"),
+        valid_until: z.string().nullish().describe("Срок применимости паспорта (ISO); после даты reuse запрещён без новой проверки"),
+        tools: z.record(z.string()).optional().describe("Версии инструментов/настроек обследования"),
+      }).optional().describe("P1: паспорт проверенного разбора (opt-in). Без него вызов прежний"),
     },
     async (params) => {
       try {
-        const result = trailSave(db, params);
-        timeline.log({
-          tool: "trail_save",
-          params: { name: params.name },
-          result_summary: `saved ${result.id}`,
-          is_write: true,
-          is_error: false,
-          affected_ids: params.node_ids,
-        });
+        const result = params.passport !== undefined
+          ? await trailSaveWithPassport(db, params as typeof params & { passport: NonNullable<typeof params.passport> })
+          : trailSave(db, params);
+        // Запись с паспортом уже журналирована атомарно в trailSaveWithPassport
+        // (тело — данные reuse в params события trail_save), дубль здесь не нужен.
+        if (!("passport" in result)) {
+          timeline.log({
+            tool: "trail_save",
+            params: { name: params.name },
+            result_summary: `saved ${result.id}`,
+            is_write: true,
+            is_error: false,
+            affected_ids: params.node_ids,
+          });
+        }
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       } catch (err) {
         timeline.log({
           tool: "trail_save",
-          params: { name: params.name },
+          params: { name: params.name, passport: params.passport !== undefined },
           result_summary: err instanceof Error ? err.message : String(err),
           is_write: true,
           is_error: true,
@@ -1120,13 +1152,14 @@ async function startMcpServer() {
 
   server.tool(
     "trail_get",
-    "Read a reasoning chain with its freshness verdict: fresh (member meaning unchanged), stale (a member's summary/epistemic status/informed_by changed or was removed), broken (a member was hard-deleted). Stale members carry a per-member reason.",
+    "Read a reasoning chain with its freshness verdict: fresh (member meaning unchanged), stale (a member's summary/epistemic status/informed_by changed or was removed), broken (a member was hard-deleted). Stale members carry a per-member reason. include_passport: true (P1, opt-in) also returns the versioned analysis passport body recorded at trail_save (or null when the journal entry was pruned by retention — qualification then honestly degrades to unknown).",
     {
       id: z.string().describe("Trail id, as returned by trail_save"),
+      include_passport: z.boolean().optional().describe("P1, opt-in: вернуть тело паспорта (или null, если запись вытеснена ретеншном журнала)"),
     },
     async (params) => {
       try {
-        const result = trailGet(db, params.id);
+        const result = trailGet(db, params.id, params.include_passport ? { include_passport: true } : undefined);
         timeline.log({
           tool: "trail_get",
           params: { id: params.id },
