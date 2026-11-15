@@ -21,7 +21,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("migrate")}         Upgrade an upstream v1.6.2 database ${pc.dim("[--dry-run|--apply]; default: dry-run; --db PATH")}
   ${pc.cyan("reembed")}         Reindex node embeddings ${pc.dim("[--batch N]; default: 16; --db PATH")}
   ${pc.cyan("consolidate")}     Find and merge near-duplicate nodes ${pc.dim("[--threshold RATIO] [--limit N] [--dry-run|--apply]; --db PATH")}
-  ${pc.cyan("digest")}          Rebuild derived digest nodes ${pc.dim("[--module ID] [--apply]; default: dry-run; --db PATH")}
+  ${pc.cyan("digest")}          Rebuild derived digest nodes ${pc.dim("[--module ID] [--apply] [--by-use] [--limit N]; default: dry-run; --db PATH")}
   ${pc.cyan("export")}          Export graph nodes to Markdown ${pc.dim("--md DIR [--check]; --db PATH")}
   ${pc.cyan("doctor")}          Run database health checks ${pc.dim("(RW open; may migrate; exit 1 on problems; --db PATH)")}
   ${pc.cyan("eval")}            Measure search recall@k ${pc.dim("[--file FILE] [--k N] [--min RATIO]; --db PATH")}
@@ -29,6 +29,7 @@ ${pc.bold("Commands:")}
                 ${pc.dim("guide --workflow prints the full workflow contract (docs/agent-workflow.md, UTF-8, no database)")}
   ${pc.cyan("bench")}           Measure graph orientation cost against files/TE ${pc.dim("--questions FILE [options]; --db PATH")}
   ${pc.cyan("expire")}          Set valid_until on selected nodes ${pc.dim("(--ids IDS|--report FILE) --until DATE|past [--apply]; --scan [--json] reviews candidates; --db PATH")}
+  ${pc.cyan("telemetry-report")} Aggregate local J0 telemetry JSONL ${pc.dim("[--file PATH] [--tariff-version VER] [--json]; no database, no network")}
 
 ${pc.bold("Global and MCP options:")}
   ${pc.cyan("--db")} ${pc.dim("PATH")}       Path to knowledge.db ${pc.dim("(--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)")}
@@ -59,9 +60,11 @@ ${pc.bold("Command options:")}
   ${pc.cyan("--threshold")} ${pc.dim("RATIO")} consolidate cosine threshold ${pc.dim("(0..1; default: 0.95)")}
   ${pc.cyan("--limit")} ${pc.dim("N")}       consolidate global output/apply pair cap ${pc.dim("(positive integer; default: 100; large groups also cap 50 pairs per node)")}
   ${pc.cyan("--module")} ${pc.dim("ID")}     digest one parent id ${pc.dim("(default: every parent with at least 5 eligible children)")}
+  ${pc.cyan("--by-use")}        digest: order the queue by explicit usefulness ${pc.dim("(stale first, then used/opened; issued only with telemetry enabled; no events: previous order, noted)")}
+  ${pc.cyan("--limit")} ${pc.dim("N")}       digest --by-use: bounded queue ${pc.dim("(top N build, remainder listed as queued — never silently dropped)")}
   ${pc.cyan("--md")} ${pc.dim("DIR")}        export destination ${pc.dim("(required)")}
   ${pc.cyan("--check")}         export: compare DIR with the current render and exit 1 on drift
-  ${pc.cyan("--file")} ${pc.dim("FILE")}     eval JSONL set ${pc.dim("(default: fixtures/eval.jsonl)")}
+  ${pc.cyan("--file")} ${pc.dim("FILE")}     eval JSONL set ${pc.dim("(default: fixtures/eval.jsonl)")}; telemetry-report: local JSONL journal
   ${pc.cyan("--k")} ${pc.dim("N")}           eval recall cutoff ${pc.dim("(positive integer; default: 10)")}
   ${pc.cyan("--min")} ${pc.dim("RATIO")}     eval pass threshold ${pc.dim("(0..1; default: 0.8)")}
 

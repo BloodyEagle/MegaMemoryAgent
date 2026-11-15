@@ -7,6 +7,7 @@ import { D3_CDN_FALLBACK_NOTE, d3Source } from "./d3-asset.js";
 import { countStubSupports } from "./stub.js";
 import { probeFtsHealth, type FtsHealth } from "./fts-health.js";
 import { computeHealth, formatHealthSummary } from "./health.js";
+import { digestPendingParents } from "./digest.js";
 
 /**
  * F13 helper: turn probe counts into a drift message. Exported for tests —
@@ -310,17 +311,9 @@ export function runDoctor(db: KnowledgeDB): {
     );
   }
 
-  // digest sync: parents with >=5 children and no digest
-  const digestPending = (db.execSqlFirst(
-    `SELECT count(*) AS n FROM nodes p
-     WHERE p.removed_at IS NULL
-       AND (SELECT count(*) FROM nodes c
-            WHERE c.parent_id = p.id AND c.removed_at IS NULL AND c.kind != 'digest') >= 5
-       AND NOT EXISTS (
-         SELECT 1 FROM nodes d
-         WHERE d.parent_id = p.id AND d.kind = 'digest' AND d.removed_at IS NULL
-       )`
-  ) as { n: number }).n;
+  // digest sync: parents with enough ELIGIBLE children and no digest
+  // (P4.3: единое правило количества детей с digest.ts — не размножается).
+  const digestPending = digestPendingParents(db).length;
   add(
     "digests",
     true, // informational

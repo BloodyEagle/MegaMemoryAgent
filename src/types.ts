@@ -378,6 +378,8 @@ export interface UnderstandInput {
     trail_id?: string;
     repo_root?: string;
     max_candidates?: number;
+    /** P4.2: для negative_search — точный запрос/инструмент/опции сверки манифеста. */
+    negative?: { query: string; tool?: string; options?: Record<string, string> };
   };
   /**
    * P3 (план 20+21 v3 §12): opt-in контекст под задачу. Явная цель и тип
@@ -1135,6 +1137,10 @@ export interface PassportPayload {
   checked_at: string;
   /** Срок применимости паспорта (ISO); null — срок не задан. */
   valid_until: string | null;
+  /** P4.1: маршрут повторяющейся задачи (необязателен — старые тела без него читаются). */
+  route?: PassportRoute;
+  /** P4.2: манифест ограниченного отрицательного результата (task_type='negative_search'). */
+  negative?: NegativeSearchManifest;
 }
 
 /** Вход паспорта при trail_save (opt-in). */
@@ -1150,6 +1156,117 @@ export interface PassportInput {
   completeness_limitations?: string[];
   valid_until?: string | null;
   tools?: Record<string, string>;
+  /** P4.1: маршрут повторяющейся задачи (необязательный раздел тела). */
+  route?: PassportRouteInput;
+  /** P4.2: манифест ограниченного отрицательного результата (только task_type='negative_search'). */
+  negative?: NegativeSearchInput;
+}
+
+// ---- P4.1 (план 20+21 v3 §13): маршрут повторяющейся задачи ----
+//
+// Рецепт — НЕ автоматически исполняемый shell-текст: команды и локаторы в
+// маршруте — ДАННЫЕ для проверки; выполнение подчиняется разрешениям среды.
+// Локатор с номером строки — данные момента проверки: актуальность резолвится
+// проверкой файла/символа (P2/freshness), не доверием номеру строки.
+
+/** Локатор маршрута: ref + что там; номер строки — данные, не идентичность. */
+export interface PassportRouteLocator {
+  ref: string;
+  what?: string;
+}
+
+/** Проверочное действие маршрута; связи с тестами — начальный набор проверок. */
+export interface PassportRouteVerification {
+  what: string;
+  test_refs?: string[];
+  note?: string;
+}
+
+/** Краткая причина ранее отвергнутого подхода. */
+export interface PassportRouteRejected {
+  approach: string;
+  reason: string;
+  date?: string;
+  /** Опора (узел/артефакт/ref), если есть. */
+  evidence?: string;
+}
+
+/** Известное платформенное ограничение и способ воспроизведения. */
+export interface PassportRoutePlatformNote {
+  constraint: string;
+  repro?: string;
+}
+
+/** Маршрут: точка входа → инварианты → локаторы → проверочные действия. */
+export interface PassportRouteInput {
+  entry?: string;
+  invariants?: string[];
+  locators?: PassportRouteLocator[];
+  verification?: PassportRouteVerification[];
+  rejected?: PassportRouteRejected[];
+  platform_notes?: PassportRoutePlatformNote[];
+}
+
+/** Маршрут в сохранённом теле паспорта (тот же состав, что во входе). */
+export interface PassportRoute {
+  entry?: string;
+  invariants?: string[];
+  locators?: PassportRouteLocator[];
+  verification?: PassportRouteVerification[];
+  rejected?: PassportRouteRejected[];
+  platform_notes?: PassportRoutePlatformNote[];
+}
+
+/** Локатор маршрута в reuse-выдаче: статус резолвинга на текущий момент. */
+export interface PassportRouteLocatorView {
+  ref: string;
+  what: string | null;
+  /** current — байты файла совпали; changed/missing — резолвить заново;
+   * unchecked — файл не сверялся (вне области/предел хеширования). */
+  status: "current" | "changed" | "missing" | "unchecked";
+  note: string | null;
+}
+
+/** Маршрут в reuse-выдаче (только reusable/stale_input; доверие не повышается молча). */
+export interface PassportRouteView {
+  entry: string | null;
+  invariants: string[];
+  locators: PassportRouteLocatorView[];
+  verification: Array<{ what: string; test_refs: string[]; note: string | null }>;
+  rejected: Array<{ approach: string; reason: string; date: string | null; evidence: string | null }>;
+  platform_notes: Array<{ constraint: string; repro: string | null }>;
+  /** Обязательные пометки: «данные, не команда»; оговорка про тесты. */
+  notes: string[];
+}
+
+// ---- P4.2 (план 20+21 v3 §13): ограниченные отрицательные результаты ----
+//
+// НЕ новый kind узла: семейство паспортов с task_type='negative_search' через
+// существующий trail/timeline-механизм P1. Манифест в теле паспорта; область
+// обследования — существующий scope с sha256 версий файлов.
+
+/** Вход манифеста отрицательного результата. */
+export interface NegativeSearchInput {
+  /** Точный запрос, как он был задан инструменту. */
+  query: string;
+  /** Инструмент и режим (например «understand mode=compact top_k=10»). */
+  tool: string;
+  /** Расширения, исключения, включение тестов и прочие настройки. */
+  options?: Record<string, string>;
+  /** Ход поиска: усечение/ошибка ЗАПРЕЩАЮТ запись «не найдено». */
+  truncated?: boolean;
+  errored?: boolean;
+  /** Повторная проверка той же области — только явно (механика дедупликации). */
+  force_duplicate?: boolean;
+}
+
+/** Манифест в теле паспорта: доказательство завершённого поиска. */
+export interface NegativeSearchManifest {
+  query: string;
+  tool: string;
+  options?: Record<string, string>;
+  /** Записывается только при завершённом поиске без усечения/ошибки. */
+  completed: true;
 }
 
 /** Запрос квалификации reuse (opt-in, только явные данные). */
@@ -1164,6 +1281,8 @@ export interface PassportReuseRequest {
   max_candidates?: number;
   /** Лимит хеширования области за запрос (default PASSPORT_SCOPE_MAX_FILES). */
   max_files?: number;
+  /** P4.2: для negative_search — точный запрос/инструмент/опции для сверки манифеста. */
+  negative?: { query: string; tool?: string; options?: Record<string, string> };
 }
 
 export type PassportReuseGapKind =
@@ -1175,7 +1294,11 @@ export type PassportReuseGapKind =
   | "member_broken"
   | "completeness"
   | "omitted_check"
-  | "limitation";
+  | "limitation"
+  /** P4.2: reuse negative-паспорта запрошен с другим запросом. */
+  | "query_mismatch"
+  /** P4.2: другой инструмент/режим/опции обследования. */
+  | "options_mismatch";
 
 export interface PassportReuseGap {
   kind: PassportReuseGapKind;
@@ -1220,6 +1343,22 @@ export interface PassportReuseCandidate {
   valid_until: string | null;
   /** journal — тело найдено в журнале; trail_only — тело вытеснено ретеншном. */
   body_source: "journal" | "trail_only";
+  notes: string[];
+  /** P4.1: маршрут повторяющейся задачи (только reusable/stale_input). */
+  route?: PassportRouteView;
+  /** P4.2: ограниченный отрицательный результат (только reusable). */
+  negative?: PassportNegativeReuseView;
+}
+
+/** Что именно переиспользуется у negative-паспорта: «не найдено в ТОЙ ЖЕ
+ * обследованной области», не «не существует». */
+export interface PassportNegativeReuseView {
+  query: string;
+  tool: string;
+  options: Record<string, string>;
+  scope_files: number;
+  checked_at: string;
+  reuse_meaning: string;
   notes: string[];
 }
 

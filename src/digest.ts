@@ -3,6 +3,7 @@ import type { KnowledgeDB } from "./db.js";
 import { isNodeExpired } from "./db.js";
 import { embeddingText, embedForStorage } from "./embeddings.js";
 import { makeId } from "./tools.js";
+import { computeDigestPriority } from "./digest-priority.js";
 import type { NodeRow } from "./types.js";
 
 /**
@@ -46,6 +47,11 @@ function existingDigest(db: KnowledgeDB, moduleId: string): string | undefined {
     moduleId
   ) as { id: string } | undefined;
   return row?.id;
+}
+
+/** id живого дайджеста родителя (для digest-priority и диагностики). */
+export function existingDigestId(db: KnowledgeDB, moduleId: string): string | undefined {
+  return existingDigest(db, moduleId);
 }
 
 // ---- Plan 04 K-08: recorded membership of a digest ----
@@ -297,13 +303,53 @@ export interface DigestPlanEntry {
   digestId: string;
   created: boolean;
   children: number;
+  /** P4.3: счётчики полезности и признак устаревания — только при by_use. */
+  use?: DigestUseInfo;
 }
 
-/** Read-only plan: what rebuildDigests would build. */
+export interface DigestUseInfo {
+  opened: number;
+  opened_error: number;
+  used: number;
+  issued: number | "unavailable";
+  stale_existing: boolean;
+}
+
+export interface DigestPlan {
+  build: DigestPlanEntry[];
+  skipped: Array<{ moduleId: string; children: number }>;
+  /** P4.3: остаток ограниченной очереди (после limit) — не теряются молча. */
+  queued?: Array<{ moduleId: string; digestId: string; created: boolean; children: number }>;
+  /** P4.3: основание порядка (явная полезность или fallback недостатка данных). */
+  use_note?: string;
+}
+
+/** Опции приоритета P4.3: порядок/ограниченная очередь, eligible-область прежняя. */
+export interface DigestPlanOpts {
+  /** Сортировать по явной полезности (устаревание → used → opened → issued → id). */
+  by_use?: boolean;
+  /** Ограниченная очередь: верх приоритета в build, остаток — в queued. */
+  limit?: number;
+  /** Путь телеметрии J0 для счётчика issued (иначе issued unavailable). */
+  telemetry_path?: string | null;
+}
+
+/** Числовой вид issued для сортировки; unavailable не смешивается с нулями. */
+function issuedRank(v: number | "unavailable"): number {
+  return v === "unavailable" ? -1 : v;
+}
+
+/**
+ * P4.3: построить план с приоритетом по явной полезности. ПОРЯДОК меняется,
+ * eligible-область (порог детей, skipped) — нет. При отсутствии достаточных
+ * событий — прежний порядок скана (стабильный fallback) с явной пометкой.
+ * Детерминизм: равные приоритеты упорядочены по id.
+ */
 export function planDigests(
   db: KnowledgeDB,
-  moduleId?: string
-): { build: DigestPlanEntry[]; skipped: Array<{ moduleId: string; children: number }> } {
+  moduleId?: string,
+  planOpts: DigestPlanOpts = {}
+): DigestPlan {
   const build: DigestPlanEntry[] = [];
   const skipped: Array<{ moduleId: string; children: number }> = [];
   for (const { id, children } of scanDigestCandidates(db, moduleId)) {
@@ -319,31 +365,100 @@ export function planDigests(
       children,
     });
   }
-  return { build, skipped };
+  if (!planOpts.by_use) {
+    return { build, skipped };
+  }
+
+  // Один проход телеметрии на весь план: computeUseCounters читает журнал
+  // раз на вызов, приоритет собирается из готовых счётчиков.
+  const withUse = build.map((entry) => {
+    const priority = computeDigestPriority(db, entry.moduleId, {
+      telemetry_path: planOpts.telemetry_path,
+    });
+    return { ...entry, use: { ...priority.counters, stale_existing: priority.stale_existing } };
+  });
+  const anyEvents = withUse.some(
+    (e) => e.use.opened > 0 || e.use.used > 0 || (typeof e.use.issued === "number" && e.use.issued > 0)
+  );
+  const ordered = anyEvents
+    ? [...withUse].sort((a, b) => {
+        // Устаревание контента сначала, затем явная полезность; равные — по id.
+        const stale = (b.use.stale_existing ? 1 : 0) - (a.use.stale_existing ? 1 : 0);
+        if (stale !== 0) return stale;
+        if (b.use.used !== a.use.used) return b.use.used - a.use.used;
+        if (b.use.opened !== a.use.opened) return b.use.opened - a.use.opened;
+        const issued = issuedRank(b.use.issued) - issuedRank(a.use.issued);
+        if (issued !== 0) return issued;
+        return a.moduleId < b.moduleId ? -1 : a.moduleId > b.moduleId ? 1 : 0;
+      })
+    : withUse;
+  const useNote = anyEvents
+    ? "порядок по событиям явной полезности: устаревшие дайджесты первее, затем области с явным использованием/открытиями; issued учитывается только там, где включена телеметрия J0"
+    : "недостаточно событий использования (открытий/использований в журнале нет) — прежний порядок (fallback), приоритет не применялся";
+  const limit = planOpts.limit !== undefined && planOpts.limit >= 1 ? Math.floor(planOpts.limit) : undefined;
+  if (limit !== undefined && ordered.length > limit) {
+    return {
+      build: ordered.slice(0, limit),
+      skipped,
+      queued: ordered.slice(limit).map((e) => ({
+        moduleId: e.moduleId,
+        digestId: e.digestId,
+        created: e.created,
+        children: e.children,
+      })),
+      use_note: useNote,
+    };
+  }
+  return { build: ordered, skipped, use_note: useNote };
 }
 
 /**
  * Rebuild digests for all parents with enough eligible children, or just one parent.
+ * P4.3: with by_use — строит по приоритетной очереди planDigests (ОДИН
+ * расчёт кандидатов и для preview, и для apply); остаток limit — в queued.
  */
 export async function rebuildDigests(
   db: KnowledgeDB,
   moduleId?: string,
-  opts: { embed?: boolean } = {}
+  opts: { embed?: boolean } & DigestPlanOpts = {}
 ): Promise<{
   built: DigestResult[];
   skipped: Array<{ moduleId: string; children: number }>;
+  queued?: Array<{ moduleId: string; digestId: string; created: boolean; children: number }>;
+  use_note?: string;
 }> {
+  const plan = planDigests(db, moduleId, {
+    ...(opts.by_use ? { by_use: true } : {}),
+    ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+    ...(opts.telemetry_path !== undefined ? { telemetry_path: opts.telemetry_path } : {}),
+  });
   const built: DigestResult[] = [];
-  const skipped: Array<{ moduleId: string; children: number }> = [];
-
-  for (const { id, children } of scanDigestCandidates(db, moduleId)) {
-    if (children < DIGEST_MIN_CHILDREN) {
-      skipped.push({ moduleId: id, children });
-      continue;
-    }
-    built.push(await buildDigest(db, id, opts));
+  for (const entry of plan.build) {
+    built.push(await buildDigest(db, entry.moduleId, { embed: opts.embed }));
   }
-  return { built, skipped };
+  return {
+    built,
+    skipped: plan.skipped,
+    ...(plan.queued ? { queued: plan.queued } : {}),
+    ...(plan.use_note ? { use_note: plan.use_note } : {}),
+  };
+}
+
+/**
+ * P4.3: единое правило диагностики (doctor) и плана — родители с достаточным
+ * числом ELIGIBLE детей и без живого дайджеста. Правило количества детей не
+ * размножается: doctor вызывает этот расчёт вместо собственного SQL.
+ */
+export function digestPendingParents(
+  db: KnowledgeDB
+): Array<{ moduleId: string; children: number }> {
+  const pending: Array<{ moduleId: string; children: number }> = [];
+  for (const { id, children } of scanDigestCandidates(db)) {
+    if (children >= DIGEST_MIN_CHILDREN && existingDigest(db, id) === undefined) {
+      pending.push({ moduleId: id, children });
+    }
+  }
+  return pending;
 }
 
 /**
