@@ -1,5 +1,12 @@
 import pc from "picocolors";
 import { KnowledgeDB } from "./db.js";
+import {
+  SESSION_GAP_MINUTES,
+  parseTimelineTs,
+  sessionize,
+  selectTimelineWindow,
+  type TimelineRow,
+} from "./sessions.js";
 
 /**
  * План 13 §2.3: воронка «understand → follow-up → запись» по реальному
@@ -12,10 +19,13 @@ import { KnowledgeDB } from "./db.js";
  * Правила сессиизации сверены 1:1 с эталоном
  * plan-13-runs/funnel-baseline.mjs: на его данных (timeline-copy.db, 147
  * записей) computeFunnel обязан давать те же числа — это кросс-проверка.
+ * Этап A (план 20+21 v3 §6.A3): сам алгоритм сессиизации вынесен в общий
+ * module sessions.ts — один и тот же для funnel и health; вызов БЕЗ новых
+ * аргументов сохраняет старый режим all и legacy-семантику.
  */
 
-/** Разрыв между соседними записями больше этого числа минут = новая сессия. */
-export const SESSION_GAP_MINUTES = 30;
+// Re-export: существующие потребители импортируют константу из funnel.
+export { SESSION_GAP_MINUTES };
 
 // В тексте плана §2.3 среди follow-up инструментов упомянут «search» —
 // инструмента с таким именем в сервере нет. Набор ниже фиксирует
@@ -33,22 +43,6 @@ const FOLLOW_UP_TOOLS = new Set([
   "trail_get",
 ]);
 
-interface TimelineRow {
-  seq: number;
-  timestamp: string;
-  tool: string;
-  params: string;
-  is_write: number;
-  is_error: number;
-  affected_ids: string;
-}
-
-interface Session {
-  start: number;
-  end: number;
-  entries: TimelineRow[];
-}
-
 export interface FunnelReport {
   /** Разрешённый путь базы (db.dbPath). */
   db: string;
@@ -65,9 +59,6 @@ export interface FunnelReport {
   shares: { follow_up_pct: number; record_pct: number };
 }
 
-/** Timestamps timeline — «YYYY-MM-DD HH:MM:SS» в UTC (SQLite datetime('now')). */
-const parseTs = (s: string): number => new Date(s.replace(" ", "T") + "Z").getTime();
-
 const parseIds = (raw: string): string[] => {
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -83,24 +74,36 @@ const parseIds = (raw: string): string[] => {
  * Сессия — последовательность записей timeline, где соседние записи разнесены
  * не больше чем на SESSION_GAP_MINUTES минут. understand-сессия — сессия,
  * содержащая хотя бы одну запись tool='understand' (в том числе с is_error).
+ *
+ * Этап A (§6.A3): опциональное окно [from, to) (epoch ms; from=null — без
+ * нижней границы) задаёт одинаковое окно для всех секций stats; вызов без
+ * opts — прежний режим all. Границы сессий, пересекающих окно,
+ * восстанавливаются ограниченным обходом до реального разрыва (sessions.ts);
+ * события считаются только по записям внутри окна.
  */
-export function computeFunnel(db: KnowledgeDB): FunnelReport {
-  const rows = db.execSqlAll(
+export function computeFunnel(
+  db: KnowledgeDB,
+  opts?: { window?: { from: number | null; to: number } }
+): FunnelReport {
+  const allRows = db.execSqlAll(
     "SELECT seq, timestamp, tool, params, is_write, is_error, affected_ids FROM timeline ORDER BY seq ASC"
   ) as TimelineRow[];
 
-  // ---- сессиизация ----
-  const sessions: Session[] = [];
-  for (const r of rows) {
-    const ts = parseTs(r.timestamp);
-    const last = sessions[sessions.length - 1];
-    if (!last || ts - last.end > SESSION_GAP_MINUTES * 60_000) {
-      sessions.push({ start: ts, end: ts, entries: [r] });
-    } else {
-      last.end = ts;
-      last.entries.push(r);
-    }
+  let rows: TimelineRow[];
+  let windowRows: TimelineRow[];
+  if (opts?.window) {
+    const { from, to } = opts.window;
+    rows = selectTimelineWindow(db, { from, to });
+    const inW = (ts: number): boolean =>
+      !Number.isNaN(ts) && (from === null || ts >= from) && ts < to;
+    windowRows = rows.filter((r) => inW(parseTimelineTs(r.timestamp)));
+  } else {
+    rows = allRows;
+    windowRows = rows;
   }
+
+  // ---- сессиизация (общий модуль) ----
+  const sessions = sessionize(rows);
 
   // ---- метрики ----
   const understandSessions = sessions.filter((s) =>
@@ -155,9 +158,9 @@ export function computeFunnel(db: KnowledgeDB): FunnelReport {
   return {
     db: db.dbPath,
     window: {
-      first: rows[0]?.timestamp,
-      last: rows[rows.length - 1]?.timestamp,
-      entries: rows.length,
+      first: windowRows[0]?.timestamp,
+      last: windowRows[windowRows.length - 1]?.timestamp,
+      entries: windowRows.length,
     },
     session_gap_minutes: SESSION_GAP_MINUTES,
     sessions_total: sessions.length,
@@ -230,7 +233,9 @@ export function formatFunnel(report: FunnelReport): string[] {
     funnelRow(
       "must_read",
       `${report.must_read_issued} issued`,
-      `${report.must_read_opened} opened via get_concept`
+      // Этап A (§15.J0): legacy-название сохранено с явным описанием —
+      // считает get_concept-вызовы, не чтение файлов агентом.
+      `${report.must_read_opened} opened via get_concept (legacy: не чтение файлов)`
     )
   );
   return lines;

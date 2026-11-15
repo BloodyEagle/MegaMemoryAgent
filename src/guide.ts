@@ -178,8 +178,8 @@ const READONLY_SECTION = `
 
 \`megamemory export\`, \`eval\` and \`conflicts\` open the database READ-ONLY: they never
 write, never migrate, and leave the file byte-identical (so do the scripted
-\`stats --funnel --json\` snapshot, \`expire\` without \`--apply\`, \`repair-ids --dry-run\`,
-and \`migrate --dry-run\`). Expire dry-run reads the original directly; repair/migrate
+\`stats --funnel --json\` and \`stats --health --json\` snapshots, \`expire\` without \`--apply\`,
+\`repair-ids --dry-run\`, and \`migrate --dry-run\`). Expire dry-run reads the original directly; repair/migrate
 compute their plans on a coherent temporary snapshot and fingerprint the original before/after,
 so a concurrent change is reported instead of claiming “nothing written”. On an outdated schema
 the direct read-only commands fail with a ready-made fix —

@@ -41,7 +41,7 @@
 | Дубли | только ручной merge | `megamemory consolidate` находит пары с близостью эмбеддингов ≥ 0.95 и сливает их с переносом рёбер |
 | Большие группы потомков | каждый ребёнок читается отдельно | производный `digest`-сосед для любого родителя после 5-го пригодного ребёнка, вес в поиске 0.8; исходные соседи остаются самостоятельными результатами, а содержательная проверка stale показывает, когда нужен `megamemory digest --apply` |
 | Переносимость | только БД | `megamemory export --md <dir>` — по файлу на узел (frontmatter + wiki-ссылки); `--check` сообщает о недостающих/изменённых/лишних markdown-файлах для CI и ничего не удаляет |
-| Видимость цены | нет | каждый `understand` / `list_roots` / `get_concept` измеряется; агрегаты за 7 дней в `megamemory stats`, `/api/stats` и панели **Tokens** в explorer; `megamemory stats --funnel` считает воронку «understand → follow-up → запись» по журналу `timeline` (`--json` для скриптов) |
+| Видимость цены | нет | каждый `understand` / `list_roots` / `get_concept` измеряется; агрегаты за 7 дней в `megamemory stats`, `/api/stats` и панели **Tokens** в explorer; `megamemory stats --funnel` считает воронку «understand → follow-up → запись» по журналу `timeline` (`--json` для скриптов); `megamemory stats --health` показывает честные метрики состояния/активности за окно (`--window 7d\|30d\|all`) — отсутствие записей это данные, а не неисправность |
 | Миграция | — | явный `megamemory migrate --apply` аддитивно обновляет сырую базу upstream v1.6.2 на месте с согласованным бэкапом; dry-run выполняет миграцию на временном SQLite-снимке и не меняет источник |
 
 ---
@@ -500,7 +500,7 @@ FTS; старые, NULL-, неверной размерности или чуж�
 | `export` (включая `--check`) | readonly | Без WAL и миграции; `--check` также никогда не удаляет экспортированные файлы. |
 | `eval` | readonly | JSONL разбирается и валидируется до открытия базы. |
 | `conflicts` | readonly | Только просмотр; `merge` и `resolve` — отдельные пишущие команды. |
-| `stats --funnel --json` без `--prune` | readonly | Только точный скриптовый снимок; обычный `stats`, funnel без JSON и любой путь с `--prune` — RW. |
+| `stats --funnel --json` / `stats --health --json` без `--prune` | readonly | Только точные скриптовые снимки (включая объединённый `--funnel --health --json`); обычный `stats`, funnel/health без JSON и любой путь с `--prune` — RW. |
 | `expire` без `--apply` | readonly | Dry-run проверяет id и показывает замену срока; `--apply` — атомарный RW. |
 | `migrate --dry-run` | источник не меняется | Настоящая миграция выполняется на одноразовом согласованном снимке, source main+WAL сравниваются по fingerprint. |
 | `repair-ids --dry-run` | источник не меняется | План строится на таком же одноразовом снимке, source main+WAL сравниваются по fingerprint. |
@@ -509,6 +509,7 @@ FTS; старые, NULL-, неверной размерности или чуж�
 Область `MEGAMEMORY_ALLOW_AUTO_MIGRATE=1` намеренно узкая: переменная превращает
 только пути `openReadonlyOrExplain`, используемые **`export`, `eval` и `conflicts`**,
 в обычное RW-открытие на время процесса. Она не влияет на `stats --funnel --json`,
+`stats --health --json`,
 dry-run `expire`, оба snapshot-dry-run, фикстуры и любые другие команды. При
 несовпадении схемы readonly-путь старой базы даёт `SCHEMA_TOO_OLD_READONLY` с
 `megamemory migrate --apply --db "<путь>"`; новая база даёт

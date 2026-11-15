@@ -4,8 +4,10 @@ import { KnowledgeDB } from "./db.js";
 import { errorBold } from "./cli-utils.js";
 import { listRoots } from "./tools.js";
 import { resolveDbPathOrExit } from "./db-path.js";
+import { valueFlag } from "./cli-flags.js";
 import { supportQualityBreakdown } from "./stub.js";
 import { computeFunnel, formatFunnel } from "./funnel.js";
+import { computeHealth, formatHealth, type HealthWindowKind } from "./health.js";
 
 const KIND_ORDER = ["feature", "module", "component", "pattern", "config", "decision"];
 
@@ -45,6 +47,14 @@ function sortedKinds(kinds: Record<string, number>): Array<[string, number]> {
   return [...preferred, ...extra];
 }
 
+/** Окно health/воронки: 7d|30d|all; неверное значение — явная ошибка. */
+function parseWindow(args: string[]): HealthWindowKind | undefined {
+  const raw = valueFlag(args, "--window");
+  if (raw === undefined) return undefined;
+  if (raw === "7d" || raw === "30d" || raw === "all") return raw;
+  throw new Error(`--window поддерживает только 7d|30d|all, получено: ${raw}`);
+}
+
 export async function runStats(args: string[]): Promise<void> {
   const dbPath = resolveDbPathOrExit(args);
 
@@ -61,7 +71,13 @@ export async function runStats(args: string[]): Promise<void> {
   // его парсит скрипт снятия метрик, остальной вывод stats мешал бы.
   // Скриптовый снимок не должен мутировать базу — открываем readonly,
   // если это единственное, что попросили (--prune требует записи).
+  //
+  // Этап A (план 20+21 v3 §6.A4): `--health` — развёрнутые health-метрики
+  // (единый расчёт с doctor), `--window 7d|30d|all` — одинаковое окно для
+  // всех запрошенных секций. `--health --json` без `--prune` — тоже
+  // readonly-путь: чистый сборщик НЕ вызывает list_roots/insertUsage.
   const funnelMode = args.includes("--funnel");
+  const healthMode = args.includes("--health");
   const jsonMode = args.includes("--json");
   // B-05 (аудит 2026-11-12): --prune — boolean-флаг. getFlag требовал
   // следующий аргумент argv, поэтому голый `stats --prune` в конце списка
@@ -69,10 +85,44 @@ export async function runStats(args: string[]): Promise<void> {
   // аргументом — запускалась): результат зависел от позиции флага.
   // Наличие флага — само по себе значение, порядок argv не важен.
   const pruneRequested = args.includes("--prune");
-  if (funnelMode && jsonMode && !pruneRequested) {
+
+  let window: HealthWindowKind | undefined;
+  try {
+    window = parseWindow(args);
+  } catch (err) {
+    errorBold(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
+  // Время один раз на запуск, UTC (§6.A3): все секции одного вызова делят
+  // один момент — окна не «уплывают» между секциями.
+  const runNow = Date.now();
+  const windowRange = window === undefined
+    ? undefined
+    : {
+        from: window === "all" ? null : runNow - (window === "7d" ? 7 * 86_400_000 : 30 * 86_400_000),
+        to: runNow,
+      };
+
+  if ((funnelMode || healthMode) && jsonMode && !pruneRequested) {
     const readonlyDb = new KnowledgeDB(dbPath, { readonly: true });
     try {
-      console.log(JSON.stringify(computeFunnel(readonlyDb), null, 2));
+      if (funnelMode && healthMode) {
+        console.log(
+          JSON.stringify(
+            {
+              funnel: computeFunnel(readonlyDb, windowRange ? { window: windowRange } : undefined),
+              health: computeHealth(readonlyDb, { window: window ?? "7d", now: runNow }),
+            },
+            null,
+            2
+          )
+        );
+      } else if (healthMode) {
+        console.log(JSON.stringify(computeHealth(readonlyDb, { window: window ?? "7d", now: runNow }), null, 2));
+      } else {
+        console.log(JSON.stringify(computeFunnel(readonlyDb, windowRange ? { window: windowRange } : undefined), null, 2));
+      }
     } finally {
       readonlyDb.close();
     }
@@ -263,9 +313,21 @@ export async function runStats(args: string[]): Promise<void> {
     }
 
     // План 13 §2.3: секция воронки в конце вывода — остальной stats не ломает.
+    // Этап A: явное --window задаёт окно и воронке (сессии через границу
+    // восстанавливаются общим модулем сессиизации).
     if (funnelMode) {
       console.log();
-      for (const line of formatFunnel(computeFunnel(db))) {
+      for (const line of formatFunnel(computeFunnel(db, windowRange ? { window: windowRange } : undefined))) {
+        console.log(line);
+      }
+    }
+
+    // Этап A (§6.A4): развёрнутые health-числа — stats с явным флагом.
+    // Отсутствие записей — данные, не неисправность: секция не влияет на
+    // exit code (runStats завершается с 0 в index.ts).
+    if (healthMode) {
+      console.log();
+      for (const line of formatHealth(computeHealth(db, { window: window ?? "7d", now: runNow }))) {
         console.log(line);
       }
     }

@@ -41,7 +41,7 @@ database at `.megamemory/knowledge.db`.
 | Duplicates | manual merge | `megamemory consolidate` finds embedding-similar pairs (≥ 0.95) and merges them with edge transfer |
 | Long parent groups | every child read separately | `digest` nodes: one derived sibling for any parent after the 5th eligible child, search weight 0.8; source siblings remain independently searchable, and content-based staleness says when `megamemory digest --apply` must refresh the digest |
 | Portability | DB only | `megamemory export --md <dir>` writes one markdown file per node (frontmatter + wiki-links); `--check` reports missing/differing/extra markdown for CI and never deletes files |
-| Cost visibility | none | every `understand` / `list_roots` / `get_concept` is measured; 7-day aggregates in `megamemory stats`, `/api/stats` and the explorer's **Tokens** panel; `megamemory stats --funnel` measures the understand → follow-up → record funnel over the `timeline` journal (`--json` for scripts) |
+| Cost visibility | none | every `understand` / `list_roots` / `get_concept` is measured; 7-day aggregates in `megamemory stats`, `/api/stats` and the explorer's **Tokens** panel; `megamemory stats --funnel` measures the understand → follow-up → record funnel over the `timeline` journal (`--json` for scripts); `megamemory stats --health` reports honest state/activity metrics for a window (`--window 7d\|30d\|all`) — absence of writes is data, never a failure |
 | Migration | — | explicit `megamemory migrate --apply` upgrades raw upstream v1.6.2 in place, additively, with coherent backups; dry-run executes the migration on a temporary SQLite snapshot and leaves the source untouched |
 
 ---
@@ -501,7 +501,7 @@ additional non-writing paths and snapshot dry-runs are listed below.
 | `export` (including `--check`) | read-only | No WAL or migration; `--check` also never deletes export files. |
 | `eval` | read-only | Parses/validates JSONL before opening the database. |
 | `conflicts` | read-only | Inspection only; `merge` and `resolve` are separate writing commands. |
-| `stats --funnel --json` without `--prune` | read-only | The exact scripted snapshot only; plain `stats`, non-JSON funnel, and any `--prune` path are RW. |
+| `stats --funnel --json` / `stats --health --json` without `--prune` | read-only | The exact scripted snapshots only (combined `--funnel --health --json` too); plain `stats`, non-JSON funnel/health, and any `--prune` path are RW. |
 | `expire` without `--apply` | read-only | Dry-run validates IDs and reports the replacement expiry; `--apply` is atomic RW. |
 | `migrate --dry-run` | unchanged source | Runs the actual migration on a disposable coherent snapshot and fingerprints source main+WAL. |
 | `repair-ids --dry-run` | unchanged source | Plans against the same kind of disposable snapshot and fingerprints source main+WAL. |
@@ -510,6 +510,7 @@ additional non-writing paths and snapshot dry-runs are listed below.
 `MEGAMEMORY_ALLOW_AUTO_MIGRATE=1` has a deliberately narrow scope: it changes only
 the `openReadonlyOrExplain` paths used by **`export`, `eval`, and `conflicts`** into an
 ordinary RW open for that process. It does not affect `stats --funnel --json`,
+`stats --health --json`,
 `expire` dry-run, either snapshot dry-run, fixtures, or any other command. On a
 read-only schema mismatch, an older database reports
 `SCHEMA_TOO_OLD_READONLY` with `megamemory migrate --apply --db "<path>"`; a newer
