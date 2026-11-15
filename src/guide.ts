@@ -107,13 +107,13 @@ export const SESSION_EXAMPLE = `
 
 \`\`\`
 # 1. Start: what does the graph already know?
-list_roots()
-  -> 4 roots: build-pipeline, catalog-import, auth-model, ci-cache
+list_roots() -> 4 roots: build-pipeline, catalog-import, auth-model, ci-cache
 # 2. Before the task: query the graph instead of reading the repo
 understand("how does catalog import resolve module paths") -> compact: catalog-import-entry (0.83), catalog-path-resolution (0.76)
   -> next.must_read: read src/catalog/import.ts before editing
 # 3. Read exact card: get_concept("catalog-import-entry") # support_check lives here, not in understand
   -> support_check: changed -> re-read that support first
+#    Budget: profile="evidence" (full wording + confirm digests) / "orientation" (short card); max_tokens bounds the answer, meta.dropped+continuation mark what did not fit (version-pinned); ids:[...] batches 25 cards.
 # 4. Record the decision WITH its evidence, in the same call
 create_concept(
   name: "catalog-import-cache", kind: "decision",

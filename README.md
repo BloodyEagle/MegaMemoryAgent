@@ -461,7 +461,7 @@ extras manually.
 | Tool | Description |
 |---|---|
 | `understand` | Budgeted hybrid retrieval in `compact` (default), `full`, or `brief`; filters inactive/expired facts and always returns the `next` action contract. |
-| `get_concept` | Exact-ID full context: parent, children, edges, trails/slots, support check, and current digests for confirmation. |
+| `get_concept` | Exact-ID full context: parent, children, edges, trails/slots, support check, and current digests for confirmation. Budgeted profiles (`orientation`/`evidence`/`full`), batch `ids` (up to 25, one shared budget, per-id status/errors), capped neighbor disclosure with `continuation` — an old plain `{id}` call returns the exact previous response. |
 | `create_concept` | Atomically create a node and optional edges/evidence; supports `supersedes`, `valid_until`, duplicate refusal, and same-call evidence snapshots. |
 | `update_concept` | Patch content or expiry and perform reasoned epistemic transitions; relevant text changes republish a current-generation vector or invalidate the old one. |
 | `link` | Add one of the eight typed relationships; `informed_by` requires a non-empty rationale and cannot close a provenance cycle. |
