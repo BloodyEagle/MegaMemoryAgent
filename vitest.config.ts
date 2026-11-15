@@ -23,6 +23,7 @@ import { defineConfig } from "vitest/config";
 const UNIT_FILES = [
   "docs-anchors",
   "error-formatting",
+  "fixtures-guard-negative",
   "guide",
   "help",
   "instructions",

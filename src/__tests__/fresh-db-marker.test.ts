@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "url";
 import Database from "libsql";
 import { KnowledgeDB, SCHEMA_VERSION, UpstreamSchemaError } from "../db.js";
@@ -12,6 +13,7 @@ import {
 import { preflight, autoMigrateIfNeeded } from "../auto-migrate.js";
 import { runDoctor } from "../doctor.js";
 import { cleanupDir } from "./helpers/cleanup.js";
+import { auditFixture } from "./helpers/audit.js";
 
 /**
  * План 15 (2.3.1): свежая база — не legacy.
@@ -48,6 +50,10 @@ afterEach(async () => {
 function freshDir(): { tmpDir: string; dbPath: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-fresh-marker-"));
   return { tmpDir: dir, dbPath: path.join(dir, "knowledge.db") };
+}
+
+function sha256File(p: string): string {
+  return createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 }
 
 /** T3: сырая upstream-база — таблицы без форк-колонок, user_version не ставится. */
@@ -132,13 +138,25 @@ describe("план 15: маркер свежей базы", () => {
     }
   });
 
-  it("T4: страж фикстуры — demo.db носит маркер конверсии '3'", () => {
-    const fixtureDb = new KnowledgeDB(FIXTURE, { readonly: true });
+  it("T4: страж фикстуры — demo.db носит маркер конверсии '3' (на изолированной копии)", async () => {
+    // Этап C (план 20+21 v3, C1.1): маркер проверяется на байт-в-байт копии,
+    // соединение с эталонным файлом не открывается. libsql при любом
+    // открытии WAL-базы создаёт -wal/-shm рядом с файлом и не удаляет их на
+    // close() внутри процесса — прежнее открытие fixtures/demo.db оставляло
+    // посторонние следы в каталоге эталонов, на которые падал страж
+    // (posttest check-fixtures, red-лог m1c-red). Равенство хешей связывает
+    // проверку с реальными байтами фикстуры; неудавшаяся очистка копии
+    // роняет тест (auditFixture.close бросает).
+    const fx = auditFixture();
     try {
+      const copyPath = fx.file("demo-marker-copy.db");
+      fs.copyFileSync(FIXTURE, copyPath);
+      expect(sha256File(copyPath)).toBe(sha256File(FIXTURE));
+      const fixtureDb = fx.track(new KnowledgeDB(copyPath, { readonly: true }));
       expect(fixtureDb.getUserVersion()).toBe(SCHEMA_VERSION);
       expect(fixtureDb.getMetaValue("schema_version")).toBe("3");
     } finally {
-      fixtureDb.close();
+      await fx.close();
     }
   });
 
