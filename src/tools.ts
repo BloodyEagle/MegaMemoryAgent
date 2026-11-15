@@ -617,6 +617,11 @@ export async function understand(
       "understand: collapse_ref_anchors поддержан только в mode=compact — верхний уровень full/brief не изменяется."
     );
   }
+  if (input.reuse && outputMode !== "compact") {
+    throw new Error(
+      "understand: reuse поддержан только в mode=compact — full/brief не несят секции паспортов."
+    );
+  }
   const includeEvidence = input.include_evidence ?? false;
   const collapseAnchors = input.collapse_ref_anchors ?? false;
 
@@ -873,6 +878,21 @@ export async function understand(
 
   const extra = input.extra_payload ?? {};
 
+  // P1.3 (план 20+21 v3 §10): opt-in reuse — квалификация паспортов по явному
+  // типу задачи и области. Только чтение: ни снимков, ни наблюдений, ни
+  // записей графа; секция участвует в бюджетной мере на общих основаниях.
+  const reuseView = input.reuse
+    ? await qualifyReuse(db, {
+        task_type: input.reuse.task_type,
+        ...(input.reuse.files !== undefined ? { files: input.reuse.files } : {}),
+        ...(input.reuse.trail_id !== undefined ? { trail_id: input.reuse.trail_id } : {}),
+        ...(input.reuse.repo_root !== undefined ? { repo_root: input.reuse.repo_root } : {}),
+        ...(input.reuse.max_candidates !== undefined
+          ? { max_candidates: input.reuse.max_candidates }
+          : {}),
+      })
+    : undefined;
+
   const edgesFor = (list: Array<{ id: string }>) =>
     list.length >= 2
       ? (db.execSqlAll(
@@ -1023,6 +1043,8 @@ export async function understand(
     // D0: секция якорей — только в opt-in режиме; пустой список присутствует
     // явно, чтобы отсутствие секции не читалось как «якорей нет».
     ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
+    // P1.3: секция reuse — только в opt-in запросе.
+    ...(reuseView ? { passport_reuse: reuseView } : {}),
     edges_between: edgesFor(compactList),
     meta,
     next: next ?? buildNextHints({
@@ -1300,6 +1322,7 @@ export async function understand(
     compact,
     refuted: refutedShown,
     ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
+    ...(reuseView ? { passport_reuse: reuseView } : {}),
     edges_between: edgesBetween,
     meta: metaFor(0, dropped, truncated),
     next,
@@ -1314,6 +1337,7 @@ export async function understand(
     compact,
     refuted: refutedShown,
     ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
+    ...(reuseView ? { passport_reuse: reuseView } : {}),
     edges_between: edgesBetween,
     meta: payloadMeta,
     next,
@@ -1333,6 +1357,7 @@ export async function understand(
     compact,
     refuted: refutedShown,
     ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
+    ...(reuseView ? { passport_reuse: reuseView } : {}),
     edges_between: edgesBetween,
     meta: payloadMeta,
     next,
@@ -2695,6 +2720,8 @@ import type {
   TrailMemberView,
   BoardOutput,
   BoardColumn,
+  PassportInput,
+  PassportPayload,
 } from "./types.js";
 
 /** Empirical rot constants from kaeru — do not change without a reason. */
@@ -2781,73 +2808,14 @@ export function computeBoard(db: KnowledgeDB, input: { done_cursor?: string; don
 }
 
 /**
- * Per-member state of a saved chain, evaluated at read time (plan 2 §1): a
- * member whose fingerprint no longer matches makes the chain `stale`; a
- * member that no longer exists at all makes it `broken` — nothing to refresh.
- *
- * Plan 04 K-09: freshness of the SNAPSHOT and fitness of the REASONING are
- * separate — a member that can no longer back any reasoning (refuted,
- * abandoned, expired) is stale however well its fingerprint matches. Expiry
- * is computed on the fresh clock at read time; it is never hashed into the
- * fingerprint, so natural expiry stales the chain without any write.
+ * Per-member and whole-chain state (trailMemberStates/trailState) живут в
+ * passport.ts (P1): их используют и trail-домен, и квалификация паспортов —
+ * один механизм доверия, не параллельный. Здесь они реэкспортируются, чтобы
+ * существующие импорты (карточка узла, concept-profile, тесты) не менялись.
  */
-export function trailMemberStates(
-  db: KnowledgeDB,
-  trailId: string
-): TrailMemberView[] {
-  return db.getTrailMembers(trailId).map((m) => {
-    const node = db.getNodeIncludingRemoved(m.node_id);
-    const view: TrailMemberView = {
-      position: m.position,
-      node_id: m.node_id,
-      node_name: node?.name ?? null,
-      fingerprint_at_save: m.fingerprint,
-      fingerprint_now: null,
-      state: "fresh",
-      reason: null,
-    };
-    if (!node) {
-      view.state = "broken";
-      view.reason = `member "${m.node_id}" was hard-deleted — the chain is broken, only a rebuild helps`;
-      return view;
-    }
-    if (node.removed_at) {
-      view.state = "stale";
-      view.reason = `member "${m.node_id}" was removed (${node.removed_reason ?? "no reason recorded"})`;
-      return view;
-    }
-    if (node.epistemic_status === "refuted") {
-      view.state = "stale";
-      view.reason = `member "${m.node_id}" опровергнут — вывод на нём строить нельзя (причина в карточке узла)`;
-      return view;
-    }
-    if (node.epistemic_status === "abandoned") {
-      view.state = "stale";
-      view.reason = `member "${m.node_id}" заброшен — вывод может устареть`;
-      return view;
-    }
-    if (isNodeExpired(node)) {
-      view.state = "stale";
-      view.reason = `member "${m.node_id}" просрочен (valid_until ${node.valid_until}) — утверждение могло перестать быть верным`;
-      return view;
-    }
-    const now = db.nodeFingerprint(m.node_id);
-    view.fingerprint_now = now;
-    if (now !== m.fingerprint) {
-      view.state = "stale";
-      view.reason = `member "${m.node_id}" meaning changed since the chain was saved (summary, epistemic status or informed_by)`;
-    }
-    return view;
-  });
-}
-
-/** Whole-chain state: broken beats stale beats fresh. */
-export function trailState(db: KnowledgeDB, trailId: string): TrailView["state"] {
-  const members = trailMemberStates(db, trailId);
-  if (members.some((m) => m.state === "broken")) return "broken";
-  if (members.some((m) => m.state === "stale")) return "stale";
-  return "fresh";
-}
+export { trailMemberStates, trailState } from "./passport.js";
+import { trailMemberStates, trailState } from "./passport.js";
+import { buildPassportBody, findLatestPassportBody, qualifyReuse } from "./passport.js";
 
 /** Uniqueness key: same name AND same summary = same chain. */
 function summaryKey(summary: string): string {
@@ -2882,7 +2850,53 @@ export function trailSave(
   };
 }
 
-export function trailGet(db: KnowledgeDB, id: string): TrailView {
+/**
+ * P1.1 (план 20+21 v3 §10): trail_save с opt-in паспортом проверенного
+ * разбора. Тело валидируется и собирается (хеши области, идентичность repo)
+ * ДО записи — ошибка входа не оставляет trail. Долговечное ядро — сам trail
+ * (члены с отпечатками смысла + WHY); версионное тело обработчик пишет в
+ * params существующего события timeline (легальная структура без DDL).
+ */
+export async function trailSaveWithPassport(
+  db: KnowledgeDB,
+  input: TrailSaveInput & { passport: PassportInput }
+): Promise<{ id: string; message: string; passport: PassportPayload }> {
+  const body = await buildPassportBody(db, input.passport, input.node_ids, input.repo_root);
+  // Тело паспорта — ДАННЫЕ reuse, а не телеметрия: пишется в params
+  // существующего типа события trail_save атомарно с самой цепочкой
+  // (легальная структура без DDL; ретеншн журнала после вытеснения даёт
+  // честную деградацию квалификации до unknown).
+  let savedId = "";
+  let savedMessage = "";
+  const passport: PassportPayload = { ...body, trail_id: "" };
+  db.runInTransaction(() => {
+    const saved = trailSave(db, input);
+    passport.trail_id = saved.id;
+    db.insertTimelineEntry({
+      tool: "trail_save",
+      params: JSON.stringify({ name: input.name ?? null, trail_id: saved.id, passport }),
+      result_summary: `passport format ${passport.passport_format} recorded for ${saved.id}`,
+      is_write: true,
+      is_error: false,
+      affected_ids: input.node_ids,
+    });
+    savedId = saved.id;
+    savedMessage = saved.message;
+  });
+  return {
+    id: savedId,
+    message:
+      `${savedMessage} Passport format ${passport.passport_format} recorded ` +
+      `(${passport.scope.files.length} scoped file(s)${passport.scope.truncated ? ", scope truncated" : ""}).`,
+    passport,
+  };
+}
+
+export function trailGet(
+  db: KnowledgeDB,
+  id: string,
+  opts?: { include_passport?: boolean }
+): TrailView & { passport?: PassportPayload | null } {
   const trail = db.getTrail(id);
   if (!trail) {
     throw new Error(`Trail "${id}" not found.`);
@@ -2897,12 +2911,16 @@ export function trailGet(db: KnowledgeDB, id: string): TrailView {
   if (Boolean(trail.stale) !== (state !== "fresh")) {
     db.setTrailStale(id, state !== "fresh");
   }
+  // P1: тело паспорта — только по явному include_passport; отсутствие тела
+  // (ретеншн журнала) честно показывается null, не молчаливым отсутствием.
+  const passport = opts?.include_passport ? findLatestPassportBody(db, id) : undefined;
   return {
     id: trail.id,
     name: trail.name,
     summary: trail.summary,
     state,
     members,
+    ...(opts?.include_passport ? { passport } : {}),
   };
 }
 

@@ -271,6 +271,11 @@ export interface NodeWithContext {
    * no digests.
    */
   current_digests?: CurrentDigestsView | null;
+  /**
+   * E4: версия полной карточки при delta-запросе (context_epoch передан).
+   * Только в profile=full ответы delta-запросов; старые вызовы не меняются.
+   */
+  delta_version?: { version: string; context_epoch: string };
 }
 
 /**
@@ -359,6 +364,21 @@ export interface UnderstandInput {
    * разрешают опору во всех режимах. Поддержан только в mode=compact.
    */
   collapse_ref_anchors?: boolean;
+  /**
+   * P1.3 (план 20+21 v3 §10): opt-in запрос переиспользования проверенного
+   * разбора. Кандидат находится по ЯВНОМУ типу задачи и проверяемому scope
+   * (не по embedding score); ответ — passport_reuse с covered/gaps/
+   * qualification по таблице состояний P1.2. Проверка применимости — только
+   * чтение: не подтверждает опоры и не заполняет next.skip.
+   * Поддержан только в mode=compact; с full/brief — явная ошибка.
+   */
+  reuse?: {
+    task_type: string;
+    files?: string[];
+    trail_id?: string;
+    repo_root?: string;
+    max_candidates?: number;
+  };
 }
 
 /**
@@ -554,6 +574,13 @@ export interface UnderstandOutput {
    * без флага секции нет.
    */
   anchors?: CollapsedAnchorView[];
+  /**
+   * P1.3 (opt-in reuse): квалификация переиспользования проверенных разборов
+   * (паспортов) для явного типа задачи и области. Без reuse-запроса секции
+   * нет. Каждое состояние — явный статус; ни один случай не повышает доверие
+   * молча; reusable не является покрытием кода.
+   */
+  passport_reuse?: PassportReuseView;
   meta?: UnderstandMeta;
   /**
    * План 13 §2.1: машинно-исполнимый контракт действия, завершающий каждый
@@ -642,6 +669,18 @@ export interface ConceptProfileInput {
   max_neighbors?: number;
   /** Opaque-токен продолжения из предыдущего бюджетного ответа. */
   continuation?: string;
+  /**
+   * E4 (план 20+21 v3 §8.4): идентификатор текущей эпохи контекста клиента.
+   * После compaction/restart/смены проекта клиент uses a NEW epoch or omits
+   * the parameter — полная выдача. Только вместе с known_versions даёт delta.
+   */
+  context_epoch?: string;
+  /**
+   * E4: подтверждённые клиентом версии проекций {id: version} из meta.version
+   * предыдущего ответа (клиент подтверждает наличие текста в своём контексте).
+   * Без context_epoch — явная ошибка (обе части протокола обязательны).
+   */
+  known_versions?: Record<string, string>;
 }
 
 /** Полные числа соседей узла — как показала бы полная карточка. */
@@ -687,6 +726,38 @@ export interface ConceptProfileMeta {
   continuations?: Array<{ list: string; token: string }>;
   /** Страница продолжения: какой список раскрыт и с какого места. */
   continuation_used?: { list: string; offset: number };
+  /**
+   * E4: версия запрошенной проекции (sha256 канонического JSON существенного
+   * состояния — та же механика, что continuation-токен M3-1). Присутствует
+   * только в delta-запросах (с context_epoch) — старые ответы не меняются.
+   */
+  version?: string;
+  /** E4: эхо эпохи контекста клиента. */
+  context_epoch?: string;
+}
+
+/**
+ * E4: компактный ответ при совпадении версии запрошенной проекции. Текст и
+ * опоры повторно не передаются; несёт квалификацию-минимум (обязательное
+ * ядро §4.3) и пометку, что unchanged НЕ является покрытием кода.
+ */
+export interface ConceptDeltaOutput {
+  unchanged: true;
+  id: string;
+  name: string;
+  kind: NodeKind;
+  profile: GetConceptProfile;
+  version: string;
+  context_epoch: string;
+  qualification: {
+    status: string;
+    epistemic_status: string | null;
+    valid_until: string | null;
+    expired: boolean;
+    refuted_reason?: string | null;
+  };
+  weak_support?: boolean;
+  note: string;
 }
 
 export interface ConceptEvidenceSupportDigests {
@@ -952,6 +1023,15 @@ export interface TrailSaveInput {
   node_ids: string[];
   summary: string;
   name?: string;
+  /**
+   * P1 (план 20+21 v3 §10): opt-in паспорт проверенного разбора. Тело пишется
+   * в params существующего события timeline (без DDL), долговечное ядро — сам
+   * trail. Только через trailSaveWithPassport (async): тело собирается с
+   * хешированием области до записи.
+   */
+  passport?: PassportInput;
+  /** Корень repo/worktree для паспорта (default: cwd сервера). */
+  repo_root?: string;
 }
 
 export interface TrailMemberView {
@@ -972,6 +1052,165 @@ export interface TrailView {
   /** fresh / stale / broken for the chain as a whole. */
   state: "fresh" | "stale" | "broken";
   members: TrailMemberView[];
+}
+
+// ---- P1 (план 20+21 v3 §10): паспорт проверенного разбора ----
+//
+// Долговечное ядро — существующий механизм trail (trails/trail_members:
+// члены с отпечатками смысла + WHY-резюме). Версионное тело — JSON в params
+// существующего события timeline вызова trail_save (легальная структура без
+// DDL; подвержено ретеншну журнала — после вытеснения квалификация честно
+// деградирует до unknown). Durable-расширение хранения — отдельный
+// дизайн-документ для review-gate владельца, не реализация.
+
+/** Версия формата тела паспорта (изменение состава полей меняет число). */
+export const PASSPORT_FORMAT_VERSION = 1;
+
+/** Файл области проверки: целевой хеш на момент обследования. */
+export interface PassportScopeFile {
+  /** Сырая ссылка (path или path:N-M), как записал агент. */
+  ref: string;
+  /** sha256 ЦЕЛОГО файла (консервативная актуальность); null — файла не было. */
+  sha256: string | null;
+  size_bytes: number | null;
+  missing?: true;
+}
+
+/** Вывод паспорта: член цепочки и файлы, на которых он rests. */
+export interface PassportConclusion {
+  node_id: string;
+  file_refs: string[];
+}
+
+/** Источник обследования с ролью. */
+export interface PassportSource {
+  ref: string;
+  role: string;
+}
+
+export interface PassportCheck {
+  what: string;
+  /** Ссылка на результат (узел, артефакт), если результат сохранён. */
+  result_ref?: string | null;
+}
+
+export interface PassportOmittedCheck {
+  what: string;
+  reason: string;
+}
+
+/** Версионное тело паспорта (format 1). */
+export interface PassportPayload {
+  passport_format: 1;
+  /** Явный тип задачи — reuse ищется по нему, не по похожести запроса. */
+  task_type: string;
+  goal: string;
+  trail_id: string;
+  /** Идентичность repo/worktree: корень и базовая ревизия HEAD (null — не git). */
+  repo: { root: string; head_at_check: string | null };
+  scope: { files: PassportScopeFile[]; truncated: boolean };
+  conclusions: PassportConclusion[];
+  sources: PassportSource[];
+  checks: { performed: PassportCheck[]; omitted: PassportOmittedCheck[] };
+  completeness: { degree: "full" | "partial"; gaps: string[]; limitations: string[] };
+  /** Версии инструментов/настроек обследования (свободная форма). */
+  tools: Record<string, string>;
+  checked_at: string;
+  /** Срок применимости паспорта (ISO); null — срок не задан. */
+  valid_until: string | null;
+}
+
+/** Вход паспорта при trail_save (opt-in). */
+export interface PassportInput {
+  task_type: string;
+  goal: string;
+  scope_files: string[];
+  sources?: PassportSource[];
+  checks_performed?: PassportCheck[];
+  checks_omitted?: PassportOmittedCheck[];
+  completeness_degree?: "full" | "partial";
+  completeness_gaps?: string[];
+  completeness_limitations?: string[];
+  valid_until?: string | null;
+  tools?: Record<string, string>;
+}
+
+/** Запрос квалификации reuse (opt-in, только явные данные). */
+export interface PassportReuseRequest {
+  task_type: string;
+  /** Запрошенная область (refs/paths) — сверяется с областью паспорта. */
+  files?: string[];
+  /** Проверить конкретный паспорт. */
+  trail_id?: string;
+  /** Корень repo/worktree (default: cwd сервера). */
+  repo_root?: string;
+  max_candidates?: number;
+  /** Лимит хеширования области за запрос (default PASSPORT_SCOPE_MAX_FILES). */
+  max_files?: number;
+}
+
+export type PassportReuseGapKind =
+  | "new_file_in_scope"
+  | "file_changed"
+  | "file_missing"
+  | "member_stale"
+  | "member_refuted"
+  | "member_broken"
+  | "completeness"
+  | "omitted_check"
+  | "limitation";
+
+export interface PassportReuseGap {
+  kind: PassportReuseGapKind;
+  detail: string;
+  node_ids?: string[];
+}
+
+export interface PassportCoveredConclusion {
+  node_id: string;
+  note: string;
+}
+
+/**
+ * Состояния квалификации (§10.P1.2): candidate — только ориентация;
+ * reusable — совпали задача/область + проверены входы + доказательство
+ * сохранено; stale_input — изменился существенный вход (перепроверить
+ * затронутое, вывод не объявляется ложным); incomplete/unknown — источник
+ * недоступен или проверка неполна (пропуск анализа не разрешён); expired;
+ * refuted_support — опора опровергнута (вывод требует пересмотра, история
+ * сохраняется); broken; wrong_repo.
+ */
+export type PassportQualification =
+  | "reusable"
+  | "candidate"
+  | "stale_input"
+  | "incomplete"
+  | "unknown"
+  | "expired"
+  | "refuted_support"
+  | "broken"
+  | "wrong_repo";
+
+export interface PassportReuseCandidate {
+  trail_id: string;
+  trail_name: string;
+  task_type: string;
+  qualification: PassportQualification;
+  trail_state: "fresh" | "stale" | "broken";
+  covered: PassportCoveredConclusion[];
+  gaps: PassportReuseGap[];
+  checked_at: string | null;
+  valid_until: string | null;
+  /** journal — тело найдено в журнале; trail_only — тело вытеснено ретеншном. */
+  body_source: "journal" | "trail_only";
+  notes: string[];
+}
+
+export interface PassportReuseView {
+  candidates: PassportReuseCandidate[];
+  /** Сколько паспортов найдено по явному типу задачи (до лимита кандидатов). */
+  found: number;
+  note: string;
 }
 
 export interface SlotView {
