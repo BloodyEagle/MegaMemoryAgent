@@ -15,7 +15,7 @@ Commands:
   migrate         Upgrade an upstream v1.6.2 database [--dry-run|--apply]; default: dry-run; --db PATH
   reembed         Reindex node embeddings [--batch N]; default: 16; --db PATH
   consolidate     Find and merge near-duplicate nodes [--threshold RATIO] [--limit N] [--dry-run|--apply]; --db PATH
-  digest          Rebuild derived digest nodes [--module ID] [--apply]; default: dry-run; --db PATH
+  digest          Rebuild derived digest nodes [--module ID] [--apply] [--by-use] [--limit N]; default: dry-run; --db PATH
   export          Export graph nodes to Markdown --md DIR [--check]; --db PATH
   doctor          Run database health checks (RW open; may migrate; exit 1 on problems; --db PATH)
   eval            Measure search recall@k [--file FILE] [--k N] [--min RATIO]; --db PATH
@@ -23,6 +23,7 @@ Commands:
                 guide --workflow prints the full workflow contract (docs/agent-workflow.md, UTF-8, no database)
   bench           Measure graph orientation cost against files/TE --questions FILE [options]; --db PATH
   expire          Set valid_until on selected nodes (--ids IDS|--report FILE) --until DATE|past [--apply]; --scan [--json] reviews candidates; --db PATH
+  telemetry-report Aggregate local J0 telemetry JSONL [--file PATH] [--tariff-version VER] [--json]; no database, no network
 
 Global and MCP options:
   --db PATH       Path to knowledge.db (--db=PATH also accepted; then MEGAMEMORY_DB_PATH; default ./.megamemory/knowledge.db)
@@ -53,9 +54,11 @@ Command options:
   --threshold RATIO consolidate cosine threshold (0..1; default: 0.95)
   --limit N       consolidate global output/apply pair cap (positive integer; default: 100; large groups also cap 50 pairs per node)
   --module ID     digest one parent id (default: every parent with at least 5 eligible children)
+  --by-use        digest: order the queue by explicit usefulness (stale first, then used/opened; issued only with telemetry enabled; no events: previous order, noted)
+  --limit N       digest --by-use: bounded queue (top N build, remainder listed as queued — never silently dropped)
   --md DIR        export destination (required)
   --check         export: compare DIR with the current render and exit 1 on drift
-  --file FILE     eval JSONL set (default: fixtures/eval.jsonl)
+  --file FILE     eval JSONL set (default: fixtures/eval.jsonl); telemetry-report: local JSONL journal
   --k N           eval recall cutoff (positive integer; default: 10)
   --min RATIO     eval pass threshold (0..1; default: 0.8)
 

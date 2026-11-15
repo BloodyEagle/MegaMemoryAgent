@@ -24,7 +24,7 @@ const VERSION = JSON.parse(
 
 const HELP = buildHelp(VERSION);
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "expire", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "expire", "telemetry-report", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string; host?: string } {
   const portIdx = args.indexOf("--port");
@@ -191,6 +191,15 @@ switch (cmd) {
   case "bench": {
     const { runBenchCli } = await import("./bench-cli.js");
     await runBenchCli(commandArgs);
+    process.exit(0);
+    break;
+  }
+
+  case "telemetry-report": {
+    // J1 (план 20+21 v3 §15): локальный агрегатор J0-телеметрии. Только
+    // локальный JSONL-файл: БД не открывается, сеть не нужна.
+    const { runTelemetryReport } = await import("./telemetry-report-cli.js");
+    await runTelemetryReport(commandArgs);
     process.exit(0);
     break;
   }
@@ -409,7 +418,12 @@ async function startMcpServer() {
         trail_id: z.string().optional().describe("Проверить конкретный паспорт"),
         repo_root: z.string().optional().describe("Корень repo/worktree (default: cwd сервера)"),
         max_candidates: z.number().int().min(1).max(5).optional().describe("Лимит кандидатов в ответе (default 2)"),
-      }).optional().describe("P1.3, opt-in (по умолчанию выключено): квалификация переиспользования проверенных разборов (паспортов trail_save). Ответ — секция passport_reuse с кандидатами {qualification: reusable|candidate|stale_input|incomplete|unknown|expired|refuted_support|broken|wrong_repo, covered[], gaps[], notes}: каждое состояние — явный статус, ни один случай не повышает доверие молча. reusable НЕ является покрытием кода и не заполняет next.skip — перед правкой читай текущий участок. Проверка только читает: не подтверждает опоры. Поддержан только в mode=compact"),
+        negative: z.object({
+          query: z.string().min(1).describe("Точный запрос повторного поиска — сверяется с манифестом negative-паспорта; расхождение инвалидирует reuse"),
+          tool: z.string().optional().describe("Инструмент/режим обследования — сверяется с записанным"),
+          options: z.record(z.string()).optional().describe("Опции обследования (включение тестов, исключения) — сверяются с записанными"),
+        }).optional().describe("P4.2: для task_type='negative_search' — сверка манифеста ограниченного отрицательного результата; reusable означает «не найдено в обследованной области», НЕ «не существует»"),
+      }).optional().describe("P1.3, opt-in (по умолчанию выключено): квалификация переиспользования проверенных разборов (паспортов trail_save). Ответ — секция passport_reuse с кандидатами {qualification: reusable|candidate|stale_input|incomplete|unknown|expired|refuted_support|broken|wrong_repo, covered[], gaps[], notes, route?, negative?}: каждое состояние — явный статус, ни один случай не повышает доверие молча. reusable НЕ является покрытием кода и не заполняет next.skip — перед правкой читай текущий участок. Локаторы маршрута (P4.1) резолвятся проверкой файла/символа, не сырым номером строки. Проверка только читает: не подтверждает опоры. Поддержан только в mode=compact"),
       task: z.object({
         goal: z.string().min(1).describe("Явная цель: что делает агент (найти определение, объяснить решение, подготовить правку, оценить последствия)"),
         kind: z.enum(["find_definition", "explain_decision", "prepare_edit", "assess_impact"]).describe("Тип задачи — детерминированное правило обязательных категорий источников (решения, опоры/инварианты, refuted, тесты, зависимые)"),
@@ -1190,7 +1204,23 @@ async function startMcpServer() {
         completeness_limitations: z.array(z.string()).optional().describe("Известные ограничения"),
         valid_until: z.string().nullish().describe("Срок применимости паспорта (ISO); после даты reuse запрещён без новой проверки"),
         tools: z.record(z.string()).optional().describe("Версии инструментов/настроек обследования"),
-      }).optional().describe("P1: паспорт проверенного разбора (opt-in). Без него вызов прежний"),
+        route: z.object({
+          entry: z.string().optional().describe("Точка входа маршрута"),
+          invariants: z.array(z.string()).optional().describe("Инварианты, которые маршрут сохраняет"),
+          locators: z.array(z.object({ ref: z.string().min(1), what: z.string().optional() })).optional().describe("Актуальные локаторы (рецепт — данные, не команда; номера строк резолвятся проверкой свежести, не идентичность)"),
+          verification: z.array(z.object({ what: z.string().min(1), test_refs: z.array(z.string()).optional(), note: z.string().optional() })).optional().describe("Проверочные действия; связи с тестами — начальный набор, не доказательство, что остальное можно пропустить"),
+          rejected: z.array(z.object({ approach: z.string().min(1), reason: z.string().min(1), date: z.string().optional(), evidence: z.string().optional() })).optional().describe("Краткие причины ранее отвергнутых подходов"),
+          platform_notes: z.array(z.object({ constraint: z.string().min(1), repro: z.string().optional() })).optional().describe("Известные платформенные ограничения и способы воспроизведения"),
+        }).optional().describe("P4.1: маршрут повторяющейся задачи (точка входа → инварианты → локаторы → проверочные действия). Не копируй исходники; команды из памяти — данные для проверки"),
+        negative: z.object({
+          query: z.string().min(1).describe("Точный запрос поиска, как он был задан"),
+          tool: z.string().min(1).describe("Инструмент и режим (например 'understand mode=compact top_k=10')"),
+          options: z.record(z.string()).optional().describe("Расширения, исключения, включение тестов"),
+          truncated: z.boolean().optional().describe("Усечение выдачи: true ЗАПРЕЩАЕТ запись «не найдено»"),
+          errored: z.boolean().optional().describe("Ошибка поиска: true ЗАПРЕЩАЕТ запись «не найдено»"),
+          force_duplicate: z.boolean().optional().describe("Повторная проверка той же области — записать второе наблюдение явно"),
+        }).optional().describe("P4.2: ограниченный отрицательный результат (только с task_type='negative_search'). Манифест + хеши области сохраняются вместе; ошибка/усечение не являются no-match. Это семейство паспортов, НЕ новый kind узла"),
+      }).optional().describe("P1: паспорт проверенного разбора (opt-in). Без него вызов прежний. P4.1 route — маршрут повторяющейся задачи; P4.2 negative — ограниченный отрицательный результат"),
     },
     async (params) => {
       try {
