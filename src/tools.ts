@@ -495,7 +495,14 @@ export function conceptWarnings(
 function compactMatch(
   db: KnowledgeDB,
   node: NodeRow,
-  opts: { score?: number; via?: SearchVia; withContext: boolean; expired?: boolean }
+  opts: {
+    score?: number;
+    via?: SearchVia;
+    withContext: boolean;
+    expired?: boolean;
+    /** E3: с флагом include_evidence матч несёт подтверждаемые версии. */
+    withEvidence?: boolean;
+  }
 ): CompactMatch {
   const fileRefs = parseFileRefs(node.file_refs);
   const match: CompactMatch = {
@@ -534,6 +541,14 @@ function compactMatch(
         to_name: e.to_name,
         relation: e.relation as RelationType,
       }));
+  }
+  // E3 (план 20+21 v3 §8.3): evidence-дополнение строится здесь, а не в
+  // placeLoop — граница размещения (контракт D-01) не должна знать о новых
+  // идентификаторах. Флаг передаётся с кандидатом (withEvidence), мера
+  // фактической формы учитывает добавку до принятия кандидата.
+  if (opts.withEvidence) {
+    match.current_digests = currentDigestsOf(node);
+    match.support_evidence = liveEvidenceSupports(db, node);
   }
   return match;
 }
@@ -655,7 +670,14 @@ export async function understand(
   let staleExcluded = 0;
   let inactiveExcluded = 0;
   // План 06 (K-01): фильтр идёт по всему пулу, нарезка top_k — после него.
-  const eligible: Array<{ node: NodeRow; score: number; via?: SearchVia; expired: boolean }> = [];
+  const eligible: Array<{
+    node: NodeRow;
+    score: number;
+    via?: SearchVia;
+    expired: boolean;
+    /** E3: флаг едет с кандидатом — placeLoop не ссылается на новые идентификаторы. */
+    evidence?: boolean;
+  }> = [];
   const refutedNodes: Array<{ node: NodeRow; score: number; via?: SearchVia }> = [];
   for (const match of topMatches) {
     const node = db.getNode(match.id);
@@ -674,7 +696,13 @@ export async function understand(
       staleExcluded += 1;
       continue;
     }
-    eligible.push({ node, score: match.similarity, via: viaById.get(match.id), expired });
+    eligible.push({
+      node,
+      score: match.similarity,
+      via: viaById.get(match.id),
+      expired,
+      ...(includeEvidence ? { evidence: true } : {}),
+    });
   }
   // top_k — это верхний уровень compact-выдачи; вложенные опоры слотов не
   // занимают, поэтому нарезка применяется к размещению (placeLoop), а не к
@@ -919,15 +947,22 @@ export async function understand(
   // Технический якорь — по происхождению И текущей структуре (stub.ts
   // isTechnicalRefAnchor: created_via='file_ref' + шаблонное саммари + имя =
   // file_refs[0]); отредактированная осмысленная карточка не прячется.
-  // Размещение идёт по осмысленным кандидатам в ранговом порядке; якоря
-  // разбираются отдельным проходом: вложение в размещённый зависимый вывод
-  // либо collapsed-локатор в секции anchors.
+  // Якоря изымаются из пула размещения ДО placeLoop: граница размещения
+  // `while (idx < eligible.length)` (контракт D-01, compact-progress) не
+  // меняется, placeLoop продолжает размещать осмысленные карточки в ранговом
+  // порядке; изъятые якоря разбираются отдельным проходом ниже — вложение в
+  // размещённый зависимый вывод либо collapsed-локатор в секции anchors.
+  // Изъятие — после построения supportIdsOf/candidateIds: fold-логика и
+  // обнаружение зависимых выводов видят якорей как кандидатов.
   const anchorEligible = collapseAnchors
     ? eligible.filter((e) => isTechnicalRefAnchor(e.node))
     : [];
-  const claimEligible = collapseAnchors
-    ? eligible.filter((e) => !isTechnicalRefAnchor(e.node))
-    : eligible;
+  if (collapseAnchors && anchorEligible.length > 0) {
+    const anchorIds = new Set(anchorEligible.map((e) => e.node.id));
+    for (let i = eligible.length - 1; i >= 0; i -= 1) {
+      if (anchorIds.has(eligible[i].node.id)) eligible.splice(i, 1);
+    }
+  }
 
   /** The answer's top level: placed candidates minus the folded ones. */
   const displayList = (): CompactMatch[] => top.filter((m) => !foldedIds.has(m.id));
@@ -1092,8 +1127,8 @@ export async function understand(
   let refutedCut = 0;
 
   const placeLoop = (): void => {
-    while (idx < claimEligible.length) {
-      if (foldedIds.has(claimEligible[idx].node.id)) {
+    while (idx < eligible.length) {
+      if (foldedIds.has(eligible[idx].node.id)) {
         idx += 1; // уже в ответе, вложенно
         continue;
       }
@@ -1101,19 +1136,18 @@ export async function understand(
         foldSupports();
         if (displayList().length >= topK) break;
       }
-      const candidate = compactMatch(db, claimEligible[idx].node, {
-        score: claimEligible[idx].score,
-        via: claimEligible[idx].via,
+      const candidate = compactMatch(db, eligible[idx].node, {
+        score: eligible[idx].score,
+        via: eligible[idx].via,
         withContext: displayList().length < 3,
-        expired: claimEligible[idx].expired,
+        expired: eligible[idx].expired,
+        // E3: флаг едет с кандидатом (см. eligible) — граница размещения
+        // (контракт D-01) не ссылается на новые идентификаторы; enrichment
+        // выполняет compactMatch, мера видит добавку ДО принятия кандидата:
+        // матч размещается целиком или снимается целиком, частичный набор
+        // доказательств не выдаётся.
+        withEvidence: eligible[idx].evidence === true,
       });
-      // E3: evidence-дополнение участвует в мере ДО принятия кандидата —
-      // матч размещается целиком или не размещается вовсе; частичный набор
-      // доказательств не выдаётся (недоказуемая половина хуже честного отказа).
-      if (includeEvidence) {
-        candidate.current_digests = currentDigestsOf(claimEligible[idx].node);
-        candidate.support_evidence = liveEvidenceSupports(db, claimEligible[idx].node);
-      }
       top.push(candidate);
       const projected = measureWith(refutedShown);
       // План 06 (K-03): кап держится и на первой ноде — гигантская карточка
@@ -1227,12 +1261,14 @@ export async function understand(
   // План 06 (K-01): счётчики не смешиваются — dropped считает усечённых
   // (top_k/бюджет, включая порезанных refuted и не поместившиеся collapsed-
   // якоря), фильтрованные живут в stale_excluded/inactive_excluded.
-  let dropped = collapseAnchors
-    ? claimEligible.length -
-      top.length +
-      refutedCut +
-      (anchorEligible.length - anchorFolded - collapsedAnchors.length)
-    : eligible.length - top.length + refutedCut;
+  // eligible к этому моменту — осмысленные кандидаты (якоря изъяты сплайсом),
+  // поэтому база dropped не меняется; якорный термин добавляет не показанных
+  // (не вложенных и не свернутых) якорей.
+  let dropped =
+    eligible.length -
+    top.length +
+    refutedCut +
+    (collapseAnchors ? anchorEligible.length - anchorFolded - collapsedAnchors.length : 0);
 
   // Build final instructions from the placed top-level cards and nested supports.
   // Placement measured this same next block before accepting each candidate.
