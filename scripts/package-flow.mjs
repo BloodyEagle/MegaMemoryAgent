@@ -12,6 +12,10 @@ const REQUIRED = [
   "package/plugin/megamemory.ts",
   "package/commands",
   "package/docs",
+  // W2 (план 20+21 v3): полный workflow-договор поставляется пакетом и
+  // печатается `guide --workflow` из установленного расклада; отсутствие —
+  // ошибка упаковки, а не подстановка старого текста.
+  "package/docs/agent-workflow.md",
   "package/fixtures/eval.jsonl",
   "package/fixtures/demo.db",
   "package/README.md",
@@ -112,6 +116,27 @@ async function smokeInstalledLayout(extracted) {
     const imports = ["--import", pathToFileURL(path.join(ROOT, "scripts", "package-deps.mjs")).href, ...offlineImports()];
     await runBounded(process.execPath, [...imports, entry, "--version"], { env, label: "package-smoke-version" });
     await runBounded(process.execPath, [...imports, entry, "--help"], { env, label: "package-smoke-help" });
+    // W2: `guide --workflow` из установленного пакета печатает поставляемый
+    // документ байт в байт из произвольного cwd и не создаёт базу. Загрузчик
+    // package-deps.mjs требует MEGAMEMORY_PACKAGE_ROOT/LOCAL_DEPS, поэтому
+    // среда берётся от основной smoke-сессии, а профиль уводится в отдельный
+    // каталог (произвольный cwd, отличное от packageRoot расположение).
+    const workflowCwd = temporaryDirectory("package-smoke-workflow");
+    try {
+      const workflowEnv = { ...env, HOME: workflowCwd, USERPROFILE: workflowCwd, APPDATA: path.join(workflowCwd, "AppData/Roaming"), LOCALAPPDATA: path.join(workflowCwd, "AppData/Local") };
+      const workflow = await runBounded(process.execPath, [...imports, entry, "guide", "--workflow"], {
+        env: workflowEnv, label: "package-smoke-guide-workflow", cwd: workflowCwd, capture: true,
+      });
+      const doc = fs.readFileSync(path.join(packageRoot, "docs", "agent-workflow.md"), "utf8");
+      if (workflow.stdout !== doc) {
+        throw new Error("PACKAGE_SMOKE_GUIDE_WORKFLOW_MISMATCH: guide --workflow stdout != docs/agent-workflow.md");
+      }
+      if (fs.existsSync(path.join(workflowCwd, ".megamemory"))) {
+        throw new Error("PACKAGE_SMOKE_GUIDE_WORKFLOW_DB_CREATED: guide --workflow must not create a database");
+      }
+    } finally {
+      await cleanup(workflowCwd);
+    }
     const database = path.join(profile, "demo-copy.db");
     fs.copyFileSync(path.join(packageRoot, "fixtures", "demo.db"), database);
     await runBounded(process.execPath, [...imports, entry, "stats", "--db", database], { env, label: "package-smoke-stats" });
