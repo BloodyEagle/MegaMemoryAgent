@@ -231,6 +231,31 @@ describe("документация 2.1.13 (F7)", () => {
   });
 });
 
+describe("сниппет согласован с workflow-договором (план 20+21 v3, W1/W2)", () => {
+  it("указывает на полный договор: megamemory guide --workflow — одна строка-указатель", () => {
+    expect(SNIPPET).toContain("megamemory guide --workflow");
+  });
+
+  it("не требует обязательного обзора при каждом старте и записи после каждой задачи", () => {
+    // конкурирующие «сначала» и обязательный record вычеркнуты, а не добавлены рядом
+    expect(SNIPPET).not.toContain("You must call `megamemory` with action `overview`");
+    expect(SNIPPET).not.toContain("After each task:** You must call");
+    expect(SNIPPET).not.toContain("before reading source files for project understanding");
+    expect(SNIPPET).toContain("not a mandatory ritual");
+  });
+
+  it("сохраняет ядро нового порядка: квалификация, структурное чтение, запись только нового", () => {
+    expect(SNIPPET).toContain("one short relevant");
+    expect(SNIPPET).toContain("support_check");
+    expect(SNIPPET).toContain("outline then exact ranges");
+    expect(SNIPPET).toContain("not whole-file coverage");
+    expect(SNIPPET).toContain("lawfully record nothing");
+    expect(SNIPPET).toContain("not an automatic refutation");
+    // нормативное ядро доверия сохранено целиком (проверки выше в этом файле)
+    expect(SNIPPET.split("\n").length).toBeLessThanOrEqual(60);
+  });
+});
+
 describe("readonly-команды в документации (план 18, 2.4.0)", () => {
   it("guide объясняет читающие команды: список, migrate --apply, env-выход", () => {
     const guide = buildGuideText();

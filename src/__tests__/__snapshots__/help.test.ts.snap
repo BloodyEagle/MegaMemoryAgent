@@ -20,6 +20,7 @@ Commands:
   doctor          Run database health checks (RW open; may migrate; exit 1 on problems; --db PATH)
   eval            Measure search recall@k [--file FILE] [--k N] [--min RATIO]; --db PATH
   guide           Print agent onboarding and worked-session guidance
+                guide --workflow prints the full workflow contract (docs/agent-workflow.md, UTF-8, no database)
   bench           Measure graph orientation cost against files/TE --questions FILE [options]; --db PATH
   expire          Set valid_until on selected nodes (--ids IDS|--report FILE) --until DATE|past [--apply]; --db PATH
 

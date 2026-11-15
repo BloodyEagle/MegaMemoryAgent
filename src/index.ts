@@ -167,9 +167,23 @@ switch (cmd) {
   case "guide": {
     // F2 (2.1.5): print the agent-facing text — the same snippet install
     // writes, plus a worked session example and the bench section.
-    const { buildGuideText } = await import("./guide.js");
-    console.log(buildGuideText());
-    process.exit(0);
+    // W2 (план 20+21 v3): `guide --workflow` печатает поставляемый документ
+    // docs/agent-workflow.md байт в байт (ровно один завершающий LF), без
+    // баннеров, без открытия базы, без сети. Ошибки флагов и упаковки —
+    // явный неуспех процесса, не молчаливое игнорирование.
+    const guide = await import("./guide.js");
+    try {
+      const mode = guide.resolveGuideMode(commandArgs);
+      if (mode === "workflow") {
+        process.stdout.write(guide.buildWorkflowText());
+      } else {
+        console.log(guide.buildGuideText());
+      }
+      process.exit(0);
+    } catch (err) {
+      errorBold(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
     break;
   }
 

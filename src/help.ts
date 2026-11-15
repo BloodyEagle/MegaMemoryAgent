@@ -26,6 +26,7 @@ ${pc.bold("Commands:")}
   ${pc.cyan("doctor")}          Run database health checks ${pc.dim("(RW open; may migrate; exit 1 on problems; --db PATH)")}
   ${pc.cyan("eval")}            Measure search recall@k ${pc.dim("[--file FILE] [--k N] [--min RATIO]; --db PATH")}
   ${pc.cyan("guide")}           Print agent onboarding and worked-session guidance
+                ${pc.dim("guide --workflow prints the full workflow contract (docs/agent-workflow.md, UTF-8, no database)")}
   ${pc.cyan("bench")}           Measure graph orientation cost against files/TE ${pc.dim("--questions FILE [options]; --db PATH")}
   ${pc.cyan("expire")}          Set valid_until on selected nodes ${pc.dim("(--ids IDS|--report FILE) --until DATE|past [--apply]; --db PATH")}
 

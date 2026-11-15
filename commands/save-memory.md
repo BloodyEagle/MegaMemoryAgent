@@ -32,9 +32,11 @@ Think about what happened this session. Consider:
 Before creating anything new, call `megamemory:understand` with queries based on
 what you worked on this session. Compact is the default; use `mode:"full"` for
 verbose cards or `mode:"brief"` for at most 8 orientation lines without cards.
-Every answer includes a mandatory `next`: read every `must_read` ref, execute
-every `followup` exactly with its supplied args, and follow `record`. `skip` is
-currently empty; `file_refs` and summaries do not prove whole-file coverage.
+Every answer includes a mandatory `next`: read every `must_read` ref (mandatory
+sources, not proof of whole-file coverage) and execute every `followup` exactly
+with its supplied args. `record` is the ready-made write form — use it for
+genuinely new or corrected knowledge; pure reading lawfully records nothing.
+`skip` is currently empty; `file_refs` and summaries do not prove whole-file coverage.
 For each area you touched, search to see if concepts already exist that should
 be updated rather than duplicated.
 
@@ -116,6 +118,9 @@ current understanding, accounting for `meta.truncated`. Report what you saved.
 - Intent and rationale ("why") are more valuable than implementation details.
 - Update existing concepts before creating new ones — keep the graph lean.
 - Don't record trivial things. If it's obvious from the code, skip it.
+- Reading without a meaningful new conclusion is a complete outcome — do not
+  create nodes for pure reading or successful reuse. Full workflow contract:
+  `megamemory guide --workflow` (docs/agent-workflow.md).
 - Max 3 levels of nesting. Flat is better than deep.
 - Connect concepts — isolated nodes are less useful than a connected graph.
 - Give state claims such as `PR open`, `merged`, or `release shipped` an

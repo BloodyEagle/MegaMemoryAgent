@@ -22,6 +22,7 @@ English version: [docs/FORK.md](./FORK.md).
 | T7 | Детерминированный containment-safe Markdown-экспорт с frontmatter, wiki-links, рационалами informed-by и проверками path/collision. `export --check` сообщает о missing/differing/extra `.md` и даёт ненулевой код при drift; он **никогда не удаляет файлы** и не владеет каталогом. | `export --md … [--check]` |
 | T8 | Учёт usage/токенов для `understand`, `list_roots`, `get_concept`; агрегаты за 7 дней и упорядоченная воронка understand → follow-up → record. | `stats`, `stats --funnel`, Tokens panel |
 | T9 | Health-check схемы, FTS, векторов, id, сирот, digest, expiry, D3 и памяти; ненулевой статус при проблемах. | `doctor`, `/api/health` |
+| W | Offline-договор workflow агента: единственная редактируемая полная версия живёт в `docs/agent-workflow.md`, печатается дословно `megamemory guide --workflow` (UTF-8, один завершающий LF, без базы и сети); реестр стоимости и ограничений операций — `docs/capabilities.md`. | `guide --workflow`, `docs/` |
 
 Нативный vector search зеркалит эмбеддинги текущего поколения в `nodes_vec`
 (`F32_BLOB`) и использует `vector_distance_cos`. Без native-capability или parity
