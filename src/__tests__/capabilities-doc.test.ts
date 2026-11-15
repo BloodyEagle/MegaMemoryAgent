@@ -45,11 +45,12 @@ describe("docs/capabilities.md — реестр возможностей (W5)", 
   });
 
   it("перечислены операции token-economy-ts с указанием базиса проверки", () => {
-    expect(text).toContain("token-economy-ts 1.3.4");
+    expect(text).toContain("token-economy-ts 1.4.0");
     expect(text).toContain("`graph op=read`");
     expect(text).toContain("`sig`");
-    // факт, не догадка: ref= в текущей версии не поддержан
-    expect(text).toContain("не поддержан");
+    // факт, не догадка: ref= поддержан в 1.4.0; git-виды распознаются, но не читаются
+    expect(text).toContain("`ref=`");
+    expect(text).toContain("unsupported_ref_kind");
   });
 
   it("непроверенные системы явно вне контракта — без выдуманных возможностей", () => {
