@@ -3,11 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import Database from "libsql";
 import { SCHEMA_VERSION } from "../db.js";
-import { openReadonlyOrExplain } from "../cli-utils.js";
 import { auditFixture, type AuditFixture } from "./helpers/audit.js";
 
 /**
@@ -67,8 +66,9 @@ function userVersion(p: string): number {
 
 /**
  * -wal/-shm исчезают после освобождения нативного хендла — нудж GC и ждём.
- * Только для in-process соединений (B6): вышедший дочерний процесс своих
- * sidecar-файлов не чистит — на спавн-тесты этот ассерт не распространяется.
+ * Для in-process соединений — внутри того же процесса; для изолированного
+ * владельца (B6) — после его завершения: штатный выход дочернего процесса
+ * снимает сайдкары (проверено пробой этапа C, m1c).
  */
 async function waitSidecarsGone(dbPath: string): Promise<void> {
   globalThis.gc?.();
@@ -235,24 +235,54 @@ describe("план 18: ошибки схемы без ввода в заблуж
 });
 
 describe("план 18 B6: родной файл фикстуры читается readonly-хелпером без мутации", () => {
-  it("openReadonlyOrExplain на fixtures/demo.db: нет FIXTURE_WRITE_FORBIDDEN, байты не изменились", async () => {
+  it("openReadonlyOrExplain на fixtures/demo.db в изолированном владельце: нет FIXTURE_WRITE_FORBIDDEN, байты и каталог не изменились", async () => {
+    // Этап C (C1.4): единственная проверка, которой действительно нужно
+    // readonly-открытие оригинала — поведение readonly-пути на защищённом
+    // пути. Она выполняется в изолированном владельце процесса, а каталог
+    // fixtures проверяется ПОСЛЕ его завершения, без параллельного открытия
+    // тем же набором. libsql при любом in-process открытии WAL-базы создаёт
+    // -wal/-shm рядом с файлом и не удаляет их на close() — прежний вариант
+    // B6 с открытием в процессе теста оставлял посторонние следы в каталоге
+    // эталонов, на которые падал страж (red-лог m1c-red). Владелец —
+    // минимальный скрипт над ТОМ ЖЕ хелпером dist/cli-utils.js, а не CLI:
+    // dist/index.js завершает команды через process.exit() без teardown,
+    // и его сайдкары не снимаются. Естественный выход владельца снимает
+    // сайдкары (штатный teardown при опустевшем event loop).
+    const ownerModule = pathToFileURL(
+      fileURLToPath(new URL("../../dist/cli-utils.js", import.meta.url))
+    ).href;
+    const ownerCode = `
+import { openReadonlyOrExplain } from ${JSON.stringify(ownerModule)};
+try {
+  const db = openReadonlyOrExplain(${JSON.stringify(FIXTURE)}, "export");
+  try {
+    console.log("OWNER_STATS", db.getStats().nodes);
+  } finally {
+    db.close();
+  }
+} catch (err) {
+  console.log("OWNER_FAIL", err?.code ?? "", String(err?.message ?? err).slice(0, 200));
+  process.exit(1);
+}
+console.log("OWNER_DONE");
+`;
     const before = sha(FIXTURE);
-    const savedEnv = process.env.MEGAMEMORY_ALLOW_AUTO_MIGRATE;
-    delete process.env.MEGAMEMORY_ALLOW_AUTO_MIGRATE;
-    try {
-      // Страж фикстур запрещает RW-открытие fixtures/*; readonly-путь —
-      // легален. Это главное отличие от прежнего поведения: RW-открытие
-      // здесь падало бы (FIXTURE_WRITE_FORBIDDEN), а чтение — работает.
-      const db = openReadonlyOrExplain(FIXTURE, "export");
-      try {
-        expect(db.getStats().nodes).toBeGreaterThan(0);
-      } finally {
-        db.close();
+    const { env } = fixture.profile();
+    const result = spawnSync(
+      process.execPath,
+      ["--input-type=module", "-e", ownerCode],
+      {
+        cwd: fixture.root,
+        env: { ...env, NODE_OPTIONS: "", NO_COLOR: "1" },
+        encoding: "utf-8",
       }
-    } finally {
-      if (savedEnv === undefined) delete process.env.MEGAMEMORY_ALLOW_AUTO_MIGRATE;
-      else process.env.MEGAMEMORY_ALLOW_AUTO_MIGRATE = savedEnv;
-    }
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("OWNER_STATS ");
+    const nodes = Number(/OWNER_STATS (\d+)/.exec(result.stdout)?.[1]);
+    expect(nodes).toBeGreaterThan(0);
+    expect(result.stdout).toContain("OWNER_DONE");
+    expect(result.stdout).not.toContain("FIXTURE_WRITE_FORBIDDEN");
 
     expect(sha(FIXTURE)).toBe(before);
     await waitSidecarsGone(FIXTURE);

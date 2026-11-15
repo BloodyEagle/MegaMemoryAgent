@@ -13,8 +13,10 @@ import { auditFixture } from "./helpers/audit.js";
  * 1. Страж окружения (MEGAMEMORY_FIXTURES_DIR от setupFile) валит RW-открытие
  *    фикстуры ДО создания соединения.
  * 2. readonly-соединение читает, но любая запись падает с SQLITE_READONLY —
- *    и файл остаётся байт-в-байт (это ловит мутацию, которую раньше прятал
- *    отложенный GC-чекпоинт).
+ *    проверяется на байт-в-байт копии фикстуры во временном каталоге (этап C
+ *    плана 20+21 v3, C1.2): libsql при любом открытии WAL-базы создаёт
+ *    -wal/-shm рядом с файлом и не удаляет их на close() внутри процесса,
+ *    поэтому эталонный файл в тестовом процессе не открывается вовсе.
  * 3. Копия фикстуры во временном каталоге — законный путь для всего, чему
  *    нужна запись; оригинал не трогается.
  */
@@ -25,6 +27,10 @@ const FIXTURE = path.resolve(
 
 function fixtureHash(): string {
   return createHash("sha256").update(fs.readFileSync(FIXTURE)).digest("hex");
+}
+
+function sha256File(p: string): string {
+  return createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 }
 
 let hashBefore: string;
@@ -52,22 +58,35 @@ describe("план 11: фикстуры только для чтения", () =>
     }
   });
 
-  it("2. readonly-соединение читает демо-граф", () => {
-    const db = new KnowledgeDB(FIXTURE, { readonly: true });
+  it("2. readonly-соединение читает демо-граф (изолированная копия фикстуры)", async () => {
+    // Этап C (C1.2): поведение readonly-соединения с теми же настройками
+    // защиты (query_only) проверяется на байт-в-байт копии — эталонный файл
+    // в тестовом процессе не открывается, сайдкары остаются во временном
+    // каталоге. Равенство хешей связывает проверку с реальными байтами
+    // фикстуры; неудавшаяся очистка роняет тест (auditFixture.close).
+    const fx = auditFixture();
     try {
+      const copyPath = fx.file("demo-copy.db");
+      fs.copyFileSync(FIXTURE, copyPath);
+      expect(sha256File(copyPath)).toBe(fixtureHash());
+      const db = fx.track(new KnowledgeDB(copyPath, { readonly: true }));
       const nodes = db.getAllNodesRaw();
       expect(nodes.length).toBeGreaterThan(0);
       // План 13.1 (F2) страж: фикстура обязана быть на текущей схеме —
-      // v4 (до перегенерации) не возвращается.
+      // v4 (до перегенерации) не возвращается. Копия байт-в-байт равна
+      // фикстуре, значит проверка относится к её реальным байтам.
       expect(db.getUserVersion()).toBe(SCHEMA_VERSION);
     } finally {
-      db.close();
+      await fx.close();
     }
   });
 
-  it("3. запись через readonly-соединение отклоняется, байты не меняются", () => {
-    const db = new KnowledgeDB(FIXTURE, { readonly: true });
+  it("3. запись через readonly-соединение отклоняется, байты не меняются (изолированная копия)", async () => {
+    const fx = auditFixture();
     try {
+      const copyPath = fx.file("demo-copy.db");
+      fs.copyFileSync(FIXTURE, copyPath);
+      const db = fx.track(new KnowledgeDB(copyPath, { readonly: true }));
       expect(() =>
         db.insertNode({
           id: "fixture-write-attempt",
@@ -76,8 +95,9 @@ describe("план 11: фикстуры только для чтения", () =>
           summary: "план 11: запись в фикстуру запрещена",
         })
       ).toThrowError(/readonly/i);
+      expect(sha256File(copyPath)).toBe(fixtureHash());
     } finally {
-      db.close();
+      await fx.close();
     }
     globalThis.gc?.();
     expect(fixtureHash()).toBe(hashBefore);
