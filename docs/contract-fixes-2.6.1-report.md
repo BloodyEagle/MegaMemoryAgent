@@ -3,8 +3,8 @@
 Дата: 2026-11-16. База: `origin/main = 2785075a34e865988f14989b3cd0ce8c65ce288e`.
 Ветка: `release/2.6.1`. Версия пакета: `2.6.1`, схема БД: `14`.
 
-Это отчёт **локального исполнения**: полный набор тестов и packaged smoke прошли, но выпуск в npm и CI ветки/main после мержа не подтверждены.
-Отправка ветки `release/2.6.1` и один non-draft PR в `main` разрешены владельцем; результаты push/PR/CI фиксируются ниже после фактического выполнения. Авто-мерж, approve, мерж, тег, GitHub Release и npm-публикация остаются запрещены без отдельного разрешения.
+Это отчёт **локальной и PR-приёмки**: локальный полный набор, packaged smoke и PR CI подтверждены; выпуск в npm и CI main после мержа не выполнялись.
+Отправка ветки `release/2.6.1` и один non-draft PR в `main` выполнены по разрешению владельца; результаты push/PR/CI приведены ниже. Авто-мерж, approve, мерж, тег, GitHub Release и npm-публикация остаются запрещены без отдельного разрешения.
 Файл `docs/project-audit-2.6.0-2026-11-16.md` оставлен нетронутым и не включён в коммиты по разрешённому исключению из проверки чистого дерева.
 
 ## Регрессии: падение до исправления и результат после
@@ -116,6 +116,10 @@ Fixup-коммиты уложены в коммиты находок. Tree до/
 
 Причина cleanup локализована: закрытая raw libsql-БД и statement остаются в async test frame во время ожидания удаления. Новые два parameterized lifecycle guards (успех/ошибка callback) реально падали до scoped helper и прошли после синхронного `try/finally` close + выхода из raw frame; проверяются настоящие native WeakRefs только через primitive predicates. Production не меняется, no-write/FTS/schema assertions и timeout не ослабляются. Проверки исправления: schema-repair **14/14**, параллельный schema-repair/auto-migrate/MCP набор **59/59** с `--maxWorkers=3`, после type-only сигнатуры close guard **2/2**, strict test typecheck — pass. Прежние предупреждения cleanup в старых suites остаются и не выдаются за отсутствующие. Следующий full total ожидается **1991**: прежние 1989 + два новых lifecycle guards.
 
-CI на исходной main был success для `2785075a…`; после мержа CI не проверялся, потому что мерж не разрешён. Push release не запускает workflow: в `ci.yml` push-фильтр только `main`/`feat/**`; использован настоящий PR-trigger.
+Повторный PR run [43906795103](https://github.com/BloodyEagle/MegaMemoryAgent/actions/runs/43906795103) — **success**: `event=pull_request`, `head_sha=c40a11dab0a6e5130c07c2f71b9b20b3d44e4332`, name `CI`, path `.github/workflows/ci.yml`, created `2026-11-16T16:22:39Z`, updated `2026-11-16T16:25:12Z`. Подтверждены ровно три реальных завершённых джоба: Linux `source (22)`, Windows `platform-windows (20.10.0, runtime)`, Windows `platform-windows (22, dev)` — все success.
+
+Linux full: **199/199 suites, 1991/1991 tests passed, skips=0**, 92,72 с; schema-repair **14/14** за 1465 мс, posttest fixture guard — OK. Linux targeted gate **4 suites / 74 tests passed**; eval recall@10 **0.800 (20/25) ≥ 0.8**. Числа сверены: 1991 = 1980 локально passed + 9 локальных skips, исполненных в CI + 2 новых lifecycle guards. Файлы не исключены. Оба Windows matrix jobs прошли предусмотренные им lint/typecheck/build/metadata и runtime smoke либо unit gate; matrix-skipped этапы относятся к разделению runtime/dev, а не пропускам Linux full.
+
+CI на исходной main был success для `2785075a…`; после мержа CI не проверялся, потому что мерж не разрешён. Push release не запускает workflow: в `ci.yml` push-фильтр только `main`/`feat/**`; использован настоящий PR-trigger. Последующее добавление этого CI-отчёта — документальный коммит без изменения production/tests; финальный CI головы PR сверяется отдельно в описании PR.
 
 Мерж/авто-мерж/approve, тег/Release/npm dist-tags/time/blob, чистая установка из реестра и doctor опубликованного пакета не выполнены: отдельного разрешения на выпуск нет, 2.6.1 пока не опубликован.
