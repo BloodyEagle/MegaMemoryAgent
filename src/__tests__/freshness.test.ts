@@ -36,6 +36,7 @@ import {
   loadFreshnessIndex,
   normalizeSourceKey,
 } from "../freshness.js";
+import { adapterResolveSymbol, resolveAdapterConfig } from "../code-adapter.js";
 import type { FreshnessIndex } from "../types.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
@@ -721,6 +722,47 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
     // Локатор с file снимает неоднозначность — данные для проверки однозначности.
     expect(r.symbols[2]?.status).toBe("unique");
     expect(r.symbols[2]?.candidates[0]?.file).toBe("src/b.ts");
+  });
+
+  it.each([
+    { label: "нет определения", files: [], locatorFile: "src/target.ts", status: "missing", expectedFiles: [] },
+    { label: "единственный кандидат в другом файле", files: ["src/other.ts"], locatorFile: "src/target.ts", status: "missing", expectedFiles: [] },
+    { label: "один из нескольких в заданном файле", files: ["src/other.ts", "src/target.ts"], locatorFile: "src/target.ts", status: "unique", expectedFiles: ["src/target.ts"] },
+    { label: "несколько кандидатов вне заданного файла", files: ["src/other.ts", "src/another.ts"], locatorFile: "src/target.ts", status: "missing", expectedFiles: [] },
+    { label: "неоднозначность только в заданном файле", files: ["src/other.ts", "src/target.ts", "src/target.ts"], locatorFile: "src/target.ts", status: "ambiguous", expectedFiles: ["src/target.ts", "src/target.ts"] },
+    { label: "разделители пути эквивалентны", files: ["src/target.ts"], locatorFile: "src\\target.ts", status: "unique", expectedFiles: ["src/target.ts"] },
+    {
+      label: "регистр пути зависит от платформы",
+      files: ["src/Target.ts", "src/other.ts"],
+      locatorFile: "src/target.ts",
+      status: process.platform === "win32" ? "unique" : "missing",
+      expectedFiles: process.platform === "win32" ? ["src/Target.ts"] : [],
+    },
+  ])("A10: $label — adapter и freshness соблюдают locator.file", async ({ files, locatorFile, status, expectedFiles }) => {
+    const scriptsDir = writeStub({
+      symbols: { make: files.map((file) => ({ file, kind: "function", line: 1, startLine: 1, endLine: 1 })) },
+      rdeps: {},
+    });
+    writeProjFile("src/target.ts", "export function make() {}\n");
+    const locator = { name: "make", file: locatorFile };
+    const cfg = resolveAdapterConfig({ graph_tool: scriptsDir }, projDir)!;
+    const outcome = await adapterResolveSymbol(cfg, locator);
+    const report = await checkFreshness(db, {
+      sources: ["src/target.ts"],
+      repo_root: projDir,
+      symbols: [locator],
+      adapter: { graph_tool: scriptsDir },
+    });
+    expect(outcome.status).toBe(status);
+    const candidates = outcome.status === "unique" ? [outcome.candidate] : outcome.status === "ambiguous" ? outcome.candidates : [];
+    expect(candidates.map((candidate) => candidate.file)).toEqual(expectedFiles);
+    expect(report.symbols[0]?.status).toBe(status);
+    expect(report.symbols[0]?.candidates.map((candidate) => candidate.file)).toEqual(expectedFiles);
+    if (status === "missing") {
+      expect(report.symbols[0]?.matched_locators).toEqual([]);
+      expect(report.symbols[0]?.locator_moved).toBe(false);
+      expect(report.symbols[0]?.note).toContain("требуется чтение");
+    }
   });
 
   it("недоступный adapter — ЯВНЫЙ фолбэк файлового уровня, не молча", async () => {

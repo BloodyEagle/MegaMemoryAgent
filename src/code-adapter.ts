@@ -202,7 +202,7 @@ export async function adapterResolveSymbol(
   if (!data || typeof data !== "object" || !Array.isArray(data.definedIn)) {
     return { status: "adapter_error", error: "op=symbol ответил без definedIn" };
   }
-  const candidates: AdapterSymbolCandidate[] = [];
+  let candidates: AdapterSymbolCandidate[] = [];
   for (const raw of data.definedIn) {
     if (!raw || typeof raw !== "object") continue;
     const e = raw as Record<string, unknown>;
@@ -218,22 +218,17 @@ export async function adapterResolveSymbol(
       ...(typeof e.bodyEndLine === "number" ? { body_end_line: e.bodyEndLine } : {}),
     });
   }
-  if (candidates.length === 0) return { status: "missing" };
-  if (candidates.length > 1) {
-    // Локатор несёт данные для проверки однозначности: file сужает до одного.
-    if (locator.file) {
-      const norm = (p: string) => p.replace(/\\/g, "/").toLowerCase();
-      const matching = candidates.filter((c) => norm(c.file) === norm(locator.file!));
-      if (matching.length === 1) {
-        return {
-          status: "unique",
-          candidate: matching[0],
-          // note неоднозначности едет наружу через отчёт — candidates сохранены.
-        } as AdapterSymbolOutcome;
-      }
-    }
-    return { status: "ambiguous", candidates };
+  if (locator.file) {
+    // Путь ограничивает множество кандидатов до оценки его кардинальности.
+    const norm = (p: string) => {
+      const normalized = p.replace(/\\/g, "/");
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    const locatorFile = norm(locator.file);
+    candidates = candidates.filter((c) => norm(c.file) === locatorFile);
   }
+  if (candidates.length === 0) return { status: "missing" };
+  if (candidates.length > 1) return { status: "ambiguous", candidates };
   return { status: "unique", candidate: candidates[0] };
 }
 
