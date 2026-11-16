@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildTelemetryReport, type TelemetryReport } from "../telemetry-report.js";
+import { buildTelemetryReport, formatTelemetryReport, type TelemetryReport } from "../telemetry-report.js";
 
 // J1 (план 20+21 v3 §15): локальный агрегатор поверх J0-телеметрии.
 //
@@ -118,19 +118,94 @@ describe("J1 агрегатор: токены и деньги", () => {
     };
     const report = buildTelemetryReport([JSON.stringify(withUsage), JSON.stringify(ev({}))]);
     expect(report.tokens.provider).toMatchObject({
-      value: "available",
+      value: "partial",
       input_tokens: 1000,
       output_tokens: 500,
       cached_tokens: 200,
       events_with_usage: 1,
       events_without_usage: 1,
     });
-    // cached не входит в сумму input/output (нет двойного учёта).
-    if (report.tokens.provider.value === "available") {
-      expect(report.tokens.provider.input_tokens).toBe(1000);
-      expect(report.tokens.provider.output_tokens).toBe(500);
-      expect(report.tokens.provider.cached_tokens).toBe(200);
+    // cached не входит в сумму input/output; событие без usage даёт partial.
+    expect(report.tokens.provider.input_tokens).toBe(1000);
+    expect(report.tokens.provider.output_tokens).toBe(500);
+    expect(report.tokens.provider.cached_tokens).toBe(200);
+    expect(buildTelemetryReport([JSON.stringify(withUsage)]).tokens.provider).toMatchObject({
+      value: "available", input_tokens: 1000, output_tokens: 500, cached_tokens: 200,
+      events_with_usage: 1, events_without_usage: 0,
+    });
+  });
+
+  it.each([
+    { label: "cost-only", usage: { cost: 0.01 }, value: "unavailable", input: "unavailable", output: "unavailable", cached: "unavailable",
+      inputCount: 0, outputCount: 0, cachedCount: 0 },
+    { label: "input-only", usage: { input_tokens: 1000 }, value: "partial", input: 1000, output: "unavailable", cached: "unavailable",
+      inputCount: 1, outputCount: 0, cachedCount: 0 },
+    { label: "output-only", usage: { output_tokens: 500 }, value: "partial", input: "unavailable", output: 500, cached: "unavailable",
+      inputCount: 0, outputCount: 1, cachedCount: 0 },
+    { label: "cached-only", usage: { cached_tokens: 200 }, value: "partial", input: "unavailable", output: "unavailable", cached: 200,
+      inputCount: 0, outputCount: 0, cachedCount: 1 },
+    { label: "input-output-no-cache", usage: { input_tokens: 1000, output_tokens: 500 }, value: "partial", input: 1000, output: 500, cached: "unavailable",
+      inputCount: 1, outputCount: 1, cachedCount: 0 },
+  ])("A14: $label usage сохраняет независимые оси без выдуманных нулей", (c) => {
+    const report = buildTelemetryReport([JSON.stringify(ev({ provider_usage: c.usage }))], { tariff_version: "test-tariff" });
+    expect(report.tokens.provider).toMatchObject({ value: c.value,
+      input_tokens: c.input, output_tokens: c.output, cached_tokens: c.cached,
+      events_with_usage: 1, events_without_usage: 0,
+      coverage: { input_tokens: { events_with_value: c.inputCount, events_without_value: 1 - c.inputCount },
+        output_tokens: { events_with_value: c.outputCount, events_without_value: 1 - c.outputCount },
+        cached_tokens: { events_with_value: c.cachedCount, events_without_value: 1 - c.cachedCount } },
+    });
+    const text = formatTelemetryReport(report).join("\n");
+    expect(text).toContain(`provider tokens: ${c.value}`);
+    expect(text).toContain(`in=${c.input}, out=${c.output}, cached=${c.cached}`);
+    expect(text).not.toMatch(/(?:in|out|cached)=0(?:[, )]|$)/);
+    expect(JSON.stringify(report)).not.toContain('"input_tokens":0');
+    if (c.label === "cost-only") {
+      expect(report.cost).toMatchObject({ value: "available", total_cost: 0.01,
+        events_with_cost: 1, events_without_cost: 0, tariff_version: "test-tariff" });
     }
+  });
+
+  it("A14: смешанные частичные строки суммируются по каждой оси и показывают denominator", () => {
+    const report = buildTelemetryReport([
+      JSON.stringify(ev({ provider_usage: { input_tokens: 1000 } })),
+      JSON.stringify(ev({ provider_usage: { output_tokens: 500, cached_tokens: 200 } })),
+      JSON.stringify(ev({ provider_usage: { input_tokens: 100, output_tokens: 50, cached_tokens: 0, cost: 0.02 } })),
+      JSON.stringify(ev({})),
+    ], { tariff_version: "test-tariff" });
+    expect(report.tokens.provider).toMatchObject({ value: "partial", input_tokens: 1100, output_tokens: 550, cached_tokens: 200,
+      events_with_usage: 3, events_without_usage: 1,
+      coverage: { input_tokens: { events_with_value: 2, events_without_value: 2 },
+        output_tokens: { events_with_value: 2, events_without_value: 2 },
+        cached_tokens: { events_with_value: 2, events_without_value: 2 } },
+    });
+    expect(report.cost).toMatchObject({ value: "partial", total_cost: 0.02, events_with_cost: 1, events_without_cost: 3 });
+    const text = formatTelemetryReport(report).join("\n");
+    expect(text).toContain("provider tokens: partial");
+    expect(text).toContain("coverage: in=2/4, out=2/4, cached=2/4");
+    expect(text).toContain("cost: partial 0.02");
+    expect(text).toContain("coverage: 1/4");
+  });
+
+  it("A14: полный usage с реальными нулями остаётся available", () => {
+    const report = buildTelemetryReport([
+      JSON.stringify(ev({ provider_usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, cost: 0 } })),
+    ], { tariff_version: "test-tariff" });
+    expect(report.tokens.provider).toMatchObject({ value: "available", input_tokens: 0, output_tokens: 0, cached_tokens: 0,
+      coverage: { input_tokens: { events_with_value: 1, events_without_value: 0 },
+        output_tokens: { events_with_value: 1, events_without_value: 0 },
+        cached_tokens: { events_with_value: 1, events_without_value: 0 } },
+    });
+    expect(report.cost).toMatchObject({ value: "available", total_cost: 0, events_with_cost: 1, events_without_cost: 0 });
+    expect(formatTelemetryReport(report).join("\n")).toContain("in=0, out=0, cached=0");
+  });
+
+  it("A14: отрицательные и нечисловые оси unavailable, валидная ось сохраняется", () => {
+    const report = buildTelemetryReport([JSON.stringify(ev({ provider_usage: {
+      input_tokens: -1, output_tokens: "500", cached_tokens: 0, cost: "0.01",
+    } }))], { tariff_version: "test-tariff" });
+    expect(report.tokens.provider).toMatchObject({ value: "partial", input_tokens: "unavailable", output_tokens: "unavailable", cached_tokens: 0 });
+    expect(report.cost.value).toBe("unavailable");
   });
 
   it("деньги: считаются только при usage И явно указанной тарифной версии; без тарифа — unavailable", () => {
