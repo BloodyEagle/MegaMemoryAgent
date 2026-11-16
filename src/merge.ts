@@ -1354,11 +1354,12 @@ export class MergeEngine {
       });
       // Import events do not apply writer retention to a lossless carried journal.
       outputDb.execSqlRun(
-        `INSERT INTO support_revisions(decision_id,support_id,edge_key,claim_digest,status_digest,edge_digest,format_version,confirmed_at,recorded_at,source,reason)
-         VALUES (?,?,?,?,?,?,?,?,?,'import',?)`,
+        `INSERT INTO support_revisions(decision_id,support_id,edge_key,claim_digest,status_digest,edge_digest,format_version,confirmed_at,recorded_at,source,reason,artifacts_digest,decision_claim_digest,confirmed_by,superseded_at)
+         VALUES (?,?,?,?,?,?,?,?,?,'import',?,?,?,?,?)`,
         decisionId, supportId, edgeKey, row.claim_digest, row.status_digest, row.edge_digest,
         row.format_version, row.confirmed_at, new Date().toISOString(),
-        mappedEdge !== undefined && String(mappedEdge) !== row.edge_key ? "edge_relinked" : null
+        mappedEdge !== undefined && String(mappedEdge) !== row.edge_key ? "edge_relinked" : null,
+        row.artifacts_digest ?? null, row.decision_claim_digest ?? null, "import", row.superseded_at ?? null
       );
       carried++;
     }
@@ -1370,7 +1371,9 @@ export class MergeEngine {
         const oldKey = String(row.edge_key);
         const mapped = edgeIdRemapping.get(`${side}:${oldKey}`);
         const key = mapped !== undefined ? String(mapped) : oldKey.startsWith(DEAD_EDGE_KEY_PREFIX) ? oldKey : `${DEAD_EDGE_KEY_PREFIX}${oldKey}`;
-        const columns = ["decision_id", "support_id", "edge_key", "claim_digest", "status_digest", "edge_digest", "format_version", "confirmed_at", "recorded_at", "source", "reason"];
+        // Dedup the complete historical payload, not just the classic fields.
+        // Missing legacy columns stay null; current observations cannot fill them.
+        const columns = ["decision_id", "support_id", "edge_key", "claim_digest", "status_digest", "edge_digest", "format_version", "confirmed_at", "recorded_at", "source", "reason", "artifacts_digest", "decision_claim_digest", "confirmed_by", "superseded_at"];
         const values = columns.map(column => column === "decision_id" ? decisionId : column === "support_id" ? supportId : column === "edge_key" ? key : row[column] ?? null);
         const duplicate = outputDb.execSqlFirst(`SELECT 1 FROM support_revisions WHERE ${columns.map(column => `${column} IS ?`).join(" AND ")}`, ...values);
         if (!duplicate) outputDb.execSqlRun(`INSERT INTO support_revisions(${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`, ...values);
