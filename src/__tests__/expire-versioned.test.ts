@@ -242,6 +242,44 @@ describe("B5: формат отчёта и флаги CLI", () => {
   });
 });
 
+describe("A07: версионный отчёт не допускает неполные или противоречивые pins", () => {
+  it.each(["claim_digest", "kind", "status", "valid_until", "removed_at"])(
+    "apply отклоняет выбранную строку без %s и не изменяет базу",
+    async (field) => {
+      insert("jr-pin", "journal", "PR #41 открыт");
+      const reviewed = reviewedReport(["jr-pin"]);
+      const candidate = reviewed.candidates.find((c) => c.id === "jr-pin")!;
+      Reflect.deleteProperty(candidate, field);
+      const reportPath = path.join(tmpDir, "incomplete.json");
+      fs.writeFileSync(reportPath, JSON.stringify(reviewed), "utf-8");
+      process.env.MEGAMEMORY_DB_PATH = path.join(tmpDir, "knowledge.db");
+
+      await expect(runExpire(["--report", reportPath, "--apply"])).rejects.toThrow(/pin|верси|поле/);
+      expect(validUntilOf("jr-pin")).toBeNull();
+      expect(db.getTimelineEntries({ tool: "expire" })).toHaveLength(0);
+    }
+  );
+
+  it("наличие pins без выбранного id запрещает legacy-fallback", () => {
+    insert("jr-missing-pin", "journal", "PR #42 открыт");
+    expect(() => expireNodes(db, ["jr-missing-pin"], "2026-11-14T00:00:00.000Z", true, new Map()))
+      .toThrow(/pin|верси/);
+    expect(validUntilOf("jr-missing-pin")).toBeNull();
+    expect(db.getTimelineEntries({ tool: "expire" })).toHaveLength(0);
+  });
+
+  it.each([true, false])("дубликат id с expire:%s отклоняется до применения", async (expire) => {
+    insert("jr-duplicate", "journal", "PR #43 открыт");
+    const reviewed = reviewedReport(["jr-duplicate"]);
+    reviewed.candidates.push({ ...reviewed.candidates[0], expire });
+    const reportPath = path.join(tmpDir, "duplicate.json");
+    fs.writeFileSync(reportPath, JSON.stringify(reviewed), "utf-8");
+    process.env.MEGAMEMORY_DB_PATH = path.join(tmpDir, "knowledge.db");
+    await expect(runExpire(["--report", reportPath, "--apply"])).rejects.toThrow(/дублик|повтор/);
+    expect(validUntilOf("jr-duplicate")).toBeNull();
+  });
+});
+
 describe("B5: старый формат — явное предупреждение в выводе", () => {
   it("apply старого отчёта печатает предупреждение о действии без защиты от устаревания", async () => {
     insert("legacy-node", "feature", "Релиз 2.1.18 влит в main 2026-11-04");
