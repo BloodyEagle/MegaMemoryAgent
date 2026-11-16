@@ -220,17 +220,6 @@ function qualificationOf(db: KnowledgeDB, node: NodeRow) {
   };
 }
 
-/** Квалификация + digest-состояние якоря: входит в отпечаток продолжения. */
-function anchorStateOf(db: KnowledgeDB, node: NodeRow) {
-  return {
-    claim: claimDigestOf(node.summary),
-    status: statusDigestOf(node.status, node.epistemic_status),
-    valid_until: node.valid_until ?? null,
-    expired: isNodeExpired(node),
-    refuted_reason: db.getLatestEpistemicReason(node.id, "refuted"),
-  };
-}
-
 // ---- E4 (план 20+21 v3 §8.4): delta-выдача — версия запрошенной проекции ----
 //
 // Та же механика, что continuation-токен M3-1: sha256 канонического JSON
@@ -305,7 +294,14 @@ function projectionStateOf(
     const row = db.getNode(ref.id);
     if (!row) return { to: ref.id, missing: true };
     const support = evidenceSupportOf(db, row, ref.description);
-    return { ...support, weak: support.weak ?? false };
+    return {
+      ...support,
+      why: row.why ?? null,
+      file_refs: parseFileRefs(row.file_refs),
+      created_via: row.created_via ?? null,
+      current_digests: currentDigestsOf(row),
+      weak: support.weak ?? false,
+    };
   });
 
   // Состав остальных списков + состояния выбранных соседей (окно раскрытия).
@@ -367,6 +363,11 @@ function projectionStateOf(
     supports,
     // Наблюдения артефактов самого узла (состав refs — тоже версионные данные).
     anchor_artifacts: artifactsDigestOf(activeArtifactRows(node, db.getNodeArtifacts(anchorId))),
+    current_digests: currentDigestsOf(node),
+    parent: node.parent_id ? (() => {
+      const parent = db.getParent(node.parent_id!);
+      return parent ? { id: parent.id, name: parent.name } : null;
+    })() : null,
     support_check: supportCheck,
   };
 }
@@ -670,8 +671,6 @@ function buildProfileProjection(
       ? ["informed_by"]
       : [...ORIENTATION_LISTS];
 
-  const anchorState = anchorStateOf(db, node);
-
   for (const list of lists) {
     const source = sources.get(list)!;
     const offset = opts?.page?.list === list ? opts.page.offset : 0;
@@ -694,6 +693,16 @@ function buildProfileProjection(
 
   // Final fit мерит ПОЛНУЮ выдачу: после каждого снятого элемента заново
   // считаются counts/dropped/incomplete и pin продолжения, без ложного offset.
+  const continuationVersions = new Map<number, string>();
+  const versionFor = (end: number) => {
+    const width = Math.max(maxNeighbors, end);
+    let version = continuationVersions.get(width);
+    if (version === undefined) {
+      version = projectionVersion(db, anchorId, node, profile, width);
+      continuationVersions.set(width, version);
+    }
+    return version;
+  };
   const finalize = () => {
     const continuations: Array<{ list: string; token: string }> = [];
     const dropped: Partial<ConceptProfileNeighborCount> = {};
@@ -715,7 +724,7 @@ function buildProfileProjection(
           offset: offset + shown.length,
           fp: fingerprint({
             anchor: anchorId, list, ids: source.ids,
-            anchor_state: anchorState,
+            anchor_state: versionFor(offset + shown.length),
             head: head.concat(shown),
           }),
           max_neighbors: ctx.maxNeighbors,
@@ -871,7 +880,7 @@ export function getConceptProfile(
       anchor: token.anchor,
       list: token.list,
       ids: source.ids,
-      anchor_state: anchorStateOf(db, anchor),
+      anchor_state: projectionVersion(db, token.anchor, anchor, token.profile, Math.max(token.max_neighbors, token.offset)),
       head,
     });
     if (fp !== token.fp) {
@@ -990,18 +999,21 @@ function recordUsage(
 // ---- Публичный вход E2: пакет ----
 
 /** Состояние элемента пакета для отпечатка продолжения. */
-function batchItemState(db: KnowledgeDB, id: string): Record<string, unknown> {
+function batchItemState(
+  db: KnowledgeDB,
+  id: string,
+  profile: GetConceptProfile,
+  maxNeighbors: number
+): Record<string, unknown> {
   const resolved = db.getAliasTarget(id) ?? id;
   const node = db.getNode(resolved);
   if (!node) return { id, status: "error" };
   return {
     id,
     resolved_id: resolved,
-    claim: claimDigestOf(node.summary),
-    status: statusDigestOf(node.status, node.epistemic_status),
-    epistemic_status: node.epistemic_status ?? null,
-    valid_until: node.valid_until ?? null,
-    expired: isNodeExpired(node),
+    // Тот же канонический существенный снимок, что delta: не только claim,
+    // но имя, rationale, refs, квалификация, доказательства и артефакты.
+    projection: projectionVersion(db, resolved, node, profile, maxNeighbors),
   };
 }
 
@@ -1012,7 +1024,7 @@ function batchItemState(db: KnowledgeDB, id: string): Record<string, unknown> {
  */
 export function getConceptBatch(db: KnowledgeDB, input: ConceptBatchInput): ConceptBatchOutput {
   const maxTokens = validateBudget(input.max_tokens, "общий бюджет пакета");
-  const maxNeighbors = validateMaxNeighbors(input.max_neighbors);
+  let maxNeighbors = validateMaxNeighbors(input.max_neighbors);
   let ids: string[];
   let profile: GetConceptProfile;
   let resume: BatchContinuationV1 | undefined;
@@ -1036,9 +1048,16 @@ export function getConceptBatch(db: KnowledgeDB, input: ConceptBatchInput): Conc
         `continuation: токен выдан для profile=${token.profile}, а запрос — ${profile}; повтори чтение.`
       );
     }
+    const tokenWidth = validateMaxNeighbors(token.max_neighbors);
+    if (input.max_neighbors !== undefined && maxNeighbors !== tokenWidth) {
+      throw new Error(`continuation: max_neighbors=${maxNeighbors} не совпадает с шириной ${tokenWidth} из токена пакета — повтори чтение с тем же лимитом.`);
+    }
+    // Ширина выдачи и canonical pin — один контракт; без явного лимита
+    // продолжение наследует токен, а не DEFAULT_MAX_NEIGHBORS.
+    maxNeighbors = tokenWidth;
     // Валидация версии уже выданного набора: состав + состояние каждого
     // обработанного элемента.
-    const head = ids.slice(0, token.offset).map((id) => batchItemState(db, id));
+    const head = ids.slice(0, token.offset).map((id) => batchItemState(db, id, token.profile, maxNeighbors));
     const fp = fingerprint({ ids, head });
     if (fp !== token.fp) {
       throw new Error(
@@ -1163,7 +1182,7 @@ export function getConceptBatch(db: KnowledgeDB, input: ConceptBatchInput): Conc
     const processed = startAt + meta.ok + meta.failed;
     delete meta.continuation;
     if (processed < ids.length) {
-      const head = ids.slice(0, processed).map((id) => batchItemState(db, id));
+      const head = ids.slice(0, processed).map((id) => batchItemState(db, id, profile, maxNeighbors));
       meta.continuation = encodeContinuation({
         v: 1, kind: "batch", profile, ids, offset: processed,
         fp: fingerprint({ ids, head }),

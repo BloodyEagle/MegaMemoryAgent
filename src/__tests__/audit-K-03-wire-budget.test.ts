@@ -5,11 +5,11 @@ import { z } from "zod";
 import { ensureSchema } from "../migrate-schema.js";
 import { addNode, auditFixture, type AuditFixture } from "./helpers/audit.js";
 import type { KnowledgeDB } from "../db.js";
-import type { UnderstandInput, UnderstandOutput, ConceptBatchOutput } from "../types.js";
+import type { UnderstandInput, UnderstandOutput, ConceptBatchOutput, ConceptProfileOutput, UpdateConceptInput } from "../types.js";
 import type { ConceptToolArgs } from "../concept-profile.js";
 
 type WireResponse = { content: Array<{ type: string; text: string }>; isError?: boolean; meta?: { reason: string } };
-type Handler = (params: UnderstandInput | ConceptToolArgs) => Promise<WireResponse>;
+type Handler = (params: UnderstandInput | ConceptToolArgs | UpdateConceptInput) => Promise<WireResponse>;
 const boundary = vi.hoisted(() => ({ handlers: new Map<string, Handler>(), schemas: new Map<string, unknown>() }));
 
 // Only the SDK transport/registration boundary is replaced. The production
@@ -110,6 +110,83 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
     const page2 = JSON.parse(second.content[0].text) as ConceptBatchOutput;
     expect(page2.batch.filter(item => item.status === "ok").map(item => item.id)).toEqual(ids.slice(placed.length));
     expect(page2.meta.budget_skipped).toBe(0);
+  });
+
+  it.each(["why", "file_refs"] as const)("A08 MCP evidence continuation rejects anchor %s drift without summary changes", async field => {
+    await wireResponse(db => {
+      addNode(db, "page-anchor", { summary: "Complete unchanged anchor wording", why: "Original rationale", file_refs: ["src/original.ts"] });
+      for (let i = 0; i < 3; i++) {
+        addNode(db, `page-support-${i}`, { summary: `Complete support wording ${i}`, file_refs: [`src/support-${i}.ts`] });
+        db.insertEdge({ from_id: "page-anchor", to_id: `page-support-${i}`, relation: "informed_by", description: `Support rationale ${i}` });
+      }
+    }, { query: "bootstrap", max_tokens: 1500 });
+    const get = boundary.handlers.get("get_concept")!;
+    const first = await get({ id: "page-anchor", profile: "evidence", max_neighbors: 1, max_tokens: 10000 });
+    expect(first.isError).not.toBe(true);
+    const page = JSON.parse(first.content[0].text) as ConceptProfileOutput;
+    expect(page.supports).toHaveLength(1);
+    const continuation = page.meta.continuations!.find(item => item.list === "informed_by")!.token;
+    const changed = await boundary.handlers.get("update_concept")!({ id: "page-anchor", changes: field === "why" ? { why: "Changed rationale only" } : { file_refs: ["src/changed.ts"] } });
+    expect(changed.isError, changed.content[0].text).not.toBe(true);
+    const resumed = await get({ continuation });
+    expect(resumed.isError, resumed.content[0].text).toBe(true);
+    expect(resumed.content[0].text).toContain("version_conflict");
+  });
+
+  it("A08 MCP batch continuation rejects issued card rationale drift", async () => {
+    const ids = Array.from({ length: 5 }, (_, i) => `mcp-pin-${i}`);
+    await wireResponse(db => {
+      for (const id of ids) addNode(db, id, { summary: "Unchanged consumer wording. ".repeat(12), why: "Original rationale" });
+    }, { query: "bootstrap", max_tokens: 1500 });
+    const get = boundary.handlers.get("get_concept")!;
+    const first = await get({ ids, max_tokens: 1300 });
+    expect(first.isError).not.toBe(true);
+    const page = JSON.parse(first.content[0].text) as ConceptBatchOutput;
+    expect(page.batch[0].status).toBe("ok");
+    expect(page.meta.continuation).toEqual(expect.any(String));
+    const changed = await boundary.handlers.get("update_concept")!({ id: ids[0], changes: { why: "Changed rationale only" } });
+    expect(changed.isError).not.toBe(true);
+    const resumed = await get({ continuation: page.meta.continuation });
+    expect(resumed.isError).toBe(true);
+    expect(resumed.content[0].text).toContain("version_conflict");
+  });
+
+  it("A08 MCP batch continuation inherits token neighbor width and rejects explicit mismatch", async () => {
+    const ids = ["width-a", "width-b", "width-c"];
+    await wireResponse(db => {
+      addNode(db, ids[0], { summary: "First bounded batch claim" });
+      addNode(db, ids[1], { kind: "module", summary: "Second bounded batch claim", file_refs: [`src/${"b".repeat(2000)}.ts`] });
+      addNode(db, ids[2], { summary: "Third bounded batch claim", file_refs: [`src/${"c".repeat(20000)}.ts`] });
+      for (const id of ["width-b1", "width-b2"]) addNode(db, id, { parent_id: ids[1], summary: "Child pointer wording" });
+    }, { query: "bootstrap", max_tokens: 1500 });
+    const get = boundary.handlers.get("get_concept")!;
+    const first = await get({ ids, profile: "orientation", max_neighbors: 1, max_tokens: 1600 });
+    expect(first.isError, first.content[0].text).not.toBe(true);
+    const page1 = JSON.parse(first.content[0].text) as ConceptBatchOutput;
+    expect(page1.batch.filter(item => item.status === "ok").map(item => item.id)).toEqual([ids[0]]);
+    expect(page1.meta.continuation).toEqual(expect.any(String));
+
+    const second = await get({ continuation: page1.meta.continuation, max_tokens: 6000 });
+    expect(second.isError, second.content[0].text).not.toBe(true);
+    const page2 = JSON.parse(second.content[0].text) as ConceptBatchOutput;
+    expect(page2.batch.filter(item => item.status === "ok").map(item => item.id)).toEqual([ids[1]]);
+    expect(page2.meta.continuation).toEqual(expect.any(String));
+    const card = page2.batch[0].card as ConceptProfileOutput;
+    expect.soft(card.children?.map(child => child.id)).toEqual(["width-b1"]);
+    expect.soft(card.meta.dropped?.children).toBe(1);
+
+    const mismatch = await get({ continuation: page1.meta.continuation, max_neighbors: 20, max_tokens: 6000 });
+    expect.soft(mismatch.isError).toBe(true);
+    expect.soft(mismatch.content[0].text).toMatch(/max_neighbors.*(?:1|токен)/);
+    const sameWidth = await get({ continuation: page1.meta.continuation, max_neighbors: 1, max_tokens: 6000 });
+    expect(sameWidth.isError).not.toBe(true);
+    expect((JSON.parse(sameWidth.content[0].text) as ConceptBatchOutput).batch[0].card).toEqual(card);
+
+    const changed = await boundary.handlers.get("update_concept")!({ id: "width-b1", changes: { name: "Changed emitted child name" } });
+    expect(changed.isError).not.toBe(true);
+    const third = await get({ continuation: page2.meta.continuation, max_tokens: 6000 });
+    expect(third.isError).toBe(true);
+    expect(third.content[0].text).toContain("version_conflict");
   });
 
   it.each(["orientation", "evidence", "full"] as const)("A05 MCP %s final wire fits all metadata, delta and unchanged or explicitly refuses", async profile => {
