@@ -964,6 +964,26 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
     });
   });
 
+  it("F4: реальный payload адаптера token-economy-ts проходит fail-closed проверку A11", async () => {
+    // Снят с живого адаптера (scripts/graph-tool.js, op=rdeps) на этом репозитории:
+    // node scripts/graph-tool.js op=rdeps file=src/freshness.ts (cwd = repo).
+    // Пин контракта: поля importedBy/importedByTotal/scope.scanRoot/
+    // completeness.complete реально есть, а не только в синтетических payload'ах.
+    const realPayload = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dirname, "fixtures", "adapter-rdeps-real.json"), "utf8")
+    ) as object;
+    const scriptsDir = writeStub({ symbols: {}, rdeps: {}, rdepsRaw: realPayload });
+    const cfg = resolveAdapterConfig({ graph_tool: scriptsDir }, projDir)!;
+    const outcome = await adapterRdepsOfFile(cfg, "src/freshness.ts");
+    expect(outcome).toEqual({
+      dependents: ["src/index.ts"],
+      total: 1,
+      complete: true,
+      scan_root: "src",
+      error: null,
+    });
+  });
+
   it("неполный import-граф (importedByTotal > выданных): префикс не весь граф", async () => {
     const scriptsDir = path.join(projDir, "scripts");
     fs.mkdirSync(scriptsDir, { recursive: true });
