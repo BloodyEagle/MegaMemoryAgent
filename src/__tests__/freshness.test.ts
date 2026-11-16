@@ -36,7 +36,7 @@ import {
   loadFreshnessIndex,
   normalizeSourceKey,
 } from "../freshness.js";
-import { adapterResolveSymbol, resolveAdapterConfig } from "../code-adapter.js";
+import { adapterRdepsOfFile, adapterResolveSymbol, resolveAdapterConfig } from "../code-adapter.js";
 import type { FreshnessIndex } from "../types.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
@@ -248,7 +248,7 @@ describe("P2.1: адресная перепроверка связанных з�
         "  console.log(JSON.stringify({ name: kv.name, definedIn: defs }));",
         "} else if (kv.op === 'rdeps') {",
         "  const r = idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 };",
-        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' } }, r)));",
+        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' }, completeness: { complete: true } }, r)));",
         "} else { console.log(JSON.stringify({ error: 'unknown op' })); }",
       ].join("\n"),
       "utf8"
@@ -619,8 +619,8 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
         "  const defs = (idx.symbols[kv.name] || []).filter(d => !kv.in || d.owner === kv.in);",
         "  console.log(JSON.stringify({ name: kv.name, definedIn: defs }));",
         "} else if (kv.op === 'rdeps') {",
-        "  const r = idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 };",
-        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' } }, r)));",
+        "  const r = Object.prototype.hasOwnProperty.call(idx, 'rdepsRaw') ? idx.rdepsRaw : Object.assign({ file: kv.file, scope: { scanRoot: 'src' }, completeness: { complete: true } }, idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 });",
+        "  console.log(JSON.stringify(r));",
         "} else { console.log(JSON.stringify({ error: 'unknown op' })); }",
       ].join("\n"),
       "utf8"
@@ -794,6 +794,67 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
     expect(r.symbols[0]?.note).toContain("не сконфигурирован");
   });
 
+  it.each([
+    { label: "пустой объект", response: {} },
+    { label: "importedBy не массив", response: { importedBy: "x" } },
+    { label: "неполная форма с complete не boolean", response: { importedBy: [], completeness: { complete: "yes" } } },
+    { label: "нет importedByTotal", response: { importedBy: [], scope: { scanRoot: "src" }, completeness: { complete: true } } },
+    { label: "importedByTotal не число", response: { importedBy: [], importedByTotal: "0", scope: { scanRoot: "src" }, completeness: { complete: true } } },
+    { label: "нет scope", response: { importedBy: [], importedByTotal: 0, completeness: { complete: true } } },
+    { label: "scope.scanRoot не строка", response: { importedBy: [], importedByTotal: 0, scope: { scanRoot: 123 }, completeness: { complete: true } } },
+    { label: "нет completeness", response: { importedBy: [], importedByTotal: 0, scope: { scanRoot: "src" } } },
+    { label: "нет completeness.complete", response: { importedBy: [], importedByTotal: 0, scope: { scanRoot: "src" }, completeness: {} } },
+    { label: "completeness.complete не boolean", response: { importedBy: [], importedByTotal: 0, scope: { scanRoot: "src" }, completeness: { complete: "yes" } } },
+    { label: "null вместо ответа", response: null },
+    { label: "массив вместо ответа", response: [] },
+  ])("A11: $label — не доказательство пустого полного графа", async ({ response }) => {
+    const scriptsDir = writeStub({ symbols: {}, rdeps: {}, rdepsRaw: response });
+    nodeWithRef("callee", ["src/callee.ts"], "fact");
+    writeProjFile("src/callee.ts", "export const CALLEE = 1;\n");
+    await checkArtifacts(db, { node_ids: ["callee"], cwd: projDir });
+    writeProjFile("src/callee.ts", "export const CALLEE = 2;\n");
+    const cfg = resolveAdapterConfig({ graph_tool: scriptsDir }, projDir)!;
+    const outcome = await adapterRdepsOfFile(cfg, "src/callee.ts");
+    const report = await checkFreshness(db, {
+      sources: ["src/callee.ts"],
+      with_dependencies: true,
+      adapter: { graph_tool: scriptsDir },
+      repo_root: projDir,
+    });
+    expect(outcome.complete).toBe(false);
+    expect(outcome.error).toEqual(expect.any(String));
+    expect(outcome.error).not.toBe("");
+    expect(outcome.dependents).toEqual([]);
+    expect(outcome.total).toBeNull();
+    expect(outcome.scan_root).toBeNull();
+    expect(report.sources[0]?.status).toBe("changed");
+    expect(report.dependencies).toEqual([]);
+    expect(report.summary.limitations.join(" ")).toContain("ошибка adapter");
+    expect(report.summary.limitations.join(" ")).toContain("это не «зависимостей нет»");
+  });
+
+  it.each([
+    { label: "валидный пустой граф", importedBy: [], total: 0, declaredComplete: true, complete: true },
+    { label: "валидный непустой граф", importedBy: [{ file: "src/caller.ts" }], total: 1, declaredComplete: true, complete: true },
+    { label: "объявленная неполнота", importedBy: [], total: 0, declaredComplete: false, complete: false },
+    { label: "усечённая выдача", importedBy: [{ file: "src/caller.ts" }], total: 7, declaredComplete: true, complete: false },
+  ])("A11: $label — форма и статическая полнота различаются", async ({ importedBy, total, declaredComplete, complete }) => {
+    const scriptsDir = writeStub({
+      symbols: {},
+      rdeps: {},
+      rdepsRaw: { importedBy, importedByTotal: total, scope: { scanRoot: "src" }, completeness: { complete: declaredComplete } },
+    });
+    const cfg = resolveAdapterConfig({ graph_tool: scriptsDir }, projDir)!;
+    const outcome = await adapterRdepsOfFile(cfg, "src/callee.ts");
+    expect(outcome).toEqual({
+      dependents: importedBy.map((entry) => entry.file),
+      total,
+      complete,
+      scan_root: "src",
+      error: null,
+    });
+  });
+
   it("неполный import-граф (importedByTotal > выданных): префикс не весь граф", async () => {
     const scriptsDir = path.join(projDir, "scripts");
     fs.mkdirSync(scriptsDir, { recursive: true });
@@ -808,7 +869,7 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
         "if (kv.op === 'info') { console.log(JSON.stringify({ projectType: 'ts' })); }",
         "else if (kv.op === 'rdeps') {",
         "  const r = idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 };",
-        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' } }, r)));",
+        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' }, completeness: { complete: true } }, r)));",
         "} else { console.log(JSON.stringify({ error: 'x' })); }",
       ].join("\n"),
       "utf8"
@@ -854,7 +915,7 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
         "if (kv.op === 'info') { console.log(JSON.stringify({ projectType: 'ts' })); }",
         "else if (kv.op === 'rdeps') {",
         "  const r = idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 };",
-        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' } }, r)));",
+        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' }, completeness: { complete: true } }, r)));",
         "} else { console.log(JSON.stringify({ error: 'x' })); }",
       ].join("\n"),
       "utf8"

@@ -261,27 +261,34 @@ export async function adapterRdepsOfFile(
     scope?: unknown;
     error?: unknown;
   };
-  if (!data || typeof data !== "object" || data.error != null) {
-    const err = data && typeof data.error === "string" ? data.error : "op=rdeps ответил без importedBy";
+  if (!data || typeof data !== "object" || Array.isArray(data) || data.error != null) {
+    const err = data && typeof data.error === "string" && data.error ? data.error : "op=rdeps ответил без importedBy";
     return { dependents: [], total: null, complete: false, scan_root: null, error: err };
   }
+  const scopeRoot = data.scope as { scanRoot?: unknown } | null | undefined;
+  const completeness = data.completeness as { complete?: unknown } | null | undefined;
+  if (
+    !Array.isArray(data.importedBy) ||
+    typeof data.importedByTotal !== "number" ||
+    !scopeRoot || typeof scopeRoot !== "object" || Array.isArray(scopeRoot) || typeof scopeRoot.scanRoot !== "string" ||
+    !completeness || typeof completeness !== "object" || Array.isArray(completeness) || typeof completeness.complete !== "boolean"
+  ) {
+    return {
+      dependents: [], total: null, complete: false, scan_root: null,
+      error: "op=rdeps ответил без обязательных importedBy/importedByTotal/scope.scanRoot/completeness.complete или с неверными типами",
+    };
+  }
   const dependents: string[] = [];
-  if (Array.isArray(data.importedBy)) {
-    for (const raw of data.importedBy) {
-      if (raw && typeof raw === "object" && typeof (raw as Record<string, unknown>).file === "string") {
-        dependents.push((raw as Record<string, string>).file);
-      }
+  for (const raw of data.importedBy) {
+    if (raw && typeof raw === "object" && typeof (raw as Record<string, unknown>).file === "string") {
+      dependents.push((raw as Record<string, string>).file);
     }
   }
-  const scopeRoot = data.scope as { scanRoot?: unknown } | undefined;
   return {
     dependents,
-    total: typeof data.importedByTotal === "number" ? data.importedByTotal : dependents.length,
-    complete:
-      (!data.completeness || (data.completeness as { complete?: unknown }).complete !== false) &&
-      (typeof data.importedByTotal !== "number" || data.importedByTotal === dependents.length),
-    scan_root:
-      scopeRoot && typeof scopeRoot.scanRoot === "string" ? scopeRoot.scanRoot : null,
+    total: data.importedByTotal,
+    complete: completeness.complete && data.importedByTotal === dependents.length,
+    scan_root: scopeRoot.scanRoot,
     error: null,
   };
 }
