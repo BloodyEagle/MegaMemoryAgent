@@ -4,7 +4,6 @@ import { seedHttpDb } from "./helpers/audit-http.js";
 import { startAuditHttpSrc, type AuditHttpSrc } from "./helpers/audit-http-src.js";
 import { auditFixture, deferred, type AuditFixture } from "./helpers/audit.js";
 import { ensureSchema } from "../migrate-schema.js";
-import { KnowledgeDB } from "../db.js";
 
 /**
  * B-04 (аудит 2026-11-12): исторический /api/graph/at показывал узел,
@@ -25,11 +24,7 @@ import { KnowledgeDB } from "../db.js";
 const REMOVED_REASON = "synthetic historical repro";
 const REMOVED_SUMMARY = "OLD visible summary removed";
 
-let fixture: AuditFixture;
-let writer: KnowledgeDB | undefined;
-
-async function startSeededServer() {
-  fixture = auditFixture();
+async function startSeededServer(fixture: AuditFixture) {
   const dbFile = await seedHttpDb(fixture, (db) => {
     ensureSchema(db);
     for (const id of ["a", "b", "removed"]) {
@@ -41,8 +36,8 @@ async function startSeededServer() {
     db.softDeleteNode("removed", REMOVED_REASON);
   });
   const server = await startAuditHttpSrc(fixture, dbFile);
-  writer = new KnowledgeDB(dbFile);
-  return { dbFile, server };
+  const writer = fixture.db(dbFile);
+  return { dbFile, server, writer };
 }
 
 function proxyReply(server: AuditHttpSrc) {
@@ -195,8 +190,9 @@ describe("B-04 — историческая карточка узла и чес�
   });
 
   it("HTTP: GET /api/node/:id?at возвращает карточку узла, существовавшего на момент t", async () => {
-    const { server } = await startSeededServer();
+    const fixture = auditFixture();
     try {
+      const { server, writer } = await startSeededServer(fixture);
       const at = "2020-01-02 00:00:00";
       // Вход red-состояния: исторический граф видит узел, текущий — нет.
       const graphAt = await server.request(`/api/graph/at?t=${encodeURIComponent(at)}`);
@@ -224,15 +220,14 @@ describe("B-04 — историческая карточка узла и чес�
       // (synthetic-записи bounds деривятся из узлов и сюда не попадают).
       expect(writer!.execSqlAll("SELECT * FROM timeline")).toHaveLength(0);
     } finally {
-      writer?.close();
-      writer = undefined;
       await fixture.close();
     }
-  }, 60_000);
+  });
 
   it("DOM: в Timeline клик по видимому удалённому узлу открывает историческую карточку без транспортного баннера", async () => {
-    const { server } = await startSeededServer();
+    const fixture = auditFixture();
     try {
+      const { server, writer } = await startSeededServer(fixture);
       const ui = await auditDom({ reply: proxyReply(server) });
       try {
         await ui.invoke("enterTimelineMode");
@@ -258,11 +253,9 @@ describe("B-04 — историческая карточка узла и чес�
         ui.close();
       }
     } finally {
-      writer?.close();
-      writer = undefined;
       await fixture.close();
     }
-  }, 60_000);
+  });
 
   it("DOM: 404 карточки показывает «узел не найден» в панели, не Server unreachable", async () => {
     const reply = ({ url }: AuditDomRequest): AuditDomReply | undefined => {

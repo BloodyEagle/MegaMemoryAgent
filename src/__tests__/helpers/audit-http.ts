@@ -63,21 +63,36 @@ export async function startAuditHttp(fixture: AuditFixture, dbFile: string, opti
     port = reservation.port;
     await fixture.release(reservation);
   }
-  if (port === 4321 || options.retry?.port === 4321) throw new AuditHarnessError("Port 4321 is forbidden in audit tests");
-  const signals = new EventEmitter();
-  const profile = fixture.profile();
-  const dbEnv = options.env?.MEGAMEMORY_DB_PATH ?? "";
-  if (dbEnv) {
-    const relative = path.relative(fixture.root, path.resolve(dbEnv));
-    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      throw new AuditHarnessError("MEGAMEMORY_DB_PATH must remain inside the owned audit fixture");
-    }
-  }
   const extraArgs = options.extraArgs ?? [];
   if (extraArgs.some((arg) => /^--(?:db|port|host)(?:=|$)/.test(arg))) {
     throw new AuditHarnessError("extraArgs must not override the isolated database or loopback binding");
   }
-  const child = spawn(process.execPath, [serveScript, "serve", "--host", "127.0.0.1", "--port", String(port), "--db", dbFile, ...extraArgs], {
+  return startAuditHttpProcess(fixture, dbFile, {
+    args: [serveScript, "serve", "--host", "127.0.0.1", "--port", String(port), "--db", dbFile, ...extraArgs],
+    port, retry: options.retry, env: options.env,
+  });
+}
+
+/** Both adapters own one Node process; readiness and transport share fixture cleanup. */
+export async function startAuditHttpProcess(fixture: AuditFixture, dbFile: string, options: {
+  args: string[];
+  port: number;
+  retry?: Reservation;
+  env?: NodeJS.ProcessEnv;
+}) {
+  if (options.port === 4321 || options.retry?.port === 4321) throw new AuditHarnessError("Port 4321 is forbidden in audit tests");
+  const dbEnv = options.env?.MEGAMEMORY_DB_PATH ?? "";
+  for (const [name, file] of [["dbFile", dbFile], ["MEGAMEMORY_DB_PATH", dbEnv]]) {
+    if (!file) continue;
+    // --db and relative env paths are resolved by the child from its owned cwd.
+    const relative = path.relative(fixture.root, path.resolve(fixture.root, file));
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new AuditHarnessError(`${name} must remain inside the owned audit fixture`);
+    }
+  }
+  const signals = new EventEmitter();
+  const profile = fixture.profile();
+  const child = spawn(process.execPath, options.args, {
     cwd: fixture.root,
     env: {
       ...profile.env, ...options.env,
@@ -110,41 +125,65 @@ export async function startAuditHttp(fixture: AuditFixture, dbFile: string, opti
   function diagnostics() {
     return JSON.stringify({ pid: child.pid, exitCode: child.exitCode, signal: child.signalCode, stdout, stderr });
   }
-  async function close() {
-    if (closed) return;
-    child.kill("SIGTERM");
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!closed) child.kill("SIGKILL");
-        reject(new AuditCleanupError(`Owned HTTP child did not close: ${diagnostics()}`));
-      }, 5000);
-      finished.promise.then(() => { clearTimeout(timer); resolve(); });
-    });
+  async function waitForClose(timeout: number) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        finished.promise.then(() => true),
+        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeout); }),
+      ]);
+    } finally { clearTimeout(timer); }
   }
-  fixture.track({ close });
+  const requests = new Map<http.ClientRequest, Promise<void>>();
+  let closing: Promise<void> | undefined;
+  const resource = fixture.track({
+    close: () => closing ??= (async () => {
+      for (const req of requests.keys()) req.destroy();
+      await Promise.all(requests.values());
+      if (closed) return;
+      child.kill("SIGTERM");
+      if (await waitForClose(1000)) return;
+      child.kill("SIGKILL");
+      // kill() is not close: pipes and native Windows handles must finish first.
+      if (!await waitForClose(2000)) throw new AuditCleanupError(`Owned HTTP child did not close after SIGKILL: ${diagnostics()}`);
+    })(),
+  });
+  let releasing: Promise<void> | undefined;
+  const close = () => releasing ??= closing ?? fixture.release(resource);
+  // One deadline for the entire startup, including the owned-port retry prompt.
+  // Leave room inside db's 15s test budget for TERM/KILL and native fixture cleanup.
+  const readyBy = Date.now() + 7000;
   async function waitForStdout(predicate: () => boolean, description: string) {
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => finish(new AuditHarnessError(`Readiness timeout (${description}): ${diagnostics()}`)), 8000);
+      const timer = setTimeout(() => finish(new AuditHarnessError(`Readiness timeout (${description}): ${diagnostics()}`)), Math.max(0, readyBy - Date.now()));
       const finish = (error?: Error) => { clearTimeout(timer); signals.off("change", check); error ? reject(error) : resolve(); };
       const check = () => {
-        if (predicate()) finish();
-        else if (startupError || closed) finish(new AuditHarnessError(`HTTP child failed before ${description}: ${diagnostics()}`, { cause: startupError }));
+        if (startupError || closed) finish(new AuditHarnessError(`HTTP child failed before ${description}: ${diagnostics()}`, { cause: startupError }));
+        else if (predicate()) finish();
       };
       signals.on("change", check);
       check();
     });
   }
-  if (options.retry) {
-    await waitForStdout(() => stdout.includes("Enter a different port"), "owned-port retry prompt");
-    await fixture.release(options.retry);
-    child.stdin.write(`${options.retry.port}\n`);
+  let origin: string;
+  try {
+    if (options.retry) {
+      await waitForStdout(() => stdout.includes("Enter a different port"), "owned-port retry prompt");
+      await fixture.release(options.retry);
+      child.stdin.write(`${options.retry.port}\n`);
+    }
+    const expectedPort = options.retry?.port ?? options.port;
+    // A 403 is a product outcome, not failed readiness; port 0 uses the bound banner.
+    const boundPort = expectedPort === 0 ? "[1-9]\\d*" : String(expectedPort);
+    const banner = new RegExp(`Local:\\s+(http://127\\.0\\.0\\.1:${boundPort})(?=\\s|$)[\\s\\S]*?Press Ctrl\\+C to stop\\.`);
+    await waitForStdout(() => banner.test(stdout), "complete Local URL banner on stdout");
+    origin = banner.exec(stdout)![1];
+    if (Number(new URL(origin).port) === 4321) throw new AuditHarnessError("Port 4321 is forbidden in audit tests");
+  } catch (error) {
+    try { await close(); }
+    catch (cleanup) { throw new AuditHarnessError("HTTP startup and cleanup failed", { cause: new AggregateError([error, cleanup]) }); }
+    throw error;
   }
-  const expectedPort = options.retry?.port ?? port;
-  // The retry path may print two banners. Wait for the explicitly chosen bound port,
-  // not for a successful endpoint response (a 403 is the W-05 product assertion).
-  const banner = new RegExp(`Local:\\s+(http://127\\.0\\.0\\.1:${expectedPort})(?=\\s|$)[\\s\\S]*?Press Ctrl\\+C to stop\\.`);
-  await waitForStdout(() => banner.test(stdout), "complete Local URL banner on stdout");
-  const origin = banner.exec(stdout)![1];
 
   function request(route: string, init: { method?: string; body?: string; headers?: Record<string, string> } = {}): Promise<AuditHttpResponse> {
     if (!route.startsWith("/") || route.startsWith("//")) throw new AuditHarnessError("Only relative requests to the owned loopback server are allowed");
@@ -153,10 +192,12 @@ export async function startAuditHttp(fixture: AuditFixture, dbFile: string, opti
       let status: number | null = null;
       let headers: http.IncomingHttpHeaders = {};
       let settled = false;
+      const done = deferred<void>();
       const finish = (transportError: string | null) => {
         if (settled) return;
         settled = true;
-        resolve({ status, text, headers, transportError });
+        req.destroy();
+        void done.promise.then(() => resolve({ status, text, headers, transportError }));
       };
       const req = http.request(new URL(route, origin), {
         method: init.method ?? "GET", agent: false,
@@ -170,7 +211,14 @@ export async function startAuditHttp(fixture: AuditFixture, dbFile: string, opti
         res.on("error", (error) => finish(String(error)));
         res.on("aborted", () => finish("HTTP response aborted"));
       });
-      req.setTimeout(3000, () => req.destroy(new Error("Owned HTTP request exceeded 3000 ms")));
+      const timer = setTimeout(() => req.destroy(new Error("Owned HTTP request exceeded 3000 ms")), 3000);
+      requests.set(req, done.promise);
+      req.once("close", () => {
+        clearTimeout(timer);
+        requests.delete(req);
+        done.resolve();
+        finish("HTTP request closed before response completed");
+      });
       // A reset/exit is an observed product outcome, never a rejection before expect(status).
       req.on("error", (error) => finish(String(error)));
       req.end(init.body);
@@ -185,6 +233,11 @@ export async function startAuditHttp(fixture: AuditFixture, dbFile: string, opti
     let streamError: string | null = null;
     let stopped = false;
     const opened = deferred<number | null>();
+    const done = deferred<void>();
+    const stop = () => {
+      stopped = true;
+      for (const waiter of waiters.splice(0)) waiter.resolve(undefined);
+    };
     const notify = (message: AuditSseEvent) => {
       const index = waiters.findIndex((waiter) => waiter.predicate(message));
       if (index < 0) messages.push(message); else waiters.splice(index, 1)[0].resolve(message);
@@ -206,12 +259,30 @@ export async function startAuditHttp(fixture: AuditFixture, dbFile: string, opti
         }
       });
       res.on("error", (error) => { if (!stopped) streamError = String(error); });
+      res.on("aborted", () => { if (!stopped) streamError = "SSE response aborted"; stop(); });
+      res.on("end", stop);
     });
-    req.on("error", (error) => { if (!stopped) streamError = String(error); opened.resolve(null); });
-    const openingTimer = setTimeout(() => req.destroy(new Error("Owned SSE readiness exceeded 5000 ms")), 5000);
+    req.on("error", (error) => { if (!stopped) streamError = String(error); opened.resolve(null); stop(); });
+    const openingTimer = setTimeout(() => req.destroy(new Error("Owned SSE readiness exceeded 3000 ms")), 3000);
+    requests.set(req, done.promise);
+    req.once("close", () => { clearTimeout(openingTimer); requests.delete(req); opened.resolve(null); stop(); done.resolve(); });
+    // Track before awaiting headers: fixture cleanup also owns failed/pending opens.
+    let closing: Promise<void> | undefined;
+    const resource = fixture.track({
+      close: () => closing ??= (async () => {
+        clearTimeout(openingTimer);
+        stop();
+        stream?.destroy();
+        req.destroy();
+        await done.promise;
+      })(),
+    });
+    let releasing: Promise<void> | undefined;
+    const close = () => releasing ??= closing ?? fixture.release(resource);
     const status = await opened.promise;
     clearTimeout(openingTimer);
-    const subscription = fixture.track({
+    if (status !== 200 || stopped) await close();
+    return {
       status,
       error: () => streamError,
       next: (predicate: (event: AuditSseEvent) => boolean, timeout = 5000): Promise<AuditSseEvent | undefined> => {
@@ -224,16 +295,10 @@ export async function startAuditHttp(fixture: AuditFixture, dbFile: string, opti
           waiters.push(waiter);
         });
       },
-      close: () => {
-        stopped = true;
-        for (const waiter of waiters.splice(0)) waiter.resolve(undefined);
-        stream?.destroy();
-        req.destroy();
-      },
-    });
-    return subscription;
+      close,
+    };
   }
-  return { origin, port: Number(new URL(origin).port), request, events, diagnostics, alive: () => child.exitCode === null && child.signalCode === null && !closed };
+  return { origin, port: Number(new URL(origin).port), request, events, close, diagnostics, alive: () => child.exitCode === null && child.signalCode === null && !closed };
 }
 
 export type AuditHttp = Awaited<ReturnType<typeof startAuditHttp>>;
