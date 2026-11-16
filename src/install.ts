@@ -2,6 +2,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomUUID } from "node:crypto";
 import pc from "picocolors";
 import { success, skip, error, info, heading, warn, multiSelect } from "./cli-utils.js";
 import { INSTRUCTIONS_STAMP_MARKER, instructionsStamp } from "./instructions.js";
@@ -293,14 +294,14 @@ function codexInvocation(executable: string): { executable: string; args: string
  */
 function upsertAgentsMdBlock(filePath: string, block: string): "created" | "replaced" | "appended" {
   if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, block);
+    writeFileSyncAtomic(filePath, block);
     return "created";
   }
 
   const content = fs.readFileSync(filePath, "utf-8");
   const markerIdx = content.indexOf(AGENTS_MD_MARKER);
   if (markerIdx === -1) {
-    fs.writeFileSync(filePath, content.replace(/\r?\n*$/, "\n\n") + block);
+    writeFileSyncAtomic(filePath, content.replace(/\r?\n*$/, "\n\n") + block);
     return "appended";
   }
 
@@ -324,7 +325,7 @@ function upsertAgentsMdBlock(filePath: string, block: string): "created" | "repl
       content.slice(0, blockStart) +
       block +
       content.slice(endIdx + AGENTS_MD_END.length).replace(/^\n+/, "");
-    fs.writeFileSync(filePath, updated);
+    writeFileSyncAtomic(filePath, updated);
     return "replaced";
   }
 
@@ -332,7 +333,7 @@ function upsertAgentsMdBlock(filePath: string, block: string): "created" | "repl
   const nextHeading = content.indexOf("\n## ", markerIdx);
   const cutEnd = nextHeading === -1 ? content.length : nextHeading + 1;
   const updated = content.slice(0, markerIdx) + block + content.slice(cutEnd);
-  fs.writeFileSync(filePath, updated);
+  writeFileSyncAtomic(filePath, updated);
   return "replaced";
 }
 
@@ -377,12 +378,12 @@ function setupToolPlugin(): void {
       return;
     }
 
-    fs.writeFileSync(dest, sourceContent);
+    writeFileSyncAtomic(dest, sourceContent);
     success(`Updated tool plugin at ${pc.dim(dest)}`);
     return;
   }
 
-  fs.writeFileSync(dest, sourceContent);
+  writeFileSyncAtomic(dest, sourceContent);
   success(`Installed tool plugin at ${pc.dim(dest)}`);
 }
 
@@ -430,12 +431,12 @@ function setupCommand(destinationDir: string, filename: string, label: string): 
       return;
     }
 
-    fs.writeFileSync(dest, stampedSource);
+    writeFileSyncAtomic(dest, stampedSource);
     success(`Updated ${label} at ${pc.dim(dest)}`);
     return;
   }
 
-  fs.writeFileSync(dest, stampedSource);
+  writeFileSyncAtomic(dest, stampedSource);
   success(`Installed ${label} at ${pc.dim(dest)}`);
 }
 
@@ -473,7 +474,7 @@ async function setupOpencodeMcpConfig(runtime: CommandRuntime): Promise<void> {
   };
   config["mcp"] = mcp;
 
-  fs.writeFileSync(OPENCODE_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+  writeFileSyncAtomic(OPENCODE_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
 
   success(
     existed
@@ -497,7 +498,7 @@ async function setupClaudeConfig(runtime: CommandRuntime): Promise<void> {
   };
   config["mcpServers"] = mcpServers;
 
-  fs.writeFileSync(CLAUDE_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+  writeFileSyncAtomic(CLAUDE_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
 
   success(
     existed
@@ -520,7 +521,7 @@ async function setupAntigravityConfig(runtime: CommandRuntime): Promise<void> {
   };
   config["mcpServers"] = mcpServers;
 
-  fs.writeFileSync(ANTIGRAVITY_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+  writeFileSyncAtomic(ANTIGRAVITY_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
 
   success(
     existed
@@ -640,17 +641,37 @@ function replaceOrAppendTomlSection(
 }
 
 /**
- * C-02 (plan 05): sibling temp file + rename — a failed or interrupted write
- * can never leave a truncated config behind; the previous bytes stay intact
- * until the rename succeeds.
+ * R02: all managed configs, instructions, commands and plugins use one
+ * sibling temp + fsync + rename writer. The original is never opened for
+ * writing or removed, so preparation/publish failure preserves its bytes.
  */
 function writeFileSyncAtomic(filePath: string, content: string): void {
-  const tmp = `${filePath}.megamemory-tmp-${process.pid}`;
+  // Preserve write-through semantics for user symlinks: publish beside the
+  // real target, never replace the configured link with an ordinary file.
+  const existed = fs.existsSync(filePath);
+  const target = existed ? fs.realpathSync(filePath) : filePath;
+  const mode = existed ? fs.statSync(target).mode & 0o7777 : 0o600;
+  const tmp = `${target}.megamemory-tmp-${process.pid}-${randomUUID()}`;
+  let fd: number | undefined;
+  let ownsTemp = false;
   try {
-    fs.writeFileSync(tmp, content, "utf-8");
-    fs.renameSync(tmp, filePath);
+    fd = fs.openSync(tmp, "wx", mode);
+    ownsTemp = true;
+    fs.writeFileSync(fd, content, "utf-8");
+    // open(mode) is masked by umask; restore existing permissions explicitly
+    // after writing (writes may clear set-ID bits) and before durability sync.
+    if (existed) fs.fchmodSync(fd, mode);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmp, target);
   } catch (err) {
-    try { fs.unlinkSync(tmp); } catch { /* the tmp file is best-effort */ }
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* preserve the original write error */ }
+    }
+    if (ownsTemp) {
+      try { fs.unlinkSync(tmp); } catch { /* cleanup is best-effort */ }
+    }
     throw err;
   }
 }
@@ -668,7 +689,7 @@ async function setupCodexConfig(runtime: CommandRuntime): Promise<void> {
     try {
       const invocation = codexInvocation(codex);
       staging = fs.mkdtempSync(path.join(os.tmpdir(), "megamemory-codex-install-"));
-      if (existed) fs.writeFileSync(path.join(staging, "config.toml"), existing, "utf8");
+      if (existed) writeFileSyncAtomic(path.join(staging, "config.toml"), existing);
       const { execFileSync } = await import("child_process");
       execFileSync(invocation.executable, [
         ...invocation.args, "mcp", "add", "megamemory", "--", runtime.stdioCommand, ...runtime.stdioArgs,
