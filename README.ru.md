@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.6.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.6.2-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -351,7 +351,7 @@ npm install -g @bloodyeagle/megamemory
 пакета со scope как `bloodyeagle-megamemory-<version>.tgz`; для этого релиза):
 
 ```bash
-npm install -g ./bloodyeagle-megamemory-2.6.1.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.2.tgz
 ```
 
 Или соберите из чекаута (для разработки):
@@ -362,7 +362,7 @@ cd MegaMemoryAgent
 npm ci
 npm run build
 npm pack                      # печатает точное имя созданного .tgz
-npm install -g ./bloodyeagle-megamemory-2.6.1.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.2.tgz
 ```
 
 Зарегистрируйте интеграцию установщиком:

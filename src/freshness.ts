@@ -122,8 +122,11 @@ function freshnessSourceSnapshot(db: KnowledgeDB): FreshnessSourceSnapshot {
   db.execSql("SAVEPOINT freshness_index_snapshot");
   try {
     // Явная проекция исключает libsql _metadata: это шум, не вход индекса.
+    // F1: вход индекса — только узлы с refs, поэтому выборка сужена до них.
+    // Обнаружение не слабеет: хеш считается по списку строк, запись/очистка
+    // file_refs меняет состав списка, removed_at у строки с refs — в проекции.
     const nodes = (db.execSqlAll(
-      `SELECT id, file_refs, removed_at FROM nodes ORDER BY id`
+      `SELECT id, file_refs, removed_at FROM nodes WHERE file_refs IS NOT NULL ORDER BY id`
     ) as FreshnessSourceSnapshot["nodes"]).map(({ id, file_refs, removed_at }) => ({ id, file_refs, removed_at }));
     const artifacts = db.hasNodeArtifactsTable()
       ? (db.execSqlAll(

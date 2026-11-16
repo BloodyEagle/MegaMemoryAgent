@@ -964,6 +964,26 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
     });
   });
 
+  it("F4: реальный payload адаптера token-economy-ts проходит fail-closed проверку A11", async () => {
+    // Снят с живого адаптера (scripts/graph-tool.js, op=rdeps) на этом репозитории:
+    // node scripts/graph-tool.js op=rdeps file=src/freshness.ts (cwd = repo).
+    // Пин контракта: поля importedBy/importedByTotal/scope.scanRoot/
+    // completeness.complete реально есть, а не только в синтетических payload'ах.
+    const realPayload = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dirname, "fixtures", "adapter-rdeps-real.json"), "utf8")
+    ) as object;
+    const scriptsDir = writeStub({ symbols: {}, rdeps: {}, rdepsRaw: realPayload });
+    const cfg = resolveAdapterConfig({ graph_tool: scriptsDir }, projDir)!;
+    const outcome = await adapterRdepsOfFile(cfg, "src/freshness.ts");
+    expect(outcome).toEqual({
+      dependents: ["src/index.ts"],
+      total: 1,
+      complete: true,
+      scan_root: "src",
+      error: null,
+    });
+  });
+
   it("неполный import-граф (importedByTotal > выданных): префикс не весь граф", async () => {
     const scriptsDir = path.join(projDir, "scripts");
     fs.mkdirSync(scriptsDir, { recursive: true });
@@ -1093,6 +1113,58 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
       expect(r.adapter.available).toBe(true);
     } finally {
       delete process.env.MEGAMEMORY_CODE_ADAPTER;
+    }
+  });
+});
+
+describe("F1: отпечаток — только индексируемые входы (узлы с file_refs)", () => {
+  it("правка узла без file_refs не меняет отпечаток и не перестраивает кэш", async () => {
+    nodeWithRef("d1", ["src/a.ts"]);
+    writeProjFile("src/a.ts", "export const A = 1;\n");
+    // 500 узлов без file_refs — большинство таблицы, во вход индекса не входят.
+    for (let i = 0; i < 500; i += 1) {
+      db.insertNode({ id: `plain-${i}`, name: `P${i}`, kind: "fact", summary: `plain-${i}` });
+    }
+    const cachePath = freshnessIndexCachePath(db.dbPath);
+    await checkFreshness(db, { node_ids: ["d1"], repo_root: projDir });
+    const saved = JSON.parse(fs.readFileSync(cachePath, "utf8")) as FreshnessIndex;
+    expect((saved.entries["src/a.ts"] ?? []).length).toBeGreaterThan(0);
+
+    db.execSqlRun("UPDATE nodes SET summary = ? WHERE id = ?", "changed-plain", "plain-250");
+    const reloaded = loadFreshnessIndex(db);
+    expect(reloaded.source_fingerprint).toBe(saved.source_fingerprint);
+    // Кэш признан валидным: перестроения не было (built_at не тронут).
+    expect(reloaded.built_at).toBe(saved.built_at);
+  });
+
+  it("очистка file_refs у узла с refs меняет отпечаток", async () => {
+    nodeWithRef("d1", ["src/a.ts"]);
+    const before = buildFreshnessIndex(db).source_fingerprint;
+    db.execSqlRun("UPDATE nodes SET file_refs = NULL WHERE id = ?", "d1");
+    expect(buildFreshnessIndex(db).source_fingerprint).not.toBe(before);
+  });
+
+  it("надгробие removed_at у узла с refs меняет отпечаток", async () => {
+    nodeWithRef("d1", ["src/a.ts"]);
+    const before = buildFreshnessIndex(db).source_fingerprint;
+    db.execSqlRun("UPDATE nodes SET removed_at = ? WHERE id = ?", "2026-11-16 12:00:00", "d1");
+    expect(buildFreshnessIndex(db).source_fingerprint).not.toBe(before);
+  });
+
+  it("check_freshness снимает ровно один snapshot (один SAVEPOINT на вызов)", async () => {
+    nodeWithRef("d1", ["src/a.ts"]);
+    writeProjFile("src/a.ts", "export const A = 1;\n");
+    let savepoints = 0;
+    const orig = db.execSql.bind(db);
+    (db as unknown as { execSql: (sql: string) => void }).execSql = (sql: string) => {
+      if (sql.includes("SAVEPOINT freshness_index_snapshot")) savepoints += 1;
+      orig(sql);
+    };
+    try {
+      await checkFreshness(db, { node_ids: ["d1"], repo_root: projDir });
+      expect(savepoints).toBe(1);
+    } finally {
+      (db as unknown as { execSql: (sql: string) => void }).execSql = orig;
     }
   });
 });

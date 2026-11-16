@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { KnowledgeDB, SCHEMA_VERSION, UpstreamSchemaError } from "./db.js";
+import { KnowledgeDB, SCHEMA_VERSION } from "./db.js";
 import {
   MIGRATION_TARGET_SCHEMA_VERSION,
   ensureSchema,
@@ -182,15 +182,13 @@ export function openStartupDatabase(dbPath: string): { db: KnowledgeDB; backupPa
   const db = new KnowledgeDB(dbPath, { autoMigrate: false });
   try {
     db.assertIntegrity();
+    // F2 (2.6.2): единственная проверка «сырой upstream v0» — тот же метод,
+    // что в конструкторе (assertSchemaOpenable), поэтому текст ошибки и класс
+    // не расходятся между конструктором и стартом MCP/serve. Порядок не тронут:
+    // проверка идёт до preflight() и до любого бэкапа (R01).
+    db.assertSchemaOpenable();
     const version = db.getUserVersion();
     const hasNodes = db.execSqlFirst("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'") !== undefined;
-    // Preserve the explicit-migration requirement for raw upstream v0.
-    if (version === 0 && hasNodes) {
-      throw new UpstreamSchemaError(
-        `База "${path.resolve(dbPath)}" создана другой версией (user_version = 0 — сырая схема upstream без форк-колонок). ` +
-        `Выполните \`megamemory migrate --apply --db "${path.resolve(dbPath)}"\` — она поднимет схему и проставит версию.`
-      );
-    }
     const before = hasNodes ? preflight(db) : null;
     const pending = hasNodes && (version < SCHEMA_VERSION ||
       db.getMetaValue("created_via_backfill_v2") !== "done" ||
