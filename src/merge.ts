@@ -1207,16 +1207,40 @@ export class MergeEngine {
     }
 
     if (hasTable("digest_sources")) {
-      const rows = sourceDb.execSqlAll("SELECT digest_id, sources FROM digest_sources") as Array<{ digest_id: string; sources: string }>;
+      // Pre-versioned tables contain legacy arrays. Versioned records keep
+      // their envelope and builder settings; only node identities are remapped.
+      const hasFormatVersion = (sourceDb.pragma("table_info(digest_sources)") as Array<{ name: string }>).some(column => column.name === "format_version");
+      const rows = sourceDb.execSqlAll(`SELECT digest_id, sources, ${hasFormatVersion ? "format_version" : "1 AS format_version"} FROM digest_sources`) as Array<{ digest_id: string; sources: string; format_version: number }>;
       for (const row of rows) {
         const digestId = resolveNodeId(row.digest_id);
-        const sources = JSON.parse(row.sources) as Array<{ node_id: string; version: string }>;
+        if (row.format_version !== 1 && row.format_version !== 2) {
+          throw new Error(`Merge rejected: unsupported digest sources format_version ${row.format_version} for "${digestId}".`);
+        }
+        let parsed: unknown;
+        try { parsed = JSON.parse(row.sources); }
+        catch { throw new Error(`Merge rejected: invalid digest sources JSON for "${digestId}".`); }
+        let sources: unknown;
+        if (row.format_version === 1) {
+          sources = parsed;
+        } else {
+          const envelope = parsed as { format?: unknown; module?: { id?: unknown; name?: unknown }; builder?: unknown; sources?: unknown } | null;
+          if (!envelope || envelope.format !== "digest-sources/2" ||
+              !envelope.module || typeof envelope.module.id !== "string" || typeof envelope.module.name !== "string" ||
+              !envelope.builder || typeof envelope.builder !== "object" || Array.isArray(envelope.builder)) {
+            throw new Error(`Merge rejected: invalid digest sources v2 envelope for "${digestId}".`);
+          }
+          envelope.module.id = resolveNodeId(envelope.module.id);
+          sources = envelope.sources;
+        }
+        if (!Array.isArray(sources) || sources.some(source => !source || typeof source.node_id !== "string")) {
+          throw new Error(`Merge rejected: invalid digest sources list for "${digestId}".`);
+        }
         for (const source of sources) source.node_id = resolveNodeId(source.node_id);
-        const payload = JSON.stringify(sources);
-        const existing = outputDb.execSqlFirst("SELECT sources FROM digest_sources WHERE digest_id = ?", digestId) as { sources: string } | undefined;
-        if (existing && existing.sources !== payload) throw new Error(`Merge rejected: conflicting digest sources for "${digestId}".`);
+        const payload = JSON.stringify(parsed);
+        const existing = outputDb.execSqlFirst("SELECT sources, format_version FROM digest_sources WHERE digest_id = ?", digestId) as { sources: string; format_version: number } | undefined;
+        if (existing && (existing.sources !== payload || existing.format_version !== row.format_version)) throw new Error(`Merge rejected: conflicting digest sources for "${digestId}".`);
         if (!existing) {
-          outputDb.execSqlRun("INSERT INTO digest_sources(digest_id,sources) VALUES (?,?)", digestId, payload);
+          outputDb.execSqlRun("INSERT INTO digest_sources(digest_id,sources,format_version) VALUES (?,?,?)", digestId, payload, row.format_version);
           carried++;
         }
       }
