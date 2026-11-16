@@ -561,7 +561,12 @@ function buildProfileProjection(
   node: NodeRow,
   profile: "orientation" | "evidence",
   maxNeighbors: number,
-  opts?: { withSupportCheck?: boolean; page?: ProjectionPage; target?: number }
+  opts?: {
+    withSupportCheck?: boolean;
+    page?: ProjectionPage;
+    target?: number;
+    delta?: { version: string; context_epoch: string };
+  }
 ): ConceptProfileOutput {
   const sources = new Map<NeighborList, NeighborSource>();
   for (const list of ORIENTATION_LISTS) {
@@ -639,6 +644,9 @@ function buildProfileProjection(
     truncated: false,
     counts,
     returned: zeroCounts(),
+    ...(opts?.delta ?? {}),
+    ...(opts?.page ? { continuation_used: { list: opts.page.list, offset: opts.page.offset } } : {}),
+    ...(opts?.target !== undefined ? { max_tokens: opts.target } : {}),
   };
 
   const target = opts?.target;
@@ -649,10 +657,7 @@ function buildProfileProjection(
   if (target !== undefined) {
     const minimum = measure();
     if (target < minimum) {
-      throw new Error(
-        `get_concept: max_tokens=${target} ниже минимума ${minimum} — обязательное ядро ` +
-          `(идентичность, квалификация, expiry) и конверт ответа не режутся. Подними max_tokens.`
-      );
+      throw budgetError(target, minimum);
     }
   }
 
@@ -665,58 +670,51 @@ function buildProfileProjection(
       ? ["informed_by"]
       : [...ORIENTATION_LISTS];
 
-  const continuations: Array<{ list: string; token: string }> = [];
-  const dropped: Partial<ConceptProfileNeighborCount> = {};
-  const incomplete: ConceptProfileIncomplete[] = [];
   const anchorState = anchorStateOf(db, node);
-  let truncated = false;
 
   for (const list of lists) {
     const source = sources.get(list)!;
-    const pageMode = opts?.page !== undefined && opts.page.list === list;
-    const head = pageMode ? opts.page!.head : [];
-    const offset = pageMode ? opts.page!.offset : 0;
+    const offset = opts?.page?.list === list ? opts.page.offset : 0;
     const end = Math.min(source.ids.length, offset + ctx.maxNeighbors);
-
-    // Размещение новых элементов окна: по одному, с мерой фактической формы.
     const shown: unknown[] = [];
     for (let i = offset; i < end; i++) {
       const item = projectListItem(ctx, list, i, source);
       if (!item) continue;
       shown.push(item);
       (output as unknown as Record<string, unknown>)[outputKeyOf(profile, list)] = shown;
-      meta.returned![list as keyof ConceptProfileNeighborCount] = shown.length;
       if (target !== undefined && measure() > target) {
-        // Не поместилось в бюджет: элемент снимается, остаток окна — dropped.
         shown.pop();
         break;
       }
     }
     if (shown.length > 0 || (profile === "evidence" && list === "informed_by")) {
-      // Пустой supports — явное «опор нет», не молчаливое отсутствие поля.
       (output as unknown as Record<string, unknown>)[outputKeyOf(profile, list)] = shown;
-      meta.returned![list as keyof ConceptProfileNeighborCount] = shown.length;
     }
+  }
 
-    const rest = source.ids.length - (offset + shown.length);
-    if (rest > 0) {
+  // Final fit мерит ПОЛНУЮ выдачу: после каждого снятого элемента заново
+  // считаются counts/dropped/incomplete и pin продолжения, без ложного offset.
+  const finalize = () => {
+    const continuations: Array<{ list: string; token: string }> = [];
+    const dropped: Partial<ConceptProfileNeighborCount> = {};
+    const incomplete: ConceptProfileIncomplete[] = [];
+    meta.returned = zeroCounts();
+    for (const list of lists) {
+      const source = sources.get(list)!;
+      const shown = ((output as unknown as Record<string, unknown>)[outputKeyOf(profile, list)] ?? []) as unknown[];
+      const offset = opts?.page?.list === list ? opts.page.offset : 0;
+      const head = opts?.page?.list === list ? opts.page.head : [];
+      meta.returned[list as keyof ConceptProfileNeighborCount] = shown.length;
+      const rest = source.ids.length - offset - shown.length;
+      if (rest <= 0) continue;
       dropped[list as keyof ConceptProfileNeighborCount] = rest;
-      truncated = true;
-      // Отпечаток версии: состав списка + состояние якоря + ВСЁ выданное
-      // ([0, offset+shown) — голова предыдущих страниц плюс эта).
       continuations.push({
         list,
         token: encodeContinuation({
-          v: 1,
-          kind: "list",
-          anchor: anchorId,
-          list,
-          profile,
+          v: 1, kind: "list", anchor: anchorId, list, profile,
           offset: offset + shown.length,
           fp: fingerprint({
-            anchor: anchorId,
-            list,
-            ids: source.ids,
+            anchor: anchorId, list, ids: source.ids,
             anchor_state: anchorState,
             head: head.concat(shown),
           }),
@@ -724,36 +722,59 @@ function buildProfileProjection(
         }),
       });
       if (profile === "evidence" && list === "informed_by") {
-        // Не поместившиеся доказательства — явная неполнота с следующим
-        // шагом; формулировки не обрезались, опор в ответе не хватает.
         incomplete.push({
-          section: "informed_by",
-          reason: "budget",
-          count: rest,
-          next_step:
-            "продолжи список опор токеном continuation (list informed_by) или прочитай карточку опоры: get_concept {id опоры}",
+          section: "informed_by", reason: "budget", count: rest,
+          next_step: "продолжи список опор токеном continuation (list informed_by) или прочитай карточку опоры: get_concept {id опоры}",
           sample_ids: source.ids.slice(offset + shown.length, offset + shown.length + MAX_BATCH_ITEMS),
         });
       }
     }
+    delete meta.dropped;
+    delete meta.incomplete;
+    delete meta.continuations;
+    if (Object.keys(dropped).length > 0) meta.dropped = dropped;
+    if (incomplete.length > 0) meta.incomplete = incomplete;
+    if (continuations.length > 0) meta.continuations = continuations;
+    meta.truncated = continuations.length > 0;
+    meta.tokens_estimated = measure();
+  };
+  finalize();
+  while (target !== undefined && meta.tokens_estimated > target) {
+    const list = [...lists].reverse().find(list => {
+      const shown = (output as unknown as Record<string, unknown>)[outputKeyOf(profile, list)];
+      return Array.isArray(shown) && shown.length > 0;
+    });
+    if (!list) throw budgetError(target, meta.tokens_estimated);
+    const key = outputKeyOf(profile, list);
+    const shown = (output as unknown as Record<string, unknown>)[key] as unknown[];
+    shown.pop();
+    if (shown.length === 0 && !(profile === "evidence" && list === "informed_by")) {
+      delete (output as unknown as Record<string, unknown>)[key];
+    }
+    finalize();
   }
-
-  if (Object.keys(dropped).length > 0) meta.dropped = dropped;
-  if (incomplete.length > 0) meta.incomplete = incomplete;
-  if (continuations.length > 0) meta.continuations = continuations;
-  meta.truncated = truncated;
-  if (opts?.page) {
-    meta.continuation_used = { list: opts.page.list, offset: opts.page.offset };
-  }
-  // max_tokens включается в меру ДО фиксации tokens_estimated: оценка —
-  // по фактической форме ответа целиком (§4.3), иначе оценка расходится
-  // с реальной выдачей на длину вложенного числа.
-  if (target !== undefined) meta.max_tokens = target;
-  meta.tokens_estimated = measure();
   return { ...output, meta };
 }
 
 // ---- Валидация входа ----
+
+export const MAX_CONTEXT_EPOCH_LENGTH = 256;
+
+function validateContextEpoch(epoch: string | undefined): void {
+  if (epoch !== undefined && (typeof epoch !== "string" || epoch.length > MAX_CONTEXT_EPOCH_LENGTH)) {
+    throw new Error(`context_epoch: идентификатор не длиннее ${MAX_CONTEXT_EPOCH_LENGTH} символов.`);
+  }
+}
+
+function budgetError(target: number, minimum: number): Error {
+  return Object.assign(new Error(`get_concept: max_tokens=${target} cannot fit the required response (minimum ${minimum}).`), { meta: { reason: "budget" } });
+}
+
+function fitWire(result: unknown, target: number | undefined): void {
+  if (target === undefined) return;
+  const minimum = measureMcpPayload(result);
+  if (minimum > target) throw budgetError(target, minimum);
+}
 
 function validateProfile(profile: unknown): GetConceptProfile {
   if (profile === undefined) return "full";
@@ -794,6 +815,7 @@ export function getConceptProfile(
   db: KnowledgeDB,
   input: ConceptProfileInput
 ): NodeWithContext | ConceptProfileOutput | ConceptDeltaOutput {
+  validateContextEpoch(input.context_epoch);
   const maxTokens = validateBudget(input.max_tokens, "минимум конверта ответа");
   const maxNeighbors = validateMaxNeighbors(input.max_neighbors);
 
@@ -901,7 +923,10 @@ export function getConceptProfile(
     const known =
       input.known_versions?.[input.id] ?? input.known_versions?.[resolved.id];
     if (known !== undefined && known === version) {
-      return buildDeltaOutput(db, resolved.node, profile, version, input.context_epoch);
+      const result = buildDeltaOutput(db, resolved.node, profile, version, input.context_epoch);
+      const target = maxTokens ?? (profile === "full" ? undefined : profile === "evidence" ? EVIDENCE_DEFAULT_TOKENS : ORIENTATION_DEFAULT_TOKENS);
+      fitWire(result, target);
+      return result;
     }
     // Расхождение или неизвестная версия — полная выдача запрошенной
     // проекции с текущей версией и эхом эпохи (клиент сверит и сохранит).
@@ -909,16 +934,8 @@ export function getConceptProfile(
       const ctx = buildNodeWithContext(db, resolved.node, undefined, { withSupportCheck: true });
       ctx.current_digests = currentDigestsOf(resolved.node);
       ctx.delta_version = { version, context_epoch: input.context_epoch };
+      fitWire(ctx, maxTokens);
       recordUsage(db, input.id, ctx);
-      if (maxTokens === undefined) return ctx;
-      // Бюджет — те же ворота, что у недельта full: карточка не режется.
-      const measured = measureMcpPayload(ctx);
-      if (measured > maxTokens) {
-        throw new Error(
-          `get_concept: полная карточка не помещается в max_tokens=${maxTokens} (нужно ${measured}); ` +
-            `возьми профиль evidence/orientation или подними бюджет.`
-        );
-      }
       return ctx;
     }
     const target =
@@ -926,9 +943,8 @@ export function getConceptProfile(
     const result = buildProfileProjection(db, resolved.id, resolved.node, profile, maxNeighbors, {
       withSupportCheck: true,
       target,
+      delta: { version, context_epoch: input.context_epoch },
     });
-    result.meta.version = version;
-    result.meta.context_epoch = input.context_epoch;
     recordUsage(db, input.id, result);
     return result;
   }
@@ -936,17 +952,8 @@ export function getConceptProfile(
   if (profile === "full") {
     const ctx = buildNodeWithContext(db, resolved.node, undefined, { withSupportCheck: true });
     ctx.current_digests = currentDigestsOf(resolved.node);
+    fitWire(ctx, maxTokens);
     recordUsage(db, input.id, ctx);
-    if (maxTokens === undefined) return ctx;
-    // Полная карточка — текущая форма: не режется и не обогащается meta;
-    // max_tokens работает воротами (как у understand mode=full).
-    const measured = measureMcpPayload(ctx);
-    if (measured > maxTokens) {
-      throw new Error(
-        `get_concept: полная карточка не помещается в max_tokens=${maxTokens} (нужно ${measured}); ` +
-          `возьми профиль evidence/orientation или подними бюджет.`
-      );
-    }
     return ctx;
   }
 
@@ -1074,10 +1081,7 @@ export function getConceptBatch(db: KnowledgeDB, input: ConceptBatchInput): Conc
     meta: { ...meta, tokens_estimated: 0, truncated: true },
   });
   if (target < minimum) {
-    throw new Error(
-      `get_concept batch: max_tokens=${target} ниже минимума ${minimum} — конверт и поимённое ` +
-        `перечисление пакета не режутся. Подними max_tokens.`
-    );
+    throw budgetError(target, minimum);
   }
 
   let checkBudget = MAX_BATCH_SUPPORT_CHECKS;
@@ -1093,7 +1097,7 @@ export function getConceptBatch(db: KnowledgeDB, input: ConceptBatchInput): Conc
         id,
         status: "budget_skipped",
         reason: "budget",
-        next_step: "общий бюджет пакета исчерпан — продолжи с continuation (meta.continuation)",
+        next_step: "continuation (meta.continuation)",
       });
       meta.budget_skipped += 1;
       continue;
@@ -1142,7 +1146,7 @@ export function getConceptBatch(db: KnowledgeDB, input: ConceptBatchInput): Conc
         id,
         status: "budget_skipped",
         reason: "budget",
-        next_step: "общий бюджет пакета исчерпан — продолжи с continuation (meta.continuation)",
+        next_step: "continuation (meta.continuation)",
       });
       meta.budget_skipped += 1;
     } else {
@@ -1150,22 +1154,34 @@ export function getConceptBatch(db: KnowledgeDB, input: ConceptBatchInput): Conc
     }
   }
 
-  // Продолжение: поимённый остаток + отпечаток обработанного набора.
-  const processed = startAt + meta.ok + meta.failed;
-  if (processed < ids.length) {
-    const head = ids.slice(0, processed).map((id) => batchItemState(db, id));
-    meta.continuation = encodeContinuation({
-      v: 1,
-      kind: "batch",
-      profile,
-      ids,
-      offset: processed,
-      fp: fingerprint({ ids, head }),
-      max_neighbors: maxNeighbors,
-    });
+  // Финальный fit включает поимённые skipped и continuation. Снимается
+  // только хвост карточек; ошибки остаются видимыми, offset пересчитывается.
+  const finalize = () => {
+    meta.ok = items.filter(item => item.status === "ok").length;
+    meta.failed = items.filter(item => item.status === "error").length;
+    meta.budget_skipped = items.filter(item => item.status === "budget_skipped").length;
+    const processed = startAt + meta.ok + meta.failed;
+    delete meta.continuation;
+    if (processed < ids.length) {
+      const head = ids.slice(0, processed).map((id) => batchItemState(db, id));
+      meta.continuation = encodeContinuation({
+        v: 1, kind: "batch", profile, ids, offset: processed,
+        fp: fingerprint({ ids, head }),
+        max_neighbors: maxNeighbors,
+      });
+    }
+    meta.truncated = meta.budget_skipped > 0;
+    meta.tokens_estimated = measureMcpPayload(buildOutput());
+  };
+  finalize();
+  while (meta.tokens_estimated > target) {
+    let index = items.length - 1;
+    while (index >= 0 && items[index].status === "budget_skipped") index -= 1;
+    // Ошибка — обязательная часть ответа; нельзя спрятать её ради fit.
+    if (index < 0 || items[index].status === "error") throw budgetError(target, meta.tokens_estimated);
+    items[index] = { id: items[index].id, status: "budget_skipped", reason: "budget", next_step: "continuation (meta.continuation)" };
+    finalize();
   }
-  meta.truncated = meta.budget_skipped > 0;
-  meta.tokens_estimated = measureMcpPayload(buildOutput());
   // Одна usage-строка на пакетный вызов: query — поимённый список пакета.
   const serializedBatch = JSON.stringify(buildOutput());
   db.insertUsage({
@@ -1202,6 +1218,7 @@ export type ConceptToolMode =
  * Конфликты параметров — явные ошибки, без скрытого приоритета.
  */
 export function branchConceptToolArgs(args: ConceptToolArgs): ConceptToolMode {
+  validateContextEpoch(args.context_epoch);
   const hasProfileFields =
     args.profile !== undefined ||
     args.max_tokens !== undefined ||

@@ -1,21 +1,23 @@
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { ensureSchema } from "../migrate-schema.js";
 import { addNode, auditFixture, type AuditFixture } from "./helpers/audit.js";
 import type { KnowledgeDB } from "../db.js";
 import type { UnderstandInput, UnderstandOutput, ConceptBatchOutput } from "../types.js";
 import type { ConceptToolArgs } from "../concept-profile.js";
 
-type WireResponse = { content: Array<{ type: string; text: string }>; isError?: boolean };
+type WireResponse = { content: Array<{ type: string; text: string }>; isError?: boolean; meta?: { reason: string } };
 type Handler = (params: UnderstandInput | ConceptToolArgs) => Promise<WireResponse>;
-const boundary = vi.hoisted(() => ({ handlers: new Map<string, Handler>() }));
+const boundary = vi.hoisted(() => ({ handlers: new Map<string, Handler>(), schemas: new Map<string, unknown>() }));
 
 // Only the SDK transport/registration boundary is replaced. The production
 // index.ts callback, tool, database, instruction fields and pretty serializer run.
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
   McpServer: class {
-    tool(name: string, _description: string, _schema: unknown, handler: Handler) {
+    tool(name: string, _description: string, schema: unknown, handler: Handler) {
+      boundary.schemas.set(name, schema);
       boundary.handlers.set(name, handler);
       return this;
     }
@@ -108,6 +110,84 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
     const page2 = JSON.parse(second.content[0].text) as ConceptBatchOutput;
     expect(page2.batch.filter(item => item.status === "ok").map(item => item.id)).toEqual(ids.slice(placed.length));
     expect(page2.meta.budget_skipped).toBe(0);
+  });
+
+  it.each(["orientation", "evidence", "full"] as const)("A05 MCP %s final wire fits all metadata, delta and unchanged or explicitly refuses", async profile => {
+    await wireResponse(db => {
+      addNode(db, "cap-anchor", { name: "Имя 中文 \\\"", summary: "Complete UTF-8 wording 中文. ".repeat(5), why: "Complete rationale", file_refs: ["src/кириллица.ts"] });
+      for (let i = 0; i < 4; i++) {
+        addNode(db, `cap-support-${i}`, { summary: `Complete support wording ${i} 中文`, file_refs: [`src/${i}.ts`] });
+        db.insertEdge({ from_id: "cap-anchor", to_id: `cap-support-${i}`, relation: "informed_by", description: `Rationale ${i}` });
+      }
+    }, { query: "bootstrap", max_tokens: 1500 });
+    const get = boundary.handlers.get("get_concept")!;
+    const epoch = "client-context";
+    const generous = await get({ id: "cap-anchor", profile, max_neighbors: 1, context_epoch: epoch, max_tokens: 10000 });
+    expect(generous.isError).not.toBe(true);
+    const issued = JSON.parse(generous.content[0].text);
+    const version = issued.meta?.version ?? issued.delta_version.version;
+    for (const max_tokens of [100, 300, 500, 700, 900, 1300, 2000, 4000]) {
+      for (const delta of [undefined, { context_epoch: epoch }, { context_epoch: epoch, known_versions: { "cap-anchor": version } }]) {
+        const response = await get({ id: "cap-anchor", profile, max_neighbors: 1, max_tokens, ...delta });
+        if (response.isError) {
+          expect(response.content[0].text).toMatch(/max_tokens|budget/i);
+          expect(response.meta?.reason).toBe("budget");
+        } else {
+          expect.soft(wireTokens(JSON.stringify(response)), `profile=${profile}, cap=${max_tokens}, delta=${JSON.stringify(delta)}`).toBeLessThanOrEqual(max_tokens);
+          const out = JSON.parse(response.content[0].text);
+          if (out.meta) expect.soft(out.meta.tokens_estimated).toBe(wireTokens(JSON.stringify(response)));
+          for (const next of out.meta?.continuations ?? []) {
+            const resumed = await get({ continuation: next.token, max_tokens });
+            if (resumed.isError) expect(resumed.content[0].text).toMatch(/max_tokens|budget/i);
+            else {
+              expect.soft(wireTokens(JSON.stringify(resumed))).toBeLessThanOrEqual(max_tokens);
+              const continuationOutput = JSON.parse(resumed.content[0].text);
+              expect.soft(continuationOutput.meta.tokens_estimated).toBe(wireTokens(JSON.stringify(resumed)));
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it.each(["orientation", "evidence", "full"] as const)("A05 MCP %s batch final wire and continuation fit the shared budget", async profile => {
+    const ids = Array.from({ length: 5 }, (_, i) => `wire-batch-${i}`);
+    await wireResponse(db => {
+      for (const id of ids) addNode(db, id, { summary: "Complete quoted 中文 consumer wording. ".repeat(5), file_refs: ["src/кириллица.ts"] });
+    }, { query: "bootstrap", max_tokens: 1500 });
+    const get = boundary.handlers.get("get_concept")!;
+    for (const max_tokens of [300, 500, 900, 1300, 2000, 4000]) {
+      for (const requested of [ids, [ids[0], "missing-wire-card", ...ids.slice(1)]]) {
+        const response = await get({ ids: requested, profile, max_tokens });
+        if (response.isError) expect(response.content[0].text).toMatch(/max_tokens|budget/i);
+        else {
+          expect.soft(wireTokens(JSON.stringify(response)), `batch ${profile}, cap=${max_tokens}`).toBeLessThanOrEqual(max_tokens);
+          const page = JSON.parse(response.content[0].text) as ConceptBatchOutput;
+          expect(page.batch.map(item => item.id)).toEqual(requested);
+          expect(page.meta.tokens_estimated).toBe(wireTokens(JSON.stringify(response)));
+          if (page.meta.continuation) {
+            const resumed = await get({ continuation: page.meta.continuation, max_tokens });
+            if (resumed.isError) expect(resumed.content[0].text).toMatch(/max_tokens|budget/i);
+            else expect.soft(wireTokens(JSON.stringify(resumed))).toBeLessThanOrEqual(max_tokens);
+          }
+        }
+      }
+    }
+  });
+
+  it("A05 MCP and SDK reject oversized context_epoch before echoing client input", async () => {
+    await wireResponse(db => addNode(db, "epoch-anchor", { summary: "Epoch-bounded consumer claim" }), { query: "bootstrap", max_tokens: 1500 });
+    const args = { id: "epoch-anchor", profile: "orientation" as const, context_epoch: "e".repeat(257) };
+    const response = await boundary.handlers.get("get_concept")!(args);
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toMatch(/context_epoch.*256/);
+    const schema = boundary.schemas.get("get_concept") as z.ZodRawShape;
+    expect(z.object(schema).safeParse(args).success).toBe(false);
+    expect(z.object(schema).safeParse({ ...args, context_epoch: "e".repeat(256) }).success).toBe(true);
+    const accepted = await boundary.handlers.get("get_concept")!({ ...args, context_epoch: "e".repeat(256), max_tokens: 2000 });
+    expect(accepted.isError).not.toBe(true);
+    expect(JSON.parse(accepted.content[0].text).meta.context_epoch).toBe("e".repeat(256));
+    expect(wireTokens(JSON.stringify(accepted))).toBeLessThanOrEqual(2000);
   });
 
   it.each([undefined, "compact", "full", "brief"] as const)("D-05 actual %s MCP wire fits caps 500..1500 or refuses required floor", async mode => {
