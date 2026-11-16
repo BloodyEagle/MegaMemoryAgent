@@ -20,7 +20,7 @@ import { defineConfig } from "vitest/config";
  *   HTTP-тесты поднимают собранный dist — полный прогон требует
  *   `npm run build` до старта.
  */
-const UNIT_FILES = [
+export const UNIT_FILES = [
   "docs-anchors",
   "error-formatting",
   "fixtures-guard-negative",
@@ -28,8 +28,15 @@ const UNIT_FILES = [
   "help",
   "instructions",
   "repo-hygiene",
+  "telemetry-report",
   "vitest-config",
 ];
+
+export const TEST_PATHS = {
+  unit: UNIT_FILES.map((f) => `src/__tests__/${f}.test.ts`),
+  db: ["src/__tests__/**/*.test.ts"],
+  integration: ["tests/integration/**/*.test.ts"],
+};
 
 export default defineConfig({
   test: {
@@ -38,7 +45,7 @@ export default defineConfig({
       {
         test: {
           name: "unit",
-          include: UNIT_FILES.map((f) => `src/__tests__/${f}.test.ts`),
+          include: TEST_PATHS.unit,
           // План 11 (2.2.1): страж фикстур — RW-открытие fixtures/* падает с
           // ReadonlyDbError. Задаётся в каждом проекте: корневой setupFiles
           // при projects не выполняется (проверено планом 11).
@@ -49,8 +56,8 @@ export default defineConfig({
         test: {
           name: "db",
           execArgv: ["--expose-gc"], // libsql releases closed native handles after collection.
-          include: ["src/__tests__/**/*.test.ts"],
-          exclude: UNIT_FILES.map((f) => `src/__tests__/${f}.test.ts`),
+          include: TEST_PATHS.db,
+          exclude: TEST_PATHS.unit,
           testTimeout: 15_000,
           // Env наследуют spawned dist-CLI интеграционных тестов.
           setupFiles: ["./src/__tests__/fixtures-guard.setup.ts"],
@@ -60,7 +67,7 @@ export default defineConfig({
         test: {
           name: "integration",
           execArgv: ["--expose-gc"],
-          include: ["tests/integration/**/*.test.ts"],
+          include: TEST_PATHS.integration,
           testTimeout: 15_000,
           setupFiles: ["./src/__tests__/fixtures-guard.setup.ts"],
         },
