@@ -106,57 +106,60 @@ function fileRefsOf(raw: string | null | undefined): string[] {
 
 // ---- Обратный индекс: сборка из БД (единственный источник истины) ----
 
-/**
- * Отпечаток исходных данных индекса: дёшево вычисляемая сводка (счётчики и
- * максимумы узлов/timeline/наблюдений/trails). Любая запись, меняющая file_refs,
- * тела паспортов (timeline) или наблюдения, меняет отпечаток → кэш перестроится.
- */
-export function freshnessSourceFingerprint(db: KnowledgeDB): string {
-  const nodeStats = db.execSqlAll(
-    `SELECT COUNT(*) AS c,
-            COALESCE(MAX(updated_at), '') AS max_updated,
-            COALESCE(MAX(created_at), '') AS max_created,
-            COALESCE(MAX(removed_at), '') AS max_removed,
-            COALESCE(MAX(COALESCE(file_refs, '')), '') AS max_refs
-     FROM nodes`
-  ) as Array<{ c: number; max_updated: string; max_created: string; max_removed: string; max_refs: string }>;
-  const timelineStats = db.execSqlAll(
-    `SELECT COUNT(*) AS c, COALESCE(MAX(seq), 0) AS max_seq FROM timeline`
-  ) as Array<{ c: number; max_seq: number }>;
-  let artifactStats = "";
-  if (db.hasNodeArtifactsTable()) {
-    const rows = db.execSqlAll(
-      `SELECT COUNT(*) AS c, COALESCE(MAX(checked_at), '') AS max_checked FROM node_artifacts`
-    ) as Array<{ c: number; max_checked: string }>;
-    artifactStats = `${rows[0]?.c ?? 0}|${rows[0]?.max_checked ?? ""}`;
-  }
-  let trailCount = "";
-  try {
-    const rows = db.execSqlAll(`SELECT COUNT(*) AS c FROM trails`) as Array<{ c: number }>;
-    trailCount = String(rows[0]?.c ?? 0);
-  } catch {
-    trailCount = "?";
-  }
-  const n = nodeStats[0];
-  const t = timelineStats[0];
-  return createHash("sha256")
-    .update(
-      [
-        `nodes:${n?.c ?? 0}|${n?.max_updated ?? ""}|${n?.max_created ?? ""}|${n?.max_removed ?? ""}|${n?.max_refs ?? ""}`,
-        `timeline:${t?.c ?? 0}|${t?.max_seq ?? 0}`,
-        `artifacts:${artifactStats}`,
-        `trails:${trailCount}`,
-      ].join("\n")
-    )
-    .digest("hex");
+interface FreshnessSourceSnapshot {
+  nodes: Array<{ id: string; file_refs: string | null; removed_at: string | null }>;
+  artifacts: NodeArtifactRow[];
+  passports: ReturnType<typeof findPassportBodies>;
 }
 
 /**
- * Собрать индекс из БД. Источники: file_refs живых узлов, файловые наблюдения
- * node_artifacts, области паспортов (тела в timeline). Записи отсутствующих
- * узлов/паспортов отфильтровываются (индекс восстанавливается, история не теряется).
+ * A16: все индексируемые входы читаются в одном readonly snapshot. SAVEPOINT
+ * не берёт write-lock BEGIN IMMEDIATE и работает внутри транзакции вызывающего.
+ * Последовательный MCP-путь раньше защищал MAX(seq); SDK/external UPDATE без
+ * нового события и конкурентные чтения требуют хеша содержимого, а не COUNT/MAX.
  */
-export function buildFreshnessIndex(db: KnowledgeDB): FreshnessIndex {
+function freshnessSourceSnapshot(db: KnowledgeDB): FreshnessSourceSnapshot {
+  db.execSql("SAVEPOINT freshness_index_snapshot");
+  try {
+    // Явная проекция исключает libsql _metadata: это шум, не вход индекса.
+    const nodes = (db.execSqlAll(
+      `SELECT id, file_refs, removed_at FROM nodes ORDER BY id`
+    ) as FreshnessSourceSnapshot["nodes"]).map(({ id, file_refs, removed_at }) => ({ id, file_refs, removed_at }));
+    const artifacts = db.hasNodeArtifactsTable()
+      ? (db.execSqlAll(
+        `SELECT node_id, kind, ref, digest, prev_digest, size_bytes,
+                checked_at, changed_at, checked_by, repo_path
+         FROM node_artifacts WHERE kind = 'file' ORDER BY node_id, kind, ref`
+      ) as NodeArtifactRow[]).map(({ node_id, kind, ref, digest, prev_digest, size_bytes,
+        checked_at, changed_at, checked_by, repo_path }) => ({ node_id, kind, ref, digest,
+        prev_digest, size_bytes, checked_at, changed_at, checked_by, repo_path }))
+      : [];
+    let passports: FreshnessSourceSnapshot["passports"] = [];
+    try {
+      passports = findPassportBodies(db);
+    } catch {
+      // Старые базы без trail/timeline сохраняют файловый индекс.
+    }
+    return { nodes, artifacts, passports };
+  } finally {
+    db.execSql("RELEASE freshness_index_snapshot");
+  }
+}
+
+/** SHA256 полного содержимого входов; сортировка строк стабильна в snapshot. */
+function snapshotFingerprint(snapshot: FreshnessSourceSnapshot): string {
+  return createHash("sha256")
+    .update("freshness-source-snapshot-v2\n")
+    .update(JSON.stringify(snapshot))
+    .digest("hex");
+}
+
+export function freshnessSourceFingerprint(db: KnowledgeDB): string {
+  return snapshotFingerprint(freshnessSourceSnapshot(db));
+}
+
+/** Собрать индекс и его fingerprint из тех же захваченных входов, без чтений БД. */
+function indexFromSnapshot(snapshot: FreshnessSourceSnapshot): FreshnessIndex {
   const entries: Record<string, FreshnessIndexEntry[]> = {};
   const push = (key: string, entry: FreshnessIndexEntry): void => {
     const bucket = entries[key] ?? (entries[key] = []);
@@ -164,48 +167,41 @@ export function buildFreshnessIndex(db: KnowledgeDB): FreshnessIndex {
   };
 
   // 1. Живые узлы с file_refs.
-  const nodeRows = db.execSqlAll(
-    `SELECT id, file_refs FROM nodes WHERE removed_at IS NULL AND file_refs IS NOT NULL`
-  ) as Array<{ id: string; file_refs: string }>;
-  for (const row of nodeRows) {
+  const liveNodes = new Set<string>();
+  for (const row of snapshot.nodes) {
+    if (row.removed_at !== null) continue;
+    liveNodes.add(row.id);
     for (const ref of fileRefsOf(row.file_refs)) {
       push(normalizeSourceKey(ref), { record: "node", id: row.id, via: "node_file_ref", ref });
     }
   }
 
-  // 2. Файловые наблюдения артефактов (история наблюдений тоже «использует» источник).
-  if (db.hasNodeArtifactsTable()) {
-    const artifactRows = db.execSqlAll(
-      `SELECT node_id, ref FROM node_artifacts WHERE kind = 'file'`
-    ) as Array<{ node_id: string; ref: string }>;
-    for (const row of artifactRows) {
-      if (db.getNode(row.node_id) === undefined) continue; // узел hard-deleted
-      push(normalizeSourceKey(row.ref), { record: "node", id: row.node_id, via: "artifact", ref: row.ref });
-    }
+  // 2. История файловых наблюдений — только для живых узлов, как getNode.
+  for (const row of snapshot.artifacts) {
+    if (!liveNodes.has(row.node_id)) continue;
+    push(normalizeSourceKey(row.ref), { record: "node", id: row.node_id, via: "artifact", ref: row.ref });
   }
 
-  // 3. Области паспортов (тела в params событий trail_save).
-  try {
-    for (const { trail_id, body } of findPassportBodies(db)) {
-      for (const f of body.scope.files) {
-        push(normalizeSourceKey(f.ref), {
-          record: "passport",
-          id: trail_id,
-          via: "passport_scope",
-          ref: f.ref,
-        });
-      }
+  // 3. Области паспортов из того же snapshot журнала.
+  for (const { trail_id, body } of snapshot.passports) {
+    for (const f of body.scope.files) {
+      push(normalizeSourceKey(f.ref), {
+        record: "passport", id: trail_id, via: "passport_scope", ref: f.ref,
+      });
     }
-  } catch {
-    // Таблицы trail могут отсутствовать в старой базе — индекс строится без паспортов.
   }
 
   return {
     index_format: FRESHNESS_INDEX_FORMAT,
     built_at: new Date().toISOString(),
-    source_fingerprint: freshnessSourceFingerprint(db),
+    source_fingerprint: snapshotFingerprint(snapshot),
     entries,
   };
+}
+
+/** Собрать восстановимый индекс из единственного согласованного снимка БД. */
+export function buildFreshnessIndex(db: KnowledgeDB): FreshnessIndex {
+  return indexFromSnapshot(freshnessSourceSnapshot(db));
 }
 
 /** Путь кэша: каталог БД (живая база: <project>/.megamemory/freshness-index.json). */
@@ -221,6 +217,8 @@ export function freshnessIndexCachePath(dbPath: string): string {
  */
 export function loadFreshnessIndex(db: KnowledgeDB): FreshnessIndex {
   const cachePath = freshnessIndexCachePath(db.dbPath);
+  const snapshot = freshnessSourceSnapshot(db);
+  const fingerprint = snapshotFingerprint(snapshot);
   try {
     const raw = JSON.parse(fs.readFileSync(cachePath, "utf8")) as FreshnessIndex;
     const valid =
@@ -230,12 +228,12 @@ export function loadFreshnessIndex(db: KnowledgeDB): FreshnessIndex {
       typeof raw.source_fingerprint === "string" &&
       raw.entries &&
       typeof raw.entries === "object" &&
-      raw.source_fingerprint === freshnessSourceFingerprint(db);
+      raw.source_fingerprint === fingerprint;
     if (valid) return raw;
   } catch {
     // нет файла / повреждён — rebuild ниже
   }
-  const index = buildFreshnessIndex(db);
+  const index = indexFromSnapshot(snapshot);
   try {
     fs.writeFileSync(cachePath, JSON.stringify(index), "utf8");
   } catch {

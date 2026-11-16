@@ -20,7 +20,7 @@
  *   пропавшее определение — явный ambiguous/missing (не первый совпадение),
  *   номера строк — текущее разрешение, фолбэк файлового уровня ЯВНЫЙ.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -162,6 +162,115 @@ describe("P2.1: обратный индекс (восстановимый кэш
     // loadFreshnessIndex возвращает валидный кэш без перезаписи.
     const loaded = loadFreshnessIndex(db);
     expect(loaded.source_fingerprint).toBe(rewritten.source_fingerprint);
+  });
+
+  it("A16: external writer меняет первую ссылку в ту же секунду — lookup новой ссылки инвалидирует кэш", async () => {
+    nodeWithRef("first", ["src/a.ts"]);
+    nodeWithRef("max-ref", ["src/z.ts"]);
+    for (const ref of ["src/a.ts", "src/b.ts", "src/z.ts"]) writeProjFile(ref, "export const X = 1;\n");
+    const writer = new KnowledgeDB(db.dbPath);
+    try {
+      // Две ссылки фиксируются в одну секунду; z.ts сохраняет прежний MAX(file_refs).
+      writer.execSqlRun("UPDATE nodes SET created_at = ?, updated_at = ?", "2026-11-16 12:00:00", "2026-11-16 12:00:00");
+      const beforeCounts = tableCounts();
+      const before = await checkFreshness(db, { sources: ["src/a.ts"], repo_root: projDir });
+      expect(before.records.map((r) => r.id)).toEqual(["first"]);
+      const cached = loadFreshnessIndex(db);
+      writer.execSqlRun("UPDATE nodes SET file_refs = ? WHERE id = ?", JSON.stringify(["src/b.ts"]), "first");
+      expect(tableCounts()).toEqual(beforeCounts); // no timeline/seq change
+
+      const after = await checkFreshness(db, { sources: ["src/b.ts"], repo_root: projDir });
+      expect(after.records.map((r) => r.id)).toEqual(["first"]);
+      expect(loadFreshnessIndex(db).source_fingerprint).not.toBe(cached.source_fingerprint);
+      const old = await checkFreshness(db, { sources: ["src/a.ts"], repo_root: projDir });
+      expect(old.records).toHaveLength(0);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("A16: external UPDATE artifact ref при прежнем checked_at обновляет reverse lookup", async () => {
+    nodeWithRef("observed", ["src/a.ts"]);
+    writeProjFile("src/a.ts", "export const X = 1;\n");
+    writeProjFile("src/b.ts", "export const X = 1;\n");
+    await checkArtifacts(db, { node_ids: ["observed"], cwd: projDir });
+    const writer = new KnowledgeDB(db.dbPath);
+    try {
+      const cached = loadFreshnessIndex(db);
+      const beforeCounts = tableCounts();
+      writer.execSqlRun("UPDATE node_artifacts SET ref = ? WHERE node_id = ?", "src/b.ts", "observed");
+      expect(tableCounts()).toEqual(beforeCounts);
+
+      const after = await checkFreshness(db, { sources: ["src/b.ts"], repo_root: projDir });
+      expect(after.records.map((r) => r.id)).toEqual(["observed"]);
+      expect(after.sources[0]?.affected_records).toContainEqual({ record: "node", id: "observed", via: "artifact" });
+      expect(loadFreshnessIndex(db).source_fingerprint).not.toBe(cached.source_fingerprint);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("A16: external UPDATE passport params без нового seq обновляет scope lookup", async () => {
+    nodeWithRef("d1", ["src/app.ts"], "fact");
+    writeProjFile("src/app.ts", "export const APP = 1;\n");
+    writeProjFile("src/other.ts", "export const APP = 1;\n");
+    const saved = await trailSaveWithPassport(db, {
+      node_ids: ["d1"], summary: "Область разбора сохраняется в паспорте.", repo_root: projDir,
+      passport: { task_type: "implementation_analysis", goal: "Разбор области", scope_files: ["src/app.ts"] },
+    });
+    const writer = new KnowledgeDB(db.dbPath);
+    try {
+      const cached = loadFreshnessIndex(db);
+      const beforeCounts = tableCounts();
+      const row = db.execSqlAll("SELECT seq, params FROM timeline WHERE tool = 'trail_save' ORDER BY seq DESC LIMIT 1")[0] as { seq: number; params: string };
+      const params = JSON.parse(row.params);
+      params.passport.scope.files[0].ref = "src/other.ts";
+      writer.execSqlRun("UPDATE timeline SET params = ? WHERE seq = ?", JSON.stringify(params), row.seq);
+      expect(tableCounts()).toEqual(beforeCounts);
+
+      const after = await checkFreshness(db, { sources: ["src/other.ts"], repo_root: projDir });
+      expect(after.records.map((r) => r.id)).toEqual([saved.passport.trail_id]);
+      expect(after.records[0]?.state).toBe("fresh");
+      expect(loadFreshnessIndex(db).source_fingerprint).not.toBe(cached.source_fingerprint);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("A16: external UPDATE между чтениями не маркирует старый index новым fingerprint", async () => {
+    nodeWithRef("first", ["src/a.ts"]);
+    nodeWithRef("max-ref", ["src/z.ts"]);
+    for (const ref of ["src/a.ts", "src/b.ts", "src/z.ts"]) writeProjFile(ref, "export const X = 1;\n");
+    await checkArtifacts(db, { node_ids: ["first"], cwd: projDir });
+    const writer = new KnowledgeDB(db.dbPath);
+    const read = db.execSqlAll.bind(db);
+    let injected = false;
+    const spy = vi.spyOn(db, "execSqlAll").mockImplementation((sql, ...args) => {
+      const rows = read(sql, ...args);
+      if (!injected && sql.includes("FROM nodes") && sql.includes("file_refs")) {
+        injected = true;
+        // Независимое соединение может писать во время readonly snapshot (WAL).
+        writer.execSqlRun("UPDATE nodes SET file_refs = ? WHERE id = ?", JSON.stringify(["src/b.ts"]), "first");
+        writer.execSqlRun("UPDATE node_artifacts SET ref = ? WHERE node_id = ?", "src/b.ts", "first");
+      }
+      return rows;
+    });
+    try {
+      await checkFreshness(db, { sources: ["src/a.ts"], repo_root: projDir });
+      expect(injected).toBe(true);
+      const initial = JSON.parse(fs.readFileSync(freshnessIndexCachePath(db.dbPath), "utf8")) as FreshnessIndex;
+      expect(initial.entries["src/a.ts"]?.filter((e) => e.id === "first").map((e) => e.via)).toEqual(["node_file_ref", "artifact"]);
+      expect(initial.entries["src/b.ts"]).toBeUndefined();
+      spy.mockRestore();
+      const after = await checkFreshness(db, { sources: ["src/b.ts"], repo_root: projDir });
+      expect(after.records.map((r) => r.id)).toEqual(["first"]);
+      const cached = loadFreshnessIndex(db);
+      expect(cached.entries["src/a.ts"]).toBeUndefined();
+      expect(cached.source_fingerprint).toBe(buildFreshnessIndex(db).source_fingerprint);
+    } finally {
+      spy.mockRestore();
+      writer.close();
+    }
   });
 
   it("невалидные записи кэша (узел-призрак) не повышают доверие: запись unknown", async () => {
