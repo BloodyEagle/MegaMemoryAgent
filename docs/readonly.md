@@ -10,7 +10,8 @@ from a read-only `KnowledgeDB`, and what happens on a schema mismatch.
 | `megamemory export --md <dir>` | read-only (`PRAGMA query_only = ON`) | Writes rendered markdown unless `--check` is used. `--check` only reports missing, differing, and extra `.md` files; it never deletes them. |
 | `megamemory eval` | read-only | JSONL is parsed and structurally validated before the database opens. |
 | `megamemory conflicts` | read-only | Inspection only. `merge` and `resolve` are separate writing commands. |
-| `megamemory stats --funnel --json` without `--prune` | read-only | This exact scripted mode only. Plain `stats`, non-JSON funnel output, or any `--prune` path opens RW. |
+| `megamemory stats --funnel --json`, `stats --health --json`, or `stats --funnel --health --json`, without `--prune` | read-only | One JSON object on stdout: funnel, health, or `{funnel, health}` respectively; no usage/timeline writes. `--window 7d\|30d\|all` selects the reporting window (default: `7d`). Plain `stats`, `stats --json` alone, non-JSON funnel/health output, or any `--prune` path opens RW. |
+| `megamemory expire --scan [--json]` | read-only | Reviews candidates without applying them; `--scan --apply` is refused. `--scan --json` prints exactly one versioned report JSON on stdout; review/apply instructions go to stderr. |
 | `megamemory expire` without `--apply` | read-only | Validates every ID and prints the replacement expiry. `--apply` opens RW and atomically rechecks, updates the whole batch, and appends one strict timeline entry. |
 | `megamemory migrate --dry-run` (also the default without `--apply`) | source unchanged | Takes a coherent `VACUUM INTO` snapshot, including committed WAL frames; runs the real apply path on the disposable copy; fingerprints source main + `-wal` before/after. |
 | `megamemory repair-ids --dry-run` (also the default without `--apply`) | source unchanged | Uses the same snapshot/fingerprint boundary and plans on the copy. |
@@ -52,7 +53,8 @@ open with an ordinary RW `KnowledgeDB` open for that process.
 
 It does **not** affect:
 
-- `stats --funnel --json`;
+- `stats --funnel --json`, `stats --health --json`, and their combined JSON mode
+  without `--prune`;
 - dry-run `expire`;
 - `migrate --dry-run` or `repair-ids --dry-run`;
 - fixture protection;

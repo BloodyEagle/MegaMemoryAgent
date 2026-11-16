@@ -84,7 +84,7 @@ ${pc.bold("Bench options:")}
 
 ${pc.bold("Expire options:")}
   ${pc.cyan("--scan")}          review-only candidate scan ${pc.dim("(readonly, never writes; --scan --apply is refused)")}
-  ${pc.cyan("--json")}          scan: print the versioned report JSON ${pc.dim("(format_version 2, compatible with --report)")}
+  ${pc.cyan("--json")}          scan: print exactly one versioned report JSON on stdout ${pc.dim("(format_version 2, compatible with --report); review/apply instructions go to stderr")}
   ${pc.cyan("--repo")} ${pc.dim("PATH")}     scan: repository for advisory tag checks ${pc.dim("(a tag never auto-refutes a claim)")}
   ${pc.cyan("--ids")} ${pc.dim("IDS")}       comma-separated node ids ${pc.dim("(mutually exclusive with --report)")}
   ${pc.cyan("--report")} ${pc.dim("FILE")}   JSON report; use candidates whose expire field is true ${pc.dim("(versioned reports pin the snapshot date and field versions; legacy reports apply with an explicit warning)")}

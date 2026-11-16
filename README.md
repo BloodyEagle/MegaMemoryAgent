@@ -200,10 +200,13 @@ gives every node an optional `valid_until` (ISO-8601, UTC):
   application writes a `timeline` entry. Cleanup candidates on a live base:
   run it on a copy, keep useful content by rewriting it instead of expiring.
 - **The `journal` kind (M2)** — an explicit kind for volatile state notes
-  ("PR #N open now"). It is not evidence and not a decision substitute: a
-  decision keeps its mandatory supports, and a historical event ("release
-  shipped on date X") does not become false with age — the term limits the
-  note's usefulness in the current context (delivery policy, not auto-refuted).
+  ("PR #N open now"). **Recommendation: do not use journals as decision
+  supports.** This is a workflow rule, not a technical prohibition: the server
+  currently permits a journal as `evidence.node` or an `informed_by` target.
+  A journal is not a decision substitute: a decision keeps its mandatory supports.
+  A historical event ("release shipped on date X") does not become false with
+  age — the term limits the note's usefulness in the current context (delivery
+  policy, not auto-refuted).
   When `valid_until` is omitted on create, the server applies a default term:
   `MEGAMEMORY_EXPIRY_JOURNAL_DAYS` env → `expiry.journal_days` in the config
   next to the database (`megamemory.config.json`) → **90 days** (the plan's
