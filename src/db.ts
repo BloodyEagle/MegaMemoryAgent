@@ -370,7 +370,7 @@ export class KnowledgeDB {
       }
       return;
     }
-    this.assertMigratable();
+    this.assertSchemaOpenable();
     this.migrate();
     this.backfillCreatedViaV2();
   }
@@ -381,8 +381,12 @@ export class KnowledgeDB {
    * штатно; на существующей таблице nodes молча мигрировать нельзя — шаг v1
    * строит индексы по форк-колонкам, которых там нет, и конструктор падал
    * «no such column: status», что выглядит как повреждение базы.
+   *
+   * F2 (2.6.2): единственная копия этой проверки. openStartupDatabase()
+   * вызывает тот же метод, поэтому конструктор и старт MCP/serve говорят
+   * про одну и ту же базу одно и то же; текст ошибки и класс не расходятся.
    */
-  private assertMigratable(): void {
+  assertSchemaOpenable(): void {
     const version = this.getUserVersion();
     if (version !== 0) return;
     const hasNodes = this.db
@@ -525,7 +529,7 @@ export class KnowledgeDB {
       return;
     }
 
-    // 2.3.1: свежая база — та же проверка, что в assertMigratable(), но
+    // 2.3.1: свежая база — та же проверка, что в assertSchemaOpenable(), но
     // ДО создания таблиц: после них `nodes` уже существует и предикат всегда
     // ложен. Только на свежей базе ставим маркер конверсии — иначе первое
     // RW-открытие считает её legacy и гоняет пустую «конверсию» с бэкапом

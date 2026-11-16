@@ -6,9 +6,9 @@ import Database from "libsql";
 import { spawn } from "node:child_process";
 import net from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { KnowledgeDB } from "../db.js";
+import { KnowledgeDB, UpstreamSchemaError } from "../db.js";
 import { dbFingerprint } from "../migrate-cli.js";
-import { preflight, autoMigrateIfNeeded } from "../auto-migrate.js";
+import { preflight, autoMigrateIfNeeded, openStartupDatabase } from "../auto-migrate.js";
 import { vectorSearchEnabled } from "../embeddings.js";
 import { getConcept } from "../tools.js";
 import { cleanupDir } from "./helpers/cleanup.js";
@@ -212,6 +212,27 @@ describe("auto-migration on first open (F14)", () => {
 });
 
 describe("R01 actual automatic startup backup boundary", () => {
+  it("F2: сырая v0-база — конструктор и openStartupDatabase дают одинаковые name и message ошибки", () => {
+    buildLegacyFixture(true, 0);
+    let ctorErr: unknown;
+    try {
+      new KnowledgeDB(dbPath);
+    } catch (err) {
+      ctorErr = err;
+    }
+    let startupErr: unknown;
+    try {
+      openStartupDatabase(dbPath);
+    } catch (err) {
+      startupErr = err;
+    }
+    expect(ctorErr).toBeInstanceOf(UpstreamSchemaError);
+    expect(startupErr).toBeInstanceOf(UpstreamSchemaError);
+    // Единая проверка assertSchemaOpenable: текст и класс не расходятся.
+    expect((startupErr as Error).name).toBe((ctorErr as Error).name);
+    expect((startupErr as Error).message).toBe((ctorErr as Error).message);
+  });
+
   function contents(raw: InstanceType<typeof Database>) {
     return {
       version: (raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
