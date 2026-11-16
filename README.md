@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.6.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.6.2-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -354,7 +354,7 @@ Or download the package asset from the matching GitHub Release (npm names a scop
 package tarball `bloodyeagle-megamemory-<version>.tgz`; for this release):
 
 ```bash
-npm install -g ./bloodyeagle-megamemory-2.6.1.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.2.tgz
 ```
 
 Or build from a checkout (for development):
@@ -365,7 +365,7 @@ cd MegaMemoryAgent
 npm ci
 npm run build
 npm pack                      # prints the exact generated .tgz filename
-npm install -g ./bloodyeagle-megamemory-2.6.1.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.2.tgz
 ```
 
 Register the integration with the installer:
