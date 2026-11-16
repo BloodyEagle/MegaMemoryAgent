@@ -354,7 +354,42 @@ describe("P2.1: адресная перепроверка связанных з�
     const r = await checkFreshness(db, { node_ids: ["d1"], repo_root: projDir });
     expect(r.sources[0]?.status).toBe("unobserved");
     expect(r.sources[0]?.note).toContain("записанной версии");
+    expect(r.records[0]?.state).toBe("unknown");
+    expect(r.records[0]?.checked_sources[0]?.status).toBe("unobserved");
+    expect(r.records[0]?.reasons.join(" ")).toContain("собственной записанной версии");
     expect(r.expected_versions[0]?.sha256).toBe(sha256File("src/a.ts"));
+  });
+
+  it("A04: общая сводка changed не подменяет собственные версии связанных записей", async () => {
+    nodeWithRef("old", ["src/shared.ts"]);
+    nodeWithRef("current", ["src/shared.ts"]);
+    nodeWithRef("unobserved", ["src/shared.ts:1-10"]);
+    writeProjFile("src/shared.ts", "export const S = 1;\n");
+    await checkArtifacts(db, { node_ids: ["old"], cwd: projDir });
+    writeProjFile("src/shared.ts", "export const S = 2;\n");
+    await checkArtifacts(db, { node_ids: ["current"], cwd: projDir });
+
+    const r = await checkFreshness(db, { sources: ["src/shared.ts"], repo_root: projDir });
+    expect(r.sources[0]?.status).toBe("changed");
+    expect(r.records.find((x) => x.id === "old")?.state).toBe("stale_input");
+    expect(r.records.find((x) => x.id === "current")?.state).toBe("fresh");
+    expect(r.records.find((x) => x.id === "unobserved")?.state).toBe("unknown");
+    expect(r.records.find((x) => x.id === "current")?.checked_sources[0]?.status).toBe("unchanged");
+    expect(r.records.find((x) => x.id === "unobserved")?.checked_sources[0]?.status).toBe("unobserved");
+    expect(r.summary.affected).toBe(1);
+  });
+
+  it("A04: частичное покрытие собственными наблюдениями не объявляется fresh", async () => {
+    nodeWithRef("d1", ["src/a.ts"]);
+    writeProjFile("src/a.ts", "export const A = 1;\n");
+    writeProjFile("src/b.ts", "export const B = 1;\n");
+    await checkArtifacts(db, { node_ids: ["d1"], cwd: projDir });
+    db.updateNode("d1", { file_refs: ["src/a.ts", "src/b.ts"] });
+
+    const r = await checkFreshness(db, { sources: ["src/a.ts"], repo_root: projDir });
+    expect(r.records[0]?.state).toBe("partial");
+    expect(r.records[0]?.checked_sources.map((s) => s.status)).toEqual(["unchanged", "unobserved"]);
+    expect(r.records[0]?.reasons.join(" ")).toContain("собственной записанной версии");
   });
 
   it("git_blob источник проверяется без записи наблюдений", async () => {
@@ -436,6 +471,27 @@ describe("P2.1: git-интеграция", () => {
     expect(r.records[0]?.state).toBe("stale_input");
   });
 
+  it("A04: смешанные repo pin квалифицируются отдельно даже при одинаковых байтах", async () => {
+    const repoB = path.join(tmpDir, "repo-b");
+    fs.mkdirSync(path.join(repoB, "src"), { recursive: true });
+    writeProjFile("src/shared.ts", "export const S = 1;\n");
+    fs.writeFileSync(path.join(repoB, "src", "shared.ts"), "export const S = 1;\n", "utf8");
+    nodeWithRef("repo-a", ["src/shared.ts"]);
+    nodeWithRef("repo-b", ["src/shared.ts"]);
+    await checkArtifacts(db, { node_ids: ["repo-a"], cwd: projDir });
+    await checkArtifacts(db, { node_ids: ["repo-b"], cwd: repoB });
+
+    for (const [root, own, foreign] of [[projDir, "repo-a", "repo-b"], [repoB, "repo-b", "repo-a"]]) {
+      const r = await checkFreshness(db, { sources: ["src/shared.ts"], repo_root: root });
+      expect(r.sources[0]?.status).toBe("unchanged");
+      expect(r.records.find((x) => x.id === own)?.state).toBe("fresh");
+      const other = r.records.find((x) => x.id === foreign);
+      expect(other?.state).toBe("unknown");
+      expect(other?.checked_sources[0]?.status).toBe("other_repo");
+      expect(other?.reasons.join(" ")).toContain("не одна опора");
+    }
+  });
+
   it("два репозитория с одинаковым путём: other_repo, сравнение байтов не делается", async () => {
     const repoB = path.join(tmpDir, "repo-b");
     fs.mkdirSync(path.join(repoB, "src"), { recursive: true });
@@ -486,8 +542,10 @@ describe("P2.1: доказательство по содержимому", () =>
     // Один физический источник — один source check (дедуп по ключу пути).
     expect(r.sources).toHaveLength(1);
     expect(r.sources[0]?.status).toBe("unchanged");
-    // Обе записи квалифицированы.
+    // Обе записи квалифицированы, но наблюдение d1 не подтверждает d2.
     expect(r.records.map((x) => x.id).sort()).toEqual(["d1", "d2"]);
+    expect(r.records.find((x) => x.id === "d1")?.state).toBe("fresh");
+    expect(r.records.find((x) => x.id === "d2")?.state).toBe("unknown");
     // expected_versions не дублируют физический источник.
     expect(r.expected_versions).toHaveLength(1);
   });

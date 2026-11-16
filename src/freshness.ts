@@ -330,6 +330,7 @@ interface Comparison {
   origin: FreshnessIndexEntry["via"];
   record: "node" | "passport";
   id: string;
+  ref: string;
   digest: string | null;
   recorded_missing: boolean;
   where: string;
@@ -570,9 +571,9 @@ export async function checkFreshness(
     else comparisons.set(key, [cmp]);
   };
 
-  const normRoot = root.replace(/\\/g, "/").toLowerCase();
+  const normRoot = absKey(path.resolve(root));
   const sameRoot = (pin: string | null | undefined): boolean =>
-    pin == null ? true : pin.replace(/\\/g, "/").toLowerCase() === normRoot;
+    pin == null ? true : absKey(path.resolve(pin)) === normRoot;
 
   for (const entry of relatedRecords.values()) {
     if (entry.record === "node") {
@@ -587,12 +588,13 @@ export async function checkFreshness(
         if (!sourceWorks.has(key)) continue;
         // Одна связка (узел, ref) — одно наблюдение: file_ref и artifact
         // записи того же узла дедуплицируются.
-        const dup = comparisons.get(key)?.some((c) => c.record === "node" && c.id === entry.id && c.origin === "artifact");
+        const dup = comparisons.get(key)?.some((c) => c.record === "node" && c.id === entry.id && c.ref === row.ref && c.origin === "artifact");
         if (dup) continue;
         addComparison(key, {
           origin: "artifact",
           record: "node",
           id: entry.id,
+          ref: row.ref,
           digest: row.digest,
           recorded_missing: row.digest === null,
           where: `наблюдение check_artifacts узла ${entry.id} (checked_at ${row.checked_at})`,
@@ -609,6 +611,7 @@ export async function checkFreshness(
           origin: "passport_scope",
           record: "passport",
           id: entry.id,
+          ref: f.ref,
           digest: f.sha256,
           recorded_missing: f.missing === true,
           where: `область паспорта trail ${entry.id} (checked_at ${body.checked_at})`,
@@ -754,12 +757,34 @@ export async function checkFreshness(
     const reasons: string[] = [];
     let state: FreshnessRecordCheck["state"] = "fresh";
     let otherRepoPin: string | null = null;
+    let unobservedCount = 0;
     for (const ref of refs) {
       const key = normalizeSourceKey(ref);
-      const st = statusByKey.get(key);
+      let st = statusByKey.get(key);
       if (st === undefined) {
         unchecked.push(ref);
         continue;
+      }
+      // A04: sourceChecks — сводка, не доказательство для каждого потребителя.
+      // Сравниваем только собственную версию этой ссылки и её repo pin: чужой
+      // узел/паспорт и исторический ref не могут сделать запись fresh/stale.
+      const own = (comparisons.get(key) ?? []).filter(
+        (c) => c.record === entry.record && c.id === entry.id && c.ref === ref
+      );
+      const valid = own.filter((c) => sameRoot(c.repo_pin));
+      if (st !== "skipped" && st !== "unstable" && st !== "unknown") {
+        if (own.some((c) => !sameRoot(c.repo_pin))) {
+          st = "other_repo";
+          otherRepoPin = own.find((c) => !sameRoot(c.repo_pin))?.repo_pin ?? otherRepoPin;
+        } else if (valid.length === 0 || valid.every((c) => c.digest === null && !c.recorded_missing)) {
+          st = "unobserved";
+        } else {
+          const digest = observations.get(key)?.digest ?? null;
+          st = digest === null
+            ? (valid.every((c) => c.recorded_missing) ? "unchanged" : "missing")
+            : (valid.some((c) => c.recorded_missing || (c.digest !== null && c.digest !== digest))
+              ? "changed" : "unchanged");
+        }
       }
       checkedSources.push({ source: ref, status: st });
       if (st === "skipped") {
@@ -779,11 +804,19 @@ export async function checkFreshness(
       } else if (st === "other_repo") {
         reasons.push(`"${ref}" закреплён за другим worktree — сравнение байтов не делалось`);
         state = "unknown";
-        otherRepoPin = comparisons.get(key)?.[0]?.repo_pin ?? otherRepoPin;
       } else if (st === "unknown") {
         reasons.push(`"${ref}" не проверен (ошибка наблюдения)`);
         state = "unknown";
+      } else if (st === "unobserved") {
+        reasons.push(`"${ref}" не имеет собственной записанной версии — наблюдение другой записи не доказывает свежесть`);
+        unobservedCount += 1;
       }
+    }
+    if (refs.length === 0) {
+      state = "unknown";
+      reasons.push("у записи нет текущих источников для сравнения — история наблюдений не доказывает свежесть");
+    } else if (unobservedCount > 0 && state === "fresh") {
+      state = unobservedCount === refs.length ? "unknown" : "partial";
     }
     if (otherRepoPin) {
       reasons.push(`запись связана с другим repo/worktree (${otherRepoPin}) — одинаковый путь в разных репозиториях не одна опора`);
