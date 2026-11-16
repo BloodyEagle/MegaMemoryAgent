@@ -4,10 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureSchema } from "../migrate-schema.js";
 import { addNode, auditFixture, type AuditFixture } from "./helpers/audit.js";
 import type { KnowledgeDB } from "../db.js";
-import type { UnderstandInput, UnderstandOutput } from "../types.js";
+import type { UnderstandInput, UnderstandOutput, ConceptBatchOutput } from "../types.js";
+import type { ConceptToolArgs } from "../concept-profile.js";
 
 type WireResponse = { content: Array<{ type: string; text: string }>; isError?: boolean };
-type Handler = (params: UnderstandInput) => Promise<WireResponse>;
+type Handler = (params: UnderstandInput | ConceptToolArgs) => Promise<WireResponse>;
 const boundary = vi.hoisted(() => ({ handlers: new Map<string, Handler>() }));
 
 // Only the SDK transport/registration boundary is replaced. The production
@@ -88,6 +89,27 @@ async function wireResponse(seed: (db: KnowledgeDB) => void, input: UnderstandIn
 function wireTokens(value: string) { return Math.ceil(Buffer.byteLength(value, "utf8") / 3); }
 
 describe("K-03: the actual pretty MCP response obeys the token cap", () => {
+  it("A06 MCP wrapper resumes a budget-truncated batch using only its continuation", async () => {
+    const ids = Array.from({ length: 5 }, (_, i) => `mcp-batch-${i}`);
+    await wireResponse(db => {
+      for (const id of ids) addNode(db, id, { summary: "A complete consumer claim. ".repeat(12) });
+    }, { query: "bootstrap", max_tokens: 1500 });
+    const handler = boundary.handlers.get("get_concept")!;
+    const first = await handler({ ids, max_tokens: 1300 });
+    expect(first.isError).not.toBe(true);
+    const page1 = JSON.parse(first.content[0].text) as ConceptBatchOutput;
+    const placed = page1.batch.filter(item => item.status === "ok").map(item => item.id);
+    expect(placed.length).toBeGreaterThan(0);
+    expect(placed.length).toBeLessThan(ids.length);
+    expect(page1.meta.continuation).toEqual(expect.any(String));
+
+    const second = await handler({ continuation: page1.meta.continuation });
+    expect(second.isError, second.content[0].text).not.toBe(true);
+    const page2 = JSON.parse(second.content[0].text) as ConceptBatchOutput;
+    expect(page2.batch.filter(item => item.status === "ok").map(item => item.id)).toEqual(ids.slice(placed.length));
+    expect(page2.meta.budget_skipped).toBe(0);
+  });
+
   it.each([undefined, "compact", "full", "brief"] as const)("D-05 actual %s MCP wire fits caps 500..1500 or refuses required floor", async mode => {
     const { response, output } = await wireResponse(db => {
       addNode(db, "escaped-claim", { name: "Имя \\\" 中文", summary: "escapedwireneedle Measured claim", file_refs: [`src/${"кириллица\\\"\\\\\n".repeat(80)}.ts:10-30`] });

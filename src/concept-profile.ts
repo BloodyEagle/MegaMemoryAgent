@@ -183,7 +183,7 @@ function encodeContinuation(token: ContinuationTokenV1): string {
 function decodeContinuation(raw: string): ContinuationTokenV1 {
   if (!raw.startsWith(CONTINUATION_PREFIX)) {
     throw new Error(
-      "continuation: токен не распознан — продолжение только из ответов этой версии формы."
+      "continuation: токен не распознан — используй токен get_concept из meta.continuation (пакет) или meta.continuations (список)."
     );
   }
   let parsed: unknown;
@@ -192,11 +192,11 @@ function decodeContinuation(raw: string): ContinuationTokenV1 {
       Buffer.from(raw.slice(CONTINUATION_PREFIX.length), "base64url").toString("utf8")
     );
   } catch {
-    throw new Error("continuation: токен не читается — повтори чтение без continuation.");
+    throw new Error("continuation: токен не читается — повтори get_concept с исходными id/ids; токен берётся из meta.continuation/meta.continuations.");
   }
   const token = parsed as ContinuationTokenV1;
   if (token?.v !== 1 || (token.kind !== "list" && token.kind !== "batch")) {
-    throw new Error("continuation: неизвестная версия токена — повтори чтение целиком.");
+    throw new Error("continuation: неизвестная версия или вид токена — повтори get_concept с исходными id/ids; используй meta.continuation/meta.continuations.");
   }
   return token;
 }
@@ -1241,6 +1241,21 @@ export function branchConceptToolArgs(args: ConceptToolArgs): ConceptToolMode {
     };
   }
   if (args.continuation !== undefined) {
+    const token = decodeContinuation(args.continuation);
+    if (token.kind === "batch") {
+      if (args.id !== undefined) {
+        throw new Error("get_concept: продолжение пакета из meta.continuation передаётся без id и ids.");
+      }
+      return {
+        mode: "batch",
+        input: {
+          profile: args.profile,
+          max_tokens: args.max_tokens,
+          max_neighbors: args.max_neighbors,
+          continuation: args.continuation,
+        },
+      };
+    }
     return {
       mode: "profile",
       input: {
