@@ -7,6 +7,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { expireNodes, resolveUntil, readReportIds, runExpire } from "../expire-cli.js";
@@ -123,6 +125,21 @@ describe("разбор аргументов (тесты 30-32)", () => {
     await expect(
       runExpire(["--db", path.join(tmpDir, "knowledge.db"), "--ids", "a", "--report", "r.json", "--until", "past"])
     ).rejects.toThrow(/взаимоисключающие/);
+  });
+});
+
+describe("A09: expire --scan --json stdout", () => {
+  it("полный stdout CLI парсится как один JSON-документ", () => {
+    insert("scan-json", "PR #44 открыт");
+    const result = spawnSync(process.execPath, [
+      "--import", "tsx", "src/index.ts", "expire",
+      "--db", path.join(tmpDir, "knowledge.db"), "--scan", "--json",
+    ], { cwd: fileURLToPath(new URL("../../", import.meta.url)), encoding: "utf-8", timeout: 20_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.format_version).toBe(2);
+    expect(report.candidates).toEqual(expect.arrayContaining([expect.objectContaining({ id: "scan-json" })]));
   });
 });
 

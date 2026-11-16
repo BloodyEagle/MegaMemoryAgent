@@ -424,12 +424,12 @@ export async function runExpire(argv: string[]): Promise<void> {
       } else {
         console.log(renderScanText(report));
       }
-      console.log(
-        pc.dim(
-          "  Скан dry-run: база не менялась, кандидаты expire не включают. " +
-            "Просмотри отчёт, разреши строки (expire: true) и примени: megamemory expire --report <json> --apply."
-        )
+      const instruction = pc.dim(
+        "  Скан dry-run: база не менялась, кандидаты expire не включают. " +
+          "Просмотри отчёт, разреши строки (expire: true) и примени: megamemory expire --report <json> --apply."
       );
+      if (json) console.error(instruction);
+      else console.log(instruction);
     } finally {
       db.close();
     }
