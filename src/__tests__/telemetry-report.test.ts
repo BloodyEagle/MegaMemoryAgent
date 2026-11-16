@@ -1,11 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect } from "vitest";
 import { buildTelemetryReport, type TelemetryReport } from "../telemetry-report.js";
-import { closeAndCleanup } from "./helpers/cleanup.js";
-import { KnowledgeDB } from "../db.js";
-import { ensureSchema } from "../migrate-schema.js";
 
 // J1 (план 20+21 v3 §15): локальный агрегатор поверх J0-телеметрии.
 //
@@ -21,19 +15,6 @@ import { ensureSchema } from "../migrate-schema.js";
 //   заранее зафиксированный oracle; автоматически не вычисляется.
 // - Полнота данных эксперимента — явные поля (пропуски/ошибки/усечения/
 //   доступность usage).
-
-let tmpDir: string;
-let db: KnowledgeDB;
-
-beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-j1rep-"));
-  db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
-  ensureSchema(db);
-});
-
-afterEach(async () => {
-  if (db) await closeAndCleanup(db, tmpDir);
-});
 
 let clock = 0;
 function ev(overrides: Record<string, unknown>): Record<string, unknown> {
@@ -71,29 +52,44 @@ describe("J1 агрегатор: вызовы, исходы, latency", () => {
     expect(report.latency.by_tool.get_concept).toMatchObject({ count: 2, p50_ms: 250, p95_ms: 300 });
   });
 
-  it("сессиизация: разрыв ≤30 минут — одна сессия, больше — новая; wall-время сессий с p50/p95", () => {
-    const lines: string[] = [];
-    // Сессия 1: 10:00 и 10:10 (10 минут).
-    lines.push(JSON.stringify({ ...ev({ ts: "2026-11-16T10:00:00.000Z" }), tool: "understand" }));
-    lines.push(JSON.stringify({ ...ev({ ts: "2026-11-16T10:10:00.000Z" }), tool: "get_concept" }));
-    // Сессия 2: 12:00 (разрыв > 30 минут).
-    lines.push(JSON.stringify({ ...ev({ ts: "2026-11-16T12:00:00.000Z" }), tool: "understand" }));
-    const report = buildTelemetryReport(lines);
-    expect(report.latency.sessions.count).toBe(2);
-    // wall: [600000, 0] → p50 = 0? sorted [0,600000] → p50=600000? Определим в коде: медиана чётного — верхняя из средних? Проверяем честно ниже.
-    expect(report.latency.sessions.wall_ms).toHaveLength(2);
+  it.each([
+    { label: "invalid", event: { tool: "understand", outcome: "error", ts: "invalid" } },
+    { label: "missing", event: { tool: "understand", outcome: "error" } },
+    { label: "non-string", event: { tool: "understand", outcome: "error", ts: 42 } },
+    { label: "empty", event: { tool: "understand", outcome: "error", ts: "" } },
+  ])("A13: $label timestamp отклоняется как malformed во всём отчёте", ({ event }) => {
+    const report = buildTelemetryReport([
+      JSON.stringify({ ...event, latency_ms: 999, response_bytes: 999,
+        write_category: "knowledge", must_read_refs: ["src/invalid.ts"],
+        provider_usage: { input_tokens: 999, output_tokens: 999, cost: 999 } }),
+      JSON.stringify(ev({ ts: "2026-11-16T10:00:00.000Z", tool: "get_concept", latency_ms: 100 })),
+    ], { tariff_version: "price-list-2026-11" });
+    expect(report.source).toEqual({ lines_total: 2, events_parsed: 1,
+      lines_skipped_malformed: 1, first_ts: "2026-11-16T10:00:00.000Z", last_ts: "2026-11-16T10:00:00.000Z" });
+    expect(report.calls).toMatchObject({ total: 1, by_tool: { get_concept: 1 },
+      by_outcome: { ok: 1, "no-op": 0, error: 0 }, sequential_round_trips: 1, sessions: 1 });
+    expect(Object.values(report.calls.by_tool).reduce((sum, n) => sum + n, 0)).toBe(report.calls.total);
+    expect(Object.values(report.calls.by_outcome).reduce((sum, n) => sum + n, 0)).toBe(report.calls.total);
+    expect(report.latency.overall).toMatchObject({ count: 1, p50_ms: 100, p95_ms: 100 });
+    expect(report.tokens.provider.value).toBe("unavailable");
+    expect(report.tokens.estimated_wire.response_bytes_total).toBe(3000);
+    expect(report.cost.value).toBe("unavailable");
+    expect(report.reads.must_read_issued).toBeNull();
+    expect(report.memory_writes.writes_total).toBe(0);
+    expect(report.data_completeness).toMatchObject({ lines_total: 2, events_parsed: 1,
+      lines_skipped_malformed: 1, events_with_error: 0, provider_usage_unavailable: 1 });
   });
 
-  it("полное время сессий: p50 пары [0, 600000] — средняя (300000); правило детерминировано", () => {
-    const lines: string[] = [];
-    // Сессия 1: 10:00 → 10:10 (wall 600000), сессия 2: 12:00 (wall 0).
-    lines.push(JSON.stringify({ ...ev({ ts: "2026-11-16T10:00:00.000Z" }) }));
-    lines.push(JSON.stringify({ ...ev({ ts: "2026-11-16T10:10:00.000Z" }) }));
-    lines.push(JSON.stringify({ ...ev({ ts: "2026-11-16T12:00:00.000Z" }) }));
-    const report = buildTelemetryReport(lines);
-    expect(report.latency.sessions.count).toBe(2);
-    expect(report.latency.sessions.wall_ms_p50).toBe(300000);
-    expect(report.latency.sessions.wall_ms_p95).toBe(600000);
+  it("две сессии: разрыв >30 минут, wall [600000, 0], p50=300000 и p95=600000", () => {
+    const report = buildTelemetryReport([
+      JSON.stringify(ev({ ts: "2026-11-16T10:00:00.000Z", tool: "understand" })),
+      JSON.stringify(ev({ ts: "2026-11-16T10:10:00.000Z", tool: "get_concept" })),
+      JSON.stringify(ev({ ts: "2026-11-16T12:00:00.000Z", tool: "understand" })),
+    ]);
+    expect(report.calls.sessions).toBe(2);
+    expect(report.latency.sessions).toMatchObject({
+      count: 2, wall_ms: [600000, 0], wall_ms_p50: 300000, wall_ms_p95: 600000,
+    });
   });
 
   it("время до ПРОВЕРЕННОГО ответа — unavailable: нет oracle-события, автоматически не вычисляется", () => {

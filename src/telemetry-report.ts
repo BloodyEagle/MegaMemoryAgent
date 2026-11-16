@@ -44,7 +44,7 @@ interface ProviderUsage {
 
 interface RawEvent {
   v?: number;
-  ts?: string;
+  ts: string;
   tool?: string;
   outcome?: string;
   write_category?: string | null;
@@ -162,7 +162,12 @@ function parseEventLine(line: string): RawEvent | null {
   if (!trimmed) return null;
   try {
     const parsed: unknown = JSON.parse(trimmed);
-    return isRecord(parsed) ? (parsed as RawEvent) : null;
+    // Один набор допустимых событий для calls, агрегатов и сессий:
+    // отсутствующее/невалидное время — malformed, а не потерянный вызов.
+    if (!isRecord(parsed) || typeof parsed.ts !== "string" || !Number.isFinite(Date.parse(parsed.ts))) {
+      return null;
+    }
+    return parsed as unknown as RawEvent;
   } catch {
     return null;
   }
@@ -190,7 +195,7 @@ export function buildTelemetryReport(
   opts: { tariff_version?: string; now?: Date } = {}
 ): TelemetryReport {
   let malformed = 0;
-  const events: Array<{ ev: RawEvent; tsMs: number | null }> = [];
+  const events: Array<{ ev: RawEvent; tsMs: number }> = [];
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === "") continue; // пустые строки не считаются данными
@@ -199,15 +204,11 @@ export function buildTelemetryReport(
       malformed += 1;
       continue;
     }
-    const tsMs = typeof ev.ts === "string" ? Date.parse(ev.ts) : Number.NaN;
-    events.push({ ev, tsMs: Number.isNaN(tsMs) ? null : tsMs });
+    events.push({ ev, tsMs: Date.parse(ev.ts) });
   }
 
-  const tsStrings = events.map((e) => (typeof e.ev.ts === "string" ? e.ev.ts : null)).filter((s): s is string => s !== null);
-  tsStrings.sort();
-  const ordered = events
-    .filter((e): e is { ev: RawEvent; tsMs: number } => e.tsMs !== null)
-    .sort((a, b) => a.tsMs - b.tsMs);
+  const ordered = [...events].sort((a, b) => a.tsMs - b.tsMs);
+  const tsStrings = ordered.map((e) => e.ev.ts);
 
   // --- вызовы и исходы ---
   const byTool: Record<string, number> = {};
