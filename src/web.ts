@@ -25,7 +25,7 @@ import {
 } from "./embeddings.js";
 import { healthReport, type HealthReport } from "./doctor.js";
 import { d3Source, resolveD3Src, type D3Source } from "./d3-asset.js";
-import type { NodeRow } from "./types.js";
+import type { EdgeRow, NodeRow } from "./types.js";
 
 const VERSION = JSON.parse(
   fs.readFileSync(
@@ -272,8 +272,12 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
   // fingerprint и для начального snapshot-а, и для каждого poll-а.
   let lastKnownNodeStates = new Map<string, string>();
   let lastKnownEdgeKeys = new Set<string>(); // "from|to|relation"
+  let lastKnownEdgeStates = new Map<string, string>();
 
-  function buildGraphPayload(): {
+  function buildGraphPayload(
+    nodeRows = db.getAllActiveNodes(),
+    edgeRows = db.getAllEdges(),
+  ): {
     nodes: Array<{
       id: string;
       name: string;
@@ -291,9 +295,11 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       to: string;
       relation: string;
       description: string | null;
+      created_via: string;
+      accepted_at: string | null;
     }>;
   } {
-    const nodes = db.getAllActiveNodes().map((n) => ({
+    const nodes = nodeRows.map((n) => ({
       id: n.id,
       name: n.name,
       kind: n.kind,
@@ -306,12 +312,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       expired: isNodeExpired(n),
     }));
 
-    const edges = db.getAllEdges().map((e) => ({
-      from: e.from_id,
-      to: e.to_id,
-      relation: e.relation,
-      description: e.description,
-    }));
+    const edges = edgeRows.map(edgePayload);
 
     const edgeCounts = new Map<string, number>();
     for (const e of edges) {
@@ -594,6 +595,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     lastKnownNodeIds = new Set(nodes.map((n) => n.id));
     lastKnownNodeStates = new Map(nodes.map((n) => [n.id, nodeStateFingerprint(n)]));
     lastKnownEdgeKeys = new Set(edges.map((e) => `${e.from_id}|${e.to_id}|${e.relation}`));
+    lastKnownEdgeStates = new Map(edges.map((e) => [`${e.from_id}|${e.to_id}|${e.relation}`, edgeStateFingerprint(e)]));
   }
 
   /**
@@ -618,6 +620,23 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
     return createHash("sha256").update(shape, "utf8").digest("hex");
   }
 
+  function edgePayload(edge: EdgeRow) {
+    return {
+      from: edge.from_id,
+      to: edge.to_id,
+      relation: edge.relation,
+      description: edge.description,
+      created_via: edge.created_via ?? "unknown",
+      accepted_at: edge.accepted_at ?? null,
+    };
+  }
+
+  /** A15: identity alone misses external rationale/acceptance writes. Hash
+   * explicit edge state, not modification clocks, for both init and polls. */
+  function edgeStateFingerprint(edge: EdgeRow): string {
+    return createHash("sha256").update(JSON.stringify(edgePayload(edge)), "utf8").digest("hex");
+  }
+
   function broadcast(event: { type: string; data: unknown }): void {
     const msg = `data: ${JSON.stringify(event)}\n\n`;
     sseClients = sseClients.filter((client) => {
@@ -638,6 +657,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       const currentNodeIds = new Set(nodes.map((n) => n.id));
       const currentNodeStates = new Map(nodes.map((n) => [n.id, nodeStateFingerprint(n)]));
       const currentEdgeKeys = new Set(edges.map((e) => `${e.from_id}|${e.to_id}|${e.relation}`));
+      const currentEdgeStates = new Map(edges.map((e) => [`${e.from_id}|${e.to_id}|${e.relation}`, edgeStateFingerprint(e)]));
 
       const nodeById = new Map(nodes.map((n) => [n.id, n]));
       const edgeByKey = new Map(edges.map((e) => [`${e.from_id}|${e.to_id}|${e.relation}`, e]));
@@ -649,6 +669,7 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       }
 
       let hasChanges = false;
+      let hasEdgeUpdates = false;
 
       for (const id of currentNodeIds) {
         if (!lastKnownNodeIds.has(id)) {
@@ -713,17 +734,18 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
         if (!lastKnownEdgeKeys.has(key)) {
           const edge = edgeByKey.get(key);
           if (!edge) continue;
-          broadcast({
-            type: "edge_added",
-            data: {
-              from: edge.from_id,
-              to: edge.to_id,
-              relation: edge.relation,
-              description: edge.description,
-            },
-          });
+          broadcast({ type: "edge_added", data: edgePayload(edge) });
           hasChanges = true;
         }
+      }
+
+      for (const [key, state] of currentEdgeStates) {
+        if (!lastKnownEdgeKeys.has(key) || lastKnownEdgeStates.get(key) === state) continue;
+        const edge = edgeByKey.get(key);
+        if (!edge) continue;
+        broadcast({ type: "edge_updated", data: edgePayload(edge) });
+        hasEdgeUpdates = true;
+        hasChanges = true;
       }
 
       for (const key of lastKnownEdgeKeys) {
@@ -740,10 +762,24 @@ export async function runServe(port: number, host = "127.0.0.1"): Promise<void> 
       lastKnownNodeIds = currentNodeIds;
       lastKnownNodeStates = currentNodeStates;
       lastKnownEdgeKeys = currentEdgeKeys;
+      lastKnownEdgeStates = currentEdgeStates;
 
       if (hasChanges) {
         const stats = db.getStats();
         const kinds = db.getKindsBreakdown();
+        if (hasEdgeUpdates) {
+          // The shipped inline explorer predates edge_updated. One init per
+          // changed poll replaces rationale and invalidates card/preview through
+          // its existing consumer, without changing server preview→apply CAS.
+          broadcast({
+            type: "init",
+            data: {
+              ...buildGraphPayload(nodes, edges),
+              stats: { nodes: stats.nodes, edges: stats.edges, removed: stats.removed },
+              kinds,
+            },
+          });
+        }
         broadcast({
           type: "stats",
           data: {
