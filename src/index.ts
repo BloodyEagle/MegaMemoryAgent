@@ -259,7 +259,7 @@ async function startMcpServer() {
     "@modelcontextprotocol/sdk/server/stdio.js"
   );
   const { z } = await import("zod");
-  const { KnowledgeDB } = await import("./db.js");
+  const { openStartupDatabase, autoMigrateIfNeeded, describeAutoMigration, describeSchemaRepair } = await import("./auto-migrate.js");
   const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailSaveWithPassport, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
   const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
@@ -281,20 +281,20 @@ async function startMcpServer() {
   // repo в каждый check_artifacts: смена startup-пути перезакрепляет git-ref.
   const REPO_PATH = resolveRepoPath(process.argv.slice(2), DB_PATH);
 
-  const db = new KnowledgeDB(DB_PATH);
+  let db: import("./db.js").KnowledgeDB;
 
   // F14: a legacy database converts itself on first open (backup, schema,
   // id repair with aliases, FTS rebuild, name_norm, embed meta) and is
   // verified before serving. MEGAMEMORY_AUTO_MIGRATE=0 opts out — then
   // only the additive schema steps run and id repair stays manual.
   try {
-    const { autoMigrateIfNeeded, describeAutoMigration, describeSchemaRepair } =
-      await import("./auto-migrate.js");
+    const opened = openStartupDatabase(DB_PATH);
+    db = opened.db;
     if (process.env.MEGAMEMORY_AUTO_MIGRATE === "0") {
       const { ensureSchema, emptyReport } = await import("./migrate-schema.js");
       ensureSchema(db, emptyReport());
     } else {
-      const result = await autoMigrateIfNeeded(db, DB_PATH);
+      const result = await autoMigrateIfNeeded(db, DB_PATH, { backupPath: opened.backupPath });
       const line = describeAutoMigration(result);
       if (line) console.error(`megamemory: ${line}`);
       // 2.3.2 (plan 16): incomplete schema on a non-legacy db (the 2.3.1

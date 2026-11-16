@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { KnowledgeDB } from "./db.js";
+import { KnowledgeDB, SCHEMA_VERSION, UpstreamSchemaError } from "./db.js";
 import {
   MIGRATION_TARGET_SCHEMA_VERSION,
   ensureSchema,
@@ -173,6 +173,37 @@ export interface AutoMigrationResult {
   repair_steps: string[];
 }
 
+/** R01: MCP/serve share a pre-write startup boundary. Normal KnowledgeDB
+ * construction migrates before autoMigrateIfNeeded can take its backup.
+ * Inspect the deferred connection first and reuse this snapshot for the
+ * later conversion; fresh/healthy databases must not get spurious backups.
+ */
+export function openStartupDatabase(dbPath: string): { db: KnowledgeDB; backupPath?: string | null } {
+  const db = new KnowledgeDB(dbPath, { autoMigrate: false });
+  try {
+    db.assertIntegrity();
+    const version = db.getUserVersion();
+    const hasNodes = db.execSqlFirst("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'") !== undefined;
+    // Preserve the explicit-migration requirement for raw upstream v0.
+    if (version === 0 && hasNodes) {
+      throw new UpstreamSchemaError(
+        `База "${path.resolve(dbPath)}" создана другой версией (user_version = 0 — сырая схема upstream без форк-колонок). ` +
+        `Выполните \`megamemory migrate --apply --db "${path.resolve(dbPath)}"\` — она поднимет схему и проставит версию.`
+      );
+    }
+    const before = hasNodes ? preflight(db) : null;
+    const pending = hasNodes && (version < SCHEMA_VERSION ||
+      db.getMetaValue("created_via_backfill_v2") !== "done" ||
+      before?.legacy || before?.schema_complete === false);
+    const backupPath = pending ? backupDb(dbPath) : undefined;
+    db.runPendingMigrations();
+    return { db, backupPath };
+  } catch (err) {
+    db.close();
+    throw err;
+  }
+}
+
 /**
  * Convert a legacy database on first open. The whole conversion runs in one
  * transaction; a failed postflight verification rolls it back, so the file
@@ -181,7 +212,8 @@ export interface AutoMigrationResult {
  */
 export async function autoMigrateIfNeeded(
   db: KnowledgeDB,
-  dbPath: string
+  dbPath: string,
+  opts: { backupPath?: string | null } = {}
 ): Promise<AutoMigrationResult> {
   const before = preflight(db);
 
@@ -222,7 +254,7 @@ export async function autoMigrateIfNeeded(
   // F14.2: backup before conversion (always). backupDb() snapshots through
   // SQLite (VACUUM INTO): committed WAL frames are included, so no checkpoint
   // runs here — a "TRUNCATE for form's sake" could be busy and proves nothing.
-  result.backup = backupDb(dbPath);
+  result.backup = opts.backupPath !== undefined ? opts.backupPath : backupDb(dbPath);
 
   const report = emptyReport();
   let rollbackReason: string | null = null;
