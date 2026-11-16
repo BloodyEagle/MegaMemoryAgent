@@ -113,6 +113,22 @@ export function edgeSetsAreIdentical(left: EdgeRow[], right: EdgeRow[]): boolean
   return true;
 }
 
+// The saved applied row is immutable content evidence. A technical carry may
+// change only its address: compare identities through the mapping, never by
+// replacing the pin with a new observation of the edge.
+function conflictEdgeMatches(
+  current: EdgeRow | undefined,
+  mapping: { edge: { id: number; applied: Record<string, unknown> }; sides: Array<{ from_id: string; to_id: string }> }
+): boolean {
+  const applied = mapping.edge?.applied;
+  const address = mapping.sides?.[0];
+  if (!current || !applied || typeof applied !== "object" || Array.isArray(applied) || !address) return false;
+  const expected = { ...applied, id: mapping.edge.id, from_id: address.from_id, to_id: address.to_id };
+  const snapshotKeys = Object.keys(applied).filter(key => key !== "_metadata");
+  return !snapshotKeys.some(key => (current as unknown as Record<string, unknown>)[key] !== (expected as Record<string, unknown>)[key]) &&
+    !Object.keys(current).some(key => key !== "_metadata" && !snapshotKeys.includes(key));
+}
+
 export function resolveEdgeConflicts(
   db: KnowledgeDB,
   input: { merge_group: string; prefer: "left" | "right"; reason: string }
@@ -129,10 +145,7 @@ export function resolveEdgeConflicts(
         throw new Error("Unsupported edge conflict payload; nothing was written.");
       }
       const current = db.getEdgeById(mapping.edge.id);
-      const snapshotKeys = Object.keys(mapping.edge.applied).filter(key => key !== "_metadata");
-      if (!current || snapshotKeys.some(key =>
-        (current as unknown as Record<string, unknown>)[key] !== mapping.edge.applied[key]
-      ) || Object.keys(current).some(key => key !== "_metadata" && !snapshotKeys.includes(key))) {
+      if (!current || !conflictEdgeMatches(current, mapping)) {
         throw new Error("version_conflict: the conflict edge changed; nothing was written.");
       }
       const address = mapping.sides[input.prefer === "left" ? 0 : 1];
@@ -852,12 +865,17 @@ export class MergeEngine {
       if (mapping.format !== "megamemory-conflict-map/1") {
         throw new Error("Merge rejected: unsupported conflict mapping; nothing was published.");
       }
+      // Validate unresolved pins in the source address space before remapping.
+      // A resolved row is history: resolution itself already changed the edge.
+      if (conflict.state === "unresolved" && !conflictEdgeMatches(sourceDb.getEdgeById(mapping.edge.id), mapping)) {
+        throw new Error("version_conflict: a saved conflict edge changed before merge; nothing was published.");
+      }
       const mapped = edges.get(`${side}:${mapping.edge.id}`);
       if (mapped === undefined) {
         throw new Error("Merge rejected: a saved conflict edge has no identity map; nothing was published.");
       }
       mapping.edge.id = mapped;
-      mapping.edge.applied = outputDb.getEdgeById(mapped);
+      // applied stays verbatim; remapping must never renew its content CAS pin.
       for (const address of mapping.sides) {
         address.from_id = nodes.get(`${side}:${address.from_id}`) ?? address.from_id;
         address.to_id = nodes.get(`${side}:${address.to_id}`) ?? address.to_id;
