@@ -44,7 +44,7 @@ interface ProviderUsage {
 
 interface RawEvent {
   v?: number;
-  ts?: string;
+  ts: string;
   tool?: string;
   outcome?: string;
   write_category?: string | null;
@@ -91,23 +91,28 @@ export interface TelemetryReport {
   };
   tokens: {
     /** Только реально переданный usage; unavailable — не нули. */
-    provider:
-      | { value: "unavailable"; note: string }
-      | {
-          value: "available";
-          input_tokens: number;
-          output_tokens: number;
-          cached_tokens: number;
-          events_with_usage: number;
-          events_without_usage: number;
-          note: string;
-        };
+    provider: {
+      value: "available" | "partial" | "unavailable";
+      input_tokens: number | "unavailable";
+      output_tokens: number | "unavailable";
+      cached_tokens: number | "unavailable";
+      /** Любая валидная ось usage (включая cost); счётчики взаимодополняющие. */
+      events_with_usage: number;
+      events_without_usage: number;
+      /** Denominator каждой оси — все допустимые события отчёта. */
+      coverage: Record<"input_tokens" | "output_tokens" | "cached_tokens", {
+        events_with_value: number;
+        events_without_value: number;
+      }>;
+      note: string;
+    };
     /** Оценочный объём wire-ответов (байты) — ОТДЕЛЬНОЕ поле, не токены. */
     estimated_wire: { response_bytes_total: number; unavailable_events: number; note: string };
   };
   cost:
-    | { value: "unavailable"; note: string }
-    | { value: "available"; total_cost: number; tariff_version: string; note: string };
+    | { value: "unavailable"; events_with_cost: number; events_without_cost: number; note: string }
+    | { value: "available" | "partial"; total_cost: number; tariff_version: string;
+        events_with_cost: number; events_without_cost: number; note: string };
   reads: {
     /** Выданные рекомендации must_read — НЕ факт чтения файла. */
     must_read_issued: {
@@ -162,7 +167,12 @@ function parseEventLine(line: string): RawEvent | null {
   if (!trimmed) return null;
   try {
     const parsed: unknown = JSON.parse(trimmed);
-    return isRecord(parsed) ? (parsed as RawEvent) : null;
+    // Один набор допустимых событий для calls, агрегатов и сессий:
+    // отсутствующее/невалидное время — malformed, а не потерянный вызов.
+    if (!isRecord(parsed) || typeof parsed.ts !== "string" || !Number.isFinite(Date.parse(parsed.ts))) {
+      return null;
+    }
+    return parsed as unknown as RawEvent;
   } catch {
     return null;
   }
@@ -190,7 +200,7 @@ export function buildTelemetryReport(
   opts: { tariff_version?: string; now?: Date } = {}
 ): TelemetryReport {
   let malformed = 0;
-  const events: Array<{ ev: RawEvent; tsMs: number | null }> = [];
+  const events: Array<{ ev: RawEvent; tsMs: number }> = [];
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === "") continue; // пустые строки не считаются данными
@@ -199,15 +209,11 @@ export function buildTelemetryReport(
       malformed += 1;
       continue;
     }
-    const tsMs = typeof ev.ts === "string" ? Date.parse(ev.ts) : Number.NaN;
-    events.push({ ev, tsMs: Number.isNaN(tsMs) ? null : tsMs });
+    events.push({ ev, tsMs: Date.parse(ev.ts) });
   }
 
-  const tsStrings = events.map((e) => (typeof e.ev.ts === "string" ? e.ev.ts : null)).filter((s): s is string => s !== null);
-  tsStrings.sort();
-  const ordered = events
-    .filter((e): e is { ev: RawEvent; tsMs: number } => e.tsMs !== null)
-    .sort((a, b) => a.tsMs - b.tsMs);
+  const ordered = [...events].sort((a, b) => a.tsMs - b.tsMs);
+  const tsStrings = ordered.map((e) => e.ev.ts);
 
   // --- вызовы и исходы ---
   const byTool: Record<string, number> = {};
@@ -267,7 +273,6 @@ export function buildTelemetryReport(
       eventsWithoutUsage += 1;
     } else {
       usageRows.push({ usage });
-      if (usage.input_tokens === undefined || usage.output_tokens === undefined) eventsWithoutUsage += 1;
     }
 
     if (typeof ev.write_category === "string") {
@@ -291,12 +296,23 @@ export function buildTelemetryReport(
   let repeatedRefs = 0;
   for (const count of refCounts.values()) if (count > 1) repeatedRefs += count - 1;
 
-  // --- usage/деньги ---
-  const anyUsage = usageRows.length > 0;
-  const fullUsageRows = usageRows.filter(
-    (r) => r.usage.input_tokens !== undefined && r.usage.output_tokens !== undefined
-  );
+  // --- usage/деньги: каждая ось имеет свой набор наблюдений ---
+  const tokenAxes = ["input_tokens", "output_tokens", "cached_tokens"] as const;
+  const tokenTotals: Record<typeof tokenAxes[number], number | "unavailable"> = {
+    input_tokens: "unavailable", output_tokens: "unavailable", cached_tokens: "unavailable",
+  };
+  const coverage = {} as TelemetryReport["tokens"]["provider"]["coverage"];
+  for (const axis of tokenAxes) {
+    const values = usageRows
+      .map((r) => r.usage[axis])
+      .filter((value): value is number => value !== undefined);
+    tokenTotals[axis] = values.length > 0 ? values.reduce((sum, value) => sum + value, 0) : "unavailable";
+    coverage[axis] = { events_with_value: values.length, events_without_value: events.length - values.length };
+  }
+  const anyTokens = tokenAxes.some((axis) => coverage[axis].events_with_value > 0);
+  const completeTokens = anyTokens && tokenAxes.every((axis) => coverage[axis].events_without_value === 0);
   const costRows = usageRows.filter((r) => typeof r.usage.cost === "number");
+  const costCoverage = { events_with_cost: costRows.length, events_without_cost: events.length - costRows.length };
   const tariff = opts.tariff_version;
 
   const report: TelemetryReport = {
@@ -357,20 +373,16 @@ export function buildTelemetryReport(
       },
     },
     tokens: {
-      provider: anyUsage
-        ? {
-            value: "available",
-            input_tokens: fullUsageRows.reduce((s, r) => s + (r.usage.input_tokens ?? 0), 0),
-            output_tokens: fullUsageRows.reduce((s, r) => s + (r.usage.output_tokens ?? 0), 0),
-            cached_tokens: usageRows.reduce((s, r) => s + (r.usage.cached_tokens ?? 0), 0),
-            events_with_usage: usageRows.length,
-            events_without_usage: eventsWithoutUsage,
-            note: "только реально переданный провайдерский/клиентский usage; cached едет ОТДЕЛЬНЫМ полем и не прибавляется к input/output (без двойного учёта); события без полного набора полей считены в events_without_usage",
-          }
-        : {
-            value: "unavailable",
-            note: "ни одно событие журнала не несёт провайдерского usage (J0-сервер его не видит) — фактические токены unavailable, не нули; нужен клиентский журнал (J2/J3)",
-          },
+      provider: {
+        value: completeTokens ? "available" : anyTokens ? "partial" : "unavailable",
+        ...tokenTotals,
+        events_with_usage: usageRows.length,
+        events_without_usage: eventsWithoutUsage,
+        coverage,
+        note: anyTokens
+          ? "суммы только по реально переданным значениям каждой оси; coverage показывает её denominator по всем допустимым событиям; partial — неполное покрытие; cached ОТДЕЛЬНО и не прибавляется к input/output (без двойного учёта)"
+          : "ни одно событие не несёт токенных осей провайдерского usage (J0-сервер его не видит) — фактические токены unavailable, не нули; cost не доказывает наличие токенов; нужен клиентский журнал (J2/J3)",
+      },
       estimated_wire: {
         response_bytes_total: responseBytesTotal,
         unavailable_events: responseBytesUnavailable,
@@ -380,13 +392,15 @@ export function buildTelemetryReport(
     cost:
       costRows.length > 0 && tariff !== undefined
         ? {
-            value: "available",
+            value: costCoverage.events_without_cost === 0 ? "available" : "partial",
             total_cost: costRows.reduce((s, r) => s + (r.usage.cost as number), 0),
             tariff_version: tariff,
-            note: "стоимость посчитана КЛИЕНТОМ по указанной тарифной версии и передана в usage; cached-часть не считается повторно (отдельное поле tokens.provider.cached_tokens)",
+            ...costCoverage,
+            note: "стоимость посчитана КЛИЕНТОМ по указанной тарифной версии и передана в usage; сумма только по событиям с cost, denominator — events_with_cost/events_without_cost; cached-часть не считается повторно (отдельное поле tokens.provider.cached_tokens)",
           }
         : {
             value: "unavailable",
+            ...costCoverage,
             note:
               costRows.length === 0
                 ? "в журнале нет стоимости (usage.cost от клиента отсутствует) — деньги unavailable, не нули"
@@ -457,20 +471,23 @@ export function formatTelemetryReport(r: TelemetryReport): string[] {
       (r.latency.sessions.wall_ms_p50 !== null ? `p50=${r.latency.sessions.wall_ms_p50} ms, p95=${r.latency.sessions.wall_ms_p95} ms` : "n/a")
   );
   out.push(`  time to verified answer: unavailable — нужен oracle (j2-experiment-design)`);
+  const provider = r.tokens.provider;
+  const tokenCoverage = provider.coverage;
   out.push(
-    `  provider tokens: ` +
-      (r.tokens.provider.value === "available"
-        ? `in=${r.tokens.provider.input_tokens}, out=${r.tokens.provider.output_tokens}, cached=${r.tokens.provider.cached_tokens} (events with usage: ${r.tokens.provider.events_with_usage}, without: ${r.tokens.provider.events_without_usage})`
-        : "unavailable — в журнале нет провайдерского usage")
+    `  provider tokens: ${provider.value}, in=${provider.input_tokens}, out=${provider.output_tokens}, cached=${provider.cached_tokens} ` +
+      `(events with usage: ${provider.events_with_usage}, without: ${provider.events_without_usage}; ` +
+      `coverage: in=${tokenCoverage.input_tokens.events_with_value}/${r.calls.total}, ` +
+      `out=${tokenCoverage.output_tokens.events_with_value}/${r.calls.total}, ` +
+      `cached=${tokenCoverage.cached_tokens.events_with_value}/${r.calls.total})`
   );
   out.push(
     `  estimated wire: ${r.tokens.estimated_wire.response_bytes_total} bytes (unavailable events: ${r.tokens.estimated_wire.unavailable_events}) — оценка, не токены`
   );
   out.push(
     `  cost: ` +
-      (r.cost.value === "available"
-        ? `${r.cost.total_cost} (tariff: ${r.cost.tariff_version})`
-        : "unavailable — нет usage.cost и/или тарифной версии")
+      (r.cost.value !== "unavailable"
+        ? `${r.cost.value} ${r.cost.total_cost} (tariff: ${r.cost.tariff_version}; coverage: ${r.cost.events_with_cost}/${r.calls.total})`
+        : `unavailable — нет usage.cost и/или тарифной версии (coverage: ${r.cost.events_with_cost}/${r.calls.total})`)
   );
   if (r.reads.must_read_issued) {
     out.push(

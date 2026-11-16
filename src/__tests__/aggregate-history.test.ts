@@ -2,8 +2,70 @@ import { describe, it, expect } from "vitest";
 import { auditFixture, addNode, sqlState } from "./helpers/audit.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { MergeEngine } from "../merge.js";
+import { buildDigest, digestSourceChildren } from "../digest.js";
 
 describe("P-04 aggregate history carry", () => {
+  it.each([false, true])("merge carries buildDigest v2 through the source reader (remap=%s)", async remap => {
+    const fixture = auditFixture();
+    try {
+      const left = fixture.db("left.db"), right = fixture.db("right.db");
+      addNode(left, "module", { kind: "module" });
+      for (const id of ["child-a", "child-b"]) addNode(left, id, { parent_id: "module" });
+      const { digestId } = await buildDigest(left, "module", { embed: false });
+      const original = left.execSqlFirst("SELECT sources, format_version FROM digest_sources WHERE digest_id = ?", digestId) as { sources: string; format_version: number };
+      const envelope = JSON.parse(original.sources);
+      if (remap) {
+        for (const node of left.getAllNodesRaw()) {
+          addNode(right, node.id, { kind: node.kind, parent_id: node.parent_id, summary: `Other branch: ${node.summary}` });
+        }
+      }
+      new MergeEngine().merge(fixture.file("left.db"), fixture.file("right.db"), fixture.file("out.db"));
+      const output = fixture.db("out.db");
+      const suffix = remap ? "::left" : "";
+      const mappedDigestId = digestId + suffix;
+      const row = output.execSqlFirst("SELECT sources, format_version FROM digest_sources WHERE digest_id = ?", mappedDigestId) as { sources: string; format_version: number };
+      expect(row.format_version).toBe(2);
+      expect(JSON.parse(row.sources)).toEqual({
+        ...envelope,
+        module: { ...envelope.module, id: "module" + suffix },
+        sources: envelope.sources.map((source: { node_id: string; version: string }) => ({ ...source, node_id: source.node_id + suffix })),
+      });
+      const result = digestSourceChildren(output, mappedDigestId);
+      expect(result.stale).toBe(false);
+      expect(result.children.map(child => child.id)).toEqual(["child-a" + suffix, "child-b" + suffix]);
+    } finally { await fixture.close(); }
+  });
+
+  it("merge preserves versioned legacy digest membership", async () => {
+    const fixture = auditFixture();
+    try {
+      const left = fixture.db("left.db"), right = fixture.db("right.db");
+      addNode(left, "module", { kind: "module" });
+      addNode(left, "support", { parent_id: "module" });
+      const { digestId } = await buildDigest(left, "module", { embed: false });
+      const legacy = JSON.stringify([{ node_id: "support", version: "historic" }]);
+      left.execSqlRun("UPDATE digest_sources SET sources = ?, format_version = 1 WHERE digest_id = ?", legacy, digestId);
+      new MergeEngine().merge(fixture.file("left.db"), fixture.file("right.db"), fixture.file("out.db"));
+      const output = fixture.db("out.db");
+      expect(output.execSqlFirst("SELECT sources, format_version FROM digest_sources WHERE digest_id = ?", digestId)).toMatchObject({ sources: legacy, format_version: 1 });
+      expect(digestSourceChildren(output, digestId).stale).toBe(true);
+    } finally { await fixture.close(); }
+  });
+
+  it("merge rejects an unknown digest membership version without publishing", async () => {
+    const fixture = auditFixture();
+    try {
+      const left = fixture.db("left.db"), right = fixture.db("right.db"), output = fixture.db("out.db");
+      addNode(left, "module", { kind: "module" });
+      const { digestId } = await buildDigest(left, "module", { embed: false });
+      left.execSqlRun("UPDATE digest_sources SET sources = '[]', format_version = 99 WHERE digest_id = ?", digestId);
+      addNode(output, "sentinel");
+      const before = sqlState(output);
+      expect(() => new MergeEngine().merge(fixture.file("left.db"), fixture.file("right.db"), fixture.file("out.db"))).toThrow(/unsupported digest sources.*99/i);
+      expect(sqlState(output)).toEqual(before);
+    } finally { await fixture.close(); }
+  });
+
   it.each([false, true])("lossless carry bypasses retention; the snapshot actor normalizes to import, the journal keeps the original (reverse=%s)", async reverse => {
     const fixture = auditFixture();
     try {

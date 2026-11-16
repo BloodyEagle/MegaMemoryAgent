@@ -259,11 +259,11 @@ async function startMcpServer() {
     "@modelcontextprotocol/sdk/server/stdio.js"
   );
   const { z } = await import("zod");
-  const { KnowledgeDB } = await import("./db.js");
+  const { openStartupDatabase, autoMigrateIfNeeded, describeAutoMigration, describeSchemaRepair } = await import("./auto-migrate.js");
   const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailSaveWithPassport, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
   const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
-  const { branchConceptToolArgs, getConceptBatch, getConceptProfile } = await import(
+  const { branchConceptToolArgs, getConceptBatch, getConceptProfile, MAX_CONTEXT_EPOCH_LENGTH } = await import(
     "./concept-profile.js"
   );
   const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
@@ -281,20 +281,20 @@ async function startMcpServer() {
   // repo в каждый check_artifacts: смена startup-пути перезакрепляет git-ref.
   const REPO_PATH = resolveRepoPath(process.argv.slice(2), DB_PATH);
 
-  const db = new KnowledgeDB(DB_PATH);
+  let db: import("./db.js").KnowledgeDB;
 
   // F14: a legacy database converts itself on first open (backup, schema,
   // id repair with aliases, FTS rebuild, name_norm, embed meta) and is
   // verified before serving. MEGAMEMORY_AUTO_MIGRATE=0 opts out — then
   // only the additive schema steps run and id repair stays manual.
   try {
-    const { autoMigrateIfNeeded, describeAutoMigration, describeSchemaRepair } =
-      await import("./auto-migrate.js");
+    const opened = openStartupDatabase(DB_PATH);
+    db = opened.db;
     if (process.env.MEGAMEMORY_AUTO_MIGRATE === "0") {
       const { ensureSchema, emptyReport } = await import("./migrate-schema.js");
       ensureSchema(db, emptyReport());
     } else {
-      const result = await autoMigrateIfNeeded(db, DB_PATH);
+      const result = await autoMigrateIfNeeded(db, DB_PATH, { backupPath: opened.backupPath });
       const line = describeAutoMigration(result);
       if (line) console.error(`megamemory: ${line}`);
       // 2.3.2 (plan 16): incomplete schema on a non-legacy db (the 2.3.1
@@ -500,15 +500,15 @@ async function startMcpServer() {
 
   server.tool(
     "get_concept",
-    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry no digests by default; include_evidence: true attaches current_digests and support_evidence (all live supports, confirm-ready) per match. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12). E1/E2: a plain single-id call returns the same card as before. profile=evidence returns full wording, rationales and confirm_supports-ready digests (never a trimmed claim — what did not fit is marked incomplete with the next step); profile=orientation returns identity, qualification and pointers under the budget; profile=full is the legacy card. max_tokens bounds the serialized answer in ESTIMATED tokens (tokens_estimated — оценка встроенного estimator'а, не гарантия провайдера); neighbor disclosure is capped (max_neighbors) with continuation tokens; a continuation pins the sample version — changed data yields version_conflict and a full re-read. Batch: pass ids (up to 25) for one call with ONE shared budget — per-id status/error/incompleteness are always visible, an unresolved id never disappears silently, budget_skipped items list the continuation. E4 delta (opt-in only): pass context_epoch + known_versions {id: version from meta.version} — ONLY if the client still holds that exact text in its context; a version match of the REQUESTED PROJECTION (all substantial state: status, expiry, refs, rationale, supports, artifacts, selected neighbors, format — never just the summary) returns a compact {unchanged, version, epoch, qualification-minimum} answer; a mismatch returns the full card with meta.version. Nothing (or a new epoch) means full issuance. unchanged is NOT code coverage: read the current source section before editing. Old single-id calls without new parameters keep the exact previous response.",
+    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry no digests by default; include_evidence: true attaches current_digests and support_evidence (all live supports, confirm-ready) per match. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12). E1/E2: a plain single-id call returns the same card as before. profile=evidence returns full wording, rationales and confirm_supports-ready digests (never a trimmed claim — what did not fit is marked incomplete with the next step); profile=orientation returns identity, qualification and pointers under the budget; profile=full is the legacy card. max_tokens bounds the final serialized MCP content envelope in ESTIMATED tokens, including all metadata, continuation tokens and delta/unchanged fields; if the required minimum cannot fit, the call explicitly refuses with meta.reason=budget. tokens_estimated is the estimator result, not a provider-token guarantee; neighbor disclosure is capped (max_neighbors) with continuation tokens; a continuation pins the sample version — changed data yields version_conflict and a full re-read. Batch: pass ids (up to 25) for one call with ONE shared budget — per-id status/error/incompleteness are always visible, an unresolved id never disappears silently, budget_skipped items list the continuation. E4 delta (opt-in only): pass context_epoch + known_versions {id: version from meta.version} — ONLY if the client still holds that exact text in its context; a version match of the REQUESTED PROJECTION (all substantial state: status, expiry, refs, rationale, supports, artifacts, selected neighbors, format — never just the summary) returns a compact {unchanged, version, epoch, qualification-minimum} answer; a mismatch returns the full card with meta.version. Nothing (or a new epoch) means full issuance. unchanged is NOT code coverage: read the current source section before editing. Old single-id calls without new parameters keep the exact previous response.",
     {
       id: z.string().optional().describe("Exact concept ID to look up (e.g., 'auth-module' or 'database-config'). Обязателен для одиночного вызова; с ids/continuation не смешивается"),
       ids: z.array(z.string()).max(25).optional().describe("Пакетное чтение (E2): до 25 id одним вызовом с ОДНИМ общим бюджетом max_tokens; каждый элемент несёт статус ok/error/budget_skipped и свою ошибку/неполноту — неразрешённый id не исчезает молча, ошибка одного не маскирует соседей. Продолжение — meta.continuation (передай только continuation без ids)"),
       profile: z.enum(["orientation", "evidence", "full"]).optional().describe("Проекция карточки (E1): orientation — идентичность + квалификация + краткий summary + указатели; evidence — полные формулировки, rationale и готовые дайджесты confirm_supports (не заставляет считать хеши; непоместившиеся доказательства — явная неполнота, не обрезка); full — прежняя полная карточка. Без параметра — full"),
-      max_tokens: z.number().int().min(100).max(200000).optional().describe("Бюджет СЕРИАЛИЗОВАННОГО ответа в оценочных токенах (tokens_estimated — оценка estimator'а ~байты/3, не гарантия токенов провайдера). Минимум конверта и обязательное ядро (идентичность, квалификация, expiry, причины refuted, weak_support) не режутся: ниже минимума — отказ"),
+      max_tokens: z.number().int().min(100).max(200000).optional().describe("Бюджет ФИНАЛЬНОГО MCP-конверта, включая все metadata/continuation/delta/unchanged, в оценочных токенах (tokens_estimated — оценка estimator'а ~байты/3, не гарантия токенов провайдера). Минимум конверта и обязательное ядро (идентичность, квалификация, expiry, причины refuted, weak_support) не режутся: ниже минимума — явный отказ meta.reason=budget"),
       max_neighbors: z.number().int().min(0).max(200).optional().describe("Лимит раскрытых соседей на список (дети, рёбра, опоры, трейлы; по умолчанию 20). Остаток виден в meta.dropped с токеном continuation"),
-      continuation: z.string().optional().describe("Opaque-токен продолжения из прошлого ответа (списка опор/соседей или остатка пакета). Продолжение фиксирует версию выборки: если состав или состояния изменились — version_conflict и повторное чтение целиком, а не склейка страниц разных состояний"),
-      context_epoch: z.string().optional().describe("E4, opt-in: идентификатор ТЕКУЩЕЙ эпохи контекста клиента. После compaction/restart/смены проекта/восстановления БД используй НОВУЮ эпоху или не передавай параметры вовсе — это возвращает полную выдачу. Delta работает только парой с known_versions"),
+      continuation: z.string().optional().describe("Opaque-токен get_concept из meta.continuations (список опор/соседей) или meta.continuation (остаток пакета). Передай только continuation без ids; для пакета также без id — вид токена маршрутизируется автоматически. Повреждённый/неизвестный токен даёт явную ошибку. Продолжение фиксирует версию выборки: если состав или состояния изменились — version_conflict и повторное чтение целиком, а не склейка страниц разных состояний"),
+      context_epoch: z.string().max(MAX_CONTEXT_EPOCH_LENGTH).optional().describe("E4, opt-in: идентификатор ТЕКУЩЕЙ эпохи контекста клиента (не длиннее 256 символов). После compaction/restart/смены проекта/восстановления БД используй НОВУЮ эпоху или не передавай параметры вовсе — это возвращает полную выдачу. Delta работает только парой с known_versions"),
       known_versions: z.record(z.string()).optional().describe("E4, opt-in: подтверждённые клиентом версии проекций {id: version} из meta.version предыдущего ответа — передавай, только если текст той версии реально ЕСТЬ в твоём контексте. Совпадение версии запрошенной проекции (сравнивается всё существенное состояние: статус, срок, ссылки, rationale, опоры, артефакты, соседи, формат — не только summary) — компактный unchanged-ответ с квалификацией-минимумом; расхождение — полная выдача. unchanged НЕ является покрытием кода: чтение исходника перед правкой не отменяется. Без context_epoch — явная ошибка"),
     },
     async (params) => {
@@ -566,7 +566,9 @@ async function startMcpServer() {
           is_error: true,
           affected_ids: [],
         });
-        return formatError(err);
+        const formatted = formatError(err);
+        const meta = (err as { meta?: { reason?: string } } | null)?.meta;
+        return meta?.reason === "budget" ? { ...formatted, meta: { reason: "budget" } } : formatted;
       }
     }
   );

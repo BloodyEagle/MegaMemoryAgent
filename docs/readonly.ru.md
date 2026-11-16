@@ -10,7 +10,8 @@
 | `megamemory export --md <каталог>` | readonly (`PRAGMA query_only = ON`) | Без `--check` пишет отрендеренный markdown. `--check` только сообщает о недостающих, изменённых и лишних `.md`; он никогда их не удаляет. |
 | `megamemory eval` | readonly | JSONL разбирается и структурно валидируется до открытия базы. |
 | `megamemory conflicts` | readonly | Только просмотр. `merge` и `resolve` — отдельные пишущие команды. |
-| `megamemory stats --funnel --json` без `--prune` | readonly | Только этот точный скриптовый режим. Обычный `stats`, funnel без JSON и любой путь с `--prune` открывают RW. |
+| `megamemory stats --funnel --json`, `stats --health --json` или `stats --funnel --health --json`, без `--prune` | readonly | Один JSON-объект в stdout: funnel, health или `{funnel, health}` соответственно; записи usage/timeline не создаются. `--window 7d\|30d\|all` задаёт окно отчёта (default: `7d`). Обычный `stats`, один `stats --json`, funnel/health без JSON и любой путь с `--prune` открывают RW. |
+| `megamemory expire --scan [--json]` | readonly | Показывает кандидатов без применения; `--scan --apply` запрещён. `--scan --json` печатает ровно один версионный JSON-отчёт в stdout; инструкция просмотра/применения идёт в stderr. |
 | `megamemory expire` без `--apply` | readonly | Проверяет каждый id и печатает замену срока. `--apply` открывает RW и атомарно повторно проверяет, обновляет весь batch и добавляет одну строгую запись timeline. |
 | `megamemory migrate --dry-run` (также по умолчанию без `--apply`) | источник не меняется | Делает согласованный снимок `VACUUM INTO` с закоммиченными WAL-фреймами; запускает настоящий apply-путь на одноразовой копии; сравнивает fingerprint source main + `-wal` до/после. |
 | `megamemory repair-ids --dry-run` (также по умолчанию без `--apply`) | источник не меняется | Использует ту же границу снимка/fingerprint и строит план на копии. |
@@ -52,7 +53,8 @@ unresolved. Полная и автоматическая миграции так
 
 Переменная **не** влияет на:
 
-- `stats --funnel --json`;
+- `stats --funnel --json`, `stats --health --json` и их совместный JSON-режим
+  без `--prune`;
 - dry-run `expire`;
 - `migrate --dry-run` и `repair-ids --dry-run`;
 - защиту фикстур;

@@ -113,6 +113,22 @@ export function edgeSetsAreIdentical(left: EdgeRow[], right: EdgeRow[]): boolean
   return true;
 }
 
+// The saved applied row is immutable content evidence. A technical carry may
+// change only its address: compare identities through the mapping, never by
+// replacing the pin with a new observation of the edge.
+function conflictEdgeMatches(
+  current: EdgeRow | undefined,
+  mapping: { edge: { id: number; applied: Record<string, unknown> }; sides: Array<{ from_id: string; to_id: string }> }
+): boolean {
+  const applied = mapping.edge?.applied;
+  const address = mapping.sides?.[0];
+  if (!current || !applied || typeof applied !== "object" || Array.isArray(applied) || !address) return false;
+  const expected = { ...applied, id: mapping.edge.id, from_id: address.from_id, to_id: address.to_id };
+  const snapshotKeys = Object.keys(applied).filter(key => key !== "_metadata");
+  return !snapshotKeys.some(key => (current as unknown as Record<string, unknown>)[key] !== (expected as Record<string, unknown>)[key]) &&
+    !Object.keys(current).some(key => key !== "_metadata" && !snapshotKeys.includes(key));
+}
+
 export function resolveEdgeConflicts(
   db: KnowledgeDB,
   input: { merge_group: string; prefer: "left" | "right"; reason: string }
@@ -129,10 +145,7 @@ export function resolveEdgeConflicts(
         throw new Error("Unsupported edge conflict payload; nothing was written.");
       }
       const current = db.getEdgeById(mapping.edge.id);
-      const snapshotKeys = Object.keys(mapping.edge.applied).filter(key => key !== "_metadata");
-      if (!current || snapshotKeys.some(key =>
-        (current as unknown as Record<string, unknown>)[key] !== mapping.edge.applied[key]
-      ) || Object.keys(current).some(key => key !== "_metadata" && !snapshotKeys.includes(key))) {
+      if (!current || !conflictEdgeMatches(current, mapping)) {
         throw new Error("version_conflict: the conflict edge changed; nothing was written.");
       }
       const address = mapping.sides[input.prefer === "left" ? 0 : 1];
@@ -852,12 +865,17 @@ export class MergeEngine {
       if (mapping.format !== "megamemory-conflict-map/1") {
         throw new Error("Merge rejected: unsupported conflict mapping; nothing was published.");
       }
+      // Validate unresolved pins in the source address space before remapping.
+      // A resolved row is history: resolution itself already changed the edge.
+      if (conflict.state === "unresolved" && !conflictEdgeMatches(sourceDb.getEdgeById(mapping.edge.id), mapping)) {
+        throw new Error("version_conflict: a saved conflict edge changed before merge; nothing was published.");
+      }
       const mapped = edges.get(`${side}:${mapping.edge.id}`);
       if (mapped === undefined) {
         throw new Error("Merge rejected: a saved conflict edge has no identity map; nothing was published.");
       }
       mapping.edge.id = mapped;
-      mapping.edge.applied = outputDb.getEdgeById(mapped);
+      // applied stays verbatim; remapping must never renew its content CAS pin.
       for (const address of mapping.sides) {
         address.from_id = nodes.get(`${side}:${address.from_id}`) ?? address.from_id;
         address.to_id = nodes.get(`${side}:${address.to_id}`) ?? address.to_id;
@@ -1207,16 +1225,40 @@ export class MergeEngine {
     }
 
     if (hasTable("digest_sources")) {
-      const rows = sourceDb.execSqlAll("SELECT digest_id, sources FROM digest_sources") as Array<{ digest_id: string; sources: string }>;
+      // Pre-versioned tables contain legacy arrays. Versioned records keep
+      // their envelope and builder settings; only node identities are remapped.
+      const hasFormatVersion = (sourceDb.pragma("table_info(digest_sources)") as Array<{ name: string }>).some(column => column.name === "format_version");
+      const rows = sourceDb.execSqlAll(`SELECT digest_id, sources, ${hasFormatVersion ? "format_version" : "1 AS format_version"} FROM digest_sources`) as Array<{ digest_id: string; sources: string; format_version: number }>;
       for (const row of rows) {
         const digestId = resolveNodeId(row.digest_id);
-        const sources = JSON.parse(row.sources) as Array<{ node_id: string; version: string }>;
+        if (row.format_version !== 1 && row.format_version !== 2) {
+          throw new Error(`Merge rejected: unsupported digest sources format_version ${row.format_version} for "${digestId}".`);
+        }
+        let parsed: unknown;
+        try { parsed = JSON.parse(row.sources); }
+        catch { throw new Error(`Merge rejected: invalid digest sources JSON for "${digestId}".`); }
+        let sources: unknown;
+        if (row.format_version === 1) {
+          sources = parsed;
+        } else {
+          const envelope = parsed as { format?: unknown; module?: { id?: unknown; name?: unknown }; builder?: unknown; sources?: unknown } | null;
+          if (!envelope || envelope.format !== "digest-sources/2" ||
+              !envelope.module || typeof envelope.module.id !== "string" || typeof envelope.module.name !== "string" ||
+              !envelope.builder || typeof envelope.builder !== "object" || Array.isArray(envelope.builder)) {
+            throw new Error(`Merge rejected: invalid digest sources v2 envelope for "${digestId}".`);
+          }
+          envelope.module.id = resolveNodeId(envelope.module.id);
+          sources = envelope.sources;
+        }
+        if (!Array.isArray(sources) || sources.some(source => !source || typeof source.node_id !== "string")) {
+          throw new Error(`Merge rejected: invalid digest sources list for "${digestId}".`);
+        }
         for (const source of sources) source.node_id = resolveNodeId(source.node_id);
-        const payload = JSON.stringify(sources);
-        const existing = outputDb.execSqlFirst("SELECT sources FROM digest_sources WHERE digest_id = ?", digestId) as { sources: string } | undefined;
-        if (existing && existing.sources !== payload) throw new Error(`Merge rejected: conflicting digest sources for "${digestId}".`);
+        const payload = JSON.stringify(parsed);
+        const existing = outputDb.execSqlFirst("SELECT sources, format_version FROM digest_sources WHERE digest_id = ?", digestId) as { sources: string; format_version: number } | undefined;
+        if (existing && (existing.sources !== payload || existing.format_version !== row.format_version)) throw new Error(`Merge rejected: conflicting digest sources for "${digestId}".`);
         if (!existing) {
-          outputDb.execSqlRun("INSERT INTO digest_sources(digest_id,sources) VALUES (?,?)", digestId, payload);
+          outputDb.execSqlRun("INSERT INTO digest_sources(digest_id,sources,format_version) VALUES (?,?,?)", digestId, payload, row.format_version);
           carried++;
         }
       }
@@ -1330,11 +1372,12 @@ export class MergeEngine {
       });
       // Import events do not apply writer retention to a lossless carried journal.
       outputDb.execSqlRun(
-        `INSERT INTO support_revisions(decision_id,support_id,edge_key,claim_digest,status_digest,edge_digest,format_version,confirmed_at,recorded_at,source,reason)
-         VALUES (?,?,?,?,?,?,?,?,?,'import',?)`,
+        `INSERT INTO support_revisions(decision_id,support_id,edge_key,claim_digest,status_digest,edge_digest,format_version,confirmed_at,recorded_at,source,reason,artifacts_digest,decision_claim_digest,confirmed_by,superseded_at)
+         VALUES (?,?,?,?,?,?,?,?,?,'import',?,?,?,?,?)`,
         decisionId, supportId, edgeKey, row.claim_digest, row.status_digest, row.edge_digest,
         row.format_version, row.confirmed_at, new Date().toISOString(),
-        mappedEdge !== undefined && String(mappedEdge) !== row.edge_key ? "edge_relinked" : null
+        mappedEdge !== undefined && String(mappedEdge) !== row.edge_key ? "edge_relinked" : null,
+        row.artifacts_digest ?? null, row.decision_claim_digest ?? null, "import", row.superseded_at ?? null
       );
       carried++;
     }
@@ -1346,7 +1389,9 @@ export class MergeEngine {
         const oldKey = String(row.edge_key);
         const mapped = edgeIdRemapping.get(`${side}:${oldKey}`);
         const key = mapped !== undefined ? String(mapped) : oldKey.startsWith(DEAD_EDGE_KEY_PREFIX) ? oldKey : `${DEAD_EDGE_KEY_PREFIX}${oldKey}`;
-        const columns = ["decision_id", "support_id", "edge_key", "claim_digest", "status_digest", "edge_digest", "format_version", "confirmed_at", "recorded_at", "source", "reason"];
+        // Dedup the complete historical payload, not just the classic fields.
+        // Missing legacy columns stay null; current observations cannot fill them.
+        const columns = ["decision_id", "support_id", "edge_key", "claim_digest", "status_digest", "edge_digest", "format_version", "confirmed_at", "recorded_at", "source", "reason", "artifacts_digest", "decision_claim_digest", "confirmed_by", "superseded_at"];
         const values = columns.map(column => column === "decision_id" ? decisionId : column === "support_id" ? supportId : column === "edge_key" ? key : row[column] ?? null);
         const duplicate = outputDb.execSqlFirst(`SELECT 1 FROM support_revisions WHERE ${columns.map(column => `${column} IS ?`).join(" AND ")}`, ...values);
         if (!duplicate) outputDb.execSqlRun(`INSERT INTO support_revisions(${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`, ...values);

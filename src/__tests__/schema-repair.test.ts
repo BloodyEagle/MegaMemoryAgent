@@ -58,6 +58,19 @@ function hashDb(p: string): string {
   return createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 }
 
+/** Keep raw connections and their statements out of the async test frame.
+ * libsql close() alone does not release every native reference; the fixture
+ * callback must finish and the owner be dropped before cleanup collects it. */
+function withRawDatabase(dbPath: string, use: (raw: Database.Database) => void): void {
+  let raw: Database.Database | undefined = new Database(dbPath);
+  try {
+    use(raw);
+  } finally {
+    raw.close();
+    raw = undefined;
+  }
+}
+
 /** libsql deletes -wal/-shm on close, but asynchronously: the native handle
  * is released after GC collection (see vitest.config execArgv) and the WAL
  * unlink follows it — nudge GC and poll briefly. */
@@ -86,6 +99,50 @@ function expectNoArtifacts(dir: string): void {
 }
 
 describe("schema repair on open (plan 16)", () => {
+  for (const fails of [false, true]) {
+    it(`raw fixture lifecycle releases the connection and statement before cleanup (throws=${fails})`, async () => {
+      makeTmp();
+      const dbPath = path.join(tmpDir, "knowledge.db");
+      let connection: WeakRef<Database.Database> | undefined;
+      let statement: WeakRef<Database.Statement> | undefined;
+      const failure = new Error("raw fixture failure");
+      let caught: unknown;
+      let closed = false;
+      try {
+        withRawDatabase(dbPath, (raw) => {
+          const close = raw.close;
+          raw.close = function () {
+            const result = close.call(this);
+            closed = true;
+            return result;
+          };
+          raw.pragma("journal_mode = WAL");
+          raw.exec("CREATE TABLE fixture (value TEXT)");
+          const insert = raw.prepare("INSERT INTO fixture VALUES (?)");
+          insert.run("fixture");
+          connection = new WeakRef(raw);
+          statement = new WeakRef(insert);
+          if (fails) throw failure;
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBe(fails ? failure : undefined);
+      expect(closed).toBe(true);
+      expect(connection).toBeDefined();
+      expect(statement).toBeDefined();
+      // WeakRef creation keeps its target alive for the current job. Exit it
+      // before the one collection; no native owner may survive into cleanup.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(globalThis.gc).toBeTypeOf("function");
+      globalThis.gc!();
+      expect(connection!.deref() === undefined).toBe(true);
+      expect(statement!.deref() === undefined).toBe(true);
+      await waitUntilGone(dbPath + "-wal");
+      await waitUntilGone(dbPath + "-shm");
+    });
+  }
+
   it("R1: fresh db is repaired to the full opt-in schema on first open", async () => {
     // trigram requested: the repair must create BOTH indexes + all triggers
     process.env.MEGAMEMORY_FTS_TOKENIZER = "trigram";
@@ -157,14 +214,14 @@ describe("schema repair on open (plan 16)", () => {
     openDbs.length = 0;
 
     // simulate the damage: everything the 2.3.1 creation path skipped
-    const raw = new Database(dbPath);
-    raw.exec(`
-      DROP TRIGGER nodes_ai; DROP TRIGGER nodes_ad; DROP TRIGGER nodes_au;
-      DROP TRIGGER nodes_tri_ai; DROP TRIGGER nodes_tri_ad; DROP TRIGGER nodes_tri_au;
-      DROP TABLE nodes_fts; DROP TABLE nodes_fts_tri;
-    `);
-    raw.prepare("DELETE FROM meta WHERE key = 'embed_model'").run();
-    raw.close();
+    withRawDatabase(dbPath, (raw) => {
+      raw.exec(`
+        DROP TRIGGER nodes_ai; DROP TRIGGER nodes_ad; DROP TRIGGER nodes_au;
+        DROP TRIGGER nodes_tri_ai; DROP TRIGGER nodes_tri_ad; DROP TRIGGER nodes_tri_au;
+        DROP TABLE nodes_fts; DROP TABLE nodes_fts_tri;
+      `);
+      raw.prepare("DELETE FROM meta WHERE key = 'embed_model'").run();
+    });
 
     const db2 = track(new KnowledgeDB(dbPath));
     const result = await autoMigrateIfNeeded(db2, dbPath);
@@ -214,34 +271,34 @@ describe("schema repair on open (plan 16)", () => {
   it("R5: legacy conversion is untouched — migrated line, no repair line", async () => {
     makeTmp();
     const dbPath = path.join(tmpDir, "upstream.db");
-    const raw = new Database(dbPath);
-    raw.pragma("journal_mode = WAL");
-    raw.exec(`
-      CREATE TABLE nodes (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
-        summary TEXT NOT NULL, why TEXT, file_refs TEXT, parent_id TEXT,
-        created_by_task TEXT, created_at TEXT DEFAULT (datetime('now')),
-        updated_at TEXT DEFAULT (datetime('now')), removed_at TEXT,
-        removed_reason TEXT, embedding BLOB, merge_group TEXT,
-        needs_merge INTEGER DEFAULT 0, source_branch TEXT, merge_timestamp TEXT,
-        FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE SET NULL
+    withRawDatabase(dbPath, (raw) => {
+      raw.pragma("journal_mode = WAL");
+      raw.exec(`
+        CREATE TABLE nodes (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+          summary TEXT NOT NULL, why TEXT, file_refs TEXT, parent_id TEXT,
+          created_by_task TEXT, created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now')), removed_at TEXT,
+          removed_reason TEXT, embedding BLOB, merge_group TEXT,
+          needs_merge INTEGER DEFAULT 0, source_branch TEXT, merge_timestamp TEXT,
+          FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE SET NULL
+        );
+        CREATE TABLE edges (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL,
+          to_id TEXT NOT NULL, relation TEXT NOT NULL, description TEXT,
+          created_at TEXT DEFAULT (datetime('now')), merge_group TEXT,
+          needs_merge INTEGER DEFAULT 0, source_branch TEXT, merge_timestamp TEXT,
+          FOREIGN KEY (from_id) REFERENCES nodes(id) ON DELETE CASCADE,
+          FOREIGN KEY (to_id) REFERENCES nodes(id) ON DELETE CASCADE
+        );
+      `);
+      const ins = raw.prepare(
+        "INSERT INTO nodes (id, name, kind, summary) VALUES (?, ?, 'feature', ?)"
       );
-      CREATE TABLE edges (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL,
-        to_id TEXT NOT NULL, relation TEXT NOT NULL, description TEXT,
-        created_at TEXT DEFAULT (datetime('now')), merge_group TEXT,
-        needs_merge INTEGER DEFAULT 0, source_branch TEXT, merge_timestamp TEXT,
-        FOREIGN KEY (from_id) REFERENCES nodes(id) ON DELETE CASCADE,
-        FOREIGN KEY (to_id) REFERENCES nodes(id) ON DELETE CASCADE
-      );
-    `);
-    const ins = raw.prepare(
-      "INSERT INTO nodes (id, name, kind, summary) VALUES (?, ?, 'feature', ?)"
-    );
-    ins.run("n1", "Книга", "заметки о книгах");
-    ins.run("n2", "Поиск", "полнотекстовый поиск");
-    raw.pragma("user_version = 4");
-    raw.close();
+      ins.run("n1", "Книга", "заметки о книгах");
+      ins.run("n2", "Поиск", "полнотекстовый поиск");
+      raw.pragma("user_version = 4");
+    });
 
     const db = track(new KnowledgeDB(dbPath));
     const result = await autoMigrateIfNeeded(db, dbPath);
@@ -267,12 +324,12 @@ describe("schema repair on open (plan 16)", () => {
     db1.insertNode({ id: "pay", name: "Payment", kind: "module", summary: "processes payments" });
     db1.close();
     openDbs.length = 0;
-    const raw = new Database(dbPath);
-    raw.exec(`
-      DROP TRIGGER nodes_ai; DROP TRIGGER nodes_ad; DROP TRIGGER nodes_au;
-      DROP TABLE nodes_fts;
-    `);
-    raw.close();
+    withRawDatabase(dbPath, (raw) => {
+      raw.exec(`
+        DROP TRIGGER nodes_ai; DROP TRIGGER nodes_ad; DROP TRIGGER nodes_au;
+        DROP TABLE nodes_fts;
+      `);
+    });
     const hashBefore = hashDb(dbPath);
 
     const ro = track(new KnowledgeDB(dbPath, { readonly: true }));
@@ -337,13 +394,13 @@ describe("schema repair on open (plan 16)", () => {
     openDbs.length = 0;
 
     // sabotage: an object named nodes_fts that no CREATE can replace
-    const raw = new Database(dbPath);
-    raw.exec(`
-      DROP TRIGGER nodes_ai; DROP TRIGGER nodes_ad; DROP TRIGGER nodes_au;
-      DROP TABLE nodes_fts;
-      CREATE VIEW nodes_fts AS SELECT 1 AS name, 1 AS summary, 1 AS why;
-    `);
-    raw.close();
+    withRawDatabase(dbPath, (raw) => {
+      raw.exec(`
+        DROP TRIGGER nodes_ai; DROP TRIGGER nodes_ad; DROP TRIGGER nodes_au;
+        DROP TABLE nodes_fts;
+        CREATE VIEW nodes_fts AS SELECT 1 AS name, 1 AS summary, 1 AS why;
+      `);
+    });
 
     const db2 = track(new KnowledgeDB(dbPath));
     // resolves — the MCP/serve startup path must survive a failed repair
@@ -371,9 +428,9 @@ describe("schema repair on open (plan 16)", () => {
     await waitUntilGone(dbPath + "-wal");
 
     // damage: exactly one trigger of the set of three
-    const raw = new Database(dbPath);
-    raw.exec("DROP TRIGGER nodes_au");
-    raw.close();
+    withRawDatabase(dbPath, (raw) => {
+      raw.exec("DROP TRIGGER nodes_au");
+    });
 
     const db2 = track(new KnowledgeDB(dbPath));
     const result = await autoMigrateIfNeeded(db2, dbPath);
@@ -404,9 +461,9 @@ describe("schema repair on open (plan 16)", () => {
     await waitUntilGone(dbPath + "-wal");
 
     // 2nd open: one trigger of three was lost — repaired again
-    const raw = new Database(dbPath);
-    raw.exec("DROP TRIGGER nodes_au");
-    raw.close();
+    withRawDatabase(dbPath, (raw) => {
+      raw.exec("DROP TRIGGER nodes_au");
+    });
     const db2 = track(new KnowledgeDB(dbPath));
     expect((await autoMigrateIfNeeded(db2, dbPath)).repaired).toBe(true);
     db2.close();
@@ -443,9 +500,9 @@ describe("schema repair on open (plan 16)", () => {
     await waitUntilGone(dbPath + "-wal");
 
     // damage: exactly one trigram trigger of the set of three
-    const raw = new Database(dbPath);
-    raw.exec("DROP TRIGGER nodes_tri_au");
-    raw.close();
+    withRawDatabase(dbPath, (raw) => {
+      raw.exec("DROP TRIGGER nodes_tri_au");
+    });
 
     const db2 = track(new KnowledgeDB(dbPath));
     const result = await autoMigrateIfNeeded(db2, dbPath);

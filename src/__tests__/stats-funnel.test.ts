@@ -211,6 +211,66 @@ describe("computeFunnel (stats --funnel)", () => {
     expect(json.shares).toEqual({ follow_up_pct: 33.3, record_pct: 33.3 });
   });
 
+  it("A12: understand до окна не попадает в воронку пересекающей сессии", () => {
+    addEntry({
+      tool: "understand", timestamp: "2026-11-01 11:55:00",
+      params: { must_read: [{ ref: "src/a.ts", node_id: "alpha" }], must_read_ids: ["alpha"] },
+    });
+    addEntry({ tool: "get_concept", timestamp: "2026-11-01 12:05:00", affected_ids: ["alpha"] });
+    addEntry({ tool: "create_concept", timestamp: "2026-11-01 12:10:00", is_write: true });
+    const r = computeFunnel(db, { window: {
+      from: Date.parse("2026-11-01T12:00:00Z"), to: Date.parse("2026-11-01T12:20:00Z"),
+    } });
+    expect(r.window).toEqual({ first: "2026-11-01 12:05:00", last: "2026-11-01 12:10:00", entries: 2 });
+    expect(r.sessions_total).toBe(1);
+    expect(r).toMatchObject({
+      understand_sessions: 0, started_with_understand: 0, with_follow_up: 0, with_record: 0,
+      avg_calls_per_understand_session: 0, must_read_issued: 0, must_read_opened: 0,
+      shares: { follow_up_pct: 0, record_pct: 0 },
+    });
+  });
+
+  it("A12: верхняя граница исключает follow-up, запись и открытие must_read", () => {
+    addEntry({ tool: "get_concept", timestamp: "2026-11-01 11:55:00" });
+    addEntry({
+      tool: "understand", timestamp: "2026-11-01 12:00:00",
+      params: { must_read: [{ ref: "src/a.ts", node_id: "alpha" }], must_read_ids: ["alpha"] },
+    });
+    addEntry({ tool: "get_concept", timestamp: "2026-11-01 12:10:00", affected_ids: ["alpha"] });
+    addEntry({ tool: "create_concept", timestamp: "2026-11-01 12:11:00", is_write: true });
+    const r = computeFunnel(db, { window: {
+      from: Date.parse("2026-11-01T12:00:00Z"), to: Date.parse("2026-11-01T12:10:00Z"),
+    } });
+    expect(r.window.entries).toBe(1);
+    expect(r.sessions_total).toBe(1);
+    expect(r).toMatchObject({
+      understand_sessions: 1, started_with_understand: 1, with_follow_up: 0, with_record: 0,
+      avg_calls_per_understand_session: 1, must_read_issued: 1, must_read_opened: 0,
+      shares: { follow_up_pct: 0, record_pct: 0 },
+    });
+    expect(formatFunnel(r).join("\n")).toContain("1 issued");
+  });
+
+  it("A12: окно считает только свои вызовы, all сохраняет полную сессию", () => {
+    addEntry({ tool: "board", timestamp: "2026-11-01 11:55:00" });
+    addEntry({ tool: "understand", timestamp: "2026-11-01 12:00:00" });
+    addEntry({ tool: "get_concept", timestamp: "2026-11-01 12:05:00" });
+    addEntry({ tool: "create_concept", timestamp: "2026-11-01 12:10:00", is_write: true });
+    const r = computeFunnel(db, { window: {
+      from: Date.parse("2026-11-01T12:00:00Z"), to: Date.parse("2026-11-01T12:10:00Z"),
+    } });
+    expect(r).toMatchObject({
+      sessions_total: 1, understand_sessions: 1, started_with_understand: 1,
+      with_follow_up: 1, with_record: 0, avg_calls_per_understand_session: 2,
+      window: { entries: 2 }, shares: { follow_up_pct: 100, record_pct: 0 },
+    });
+    expect(computeFunnel(db)).toMatchObject({
+      sessions_total: 1, understand_sessions: 1, started_with_understand: 0,
+      with_follow_up: 1, with_record: 1, avg_calls_per_understand_session: 4,
+      window: { entries: 4 },
+    });
+  });
+
   it("пустая база: нули, window без first/last после JSON", () => {
     const r = computeFunnel(db);
     expect(r.sessions_total).toBe(0);

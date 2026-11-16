@@ -304,16 +304,18 @@ export class KnowledgeDB {
       this.db.pragma("query_only = ON");
     }
     this.dbFile = path.resolve(dbPath);
-    if (!readonly) {
+    // R01: autoMigrate:false also defers persistent PRAGMAs until
+    // runPendingMigrations(), so a migration consumer can snapshot before
+    // the first write. Normal RW startup retains WAL + NORMAL behavior.
+    if (!readonly && opts.autoMigrate !== false) {
       this.db.pragma("journal_mode = WAL");
     }
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
-    if (!readonly) {
+    if (!readonly && opts.autoMigrate !== false) {
       this.db.pragma("synchronous = NORMAL");
     }
-    // 08-N1 (план 09): migrate --apply открывает сырую upstream-базу без
-    // авто-миграции и поднимает схему сам (runPendingMigrations + runMigration).
+    // migrate --apply opens raw upstream without constructor migrations.
     if (opts.autoMigrate === false) return;
     if (readonly) {
       // План 11: readonly-соединение мигрировать не может — молчаливый пропуск
@@ -400,6 +402,8 @@ export class KnowledgeDB {
    * (status, name_norm), FTS и метки.
    */
   runPendingMigrations(): void {
+    this.db.pragma("journal_mode = WAL");
+    this.db.pragma("synchronous = NORMAL");
     this.migrate();
     this.backfillCreatedViaV2();
   }

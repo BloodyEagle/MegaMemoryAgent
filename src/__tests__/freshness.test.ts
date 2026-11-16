@@ -20,7 +20,7 @@
  *   пропавшее определение — явный ambiguous/missing (не первый совпадение),
  *   номера строк — текущее разрешение, фолбэк файлового уровня ЯВНЫЙ.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +36,7 @@ import {
   loadFreshnessIndex,
   normalizeSourceKey,
 } from "../freshness.js";
+import { adapterRdepsOfFile, adapterResolveSymbol, resolveAdapterConfig } from "../code-adapter.js";
 import type { FreshnessIndex } from "../types.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
@@ -163,6 +164,115 @@ describe("P2.1: обратный индекс (восстановимый кэш
     expect(loaded.source_fingerprint).toBe(rewritten.source_fingerprint);
   });
 
+  it("A16: external writer меняет первую ссылку в ту же секунду — lookup новой ссылки инвалидирует кэш", async () => {
+    nodeWithRef("first", ["src/a.ts"]);
+    nodeWithRef("max-ref", ["src/z.ts"]);
+    for (const ref of ["src/a.ts", "src/b.ts", "src/z.ts"]) writeProjFile(ref, "export const X = 1;\n");
+    const writer = new KnowledgeDB(db.dbPath);
+    try {
+      // Две ссылки фиксируются в одну секунду; z.ts сохраняет прежний MAX(file_refs).
+      writer.execSqlRun("UPDATE nodes SET created_at = ?, updated_at = ?", "2026-11-16 12:00:00", "2026-11-16 12:00:00");
+      const beforeCounts = tableCounts();
+      const before = await checkFreshness(db, { sources: ["src/a.ts"], repo_root: projDir });
+      expect(before.records.map((r) => r.id)).toEqual(["first"]);
+      const cached = loadFreshnessIndex(db);
+      writer.execSqlRun("UPDATE nodes SET file_refs = ? WHERE id = ?", JSON.stringify(["src/b.ts"]), "first");
+      expect(tableCounts()).toEqual(beforeCounts); // no timeline/seq change
+
+      const after = await checkFreshness(db, { sources: ["src/b.ts"], repo_root: projDir });
+      expect(after.records.map((r) => r.id)).toEqual(["first"]);
+      expect(loadFreshnessIndex(db).source_fingerprint).not.toBe(cached.source_fingerprint);
+      const old = await checkFreshness(db, { sources: ["src/a.ts"], repo_root: projDir });
+      expect(old.records).toHaveLength(0);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("A16: external UPDATE artifact ref при прежнем checked_at обновляет reverse lookup", async () => {
+    nodeWithRef("observed", ["src/a.ts"]);
+    writeProjFile("src/a.ts", "export const X = 1;\n");
+    writeProjFile("src/b.ts", "export const X = 1;\n");
+    await checkArtifacts(db, { node_ids: ["observed"], cwd: projDir });
+    const writer = new KnowledgeDB(db.dbPath);
+    try {
+      const cached = loadFreshnessIndex(db);
+      const beforeCounts = tableCounts();
+      writer.execSqlRun("UPDATE node_artifacts SET ref = ? WHERE node_id = ?", "src/b.ts", "observed");
+      expect(tableCounts()).toEqual(beforeCounts);
+
+      const after = await checkFreshness(db, { sources: ["src/b.ts"], repo_root: projDir });
+      expect(after.records.map((r) => r.id)).toEqual(["observed"]);
+      expect(after.sources[0]?.affected_records).toContainEqual({ record: "node", id: "observed", via: "artifact" });
+      expect(loadFreshnessIndex(db).source_fingerprint).not.toBe(cached.source_fingerprint);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("A16: external UPDATE passport params без нового seq обновляет scope lookup", async () => {
+    nodeWithRef("d1", ["src/app.ts"], "fact");
+    writeProjFile("src/app.ts", "export const APP = 1;\n");
+    writeProjFile("src/other.ts", "export const APP = 1;\n");
+    const saved = await trailSaveWithPassport(db, {
+      node_ids: ["d1"], summary: "Область разбора сохраняется в паспорте.", repo_root: projDir,
+      passport: { task_type: "implementation_analysis", goal: "Разбор области", scope_files: ["src/app.ts"] },
+    });
+    const writer = new KnowledgeDB(db.dbPath);
+    try {
+      const cached = loadFreshnessIndex(db);
+      const beforeCounts = tableCounts();
+      const row = db.execSqlAll("SELECT seq, params FROM timeline WHERE tool = 'trail_save' ORDER BY seq DESC LIMIT 1")[0] as { seq: number; params: string };
+      const params = JSON.parse(row.params);
+      params.passport.scope.files[0].ref = "src/other.ts";
+      writer.execSqlRun("UPDATE timeline SET params = ? WHERE seq = ?", JSON.stringify(params), row.seq);
+      expect(tableCounts()).toEqual(beforeCounts);
+
+      const after = await checkFreshness(db, { sources: ["src/other.ts"], repo_root: projDir });
+      expect(after.records.map((r) => r.id)).toEqual([saved.passport.trail_id]);
+      expect(after.records[0]?.state).toBe("fresh");
+      expect(loadFreshnessIndex(db).source_fingerprint).not.toBe(cached.source_fingerprint);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("A16: external UPDATE между чтениями не маркирует старый index новым fingerprint", async () => {
+    nodeWithRef("first", ["src/a.ts"]);
+    nodeWithRef("max-ref", ["src/z.ts"]);
+    for (const ref of ["src/a.ts", "src/b.ts", "src/z.ts"]) writeProjFile(ref, "export const X = 1;\n");
+    await checkArtifacts(db, { node_ids: ["first"], cwd: projDir });
+    const writer = new KnowledgeDB(db.dbPath);
+    const read = db.execSqlAll.bind(db);
+    let injected = false;
+    const spy = vi.spyOn(db, "execSqlAll").mockImplementation((sql, ...args) => {
+      const rows = read(sql, ...args);
+      if (!injected && sql.includes("FROM nodes") && sql.includes("file_refs")) {
+        injected = true;
+        // Независимое соединение может писать во время readonly snapshot (WAL).
+        writer.execSqlRun("UPDATE nodes SET file_refs = ? WHERE id = ?", JSON.stringify(["src/b.ts"]), "first");
+        writer.execSqlRun("UPDATE node_artifacts SET ref = ? WHERE node_id = ?", "src/b.ts", "first");
+      }
+      return rows;
+    });
+    try {
+      await checkFreshness(db, { sources: ["src/a.ts"], repo_root: projDir });
+      expect(injected).toBe(true);
+      const initial = JSON.parse(fs.readFileSync(freshnessIndexCachePath(db.dbPath), "utf8")) as FreshnessIndex;
+      expect(initial.entries["src/a.ts"]?.filter((e) => e.id === "first").map((e) => e.via)).toEqual(["node_file_ref", "artifact"]);
+      expect(initial.entries["src/b.ts"]).toBeUndefined();
+      spy.mockRestore();
+      const after = await checkFreshness(db, { sources: ["src/b.ts"], repo_root: projDir });
+      expect(after.records.map((r) => r.id)).toEqual(["first"]);
+      const cached = loadFreshnessIndex(db);
+      expect(cached.entries["src/a.ts"]).toBeUndefined();
+      expect(cached.source_fingerprint).toBe(buildFreshnessIndex(db).source_fingerprint);
+    } finally {
+      spy.mockRestore();
+      writer.close();
+    }
+  });
+
   it("невалидные записи кэша (узел-призрак) не повышают доверие: запись unknown", async () => {
     nodeWithRef("d1", ["src/a.ts"]);
     writeProjFile("src/a.ts", "export const A = 1;\n");
@@ -247,7 +357,7 @@ describe("P2.1: адресная перепроверка связанных з�
         "  console.log(JSON.stringify({ name: kv.name, definedIn: defs }));",
         "} else if (kv.op === 'rdeps') {",
         "  const r = idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 };",
-        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' } }, r)));",
+        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' }, completeness: { complete: true } }, r)));",
         "} else { console.log(JSON.stringify({ error: 'unknown op' })); }",
       ].join("\n"),
       "utf8"
@@ -354,7 +464,42 @@ describe("P2.1: адресная перепроверка связанных з�
     const r = await checkFreshness(db, { node_ids: ["d1"], repo_root: projDir });
     expect(r.sources[0]?.status).toBe("unobserved");
     expect(r.sources[0]?.note).toContain("записанной версии");
+    expect(r.records[0]?.state).toBe("unknown");
+    expect(r.records[0]?.checked_sources[0]?.status).toBe("unobserved");
+    expect(r.records[0]?.reasons.join(" ")).toContain("собственной записанной версии");
     expect(r.expected_versions[0]?.sha256).toBe(sha256File("src/a.ts"));
+  });
+
+  it("A04: общая сводка changed не подменяет собственные версии связанных записей", async () => {
+    nodeWithRef("old", ["src/shared.ts"]);
+    nodeWithRef("current", ["src/shared.ts"]);
+    nodeWithRef("unobserved", ["src/shared.ts:1-10"]);
+    writeProjFile("src/shared.ts", "export const S = 1;\n");
+    await checkArtifacts(db, { node_ids: ["old"], cwd: projDir });
+    writeProjFile("src/shared.ts", "export const S = 2;\n");
+    await checkArtifacts(db, { node_ids: ["current"], cwd: projDir });
+
+    const r = await checkFreshness(db, { sources: ["src/shared.ts"], repo_root: projDir });
+    expect(r.sources[0]?.status).toBe("changed");
+    expect(r.records.find((x) => x.id === "old")?.state).toBe("stale_input");
+    expect(r.records.find((x) => x.id === "current")?.state).toBe("fresh");
+    expect(r.records.find((x) => x.id === "unobserved")?.state).toBe("unknown");
+    expect(r.records.find((x) => x.id === "current")?.checked_sources[0]?.status).toBe("unchanged");
+    expect(r.records.find((x) => x.id === "unobserved")?.checked_sources[0]?.status).toBe("unobserved");
+    expect(r.summary.affected).toBe(1);
+  });
+
+  it("A04: частичное покрытие собственными наблюдениями не объявляется fresh", async () => {
+    nodeWithRef("d1", ["src/a.ts"]);
+    writeProjFile("src/a.ts", "export const A = 1;\n");
+    writeProjFile("src/b.ts", "export const B = 1;\n");
+    await checkArtifacts(db, { node_ids: ["d1"], cwd: projDir });
+    db.updateNode("d1", { file_refs: ["src/a.ts", "src/b.ts"] });
+
+    const r = await checkFreshness(db, { sources: ["src/a.ts"], repo_root: projDir });
+    expect(r.records[0]?.state).toBe("partial");
+    expect(r.records[0]?.checked_sources.map((s) => s.status)).toEqual(["unchanged", "unobserved"]);
+    expect(r.records[0]?.reasons.join(" ")).toContain("собственной записанной версии");
   });
 
   it("git_blob источник проверяется без записи наблюдений", async () => {
@@ -436,6 +581,27 @@ describe("P2.1: git-интеграция", () => {
     expect(r.records[0]?.state).toBe("stale_input");
   });
 
+  it("A04: смешанные repo pin квалифицируются отдельно даже при одинаковых байтах", async () => {
+    const repoB = path.join(tmpDir, "repo-b");
+    fs.mkdirSync(path.join(repoB, "src"), { recursive: true });
+    writeProjFile("src/shared.ts", "export const S = 1;\n");
+    fs.writeFileSync(path.join(repoB, "src", "shared.ts"), "export const S = 1;\n", "utf8");
+    nodeWithRef("repo-a", ["src/shared.ts"]);
+    nodeWithRef("repo-b", ["src/shared.ts"]);
+    await checkArtifacts(db, { node_ids: ["repo-a"], cwd: projDir });
+    await checkArtifacts(db, { node_ids: ["repo-b"], cwd: repoB });
+
+    for (const [root, own, foreign] of [[projDir, "repo-a", "repo-b"], [repoB, "repo-b", "repo-a"]]) {
+      const r = await checkFreshness(db, { sources: ["src/shared.ts"], repo_root: root });
+      expect(r.sources[0]?.status).toBe("unchanged");
+      expect(r.records.find((x) => x.id === own)?.state).toBe("fresh");
+      const other = r.records.find((x) => x.id === foreign);
+      expect(other?.state).toBe("unknown");
+      expect(other?.checked_sources[0]?.status).toBe("other_repo");
+      expect(other?.reasons.join(" ")).toContain("не одна опора");
+    }
+  });
+
   it("два репозитория с одинаковым путём: other_repo, сравнение байтов не делается", async () => {
     const repoB = path.join(tmpDir, "repo-b");
     fs.mkdirSync(path.join(repoB, "src"), { recursive: true });
@@ -486,8 +652,10 @@ describe("P2.1: доказательство по содержимому", () =>
     // Один физический источник — один source check (дедуп по ключу пути).
     expect(r.sources).toHaveLength(1);
     expect(r.sources[0]?.status).toBe("unchanged");
-    // Обе записи квалифицированы.
+    // Обе записи квалифицированы, но наблюдение d1 не подтверждает d2.
     expect(r.records.map((x) => x.id).sort()).toEqual(["d1", "d2"]);
+    expect(r.records.find((x) => x.id === "d1")?.state).toBe("fresh");
+    expect(r.records.find((x) => x.id === "d2")?.state).toBe("unknown");
     // expected_versions не дублируют физический источник.
     expect(r.expected_versions).toHaveLength(1);
   });
@@ -560,8 +728,8 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
         "  const defs = (idx.symbols[kv.name] || []).filter(d => !kv.in || d.owner === kv.in);",
         "  console.log(JSON.stringify({ name: kv.name, definedIn: defs }));",
         "} else if (kv.op === 'rdeps') {",
-        "  const r = idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 };",
-        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' } }, r)));",
+        "  const r = Object.prototype.hasOwnProperty.call(idx, 'rdepsRaw') ? idx.rdepsRaw : Object.assign({ file: kv.file, scope: { scanRoot: 'src' }, completeness: { complete: true } }, idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 });",
+        "  console.log(JSON.stringify(r));",
         "} else { console.log(JSON.stringify({ error: 'unknown op' })); }",
       ].join("\n"),
       "utf8"
@@ -665,6 +833,47 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
     expect(r.symbols[2]?.candidates[0]?.file).toBe("src/b.ts");
   });
 
+  it.each([
+    { label: "нет определения", files: [], locatorFile: "src/target.ts", status: "missing", expectedFiles: [] },
+    { label: "единственный кандидат в другом файле", files: ["src/other.ts"], locatorFile: "src/target.ts", status: "missing", expectedFiles: [] },
+    { label: "один из нескольких в заданном файле", files: ["src/other.ts", "src/target.ts"], locatorFile: "src/target.ts", status: "unique", expectedFiles: ["src/target.ts"] },
+    { label: "несколько кандидатов вне заданного файла", files: ["src/other.ts", "src/another.ts"], locatorFile: "src/target.ts", status: "missing", expectedFiles: [] },
+    { label: "неоднозначность только в заданном файле", files: ["src/other.ts", "src/target.ts", "src/target.ts"], locatorFile: "src/target.ts", status: "ambiguous", expectedFiles: ["src/target.ts", "src/target.ts"] },
+    { label: "разделители пути эквивалентны", files: ["src/target.ts"], locatorFile: "src\\target.ts", status: "unique", expectedFiles: ["src/target.ts"] },
+    {
+      label: "регистр пути зависит от платформы",
+      files: ["src/Target.ts", "src/other.ts"],
+      locatorFile: "src/target.ts",
+      status: process.platform === "win32" ? "unique" : "missing",
+      expectedFiles: process.platform === "win32" ? ["src/Target.ts"] : [],
+    },
+  ])("A10: $label — adapter и freshness соблюдают locator.file", async ({ files, locatorFile, status, expectedFiles }) => {
+    const scriptsDir = writeStub({
+      symbols: { make: files.map((file) => ({ file, kind: "function", line: 1, startLine: 1, endLine: 1 })) },
+      rdeps: {},
+    });
+    writeProjFile("src/target.ts", "export function make() {}\n");
+    const locator = { name: "make", file: locatorFile };
+    const cfg = resolveAdapterConfig({ graph_tool: scriptsDir }, projDir)!;
+    const outcome = await adapterResolveSymbol(cfg, locator);
+    const report = await checkFreshness(db, {
+      sources: ["src/target.ts"],
+      repo_root: projDir,
+      symbols: [locator],
+      adapter: { graph_tool: scriptsDir },
+    });
+    expect(outcome.status).toBe(status);
+    const candidates = outcome.status === "unique" ? [outcome.candidate] : outcome.status === "ambiguous" ? outcome.candidates : [];
+    expect(candidates.map((candidate) => candidate.file)).toEqual(expectedFiles);
+    expect(report.symbols[0]?.status).toBe(status);
+    expect(report.symbols[0]?.candidates.map((candidate) => candidate.file)).toEqual(expectedFiles);
+    if (status === "missing") {
+      expect(report.symbols[0]?.matched_locators).toEqual([]);
+      expect(report.symbols[0]?.locator_moved).toBe(false);
+      expect(report.symbols[0]?.note).toContain("требуется чтение");
+    }
+  });
+
   it("недоступный adapter — ЯВНЫЙ фолбэк файлового уровня, не молча", async () => {
     // Несуществующий скрипт: spawn завершится ошибкой.
     writeProjFile("src/a.ts", "export const A = 1;\n");
@@ -694,6 +903,67 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
     expect(r.symbols[0]?.note).toContain("не сконфигурирован");
   });
 
+  it.each([
+    { label: "пустой объект", response: {} },
+    { label: "importedBy не массив", response: { importedBy: "x" } },
+    { label: "неполная форма с complete не boolean", response: { importedBy: [], completeness: { complete: "yes" } } },
+    { label: "нет importedByTotal", response: { importedBy: [], scope: { scanRoot: "src" }, completeness: { complete: true } } },
+    { label: "importedByTotal не число", response: { importedBy: [], importedByTotal: "0", scope: { scanRoot: "src" }, completeness: { complete: true } } },
+    { label: "нет scope", response: { importedBy: [], importedByTotal: 0, completeness: { complete: true } } },
+    { label: "scope.scanRoot не строка", response: { importedBy: [], importedByTotal: 0, scope: { scanRoot: 123 }, completeness: { complete: true } } },
+    { label: "нет completeness", response: { importedBy: [], importedByTotal: 0, scope: { scanRoot: "src" } } },
+    { label: "нет completeness.complete", response: { importedBy: [], importedByTotal: 0, scope: { scanRoot: "src" }, completeness: {} } },
+    { label: "completeness.complete не boolean", response: { importedBy: [], importedByTotal: 0, scope: { scanRoot: "src" }, completeness: { complete: "yes" } } },
+    { label: "null вместо ответа", response: null },
+    { label: "массив вместо ответа", response: [] },
+  ])("A11: $label — не доказательство пустого полного графа", async ({ response }) => {
+    const scriptsDir = writeStub({ symbols: {}, rdeps: {}, rdepsRaw: response });
+    nodeWithRef("callee", ["src/callee.ts"], "fact");
+    writeProjFile("src/callee.ts", "export const CALLEE = 1;\n");
+    await checkArtifacts(db, { node_ids: ["callee"], cwd: projDir });
+    writeProjFile("src/callee.ts", "export const CALLEE = 2;\n");
+    const cfg = resolveAdapterConfig({ graph_tool: scriptsDir }, projDir)!;
+    const outcome = await adapterRdepsOfFile(cfg, "src/callee.ts");
+    const report = await checkFreshness(db, {
+      sources: ["src/callee.ts"],
+      with_dependencies: true,
+      adapter: { graph_tool: scriptsDir },
+      repo_root: projDir,
+    });
+    expect(outcome.complete).toBe(false);
+    expect(outcome.error).toEqual(expect.any(String));
+    expect(outcome.error).not.toBe("");
+    expect(outcome.dependents).toEqual([]);
+    expect(outcome.total).toBeNull();
+    expect(outcome.scan_root).toBeNull();
+    expect(report.sources[0]?.status).toBe("changed");
+    expect(report.dependencies).toEqual([]);
+    expect(report.summary.limitations.join(" ")).toContain("ошибка adapter");
+    expect(report.summary.limitations.join(" ")).toContain("это не «зависимостей нет»");
+  });
+
+  it.each([
+    { label: "валидный пустой граф", importedBy: [], total: 0, declaredComplete: true, complete: true },
+    { label: "валидный непустой граф", importedBy: [{ file: "src/caller.ts" }], total: 1, declaredComplete: true, complete: true },
+    { label: "объявленная неполнота", importedBy: [], total: 0, declaredComplete: false, complete: false },
+    { label: "усечённая выдача", importedBy: [{ file: "src/caller.ts" }], total: 7, declaredComplete: true, complete: false },
+  ])("A11: $label — форма и статическая полнота различаются", async ({ importedBy, total, declaredComplete, complete }) => {
+    const scriptsDir = writeStub({
+      symbols: {},
+      rdeps: {},
+      rdepsRaw: { importedBy, importedByTotal: total, scope: { scanRoot: "src" }, completeness: { complete: declaredComplete } },
+    });
+    const cfg = resolveAdapterConfig({ graph_tool: scriptsDir }, projDir)!;
+    const outcome = await adapterRdepsOfFile(cfg, "src/callee.ts");
+    expect(outcome).toEqual({
+      dependents: importedBy.map((entry) => entry.file),
+      total,
+      complete,
+      scan_root: "src",
+      error: null,
+    });
+  });
+
   it("неполный import-граф (importedByTotal > выданных): префикс не весь граф", async () => {
     const scriptsDir = path.join(projDir, "scripts");
     fs.mkdirSync(scriptsDir, { recursive: true });
@@ -708,7 +978,7 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
         "if (kv.op === 'info') { console.log(JSON.stringify({ projectType: 'ts' })); }",
         "else if (kv.op === 'rdeps') {",
         "  const r = idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 };",
-        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' } }, r)));",
+        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' }, completeness: { complete: true } }, r)));",
         "} else { console.log(JSON.stringify({ error: 'x' })); }",
       ].join("\n"),
       "utf8"
@@ -754,7 +1024,7 @@ describe("P2.2: символьная ступень (пилот adapter)", () =>
         "if (kv.op === 'info') { console.log(JSON.stringify({ projectType: 'ts' })); }",
         "else if (kv.op === 'rdeps') {",
         "  const r = idx.rdeps[kv.file] || { importedBy: [], importedByTotal: 0 };",
-        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' } }, r)));",
+        "  console.log(JSON.stringify(Object.assign({ file: kv.file, scope: { scanRoot: 'src' }, completeness: { complete: true } }, r)));",
         "} else { console.log(JSON.stringify({ error: 'x' })); }",
       ].join("\n"),
       "utf8"

@@ -302,6 +302,18 @@ export async function runMigration(
   db.assertIntegrity();
   const report = emptyReport();
 
+  // R01: backup precedes pending schema migrations, including v<4 edge
+  // dedup and persistent PRAGMAs. SDK callers must open autoMigrate:false;
+  // the CLI already snapshots before opening and supplies that same path.
+  // snapshotDb includes committed WAL frames without a checkpoint (S-01).
+  if (opts.apply) {
+    if (opts.backup && opts.dbPath) {
+      const backupPath = opts.backup(opts.dbPath);
+      if (backupPath) report.applied.push(`backup: ${backupPath}`);
+    }
+    db.runPendingMigrations();
+  }
+
   // Read-only previews (also shown in dry-run).
   report.digestPending = countDigestPending(db);
   const repairPlan = planIdRepair(db);
@@ -328,16 +340,6 @@ export async function runMigration(
       );
     }
     return report;
-  }
-
-  // Step 0: backup (apply only). snapshotDb() takes a coherent SQLite
-  // snapshot — committed WAL frames included — so no checkpoint is needed
-  // here (S-01): a checkpoint could be busy and does not freeze the copy.
-  if (opts.backup && opts.dbPath) {
-    const backupPath = opts.backup(opts.dbPath);
-    if (backupPath) {
-      report.applied.push(`backup: ${backupPath}`);
-    }
   }
 
   ensureSchema(db, report);

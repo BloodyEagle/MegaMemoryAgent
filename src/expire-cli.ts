@@ -98,19 +98,39 @@ export function expirePinsFromReport(
       claim_digest?: unknown;
       valid_until?: unknown;
       removed_at?: unknown;
+      expire?: unknown;
     }>;
   }
 ): Map<string, ExpirePin> {
   const pins = new Map<string, ExpirePin>();
+  const seen = new Set<string>();
   for (const c of report.candidates ?? []) {
-    if (typeof c?.id !== "string" || c.id === "") continue;
-    if (typeof c.claim_digest !== "string" || c.claim_digest === "") continue;
+    if (typeof c?.id !== "string" || c.id.trim() === "" || c.id !== c.id.trim()) {
+      throw new Error("--report: версионный кандидат без корректного id.");
+    }
+    if (seen.has(c.id)) {
+      throw new Error(`--report: повторяющийся id "${c.id}" — дубликат кандидата.`);
+    }
+    seen.add(c.id);
+    if (c.expire !== undefined && typeof c.expire !== "boolean") {
+      throw new Error(`--report: поле expire кандидата "${c.id}" не boolean.`);
+    }
+    if (c.expire !== true) continue;
+    if (
+      typeof c.kind !== "string" || c.kind.trim() === "" ||
+      typeof c.status !== "string" || c.status.trim() === "" ||
+      typeof c.claim_digest !== "string" || !/^[a-f0-9]{64}$/i.test(c.claim_digest) ||
+      !(c.valid_until === null || (typeof c.valid_until === "string" && Number.isFinite(Date.parse(c.valid_until)))) ||
+      !(c.removed_at === null || (typeof c.removed_at === "string" && Number.isFinite(Date.parse(c.removed_at))))
+    ) {
+      throw new Error(`--report: выбранный id "${c.id}" без полного валидного pin версии (kind, status, claim_digest, valid_until, removed_at).`);
+    }
     pins.set(c.id, {
-      kind: typeof c.kind === "string" ? c.kind : "",
-      status: typeof c.status === "string" ? c.status : "active",
+      kind: c.kind,
+      status: c.status,
       claim_digest: c.claim_digest,
-      valid_until: typeof c.valid_until === "string" ? c.valid_until : null,
-      removed_at: typeof c.removed_at === "string" ? c.removed_at : null,
+      valid_until: c.valid_until,
+      removed_at: c.removed_at,
     });
   }
   return pins;
@@ -157,8 +177,18 @@ export function readReport(filePath: string): ReadReportResult {
 
   const ids: string[] = [];
   const verdicts = new Map<string, string>();
+  const seen = new Set<string>();
   for (const c of candidates as ReportCandidate[]) {
-    if (typeof c?.id !== "string" || c.id === "") continue;
+    if (typeof c?.id !== "string" || c.id === "") {
+      if (rawFormat === 2 || c?.expire === true) {
+        throw new Error("--report: выбранный или версионный кандидат без корректного id.");
+      }
+      continue;
+    }
+    if (seen.has(c.id)) {
+      throw new Error(`--report: повторяющийся id "${c.id}" — дубликат кандидата.`);
+    }
+    seen.add(c.id);
     if (c.expire === true) {
       ids.push(c.id);
       if (typeof c.verdict === "string") verdicts.set(c.id, c.verdict);
@@ -215,6 +245,14 @@ export function expireNodes(
   if (unique.length === 0) {
     throw new Error("expire: пустой список id — нечего просрочивать.");
   }
+  if (pins !== undefined) {
+    if (unique.length !== ids.length) {
+      throw new Error("expire: версионный список id содержит дубликаты или пустые значения.");
+    }
+    if (pins.size !== unique.length || unique.some((id) => !pins.has(id))) {
+      throw new Error("expire: выбранные ids не совпадают с pin-версиями — legacy-fallback запрещён.");
+    }
+  }
   const unknown = unique.filter((id) => !db.getNode(id));
   if (unknown.length > 0) {
     throw new Error(
@@ -250,7 +288,13 @@ export function expireNodes(
         );
       }
       const pin = pins?.get(id);
+      if (pins !== undefined && !pin) {
+        throw new Error(`expire: для выбранного id "${id}" нет pin версии — batch отменён.`);
+      }
       if (pin) {
+        if ((node.removed_at ?? null) !== pin.removed_at) {
+          throw new Error(`version_conflict: состояние удаления узла "${id}" изменилось после построения отчёта — batch отменён.`);
+        }
         if (node.kind !== pin.kind) {
           throw new Error(
             `version_conflict: kind узла "${id}" изменился после построения отчёта ` +
@@ -380,12 +424,12 @@ export async function runExpire(argv: string[]): Promise<void> {
       } else {
         console.log(renderScanText(report));
       }
-      console.log(
-        pc.dim(
-          "  Скан dry-run: база не менялась, кандидаты expire не включают. " +
-            "Просмотри отчёт, разреши строки (expire: true) и примени: megamemory expire --report <json> --apply."
-        )
+      const instruction = pc.dim(
+        "  Скан dry-run: база не менялась, кандидаты expire не включают. " +
+          "Просмотри отчёт, разреши строки (expire: true) и примени: megamemory expire --report <json> --apply."
       );
+      if (json) console.error(instruction);
+      else console.log(instruction);
     } finally {
       db.close();
     }

@@ -3,7 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "libsql";
+import { spawn } from "node:child_process";
+import net from "node:net";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { KnowledgeDB } from "../db.js";
+import { dbFingerprint } from "../migrate-cli.js";
 import { preflight, autoMigrateIfNeeded } from "../auto-migrate.js";
 import { vectorSearchEnabled } from "../embeddings.js";
 import { getConcept } from "../tools.js";
@@ -24,11 +28,11 @@ afterEach(async () => {
  * Upstream-shaped fixture (F14.6.1): 6 nodes, 2 with id='' (only one such
  * row can exist — PK), 1 with id='parent/', 8 edges, MiniLM-shaped vectors.
  */
-function buildLegacyFixture(withVectors = true): void {
+function buildLegacyFixture(withVectors = true, version = 4, journal = "WAL"): void {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-automigrate-"));
   dbPath = path.join(tmpDir, "knowledge.db");
   const raw = new Database(dbPath);
-  raw.pragma("journal_mode = WAL");
+  raw.pragma(`journal_mode = ${journal}`);
   raw.exec(`
     CREATE TABLE nodes (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
@@ -70,7 +74,8 @@ function buildLegacyFixture(withVectors = true): void {
   edge.run("parent/child", "parent/");
   edge.run("n6", "parent/child");
   edge.run("n1", "n6");
-  raw.pragma("user_version = 4");
+  raw.pragma(`user_version = ${version}`);
+  if (version !== 4) raw.pragma("wal_checkpoint(TRUNCATE)");
   raw.close();
 }
 
@@ -202,6 +207,142 @@ describe("auto-migration on first open (F14)", () => {
       expect(fs.readdirSync(tmpDir).filter((f) => f.includes(".bak-"))).toHaveLength(0);
     } else if (result.performed) {
       expect(result.after?.nodes).toBe(6);
+    }
+  });
+});
+
+describe("R01 actual automatic startup backup boundary", () => {
+  function contents(raw: InstanceType<typeof Database>) {
+    return {
+      version: (raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+      schema: raw.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all(),
+      nodes: raw.prepare("SELECT * FROM nodes ORDER BY id").all(),
+      edges: raw.prepare("SELECT * FROM edges ORDER BY id").all(),
+    };
+  }
+
+  async function startup(target: "mcp" | "serve", optOut = false) {
+    const project = fileURLToPath(new URL("../../", import.meta.url));
+    const home = path.join(tmpDir, "profile");
+    fs.mkdirSync(home, { recursive: true });
+    const port = target === "serve" ? await new Promise<number>((resolve, reject) => {
+      const server = net.createServer();
+      server.on("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const value = (server.address() as net.AddressInfo).port;
+        server.close((err) => err ? reject(err) : resolve(value));
+      });
+    }) : 0;
+    const args = target === "mcp" ? ["--db", dbPath] : ["serve", "--db", dbPath, "--port", String(port)];
+    return new Promise<{ ready: boolean; stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--import", pathToFileURL(path.join(project, "node_modules/tsx/dist/loader.mjs")).href, path.join(project, "src/index.ts"), ...args], {
+        cwd: tmpDir, shell: false, windowsHide: true,
+        env: { ...process.env, NODE_OPTIONS: "", HOME: home, USERPROFILE: home,
+          XDG_CONFIG_HOME: path.join(home, "config"), XDG_CACHE_HOME: path.join(home, "cache"), XDG_DATA_HOME: path.join(home, "data"),
+          OPENCODE_CONFIG_DIR: path.join(home, "opencode"), CODEX_HOME: path.join(home, "codex"), CLAUDE_CONFIG_DIR: path.join(home, "claude"),
+          MEGAMEMORY_DB_PATH: dbPath, MEGAMEMORY_AUTO_MIGRATE: optOut ? "0" : "1", MEGAMEMORY_AUTO_DIGEST: "0", MEGAMEMORY_SEARCH: "fts",
+          HF_HOME: path.join(home, "hf"), HF_HUB_OFFLINE: "1", TRANSFORMERS_OFFLINE: "1", NO_COLOR: "1" },
+      });
+      let ready = false, stdout = "", stderr = "", timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, 8000);
+      child.stdin.on("error", () => {});
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk.toString();
+        const initialized = target === "serve" ? /Local:\s+http:\/\/127\.0\.0\.1:\d+/.test(stdout) : stdout.split(/\r?\n/).some((line) => {
+          try { const message = JSON.parse(line); return message.id === 1 && !!message.result?.serverInfo; } catch { return false; }
+        });
+        if (initialized && !ready) { ready = true; child.kill("SIGTERM"); }
+      });
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.on("error", (err) => { clearTimeout(timer); reject(err); });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (timedOut) reject(new Error(`startup timed out: ${stderr}\n${stdout}`));
+        else resolve({ ready, stdout, stderr, code });
+      });
+      if (target === "mcp") child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
+        protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "prewrite-startup-regression", version: "1" },
+      } }) + "\n");
+    });
+  }
+
+  it.each(["mcp", "serve"] as const)("%s snapshots v3 duplicate edges and committed WAL before constructor migration", async (target) => {
+    buildLegacyFixture(false, 3);
+    const source = new Database(dbPath);
+    try {
+      source.exec("INSERT INTO edges (from_id, to_id, relation, description) VALUES ('n1', 'n2', 'connects_to', 'duplicate before startup')");
+      source.exec("UPDATE nodes SET summary = 'committed WAL before startup' WHERE id = 'n1'");
+      const before = contents(source);
+      expect(fs.statSync(`${dbPath}-wal`).size).toBeGreaterThan(0);
+      const result = await startup(target);
+      expect(result.ready, result.stderr + result.stdout).toBe(true);
+      const backups = fs.readdirSync(tmpDir).filter((file) => file.startsWith("knowledge.db.bak-"));
+      expect(backups).toHaveLength(1);
+      const copy = new Database(path.join(tmpDir, backups[0]));
+      try {
+        copy.pragma("query_only = ON");
+        expect(contents(copy)).toEqual(before);
+      } finally { copy.close(); }
+      const after = new Database(dbPath);
+      try {
+        expect((after.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(14);
+        expect(after.prepare("SELECT * FROM edges").all()).toHaveLength(8);
+        expect(after.prepare("SELECT id FROM nodes WHERE id = ''").get()).toBeUndefined();
+      } finally { after.close(); }
+    } finally { source.close(); }
+  });
+
+  it("MCP opt-out still snapshots pending migration but leaves legacy ids unrepaired", async () => {
+    buildLegacyFixture(false, 3, "DELETE");
+    const source = new Database(dbPath);
+    const before = contents(source);
+    source.close();
+    const result = await startup("mcp", true);
+    expect(result.ready, result.stderr).toBe(true);
+    const backups = fs.readdirSync(tmpDir).filter((file) => file.startsWith("knowledge.db.bak-"));
+    expect(backups).toHaveLength(1);
+    const copy = new Database(path.join(tmpDir, backups[0]));
+    try { expect(contents(copy)).toEqual(before); } finally { copy.close(); }
+    const after = new Database(dbPath);
+    try {
+      expect(after.prepare("SELECT id FROM nodes WHERE id = ''").get()).toBeDefined();
+      expect(after.prepare("SELECT id FROM nodes WHERE id = 'parent/'").get()).toBeDefined();
+    } finally { after.close(); }
+    expect(fs.readdirSync(tmpDir).filter((file) => file.startsWith("migration-report-"))).toEqual([]);
+  });
+
+  it.each(["mcp", "serve"] as const)("%s preserves the raw-upstream explicit-migration error without writes", async (target) => {
+    buildLegacyFixture(false, 0, "DELETE");
+    const before = dbFingerprint(dbPath);
+    const result = await startup(target);
+    expect(result.ready).toBe(false);
+    expect(result.stderr + result.stdout).toContain("migrate --apply");
+    expect(dbFingerprint(dbPath)).toEqual(before);
+    expect(fs.readdirSync(tmpDir).filter((file) => file.includes(".bak-") || file.startsWith("migration-report-"))).toEqual([]);
+  });
+
+  it("startup backup failure stops before persistent PRAGMA or schema writes", async () => {
+    buildLegacyFixture(false, 3, "DELETE");
+    const before = dbFingerprint(dbPath);
+    const { openStartupDatabase } = await import("../auto-migrate.js");
+    const exec = Database.prototype.exec;
+    vi.spyOn(Database.prototype, "exec").mockImplementation(function (this: InstanceType<typeof Database>, sql: string) {
+      if (sql.startsWith("VACUUM INTO")) throw new Error("startup snapshot denied");
+      return exec.call(this, sql);
+    });
+    try {
+      expect(() => openStartupDatabase(dbPath)).toThrow("startup snapshot denied");
+      expect(dbFingerprint(dbPath)).toEqual(before);
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it.each(["mcp", "serve"] as const)("%s first fresh startup and healthy repeat create no migration backup or report", async (target) => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-startup-fresh-"));
+    dbPath = path.join(tmpDir, "knowledge.db");
+    for (let i = 0; i < 2; i++) {
+      const result = await startup(target);
+      expect(result.ready, result.stderr + result.stdout).toBe(true);
+      expect(fs.readdirSync(tmpDir).filter((file) => file.includes(".bak-") || file.startsWith("migration-report-"))).toEqual([]);
     }
   });
 });

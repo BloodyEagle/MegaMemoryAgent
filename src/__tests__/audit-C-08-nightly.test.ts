@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { describe, expect, it } from "vitest";
 import { AuditHarnessError } from "./helpers/audit.js";
+import config, { TEST_PATHS } from "../../vitest.config.js";
 
 function nightlySteps() {
   const workflow = fs.readFileSync(new URL("../../.github/workflows/nightly.yml", import.meta.url), "utf8");
@@ -52,14 +53,15 @@ describe("C-08 nightly prepares dist before dist-dependent integrations", () => 
   });
 
   it("includes integrations in the default suite and exposes the compiled CLI", () => {
-    const config = fs.readFileSync(new URL("../../vitest.config.ts", import.meta.url), "utf8");
     const manifest = JSON.parse(fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
       bin: { megamemory: string }; scripts: { test: string };
     };
+    const projects = config.test!.projects as Array<{ test: { name: string; include: string[] } }>;
 
-    // Package/config metadata is the contract: moving the server launcher to
-    // a shared HTTP helper must not change this test's outcome.
-    expect(config).toContain('include: ["tests/integration/**/*.test.ts"]');
+    // Nightly invokes the same default suite; its integration paths are not
+    // a second set of literals that can drift from the config contract.
+    expect(projects.find((project) => project.test.name === "integration")!.test.include).toEqual(TEST_PATHS.integration);
+    expect(nightlySteps().filter(({ command }) => invokesTest.test(command)).every(({ command }) => !/--project|--exclude|--include/.test(command))).toBe(true);
     expect(manifest.scripts.test).toMatch(/\bvitest\s+run\b/);
     expect(manifest.bin.megamemory).toBe("dist/index.js");
   });

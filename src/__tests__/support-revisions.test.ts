@@ -20,6 +20,8 @@ import {
   statusDigestOf,
 } from "../support-baselines.js";
 import { MergeEngine } from "../merge.js";
+import { activeArtifactRows, artifactsDigestOf, checkArtifacts } from "../artifacts.js";
+import type { SupportRevisionRow } from "../types.js";
 
 vi.mock("../embeddings.js", () => ({
   embed: vi.fn(async () => Buffer.alloc(0)),
@@ -269,6 +271,107 @@ describe("F1: journal writes", () => {
     } finally {
       out.close();
     }
+  });
+
+  it.each([false, true])("merge keeps artifact confirmations and full history metadata (remap=%s)", async remap => {
+    node("d", "decision", "decision v1");
+    node("f", "fact");
+    db.updateNode("f", { file_refs: ["evidence.txt"] });
+    supportEdge("d", "f");
+    const pinnedConfirm = () => {
+      const support = db.getNode("f")!;
+      const edge = db.getInformedByEdges("d", "ancestry", false)[0];
+      return confirmSupports(db, { decision_id: "d", expected_claim_digest: claimDigestOf(db.getNode("d")!.summary), items: [{
+        support_id: "f", expected_edge_key: String(edge.id), expected_claim_digest: claimDigestOf(support.summary),
+        expected_status_digest: statusDigestOf(support.status, support.epistemic_status), expected_edge_digest: edgeDigestOf(edge.description),
+        expected_artifacts_digest: artifactsDigestOf(activeArtifactRows(support, db.getNodeArtifacts("f"))),
+      }] });
+    };
+    for (let version = 1; version <= 3; version++) {
+      fs.writeFileSync(path.join(tmpDir, "evidence.txt"), `artifact v${version}`, "utf8");
+      await checkArtifacts(db, { node_ids: ["f"], cwd: tmpDir });
+      db.updateNode("d", { summary: `decision v${version}` });
+      pinnedConfirm();
+      await sleep(5);
+    }
+    const original = db.getSupportRevisions("d", "f", 100);
+    const displaced = original.filter(row => row.source === "superseded");
+    expect(displaced).toHaveLength(2);
+    expect(new Set(displaced.map(row => row.artifacts_digest)).size).toBe(2);
+    expect(new Set(displaced.map(row => row.decision_claim_digest)).size).toBe(2);
+    const history = provenanceHistory(db, { decision_id: "d", support_id: "f", limit: 100 }).pairs[0].revisions.filter(row => !row.is_current);
+    const right = new KnowledgeDB(path.join(tmpDir, "right.db"));
+    let output: KnowledgeDB | undefined;
+    try {
+      if (remap) {
+        right.insertNode({ id: "d", name: "D", kind: "decision", summary: "Other decision" });
+        right.insertNode({ id: "f", name: "F", kind: "fact", summary: "Other support" });
+      }
+      new MergeEngine().merge(db.dbPath, right.dbPath, path.join(tmpDir, "out.db"));
+      output = new KnowledgeDB(path.join(tmpDir, "out.db"));
+      const decisionId = remap ? "d::left" : "d";
+      const supportId = remap ? "f::left" : "f";
+      const baseline = output.getSupportBaselines(decisionId)[0];
+      const contents = (row: SupportRevisionRow) => {
+        const { id: _id, ...fields } = row;
+        return fields;
+      };
+      const carried = output.getSupportRevisions(decisionId, supportId, 100);
+      expect(carried.filter(row => row.source !== "import").map(contents)).toEqual(original.map(row => ({
+        ...contents(row), decision_id: decisionId, support_id: supportId, edge_key: baseline.edge_key,
+      })));
+      expect(provenanceHistory(output, { decision_id: decisionId, support_id: supportId, limit: 100 }).pairs[0].revisions.filter(row => !row.is_current && row.source !== "import")).toEqual(history.map(row => ({ ...row, edge_key: baseline.edge_key })));
+      const imported = carried.find(row => row.source === "import")!;
+      expect(imported).toMatchObject({
+        artifacts_digest: baseline.artifacts_digest, decision_claim_digest: baseline.decision_claim_digest,
+        confirmed_by: "import", superseded_at: baseline.superseded_at,
+      });
+    } finally { output?.close(); right.close(); }
+  });
+
+  it.each(["artifacts_digest", "decision_claim_digest", "confirmed_by", "superseded_at"] as const)("merge deduplicates the full journal including %s", column => {
+    node("d", "decision"); node("f", "fact"); supportEdge("d", "f");
+    const shared: SupportRevisionRow = {
+      decision_id: "d", support_id: "f", edge_key: String(db.getInformedByEdges("d", "ancestry", false)[0].id),
+      claim_digest: "claim", status_digest: "status", edge_digest: "edge", format_version: 1,
+      confirmed_at: "2026-11-10T00:00:00.000Z", recorded_at: "2026-11-10T00:00:00.000Z", source: "superseded", reason: "reconfirmed",
+      artifacts_digest: null, decision_claim_digest: null, confirmed_by: null, superseded_at: null,
+    };
+    db.insertSupportRevision(shared);
+    db.insertSupportRevision({ ...shared, [column]: "different-historical-value" });
+    db.insertSupportRevision({ ...shared, [column]: "different-historical-value" });
+    const right = new KnowledgeDB(path.join(tmpDir, "right.db"));
+    let output: KnowledgeDB | undefined, repeated: KnowledgeDB | undefined;
+    try {
+      new MergeEngine().merge(db.dbPath, right.dbPath, path.join(tmpDir, "out.db"));
+      output = new KnowledgeDB(path.join(tmpDir, "out.db"));
+      expect(output.getSupportRevisions("d", "f", 100).map(row => row[column]).sort()).toEqual(["different-historical-value", null]);
+      expect(provenanceHistory(output, { decision_id: "d", support_id: "f" }).pairs[0].revisions).toHaveLength(2);
+      new MergeEngine().merge(output.dbPath, db.dbPath, path.join(tmpDir, "repeated.db"));
+      repeated = new KnowledgeDB(path.join(tmpDir, "repeated.db"));
+      expect(repeated.getSupportRevisions("d", "f", 100)).toHaveLength(2);
+    } finally { repeated?.close(); output?.close(); right.close(); }
+  });
+
+  it("merge leaves absent legacy journal columns null despite current artifact observations", () => {
+    node("d", "decision"); node("f", "fact"); supportEdge("d", "f");
+    db.updateNode("f", { file_refs: ["evidence.txt"] });
+    db.upsertNodeArtifact({ node_id: "f", kind: "file", ref: "evidence.txt", digest: "current-not-historical", prev_digest: null,
+      size_bytes: null, checked_at: "2026-11-10", changed_at: null, checked_by: "agent", repo_path: tmpDir });
+    db.insertSupportRevision({ decision_id: "d", support_id: "f", edge_key: String(db.getInformedByEdges("d", "ancestry", false)[0].id),
+      claim_digest: "old-claim", status_digest: "old-status", edge_digest: "old-edge", format_version: 1,
+      confirmed_at: "2026-11-10", recorded_at: "2026-11-10", source: "agent", reason: "confirmed" });
+    for (const column of ["artifacts_digest", "decision_claim_digest", "confirmed_by", "superseded_at"]) db.execSqlRun(`ALTER TABLE support_revisions DROP COLUMN ${column}`);
+    const right = new KnowledgeDB(path.join(tmpDir, "right.db"));
+    let output: KnowledgeDB | undefined;
+    try {
+      new MergeEngine().merge(db.dbPath, right.dbPath, path.join(tmpDir, "out.db"));
+      output = new KnowledgeDB(path.join(tmpDir, "out.db"));
+      expect(output.getNodeArtifacts("f")[0].digest).toBe("current-not-historical");
+      expect(provenanceHistory(output, { decision_id: "d", support_id: "f" }).pairs[0].revisions[0]).toMatchObject({
+        artifacts_digest: null, decision_claim_digest: null, confirmed_by: null, superseded_at: null,
+      });
+    } finally { output?.close(); right.close(); }
   });
 
   it("6. retention: 60 confirmations leave 50 revisions, the oldest dropped", async () => {

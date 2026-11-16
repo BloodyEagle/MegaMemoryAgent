@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.6.0-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.6.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -198,10 +198,13 @@ git-blob refs также используют закреплённый коре�
   Уборку живой базы делать на копии: полезное содержание не просрочивать,
   а переписывать.
 - **Вид `journal` (M2)** — явный kind для изменчивых записей о состоянии
-  («PR #N открыт сейчас»). Это не опора и не замена decision: решение
-  сохраняет обязательные опоры, а историческое событие («релиз опубликован
-  в дату X») от возраста не становится ложным — срок ограничивает полезность
-  записи в текущем контексте (политика выдачи, а не авто-refuted). При
+  («PR #N открыт сейчас»). **Рекомендация: не использовать journal как опору
+  решений.** Это правило workflow, а не технический запрет: сервер сейчас
+  допускает journal в `evidence.node` и как цель `informed_by`. Journal не
+  заменяет decision: решение сохраняет обязательные опоры. Историческое
+  событие («релиз опубликован в дату X») от возраста не становится ложным —
+  срок ограничивает полезность записи в текущем контексте (политика выдачи,
+  а не авто-refuted). При
   создании без `valid_until` сервер ставит срок по умолчанию: env
   `MEGAMEMORY_EXPIRY_JOURNAL_DAYS` → `expiry.journal_days` в конфиге рядом
   с базой (`megamemory.config.json`) → **90 дней** (стартовый fallback
@@ -348,7 +351,7 @@ npm install -g @bloodyeagle/megamemory
 пакета со scope как `bloodyeagle-megamemory-<version>.tgz`; для этого релиза):
 
 ```bash
-npm install -g ./bloodyeagle-megamemory-2.6.0.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.1.tgz
 ```
 
 Или соберите из чекаута (для разработки):
@@ -359,7 +362,7 @@ cd MegaMemoryAgent
 npm ci
 npm run build
 npm pack                      # печатает точное имя созданного .tgz
-npm install -g ./bloodyeagle-megamemory-2.6.0.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.1.tgz
 ```
 
 Зарегистрируйте интеграцию установщиком:

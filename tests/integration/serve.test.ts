@@ -1,39 +1,22 @@
 import { describe, it, expect, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { KnowledgeDB } from "../../src/db.js";
 import { ensureSchema } from "../../src/migrate-schema.js";
-import { cleanupDir } from "../../src/__tests__/helpers/cleanup.js";
-import { AuditCleanupError, auditFixture, type AuditFixture } from "../../src/__tests__/helpers/audit.js";
+import { auditFixture, type AuditFixture } from "../../src/__tests__/helpers/audit.js";
 import { startAuditHttp } from "../../src/__tests__/helpers/audit-http.js";
 
 // Integration (plan 3.3): real HTTP server on an ephemeral port, real
 // cyrillic ids through the URL layer, killed afterwards.
 
 let serverFixture: AuditFixture | null = null;
-let tmpDir: string | null = null;
 let port = 0;
 
 afterEach(async () => {
-  const errors: unknown[] = [];
-  try {
-    await serverFixture?.close();
-  } catch (error) {
-    errors.push(error);
-  } finally {
-    serverFixture = null;
-    if (tmpDir) {
-      try { await cleanupDir(tmpDir); } catch (error) { errors.push(error); }
-      tmpDir = null;
-    }
-  }
-  if (errors.length) throw new AuditCleanupError("HTTP fixture cleanup failed", { cause: new AggregateError(errors) });
+  const owned = serverFixture;
+  serverFixture = null;
+  await owned?.close();
 });
 
 async function startServe(dbFile: string): Promise<number> {
-  serverFixture = auditFixture();
-  const server = await startAuditHttp(serverFixture, dbFile);
+  const server = await startAuditHttp(serverFixture!, dbFile);
   port = server.port;
   return port;
 }
@@ -43,9 +26,9 @@ describe("serve integration", () => {
     "exposes graph, search and node APIs with cyrillic ids over HTTP",
     { timeout: 45000 },
     async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-serve-"));
-      const dbFile = path.join(tmpDir, "knowledge.db");
-      const db = new KnowledgeDB(dbFile);
+      serverFixture = auditFixture();
+      const dbFile = serverFixture.file("knowledge.db");
+      const db = serverFixture.db("knowledge.db");
       ensureSchema(db);
       db.insertNode({ id: "книга", name: "Книга", kind: "module", summary: "рецепты и заметки" });
       db.insertNode({
@@ -56,7 +39,7 @@ describe("serve integration", () => {
         parent_id: "книга",
       });
       db.insertNode({ id: "模块", name: "模块设计", kind: "module", summary: "支付模块" });
-      db.close();
+      await serverFixture.release(db);
 
       const actualPort = await startServe(dbFile);
       expect(actualPort).toBeGreaterThan(0);
@@ -110,9 +93,9 @@ describe("serve export endpoints (U2)", () => {
     "serves the bundle and single-node markdown with attachment headers",
     { timeout: 45000 },
     async () => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-export-serve-"));
-      const dbFile = path.join(tmpDir, "knowledge.db");
-      const db = new KnowledgeDB(dbFile);
+      serverFixture = auditFixture();
+      const dbFile = serverFixture.file("knowledge.db");
+      const db = serverFixture.db("knowledge.db");
       ensureSchema(db);
       db.insertNode({ id: "книга", name: "Книга", kind: "module", summary: "заметки" });
       db.insertNode({
@@ -122,7 +105,7 @@ describe("serve export endpoints (U2)", () => {
         summary: "полнотекстовый поиск",
         parent_id: "книга",
       });
-      db.close();
+      await serverFixture.release(db);
 
       const port = await startServe(dbFile);
 

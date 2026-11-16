@@ -14,7 +14,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { KnowledgeDB } from "../db.js";
 import { createConcept, updateConcept, getConcept, understand } from "../tools.js";
 import { exportMarkdown } from "../export.js";
@@ -141,9 +143,33 @@ describe("B1: kind journal — публичный контракт", () => {
     expect(db.getNode("decision-plain")!.kind).toBe("decision");
   });
 
-  it("MCP-описание create_concept упоминает journal (контракт tools/list синхронизирован)", async () => {
+  it("MCP tools/list публикует journal в описании и схемах create/update_concept", async () => {
     const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-    const source = fs.readFileSync(path.join(projectRoot, "src", "index.ts"), "utf-8");
-    expect(source).toContain("journal");
+    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["--import", pathToFileURL(path.join(projectRoot, "node_modules/tsx/dist/loader.mjs")).href,
+        path.join(projectRoot, "src/index.ts"), "--db", path.join(tmpDir, "knowledge.db")],
+      cwd: tmpDir,
+      env: { ...env, NODE_OPTIONS: "", HOME: tmpDir, USERPROFILE: tmpDir, APPDATA: tmpDir, LOCALAPPDATA: tmpDir,
+        XDG_CONFIG_HOME: tmpDir, XDG_CACHE_HOME: tmpDir, XDG_DATA_HOME: tmpDir,
+        MEGAMEMORY_DB_PATH: path.join(tmpDir, "knowledge.db"), MEGAMEMORY_SEARCH: "fts",
+        MEGAMEMORY_AUTO_MIGRATE: "0", MEGAMEMORY_AUTO_DIGEST: "0", HF_HUB_OFFLINE: "1", TRANSFORMERS_OFFLINE: "1" },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "journal-contract-test", version: "1" });
+    try {
+      await client.connect(transport, { timeout: 7_000 });
+      const { tools } = await client.listTools({}, { timeout: 3_000 });
+      const create = tools.find((tool) => tool.name === "create_concept")!;
+      const update = tools.find((tool) => tool.name === "update_concept")!;
+      expect(create.description).toContain("journal");
+      expect(create.inputSchema.properties?.kind).toMatchObject({ enum: expect.arrayContaining(["journal"]) });
+      expect(update.inputSchema.properties?.changes).toMatchObject({
+        properties: { kind: { enum: expect.arrayContaining(["journal"]) } },
+      });
+    } finally {
+      await client.close();
+    }
   });
 });

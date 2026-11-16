@@ -40,7 +40,7 @@ describe("W-06 — real SSE transports complete graph state", () => {
     const first = await server.events();
     expect(first.status).toBe(200);
     expect(await first.next((event) => event.type === "init")).toBeDefined();
-    await fixture!.release(first);
+    await first.close();
     const writer = fixture!.db("http.db");
     writer.execSqlRun("UPDATE nodes SET status = ?, parent_id = ?, updated_at = ? WHERE id = ?", "deprecated", "new-parent", "2040-01-02 03:04:05", "moving");
     writer.softDeleteNode("old-parent", "removed while disconnected");

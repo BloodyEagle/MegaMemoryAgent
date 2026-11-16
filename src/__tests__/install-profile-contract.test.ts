@@ -171,6 +171,245 @@ describe("F-04 install profile contract", () => {
   });
 });
 
+describe("R02 atomic managed install publication", () => {
+  function destinations() {
+    const json = '{"theme":"пользователь","mcp":{"other":{"command":"keep"}},"mcpServers":{"other":{"command":"keep"}}}\r\n';
+    const instructions = '# User rules\r\n\r\n<!-- megamemory:instructions v0.0.1 -->\n## Project Knowledge Graph\nold workflow\n<!-- /megamemory-snippet -->\n\n## User tail\nСохранить правила.\n';
+    const managed = 'MegaMemory-managed file. Safe for megamemory install to update.\nold managed content\n';
+    return [
+      { target: "opencode", name: "MCP server config", file: path.join(opencode, "opencode.json"), prior: json },
+      { target: "claudecode", name: "MCP server config", file: path.join(home, ".claude.json"), prior: json },
+      { target: "antigravity", name: "MCP server config", file: path.join(workspace, "mcp_config.json"), prior: json },
+      { target: "codex", name: "MCP server config", file: path.join(home, ".codex/config.toml"), prior: 'model = "keep"\n[mcp_servers.megamemory]\ncommand = "old"\nargs = ["old"]\nenv = { DB_PATH = "пользователь.db" }\n' },
+      { target: "opencode", name: "Global AGENTS.md", file: path.join(opencode, "AGENTS.md"), prior: instructions },
+      { target: "claudecode", name: "Global CLAUDE.md", file: path.join(home, ".claude/CLAUDE.md"), prior: instructions },
+      { target: "codex", name: "Global AGENTS.md", file: path.join(home, ".codex/AGENTS.md"), prior: instructions },
+      { target: "opencode", name: "Skill tool plugin", file: path.join(opencode, "tool/megamemory.ts"), prior: "// " + managed },
+      { target: "opencode", name: "Bootstrap command", file: path.join(opencode, "commands/bootstrap-memory.md"), prior: "<!-- " + managed },
+      { target: "opencode", name: "Save memory command", file: path.join(opencode, "commands/save-memory.md"), prior: "<!-- " + managed },
+      { target: "claudecode", name: "Bootstrap command", file: path.join(home, ".claude/commands/bootstrap-memory.md"), prior: "<!-- " + managed },
+      { target: "claudecode", name: "Save memory command", file: path.join(home, ".claude/commands/save-memory.md"), prior: "<!-- " + managed },
+    ];
+  }
+
+  it.each(Array.from({ length: 12 }, (_, i) => [i]))("rename failure preserves original bytes and reports failed managed destination #%s", async (index) => {
+    const item = destinations()[index];
+    fs.mkdirSync(path.dirname(item.file), { recursive: true });
+    const before = Buffer.from(item.prior, "utf8");
+    fs.writeFileSync(item.file, before);
+    const rename = fs.renameSync;
+    let attempted = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === item.file) {
+        attempted = true;
+        expect(path.dirname(String(from))).toBe(path.dirname(item.file));
+        expect(fs.readFileSync(item.file)).toEqual(before);
+        throw Object.assign(new Error("R02 mocked publish failure"), { code: "EACCES" });
+      }
+      return rename(from, to);
+    });
+
+    const result = await install(item.target);
+    expect(attempted).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.failed).toEqual([expect.objectContaining({ target: item.target, name: item.name, error: expect.stringContaining("R02 mocked publish failure") })]);
+    expect(fs.readFileSync(item.file)).toEqual(before);
+    expect(fs.readdirSync(path.dirname(item.file)).filter((name) => name.includes(".megamemory-tmp-"))).toEqual([]);
+  });
+
+  it.each(["append", "legacy"])("instruction %s publication failure preserves surrounding user text", async (mode) => {
+    const file = path.join(opencode, "AGENTS.md");
+    const before = Buffer.from(mode === "append" ? "# User rules\r\nТолько пользовательские правила.\r\n" : "# User rules\n## Project Knowledge Graph\nold\n## User tail\nСохранить.\n", "utf8");
+    fs.writeFileSync(file, before);
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === file) throw new Error("instruction publish failed");
+      return rename(from, to);
+    });
+    expect((await install("opencode")).ok).toBe(false);
+    expect(fs.readFileSync(file)).toEqual(before);
+    expect(fs.readdirSync(opencode).filter((name) => name.includes(".megamemory-tmp-"))).toEqual([]);
+  });
+
+  it("fresh all-target installation fsyncs and closes each sibling temp before publishing", async () => {
+    const files = destinations().map((item) => item.file);
+    const open = fs.openSync;
+    const sync = fs.fsyncSync;
+    const close = fs.closeSync;
+    const rename = fs.renameSync;
+    const handles = new Map<number, string>();
+    const synced = new Set<string>();
+    const closed = new Set<string>();
+    const published: string[] = [];
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      if (String(file).includes(".megamemory-tmp-")) {
+        expect(flags).toBe("wx");
+        handles.set(fd, String(file));
+      }
+      return fd;
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      sync(fd);
+      const file = handles.get(fd);
+      if (file) synced.add(file);
+    });
+    vi.spyOn(fs, "closeSync").mockImplementation((fd) => {
+      const file = handles.get(fd);
+      if (file) {
+        expect(synced.has(file)).toBe(true);
+        closed.add(file);
+        handles.delete(fd);
+      }
+      close(fd);
+    });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      const temp = String(from);
+      const target = String(to);
+      expect(path.dirname(temp)).toBe(path.dirname(target));
+      expect(synced.has(temp)).toBe(true);
+      expect(closed.has(temp)).toBe(true);
+      expect(fs.existsSync(target)).toBe(false);
+      published.push(target);
+      rename(from, to);
+    });
+    const { runInstall } = await import("../install.js");
+    const result = await runInstall(["--target", "opencode", "--target", "claudecode", "--target", "antigravity", "--target", "codex"]);
+    expect(result.ok).toBe(true);
+    expect(published.sort()).toEqual(files.sort());
+    expect(handles.size).toBe(0);
+    for (const file of files) expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it("failed fsync never publishes or truncates existing user config", async () => {
+    const file = path.join(opencode, "opencode.json");
+    const before = Buffer.from('{"theme":"keep","mcp":{}}\r\n', "utf8");
+    fs.writeFileSync(file, before);
+    const rename = vi.spyOn(fs, "renameSync");
+    vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("R02 fsync failed"); });
+    const result = await install("opencode");
+    expect(result.ok).toBe(false);
+    expect(result.failed[0].error).toContain("R02 fsync failed");
+    expect(rename).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file)).toEqual(before);
+    expect(fs.readdirSync(opencode)).toEqual(["opencode.json"]);
+  });
+});
+
+describe("R02 symlink and permission publication", () => {
+  it.for([
+    ["opencode", "config", false], ["opencode", "config", true],
+    ["codex", "config", false], ["codex", "config", true],
+    ["opencode", "instructions", false], ["opencode", "instructions", true],
+  ] as const)("%s %s follows file symlink and preserves it (publish failure=%s)", async ([target, kind, fail], context) => {
+    const file = kind === "instructions" ? path.join(opencode, "AGENTS.md") : target === "codex" ? path.join(home, ".codex/config.toml") : path.join(opencode, "opencode.json");
+    const actual = path.join(root, "shared settings", kind === "instructions" ? "rules.md" : "settings");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.mkdirSync(path.dirname(actual), { recursive: true });
+    const prior = Buffer.from(kind === "instructions" ? "# User rules\nСохранить мои правила.\n" : target === "codex" ? 'model = "keep"\n[mcp_servers.megamemory]\ncommand = "old"\nargs = ["old"]\nenv = { DB_PATH = "keep.db" }\n' : '{"theme":"keep","mcp":{"other":{"command":"keep"}}}\n', "utf8");
+    fs.writeFileSync(actual, prior);
+    const relative = path.relative(path.dirname(file), actual);
+    try { fs.symlinkSync(relative, file, "file"); } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform === "win32" && ["EPERM", "EACCES", "ENOTSUP"].includes(code ?? "")) {
+        console.warn(`R02 real file symlink skipped: Windows file-symlink privilege unavailable (${code})`);
+        context.skip();
+        return;
+      }
+      throw err;
+    }
+    const rename = fs.renameSync;
+    let published = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === actual) {
+        published = true;
+        expect(path.dirname(String(from))).toBe(path.dirname(actual));
+        expect(fs.readFileSync(actual)).toEqual(prior);
+        if (fail) throw new Error("symlink target publish denied");
+      }
+      return rename(from, to);
+    });
+    const result = await install(target);
+    expect(published).toBe(true);
+    expect(result.ok).toBe(!fail);
+    expect(fs.lstatSync(file).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(file)).toBe(relative);
+    expect(fs.readFileSync(file)).toEqual(fs.readFileSync(actual));
+    if (fail) expect(fs.readFileSync(actual)).toEqual(prior);
+    else {
+      expect(fs.readFileSync(actual)).not.toEqual(prior);
+      expect(fs.readFileSync(actual, "utf8")).toContain(kind === "instructions" ? "Сохранить мои правила." : target === "codex" ? 'DB_PATH = "keep.db"' : '"theme": "keep"');
+    }
+    expect(fs.readdirSync(path.dirname(actual))).toEqual([path.basename(actual)]);
+  });
+
+  it.each([false, true])("resolved-path boundary publishes beside target, not configured alias (failure=%s)", async (fail) => {
+    const file = path.join(opencode, "opencode.json");
+    const actual = path.join(root, "shared settings", "actual.json");
+    const prior = Buffer.from('{"theme":"keep","mcp":{}}\n', "utf8");
+    fs.mkdirSync(path.dirname(actual), { recursive: true });
+    fs.writeFileSync(file, prior);
+    fs.writeFileSync(actual, prior);
+    // Portable consumer seam for Windows without file-symlink privileges.
+    // Actual symlink semantics are covered separately and explicitly skipped.
+    const realpath = fs.realpathSync;
+    vi.spyOn(fs, "realpathSync").mockImplementation((value, options) => String(value) === file ? actual : realpath(value, options));
+    const rename = fs.renameSync;
+    let published = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === actual) {
+        published = true;
+        expect(path.dirname(String(from))).toBe(path.dirname(actual));
+        if (fail) throw new Error("resolved target publish denied");
+      }
+      return rename(from, to);
+    });
+    const result = await install("opencode");
+    expect(published).toBe(true);
+    expect(result.ok).toBe(!fail);
+    expect(fs.readFileSync(file)).toEqual(prior);
+    if (fail) expect(fs.readFileSync(actual)).toEqual(prior);
+    else expect(JSON.parse(fs.readFileSync(actual, "utf8")).mcp.megamemory).toBeDefined();
+    expect(fs.readdirSync(path.dirname(actual))).toEqual(["actual.json"]);
+  });
+
+  it("restores existing mode through fchmod before fsync and publication", async () => {
+    const file = path.join(opencode, "opencode.json");
+    fs.writeFileSync(file, '{"theme":"keep","mcp":{}}\n', "utf8");
+    const mode = fs.statSync(file).mode & 0o7777;
+    const chmod = fs.fchmodSync;
+    const sync = fs.fsyncSync;
+    const rename = fs.renameSync;
+    let restored = false;
+    vi.spyOn(fs, "fchmodSync").mockImplementation((fd, value) => {
+      expect(value).toBe(mode);
+      chmod(fd, value);
+      restored = true;
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      expect(restored).toBe(true);
+      sync(fd);
+    });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === file) expect(restored).toBe(true);
+      rename(from, to);
+    });
+    expect((await install("opencode")).ok).toBe(true);
+    expect(restored).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("retains POSIX mode 0660 despite umask 0022", async () => {
+    const file = path.join(opencode, "opencode.json");
+    fs.writeFileSync(file, '{"theme":"keep","mcp":{}}\n', "utf8");
+    fs.chmodSync(file, 0o660);
+    const previous = process.umask(0o022);
+    try {
+      expect((await install("opencode")).ok).toBe(true);
+      expect(fs.statSync(file).mode & 0o7777).toBe(0o660);
+    } finally { process.umask(previous); }
+  });
+});
+
 async function localPackage() {
   const packageRoot = path.join(root, "local package данные & % ! ^ (copy)");
   const entry = path.join(packageRoot, "dist/index.js");

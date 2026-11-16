@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,7 +6,8 @@ import { createHash } from "node:crypto";
 import Database from "libsql";
 import { KnowledgeDB, UpstreamSchemaError } from "../db.js";
 import { runMigration, ensureEmbedMeta, emptyReport } from "../migrate-schema.js";
-import { runMigrate } from "../migrate-cli.js";
+import { runMigrate, dbFingerprint } from "../migrate-cli.js";
+import { backupDb } from "../migrate.js";
 import { vectorSearchEnabled, MODEL_NAME } from "../embeddings.js";
 import { runDoctor } from "../doctor.js";
 import { cleanupDir } from "./helpers/cleanup.js";
@@ -15,9 +16,9 @@ import { closeAndCleanup } from "./helpers/cleanup.js";
 // Upstream v1.6.2-shaped fixture: exact upstream schema, no fork columns.
 // userVersion: 4 — каноничная репо-фикстура; null — сырая upstream-база,
 // как в реальном 1.6.2: user_version не проставлялась, остаётся 0 (08-N1).
-function buildUpstreamFixture(dbPath: string, userVersion: number | null = 4): void {
+function buildUpstreamFixture(dbPath: string, userVersion: number | null = 4, journalMode = "WAL"): void {
   const db = new Database(dbPath);
-  db.pragma("journal_mode = WAL");
+  db.pragma(`journal_mode = ${journalMode}`);
   db.exec(`
     CREATE TABLE nodes (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
@@ -250,6 +251,112 @@ describe("fork migration — downstream compatibility (Б8)", () => {
       db.execSql("UPDATE nodes SET summary = 'ok' WHERE kind = 'digest'");
     } finally {
       db.close();
+    }
+  });
+});
+
+describe("R01 migration backup before the first write", () => {
+  function inspect(raw: InstanceType<typeof Database>) {
+    return {
+      version: (raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+      schema: raw.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all(),
+      nodes: raw.prepare("SELECT * FROM nodes ORDER BY id").all(),
+      edges: raw.prepare("SELECT * FROM edges ORDER BY id").all(),
+      timeline: raw.prepare("SELECT * FROM timeline ORDER BY seq").all(),
+    };
+  }
+
+  it.each([0, 3])("CLI preserves the complete v%s input, including duplicate edges and committed WAL", async (version) => {
+    const { dbPath } = freshDir();
+    const source = new Database(dbPath);
+    try {
+      source.pragma(`user_version = ${version}`);
+      source.exec("INSERT INTO edges (from_id, to_id, relation, description) VALUES ('node-01', 'node-02', 'connects_to', 'duplicate kept in backup')");
+      source.exec("UPDATE nodes SET summary = 'committed WAL before migration' WHERE id = 'node-01'");
+      const before = inspect(source);
+      expect(fs.statSync(`${dbPath}-wal`).size).toBeGreaterThan(0);
+
+      await runMigrate(["--db", dbPath, "--apply"]);
+
+      const backups = fs.readdirSync(tmpDir).filter((f) => f.startsWith("knowledge.db.bak-"));
+      expect(backups).toHaveLength(1);
+      const backup = new Database(path.join(tmpDir, backups[0]));
+      try {
+        backup.pragma("query_only = ON");
+        expect(inspect(backup)).toEqual(before);
+      } finally {
+        backup.close();
+      }
+      const migrated = new KnowledgeDB(dbPath);
+      try {
+        expect(migrated.getUserVersion()).toBe(14);
+        expect(migrated.getAllEdgesRaw()).toHaveLength(30);
+        expect(migrated.nodeExists("книга")).toBe(true);
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      source.close();
+    }
+  });
+
+  it("SDK backs up an unmodified raw connection before pending migrations", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-migration-sdk-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    buildUpstreamFixture(dbPath, 3, "DELETE");
+    const source = new Database(dbPath);
+    source.exec("INSERT INTO edges (from_id, to_id, relation) VALUES ('node-01', 'node-02', 'connects_to')");
+    const before = inspect(source);
+    source.close();
+    const fingerprint = dbFingerprint(dbPath);
+    const db = new KnowledgeDB(dbPath, { autoMigrate: false });
+    try {
+      const backup = vi.fn((file: string) => {
+        expect(dbFingerprint(file)).toEqual(fingerprint);
+        return backupDb(file);
+      });
+      const report = await runMigration(db, { apply: true, dbPath, backup });
+      expect(backup).toHaveBeenCalledExactlyOnceWith(dbPath);
+      const copy = new Database(backup.mock.results[0].value!);
+      try {
+        copy.pragma("query_only = ON");
+        expect(inspect(copy)).toEqual(before);
+      } finally {
+        copy.close();
+      }
+      expect(report.repairedIds).toBe(3);
+      expect(db.getUserVersion()).toBe(14);
+      expect(db.getAllEdgesRaw()).toHaveLength(30);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("SDK backup failure leaves the main file, WAL and schema unchanged", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-migration-sdk-fail-"));
+    const dbPath = path.join(tmpDir, "knowledge.db");
+    buildUpstreamFixture(dbPath, 3, "DELETE");
+    const source = new Database(dbPath);
+    const before = inspect(source);
+    source.close();
+    const fingerprint = dbFingerprint(dbPath);
+    const db = new KnowledgeDB(dbPath, { autoMigrate: false });
+    try {
+      await expect(runMigration(db, {
+        apply: true,
+        dbPath,
+        backup: () => { throw new Error("backup publish failed"); },
+      })).rejects.toThrow("backup publish failed");
+      expect(dbFingerprint(dbPath)).toEqual(fingerprint);
+      expect(db.getUserVersion()).toBe(3);
+    } finally {
+      db.close();
+    }
+    const check = new Database(dbPath);
+    try {
+      expect(inspect(check)).toEqual(before);
+    } finally {
+      check.close();
     }
   });
 });

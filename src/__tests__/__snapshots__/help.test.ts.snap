@@ -78,7 +78,7 @@ Bench options:
 
 Expire options:
   --scan          review-only candidate scan (readonly, never writes; --scan --apply is refused)
-  --json          scan: print the versioned report JSON (format_version 2, compatible with --report)
+  --json          scan: print exactly one versioned report JSON on stdout (format_version 2, compatible with --report); review/apply instructions go to stderr
   --repo PATH     scan: repository for advisory tag checks (a tag never auto-refutes a claim)
   --ids IDS       comma-separated node ids (mutually exclusive with --report)
   --report FILE   JSON report; use candidates whose expire field is true (versioned reports pin the snapshot date and field versions; legacy reports apply with an explicit warning)

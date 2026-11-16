@@ -123,16 +123,32 @@ describe("retrospective weak links match the shown graph (F8)", () => {
 
 describe("scan budget bounds the work (F17, contract 5)", () => {
   it("max_scan_nodes=100 over a 10k and a 20k star: scan cut, inexact total, output size does not depend on graph size", () => {
-    const runStar = (width: number): { out: ProvenanceTraceOutput; ms: number } => {
+    const runStar = (width: number): { out: ProvenanceTraceOutput; ms: number; seedMs: number } => {
       const rootId = `root${width}`;
-      node(rootId, "decision");
-      for (let i = 1; i <= width; i++) node(`s${width}_${i}`);
-      for (let i = 1; i <= width; i++) edge(rootId, `s${width}_${i}`);
+      const seedStart = performance.now();
+      // Keep the same real DB write paths; batch fixture commits, not the trace.
+      db.runInTransaction(() => {
+        node(rootId, "decision");
+        for (let i = 1; i <= width; i++) node(`s${width}_${i}`);
+        for (let i = 1; i <= width; i++) edge(rootId, `s${width}_${i}`);
+      });
+      const seedMs = performance.now() - seedStart;
+
+      const nodeCount = db.execSqlAll(
+        "SELECT COUNT(*) AS count FROM nodes WHERE id = ? OR id GLOB ?",
+        rootId, `s${width}_*`
+      ) as Array<{ count: number }>;
+      const edgeCount = db.execSqlAll(
+        "SELECT COUNT(*) AS count FROM edges WHERE from_id = ? AND relation = 'informed_by' AND removed_at IS NULL",
+        rootId
+      ) as Array<{ count: number }>;
+      expect(Number(nodeCount[0].count)).toBe(width + 1);
+      expect(Number(edgeCount[0].count)).toBe(width);
 
       const t0 = performance.now();
       const out = trace(rootId, { scan: 100 });
       const ms = performance.now() - t0;
-      return { out, ms };
+      return { out, ms, seedMs };
     };
 
     const small = runStar(10000);
@@ -156,6 +172,9 @@ describe("scan budget bounds the work (F17, contract 5)", () => {
     expect(big.ms).toBeLessThan(10000);
     console.log(
       `SCAN_T10K_MS ${small.ms.toFixed(0)} SCAN_T20K_MS ${big.ms.toFixed(0)}`
+    );
+    console.log(
+      `SEED_T10K_MS ${small.seedMs.toFixed(0)} SEED_T20K_MS ${big.seedMs.toFixed(0)}`
     );
   }, 60000);
 });

@@ -103,7 +103,12 @@ export function computeFunnel(
   }
 
   // ---- сессиизация (общий модуль) ----
-  const sessions = sessionize(rows);
+  // Внешние записи восстанавливают принадлежность к сессии, но не входят
+  // в метрики окна (включая первый вызов, средние и must_read).
+  const windowSeqs = new Set(windowRows.map((r) => r.seq));
+  const sessions = sessionize(rows)
+    .map((s) => ({ ...s, entries: s.entries.filter((e) => windowSeqs.has(e.seq)) }))
+    .filter((s) => s.entries.length > 0);
 
   // ---- метрики ----
   const understandSessions = sessions.filter((s) =>

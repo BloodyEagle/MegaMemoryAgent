@@ -46,7 +46,7 @@ You have access to a project knowledge graph via the \`megamemory\` MCP server a
 
 1. **Available memory:** start with one short relevant \`understand\` (action \`query\`) for the task; qualify it — supports/\`support_check\`, \`valid_until\`/expired, \`refuted_reason\`, status/scope. \`list_roots\` is an on-demand graph overview, not a mandatory ritual. If MegaMemory is unavailable, continue with your usual navigation — never invent remembered facts or retry connecting in a loop.
 2. **Current code:** verify structure and behavior with the structural skill and fresh sources; read small files whole, large files by outline then exact ranges — an analysis is not one line around a hit. Don't run the same search through both tools as a ritual. \`compact\` is default, \`full\` is verbose, \`brief\` is ≤8 lines. \`next\`: read every \`must_read\` (mandatory sources, not whole-file coverage), run every \`followup\` exactly; \`skip\` is empty; refs/summaries never prove coverage. Opt-in noise control: \`collapse_ref_anchors: true\` demotes template ref-anchors to compact locators (with their dependents and rationale) — direct id/path lookups and provenance still resolve them.
-3. **After work:** record only new verified knowledge, a fix of an old node, or needed history (action \`record\`); pure reading and successful reuse lawfully record nothing — \`record\` is an action form, not a must-create. Reuse of saved analysis (passport via \`trail_save\` + \`understand.reuse\`) answers with an explicit qualification (covered/gaps) — never silent trust, and a delta \`unchanged\` is not code coverage. After code changes, targeted re-verification is the explicit \`check_freshness\` call (related conclusions/passports via a reverse index, not the whole graph; sha256 proof, \`expected_versions\` to re-check before editing) — it only reads: it never confirms supports and never raises reuse trust. On code/memory divergence investigate first (scope, versions, rationale): current code is the fact of implementation, not an automatic refutation of the decision.
+3. **After work:** record only new verified knowledge, a fix of an old node, or needed history (action \`record\`); pure reading and successful reuse lawfully record nothing — \`record\` is an action form, not a must-create. Reuse of saved analysis (passport via \`trail_save\` + \`understand.reuse\`) answers with an explicit qualification (covered/gaps) — never silent trust, and a delta \`unchanged\` is not code coverage. After compaction/restart/project switch, change \`context_epoch\` AND clear \`known_versions\`: a new epoch alone does not invalidate old versions on the stateless server. After code changes, targeted re-verification is the explicit \`check_freshness\` call (related conclusions/passports via a reverse index, not the whole graph; file/blob SHA-256 versus git-ref commit SHA in \`expected_versions[].sha256\` to re-check before editing) — it writes no knowledge, observations or confirmations and never raises reuse trust; it may write the derived freshness index cache, and MCP writes service call telemetry. On code/memory divergence investigate first (scope, versions, rationale): current code is the fact of implementation, not an automatic refutation of the decision.
 
 Be specific in summaries: parameters, defaults, files, rationale. One idea — one node; update instead of duplicating. Replacement = new \`create_concept\` with \`supersedes: [old_id]\`; disproved = \`update_concept\` → \`refuted\`; \`remove_concept\` = truly gone and no longer needed. Max 3 levels.
 
@@ -70,7 +70,7 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
    A git object is a ref too: \`evidence: [{ref: "git:tag:v2.1.11", why}]\` (also \`git:commit:<sha>\`,
    \`git:branch:<name>\`) — the anchor resolves to a commit sha with LOCAL git; a moved tag flips
    \`check_artifacts\` to \`changed\`.
-   Relations (full enum): \`connects_to | depends_on | implements | calls | configured_by | supersedes | contradicts | informed_by\`; \`informed_by\` requires a rationale saying what in the target supports the source.
+   Relations (full enum): \`connects_to | depends_on | implements | calls | configured_by | supersedes | contradicts | informed_by\`; \`informed_by\` requires a rationale saying what in the target supports the source. Recommendation: do not use \`journal\` as decision evidence; the server currently permits it (not a technical ban).
 10. **Confirm versions:** after reading a support, confirm it: \`confirm_supports(decision_id,
     expected_claim_digest, items:[{support_id, expected_claim_digest, expected_status_digest,
     expected_edge_digest}])\` — digests travel in server answers (\`get_concept.current_digests\`,
@@ -91,9 +91,9 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
 13. **State claims expire:** a statement about the world AS IT WAS ("merged", "PR open",
     "release shipped") MUST carry \`valid_until\` (ISO date) — it drops out of answers after
     that date (\`include_stale: true\` returns it marked \`expired\`). Architecture and
-    conventions stay dateless; the server never invents an expiry for you. A state-claim
-    summary without a date gets a \`state_claim_without_expiry\` warning in the response —
-    a warning, not a refusal: set the date or reword it as durable knowledge.
+    conventions stay dateless; \`journal\` alone gets a configured default term when
+    \`valid_until\` is omitted on create. A state-claim summary without a date gets a
+    \`state_claim_without_expiry\` warning in the response — a warning, not a refusal: set the date or reword it as durable knowledge.
 ${AGENTS_MD_END}
 `;
 
@@ -188,9 +188,13 @@ the direct read-only commands fail with a ready-made fix —
 \`conflicts\`: it restores their old read-write open and possible auto-migration for one
 invocation. It does not change expire dry-run or the repair/migrate snapshot semantics.
 
-\`stats\`, \`bench\` and \`doctor\` still open the database for writing, on purpose:
-the read paths of \`stats\`/\`bench\` record usage telemetry, \`stats --prune\` writes
+\`stats\`, \`bench\` and \`doctor\` still open the database for writing, on purpose
+(except the JSON-only funnel/health snapshots without \`--prune\` listed above):
+the read paths of ordinary \`stats\`/\`bench\` record usage telemetry, \`stats --prune\` writes
 by design, and \`doctor\` migrates in place. \`serve\` and the MCP server write too.
+Combined \`stats --funnel --health --json\` is also read-only without \`--prune\` and
+prints one \`{funnel, health}\` object. \`expire --scan --json\` prints exactly one report
+JSON on stdout; review/apply instructions go to stderr (\`--scan --apply\` is refused).
 `;
 
 /**

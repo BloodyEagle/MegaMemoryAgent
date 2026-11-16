@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import pc from "picocolors";
-import { KnowledgeDB, UpstreamSchemaError } from "./db.js";
+import { KnowledgeDB } from "./db.js";
 import { planIdRepair, applyIdRepair, backupDb, snapshotDb } from "./migrate.js";
 import { runMigration } from "./migrate-schema.js";
 import { success, info, heading, skip, warn } from "./cli-utils.js";
@@ -12,19 +12,12 @@ import { resolveDbPathOrExit } from "./db-path.js";
 /**
  * 08-N1 (план 09): сырая upstream-база (user_version = 0) не открывается
  * конструктором с авто-миграцией — тот падал на индексе по ещё не существующей
- * колонке. Для migrate это штатный вход: открываем базу без авто-миграции,
- * поднимаем схему шагами конструктора (runPendingMigrations), форк-колонки
- * (status, name_norm), FTS и метки добавит runMigration.
+ * колонке. Для migrate это штатный вход: открываем базу без авто-миграции
+ * и persistent PRAGMA. runMigration поднимет схему только ПОСЛЕ snapshot;
+ * форк-колонки (status, name_norm), FTS и метки добавит там же.
  */
 function openForMigration(dbPath: string): KnowledgeDB {
-  try {
-    return new KnowledgeDB(dbPath);
-  } catch (err) {
-    if (!(err instanceof UpstreamSchemaError)) throw err;
-    const db = new KnowledgeDB(dbPath, { autoMigrate: false });
-    db.runPendingMigrations();
-    return db;
-  }
+  return new KnowledgeDB(dbPath, { autoMigrate: false });
 }
 
 function printReport(
@@ -217,12 +210,15 @@ export async function runMigrate(args: string[], deps: DryRunDeps = {}): Promise
     return;
   }
 
+  // Snapshot before even opening a writable connection: constructor startup
+  // and old-schema edge dedup must never become part of the recovery copy.
+  const backupPath = backupDb(p);
   const db = openForMigration(p);
   try {
     const report = await runMigration(db, {
       apply: true,
       dbPath: p,
-      backup: backupDb,
+      backup: () => backupPath,
     });
     printReport(report, false);
     success("migration complete.");

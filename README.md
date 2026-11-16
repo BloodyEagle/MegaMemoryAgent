@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.6.0-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.6.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -200,10 +200,13 @@ gives every node an optional `valid_until` (ISO-8601, UTC):
   application writes a `timeline` entry. Cleanup candidates on a live base:
   run it on a copy, keep useful content by rewriting it instead of expiring.
 - **The `journal` kind (M2)** — an explicit kind for volatile state notes
-  ("PR #N open now"). It is not evidence and not a decision substitute: a
-  decision keeps its mandatory supports, and a historical event ("release
-  shipped on date X") does not become false with age — the term limits the
-  note's usefulness in the current context (delivery policy, not auto-refuted).
+  ("PR #N open now"). **Recommendation: do not use journals as decision
+  supports.** This is a workflow rule, not a technical prohibition: the server
+  currently permits a journal as `evidence.node` or an `informed_by` target.
+  A journal is not a decision substitute: a decision keeps its mandatory supports.
+  A historical event ("release shipped on date X") does not become false with
+  age — the term limits the note's usefulness in the current context (delivery
+  policy, not auto-refuted).
   When `valid_until` is omitted on create, the server applies a default term:
   `MEGAMEMORY_EXPIRY_JOURNAL_DAYS` env → `expiry.journal_days` in the config
   next to the database (`megamemory.config.json`) → **90 days** (the plan's
@@ -351,7 +354,7 @@ Or download the package asset from the matching GitHub Release (npm names a scop
 package tarball `bloodyeagle-megamemory-<version>.tgz`; for this release):
 
 ```bash
-npm install -g ./bloodyeagle-megamemory-2.6.0.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.1.tgz
 ```
 
 Or build from a checkout (for development):
@@ -362,7 +365,7 @@ cd MegaMemoryAgent
 npm ci
 npm run build
 npm pack                      # prints the exact generated .tgz filename
-npm install -g ./bloodyeagle-megamemory-2.6.0.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.1.tgz
 ```
 
 Register the integration with the installer:

@@ -5,7 +5,6 @@ import { seedHttpDb } from "./helpers/audit-http.js";
 import { startAuditHttpSrc, type AuditHttpSrc } from "./helpers/audit-http-src.js";
 import { auditFixture, sqlState, type AuditFixture } from "./helpers/audit.js";
 import { ensureSchema } from "../migrate-schema.js";
-import { KnowledgeDB } from "../db.js";
 
 /**
  * B-02 (аудит 2026-11-12): клиент подтверждал merge по устаревшим карточкам.
@@ -28,19 +27,15 @@ const OLD_B = "OLD visible summary b";
 const NEW_A = "NEW UNSEEN summary from concurrent agent";
 const NEW_WHY = "NEW UNSEEN reason";
 
-let fixture: AuditFixture;
-let writer: KnowledgeDB | undefined;
-
-async function startSeededServer() {
-  fixture = auditFixture();
+async function startSeededServer(fixture: AuditFixture) {
   const dbFile = await seedHttpDb(fixture, (db) => {
     ensureSchema(db);
     db.insertNode({ id: "a", name: "a", kind: "feature", summary: OLD_A });
     db.insertNode({ id: "b", name: "b", kind: "feature", summary: OLD_B });
   });
   const server = await startAuditHttpSrc(fixture, dbFile);
-  writer = new KnowledgeDB(dbFile);
-  return { dbFile, server };
+  const writer = fixture.db(dbFile);
+  return { dbFile, server, writer };
 }
 
 /** Прокси всех запросов DOM-обозревателя на реальный loopback-сервер. */
@@ -100,8 +95,9 @@ KnowledgeDB.prototype.runInTransaction = function (fn) {
   });
 
   it("GET /api/consolidate/preview содержит cards с текущим содержимым обоих узлов", async () => {
-    const { server } = await startSeededServer();
+    const fixture = auditFixture();
     try {
+      const { server, writer } = await startSeededServer(fixture);
       // Изменение ДО preview: cards обязаны показать уже новое содержимое.
       writer!.updateNode("a", { summary: NEW_A, why: NEW_WHY });
       const res = await server.request("/api/consolidate/preview?survivor=a&other=b");
@@ -116,15 +112,14 @@ KnowledgeDB.prototype.runInTransaction = function (fn) {
       expect(body.cards.survivor).toMatchObject({ id: "a", summary: NEW_A, why: NEW_WHY });
       expect(body.cards.other).toMatchObject({ id: "b", summary: OLD_B });
     } finally {
-      writer?.close();
-      writer = undefined;
       await fixture.close();
     }
-  }, 60_000);
+  });
 
   it("DOM: совпавший выбор переиспользует bundle; поздняя запись даёт 409 и требует повторного confirm", async () => {
-    const { server } = await startSeededServer();
+    const fixture = auditFixture();
     try {
+      const { server, writer } = await startSeededServer(fixture);
       const ui = await auditDom({ reply: proxyReply(server) });
       try {
         await ui.invoke("openConsolidatePreview", "a", "b", { older: "a", similarity: 1 });
@@ -181,15 +176,14 @@ KnowledgeDB.prototype.runInTransaction = function (fn) {
         ui.close();
       }
     } finally {
-      writer?.close();
-      writer = undefined;
       await fixture.close();
     }
-  }, 60_000);
+  });
 
   it("серверный CAS: запись узла после preview даёт 409 и ноль записей", async () => {
-    const { dbFile, server } = await startSeededServer();
+    const fixture = auditFixture();
     try {
+      const { server, writer } = await startSeededServer(fixture);
       const preview = await server.request("/api/consolidate/preview?survivor=a&other=b");
       const body = JSON.parse(preview.text);
       expect(body.base.digest).toMatch(/^[0-9a-f]{64}$/);
@@ -206,9 +200,7 @@ KnowledgeDB.prototype.runInTransaction = function (fn) {
       expect(sqlState(writer!)).toEqual(afterEdit);
       expect(sqlState(writer!)).not.toEqual(before);
     } finally {
-      writer?.close();
-      writer = undefined;
       await fixture.close();
     }
-  }, 60_000);
+  });
 });

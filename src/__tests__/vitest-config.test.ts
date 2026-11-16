@@ -6,43 +6,39 @@
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "url";
+import config, { UNIT_FILES, TEST_PATHS } from "../../vitest.config.js";
+import { fileURLToPath } from "node:url";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const CONFIG_PATH = path.join(PROJECT_ROOT, "vitest.config.ts");
+const projects = config.test!.projects as Array<{ test: { name: string; include: string[]; exclude?: string[]; testTimeout?: number; setupFiles: string[] } }>;
 
 describe("vitest.config.ts (2.1.12 F3)", () => {
-  const config = fs.readFileSync(CONFIG_PATH, "utf8");
-
   it("16. maxWorkers: 3 задан по умолчанию, а не только флагом", () => {
-    expect(config).toContain("maxWorkers: 3");
+    expect(config.test!.maxWorkers).toBe(3);
   });
 
   it("17. testTimeout: 15_000 у db-проекта, не глобально", () => {
-    // таймаут есть и поднят именно в проекте db
-    expect(config).toContain("testTimeout: 15_000");
-    expect(config).toContain('name: "db"');
-    // и он не задет на корневом уровне test-конфига
-    expect(config).not.toMatch(/^\s{4}testTimeout/m);
+    expect(projects.find((p) => p.test.name === "db")!.test.testTimeout).toBe(15_000);
+    expect(config.test!.testTimeout).toBeUndefined();
+    expect(projects.find((p) => p.test.name === "unit")!.test.testTimeout).toBeUndefined();
   });
 
   it("unit-список не протух: перечисленные файлы существуют на диске", () => {
-    const match = config.match(/const UNIT_FILES = \[([^\]]*)\]/);
-    expect(match).not.toBeNull();
-    const files = [...match![1].matchAll(/"([a-z0-9.-]+)"/g)].map((m) => m[1]);
-    expect(files.length).toBeGreaterThan(0);
-    for (const f of files) {
-      expect(fs.existsSync(path.join(PROJECT_ROOT, "src", "__tests__", `${f}.test.ts`))).toBe(true);
-    }
+    expect(UNIT_FILES.length).toBeGreaterThan(0);
+    expect(UNIT_FILES).toContain("telemetry-report");
+    for (const file of TEST_PATHS.unit) expect(fs.existsSync(path.join(PROJECT_ROOT, file))).toBe(true);
   });
 });
 
 describe("vitest.config.ts — интеграции в общем прогоне (2.1.13 F6)", () => {
-  const config = fs.readFileSync(CONFIG_PATH, "utf8");
-
-  it("33. проект integration объявлен и включает tests/integration", () => {
-    expect(config).toContain('name: "integration"');
-    expect(config).toContain('include: ["tests/integration/**/*.test.ts"]');
+  it("33. проекты используют один контракт include/exclude", () => {
+    expect(projects.map((p) => p.test.name)).toEqual(["unit", "db", "integration"]);
+    expect(projects[0].test.include).toEqual(TEST_PATHS.unit);
+    expect(projects[1].test.include).toEqual(TEST_PATHS.db);
+    expect(projects[1].test.exclude).toEqual(TEST_PATHS.unit);
+    expect(projects[2].test.include).toEqual(TEST_PATHS.integration);
+    expect(TEST_PATHS.integration).toEqual(["tests/integration/**/*.test.ts"]);
+    for (const project of projects) expect(project.test.setupFiles).toContain("./src/__tests__/fixtures-guard.setup.ts");
   });
 
   it("33b. интеграционные файлы существуют на диске и не попадают в db/unit", () => {
@@ -51,6 +47,8 @@ describe("vitest.config.ts — интеграции в общем прогоне
     expect(files.length).toBeGreaterThan(0);
     for (const f of files) {
       expect(fs.existsSync(path.join(integrationDir, f))).toBe(true);
+      expect(TEST_PATHS.unit).not.toContain(`tests/integration/${f}`);
     }
+    expect(TEST_PATHS.db).toEqual(["src/__tests__/**/*.test.ts"]);
   });
 });
