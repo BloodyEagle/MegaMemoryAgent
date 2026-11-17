@@ -351,7 +351,7 @@ npm install -g @bloodyeagle/megamemory
 пакета со scope как `bloodyeagle-megamemory-<version>.tgz`; для этого релиза):
 
 ```bash
-npm install -g ./bloodyeagle-megamemory-2.6.2.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.3.tgz
 ```
 
 Или соберите из чекаута (для разработки):
@@ -362,7 +362,7 @@ cd MegaMemoryAgent
 npm ci
 npm run build
 npm pack                      # печатает точное имя созданного .tgz
-npm install -g ./bloodyeagle-megamemory-2.6.2.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.3.tgz
 ```
 
 Зарегистрируйте интеграцию установщиком:

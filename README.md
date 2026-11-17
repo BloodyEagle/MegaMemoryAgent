@@ -354,7 +354,7 @@ Or download the package asset from the matching GitHub Release (npm names a scop
 package tarball `bloodyeagle-megamemory-<version>.tgz`; for this release):
 
 ```bash
-npm install -g ./bloodyeagle-megamemory-2.6.2.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.3.tgz
 ```
 
 Or build from a checkout (for development):
@@ -365,7 +365,7 @@ cd MegaMemoryAgent
 npm ci
 npm run build
 npm pack                      # prints the exact generated .tgz filename
-npm install -g ./bloodyeagle-megamemory-2.6.2.tgz
+npm install -g ./bloodyeagle-megamemory-2.6.3.tgz
 ```
 
 Register the integration with the installer:
