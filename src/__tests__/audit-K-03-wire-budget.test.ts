@@ -347,7 +347,9 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
         const payload = JSON.parse(actual.content[0].text) as UnderstandOutput;
         expect(wireTokens(JSON.stringify(actual))).toBeLessThanOrEqual(max_tokens);
         expect(payload.meta?.tokens_estimated).toBe(wireTokens(JSON.stringify(actual)));
-        expect(payload.next?.record).toContain("kind=feature");
+        expect(payload.next?.record).toContain("create_concept");
+        expect(payload.next?.record).toContain("evidence");
+        expect(payload.next?.record).toContain("informed_by");
         if (payload.meta?.returned) expect(payload.next?.must_read).toEqual(output.next?.must_read);
       }
     }

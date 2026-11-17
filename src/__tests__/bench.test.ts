@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
-import { link, estimateTokens } from "../tools.js";
+import { link, estimateTokens, understand } from "../tools.js";
 import {
   BenchError,
   BENCH_DISCLAIMER,
@@ -63,6 +63,11 @@ afterEach(() => {
   db.close();
 });
 
+/** Независимый wire-оракул UTF-8/3, тот же, что в K-03. */
+function wireTokens(value: string): number {
+  return Math.ceil(Buffer.byteLength(value, "utf8") / 3);
+}
+
 function opts(over: Partial<BenchOptions> = {}): BenchOptions {
   // git-root по умолчанию выключен: тесты герметичны, git не вызывается
   return { baseline: "files", root, resolveGitRoot: () => null, ...over };
@@ -105,12 +110,16 @@ describe("megamemory bench (2.1.5 F3)", () => {
     ];
     const report = await runBench(db, questions, opts());
     const q = report.questions[0];
-    // План 06 (K-03): оценка честная — пустой ответ стоит конверт+meta
-    // (~130 токенов), нулём он больше не притворяется.
-    // План 13: в ответе всегда есть блок next (record не режется никогда) —
-    // пустой ответ стоит конверт+meta+record (~205 в этой фикстуре), кап поднят до 220.
+    const answer = await understand(db, { query: questions[0].query, top_k: 10 });
+    const wire = JSON.stringify({ content: [{ type: "text", text: JSON.stringify(answer, null, 2) }] });
+    const floor = wireTokens(JSON.stringify({ content: [{
+      type: "text", text: JSON.stringify({ meta: answer.meta, next: { record: answer.next!.record } }, null, 2),
+    }] }));
+    // Пустой ответ оплачивает конверт, meta и фактический record — без магического потолка.
     expect(q.graph_tokens).toBeGreaterThan(0);
-    expect(q.graph_tokens).toBeLessThanOrEqual(220);
+    expect(q.graph_tokens).toBeLessThanOrEqual(1500);
+    expect(q.graph_tokens).toBe(wireTokens(wire));
+    expect(q.graph_tokens).toBeGreaterThanOrEqual(floor);
     expect(q.ratio_files).toBeNull();
     expect(q.hit).toBe(false);
     expect(report.hit_rate).toBe(0);
