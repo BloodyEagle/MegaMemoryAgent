@@ -58,12 +58,24 @@ describe("I-01 generated record schema roundtrip", () => {
         if (previousModel) db.setMetaValue("embed_model", previousModel);
       }
       const schema = publicCreateSchema();
-      const expectedKinds = ["feature", "feature", "feature", "feature", "decision", "feature"];
-      for (const [index, record] of records.entries()) {
-        const kind = /create_concept kind=(\w+)/.exec(record)?.[1];
-        expect(kind).toBe(expectedKinds[index]);
+      for (const record of records) {
+        const explicitKind = /create_concept kind=([^\s,]+)/.exec(record);
+        const semanticKinds = /create_concept kind по смыслу \(решение — ([^,]+), факт — ([^)]+)\)/.exec(record);
+        const candidates = explicitKind
+          ? [explicitKind[1]]
+          : semanticKinds
+            ? [semanticKinds[1], ...semanticKinds[2].split("/")].map((kind) => kind.trim())
+            : [];
+        expect(candidates.length, record).toBeGreaterThan(0);
+        if (!explicitKind) {
+          expect(record).toContain("kind по смыслу");
+          expect(record).not.toContain("kind=feature");
+        }
         expect(record).toContain("evidence");
-        expect(schema.safeParse({ name: "Verified result", kind, summary: "Independent measured result", evidence: [{ ref: "src/result.ts:10-20", why: "The current source establishes the result" }] }).success, record).toBe(true);
+        expect(record).toContain("informed_by");
+        for (const kind of candidates) {
+          expect(schema.safeParse({ name: "Verified result", kind, summary: "Independent measured result", evidence: [{ ref: "src/result.ts:10-20", why: "The current source establishes the result" }] }).success, `${kind}: ${record}`).toBe(true);
+        }
       }
       expect(schema.safeParse({ name: "Bad kind", kind: "fact", summary: "Legacy unsupported kind" }).success).toBe(false);
     } finally { db.close(); }

@@ -282,6 +282,9 @@ describe("План 13 §2.2: режим brief в understand", () => {
     expect(out.next.must_read).toEqual([]);
     expect(out.next.skip).toEqual([]);
     expect(out.next.followups).toEqual([]);
-    expect(out.next.record).toContain("create_concept kind=feature");
+    expect(out.next.record).toContain("create_concept");
+    expect(out.next.record).toContain("kind по смыслу");
+    expect(out.next.record).toContain("informed_by");
+    expect(out.next.record.length).toBeLessThanOrEqual(240);
   });
 });

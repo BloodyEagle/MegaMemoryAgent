@@ -90,7 +90,9 @@ describe("P-12 knowledge qualification and wire budget", () => {
       await expect(understand(db, { query: "nothing", mode, max_tokens: floor - 1, extra_payload })).rejects.toThrow(/max_tokens.*(?:minimum|минимум|cannot fit)/);
       const exact = await understand(db, { query: "nothing", mode, max_tokens: floor, extra_payload });
       expect(exact.meta?.tokens_estimated).toBe(floor);
-      expect(exact.next?.record).toContain("kind=feature");
+      expect(exact.next?.record).toContain("create_concept");
+      expect(exact.next?.record).toContain("evidence");
+      expect(exact.next?.record).toContain("informed_by");
     } finally { db.close(); }
   });
 
