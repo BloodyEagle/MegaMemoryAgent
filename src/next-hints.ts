@@ -5,7 +5,6 @@ import {
   DEFAULT_MAX_CHECK_EDGES,
   computeSupportCheck,
 } from "./support-baselines.js";
-import { NODE_KINDS } from "./types.js";
 import type {
   NextHintFollowup,
   NextHintRead,
@@ -24,6 +23,14 @@ import type {
 
 /** Больше трёх — это уже чтение, а не ориентация (план 13 §2.1). */
 export const MUST_READ_LIMIT = 3;
+
+/** Форма записи факта: влезает в brief.LINE_MAX без обрезки. */
+export const RECORD_FACT =
+  'Итог запиши: create_concept kind по смыслу (решение — decision, факт — feature/module), evidence: [{ref: "файл:строки", why: "что подтверждает"}] — это и есть informed_by; file_refs связей не даёт. Состояние — с valid_until.';
+
+/** Форма записи решения: влезает в brief.LINE_MAX без обрезки. */
+export const RECORD_DECISION =
+  'После правки запиши решение: create_concept kind=decision, evidence: [{ref|node, why: "что подтверждает"}] — это и есть informed_by; file_refs связей не даёт. Состояние — с valid_until.';
 
 /** Follow-ups тоже не более трёх: каждый исполняется дословно. */
 export const FOLLOWUPS_LIMIT = 3;
@@ -132,7 +139,7 @@ function refutedRecord(refuted: NextHintsRefuted[]): string {
   const reason = first.reason?.trim() ? first.reason.trim() : "причина не записана";
   return (
     `Опираться на refuted «${first.name}»${more} нельзя: ${reason}. ` +
-    `Запиши проверенное: create_concept kind=${NODE_KINDS[0]} с evidence на файл+строки.`
+    RECORD_FACT
   );
 }
 
@@ -141,7 +148,7 @@ function refutedRecord(refuted: NextHintsRefuted[]): string {
  * ответа: решения → форма записи решения; решения и refuted → плюс
  * предупреждение про refuted; только refuted → отказ от них и запись
  * проверенного; только факты → форма записи факта; пустой ответ →
- * предложение записывать найденное по ходу задачи.
+ * форма записи факта с выбором kind по смыслу.
  */
 function buildRecord(
   cards: Array<NextHintsCard & { isDecision: boolean }>,
@@ -149,15 +156,10 @@ function buildRecord(
 ): string {
   const hasDecision = cards.some((c) => c.isDecision === true);
   if (hasDecision) {
-    const base =
-      "После правки запиши решение: create_concept kind=decision, evidence на файл+строки, informed_by на опоры.";
-    return refuted.length > 0 ? `${base} ${refutedNote(refuted)}` : base;
+    return refuted.length > 0 ? `${RECORD_DECISION} ${refutedNote(refuted)}` : RECORD_DECISION;
   }
   if (refuted.length > 0) return refutedRecord(refuted);
-  if (cards.length > 0) {
-    return `Запиши найденное по задаче: create_concept kind=${NODE_KINDS[0]} с evidence на файл+строки.`;
-  }
-  return `По ходу задачи записывай найденное: create_concept kind=${NODE_KINDS[0]} с evidence на файл+строки.`;
+  return RECORD_FACT;
 }
 
 /** Next для вырожденного ответа (0 карточек, векторный ранний возврат). */
@@ -166,7 +168,7 @@ export function emptyNextHints(): NextHints {
     must_read: [],
     skip: [],
     followups: [],
-    record: `По ходу задачи записывай найденное: create_concept kind=${NODE_KINDS[0]} с evidence на файл+строки.`,
+    record: RECORD_FACT,
   };
 }
 

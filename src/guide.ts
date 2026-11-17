@@ -60,7 +60,7 @@ Bad node: \`auth\` — "Everything about auth." — a vague label no query can r
    \`include_inactive: true\` — the concept may be marked superseded.
 7. **Digests:** \`digest\` nodes summarize any parent with 5+ eligible children — read the digest first, siblings second; generation is automatic/CLI, manual digest is compatibility-only.
 8. **Embedding model changed?** Run \`megamemory reembed\`: vector search starts with the first valid current-generation row; FTS covers nodes not published yet.
-9. **Supports:** for a decision/solution pass \`evidence: [{node | ref, why}]\` in the same call
+9. **Supports:** for any claim resting on code — decision, solution or fact — pass \`evidence: [{node | ref, why}]\` in the same call
    that creates it; \`why\` names what exactly in the support backs the conclusion — not a
    retelling. A support on a file is a ref — \`evidence: [{ref: "src/x.ts:120-180", why}]\` — not
    a new node: create a support node only for a thought a link cannot express. The ref creates
