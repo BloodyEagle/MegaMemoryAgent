@@ -10,7 +10,7 @@ import {
   edgeDigestOf,
   statusDigestOf,
 } from "../support-baselines.js";
-import { buildNextHints } from "../next-hints.js";
+import { buildNextHints, emptyNextHints, RECORD_FACT } from "../next-hints.js";
 import type { UnderstandOutput } from "../types.js";
 
 // План 13 §2.1: блок next в ответе understand — машинно-исполнимый контракт
@@ -414,22 +414,44 @@ describe("План 13 §2.1: блок next в understand", () => {
   it("record меняется по содержимому: решения, факты, refuted", async () => {
     seedMerge();
     const withDecision = await understand(db, { query: "перенос задач и слотов", top_k: 5, max_tokens: 2000 });
-    expect(withDecision.next!.record).toBe(
-      "После правки запиши решение: create_concept kind=decision, evidence на файл+строки, informed_by на опоры."
-    );
+    expect(withDecision.next!.record).toContain("kind=decision");
+    expect(withDecision.next!.record.length).toBeLessThanOrEqual(240);
 
     seedEdges();
     const factsOnly = await understand(db, { query: "node сборки", top_k: 5, max_tokens: 1500 });
     expect(factsOnly.next!.record).toBe(
-      "Запиши найденное по задаче: create_concept kind=feature с evidence на файл+строки."
+      'Итог запиши: create_concept kind по смыслу (решение — decision, факт — feature/module), evidence: [{ref: "файл:строки", why: "что подтверждает"}] — это и есть informed_by; file_refs связей не даёт. Состояние — с valid_until.'
     );
+    expect(factsOnly.next!.record).not.toContain("kind=feature");
+    expect(factsOnly.next!.record.length).toBeLessThanOrEqual(240);
 
     seedBudget();
     const withRefuted = await understand(db, { query: "кэширует все ответы", top_k: 3, max_tokens: 1200 });
-    expect(withRefuted.next!.record).toBe(
-      "Опираться на refuted «refuted-claim» нельзя: Измерение показало обратное: кэш не даёт выигрыша. " +
-        "Запиши проверенное: create_concept kind=feature с evidence на файл+строки."
+    expect(withRefuted.next!.record).toContain(
+      "Опираться на refuted «refuted-claim» нельзя: Измерение показало обратное: кэш не даёт выигрыша. "
     );
+    expect(withRefuted.next!.record.endsWith(RECORD_FACT)).toBe(true);
+    expect(withRefuted.next!.record).toContain("kind по смыслу");
+    expect(withRefuted.next!.record).not.toContain("kind=feature");
+
+    for (const out of [withDecision, factsOnly, withRefuted]) {
+      for (const part of ["create_concept", "evidence", "informed_by", "valid_until"]) {
+        expect(out.next!.record).toContain(part);
+      }
+    }
+  });
+
+  it("record решения сохраняет предупреждение и дословную причину refuted", () => {
+    const reason = "Измерение показало обратное: кэш не даёт выигрыша";
+    const record = buildNextHints({
+      db,
+      cards: [{ id: "missing-decision", kind: "decision" }],
+      refuted: [{ name: "wrong", reason }],
+    }).record;
+    for (const part of ["create_concept", "kind=decision", "evidence", "informed_by", "valid_until"]) {
+      expect(record).toContain(part);
+    }
+    expect(record).toContain(`Refuted «wrong» опорой не служит: ${reason}.`);
   });
 
   it("пустой ответ: next с пустыми списками и формой записи присутствует", async () => {
@@ -440,9 +462,13 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(out.next!.must_read).toEqual([]);
     expect(out.next!.skip).toEqual([]);
     expect(out.next!.followups).toEqual([]);
-    expect(out.next!.record).toBe(
-      "По ходу задачи записывай найденное: create_concept kind=feature с evidence на файл+строки."
-    );
+    for (const record of [out.next!.record, emptyNextHints().record]) {
+      for (const part of ["create_concept", "evidence", "informed_by", "valid_until", "kind по смыслу"]) {
+        expect(record).toContain(part);
+      }
+      expect(record).not.toContain("kind=feature");
+      expect(record.length).toBeLessThanOrEqual(240);
+    }
   });
 
   it("бюджет max_tokens=500: skip режется, must_read и record остаются, мера сходится с wire-формой", async () => {
@@ -464,7 +490,8 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(tight.meta!.returned).toBe(0);
     expect(tight.meta!.dropped).toBe(2);
     expect(tight.next!.must_read).toEqual([]);
-    expect(tight.next!.record).toContain("create_concept kind=feature");
+    expect(tight.next!.record).toContain("create_concept");
+    expect(tight.next!.record).toContain("informed_by");
     expect(tight.meta!.truncated).toBe(true);
     // Мера считается по той же wire-форме, что уходит по проводу (K-03),
     // включая extra_payload обработчика и блок next.
