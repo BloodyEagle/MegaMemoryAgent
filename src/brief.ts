@@ -35,6 +35,8 @@ const NAME_MAX = 80;
 const WHY_MAX = 120;
 /** Потолок одной строки брифа: восемь коротких строк не взрывают бюджет. */
 const LINE_MAX = 240;
+/** Форма записи с причиной пустоты и нуджем имеет собственный предел. */
+export const RECORD_MAX = 400;
 /** Узлов в тексте («Ключевое» + «Также»): 1 + 3 + 1 + 1 + 1 = 7 ≤ 8 строк. */
 const KEY_NODES_LIMIT = 3;
 /** Файлов в строке «Не читай …»: перечисляются первые два, дальше «и ещё N». */
@@ -124,7 +126,7 @@ export function renderBrief(nodes: BriefNodeInfo[], next: NextHints): string {
   }
 
   // (5) Строка next.record — форма записи по итогам задачи.
-  lines.push(clip(oneLine(next.record), LINE_MAX));
+  lines.push(clip(oneLine(next.record), RECORD_MAX));
 
   return lines.join("\n");
 }

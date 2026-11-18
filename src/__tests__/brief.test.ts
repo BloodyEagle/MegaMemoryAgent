@@ -9,7 +9,8 @@ import {
   edgeDigestOf,
   statusDigestOf,
 } from "../support-baselines.js";
-import { BRIEF_EMPTY_TEXT } from "../brief.js";
+import { BRIEF_EMPTY_TEXT, RECORD_MAX, renderBrief } from "../brief.js";
+import { buildNextHints, EMPTY_REASON_RECORD, RECORD_FACT, UNRECORDED_READS_THRESHOLD } from "../next-hints.js";
 import type { BriefOutput, UnderstandInput } from "../types.js";
 
 // План 13 §2.2: режим brief в understand — до 8 строк текста плюс блок next,
@@ -285,6 +286,21 @@ describe("План 13 §2.2: режим brief в understand", () => {
     expect(out.next.record).toContain("create_concept");
     expect(out.next.record).toContain("kind по смыслу");
     expect(out.next.record).toContain("informed_by");
-    expect(out.next.record.length).toBeLessThanOrEqual(240);
+    expect(out.next.record.length).toBeLessThanOrEqual(RECORD_MAX);
+    expect(out.meta.reason).toBe("empty_base");
+    expect(out.next.record).toBe(`${EMPTY_REASON_RECORD.empty_base} ${RECORD_FACT}`);
+  });
+
+  it.each(["empty_base", "no_match", "budget"] as const)("record сохраняет полную форму и пояснение %s в RECORD_MAX", (reason) => {
+    const next = buildNextHints({ db, cards: [], emptyReason: reason });
+    expect(next.record).toBe(`${EMPTY_REASON_RECORD[reason]} ${RECORD_FACT}`);
+    expect(next.record.length).toBeLessThanOrEqual(RECORD_MAX);
+    const brief = renderBrief([{ name: "проверенный узел", kind: "feature", fileRefs: [] }], next);
+    expect(brief.split("\n").at(-1)).toBe(next.record);
+    for (const reads of [UNRECORDED_READS_THRESHOLD, Number.MAX_SAFE_INTEGER]) {
+      const nudged = buildNextHints({ db, cards: [], emptyReason: reason, activity: { reads_since_write: reads, writes: 0, last_write_at: null } });
+      expect(nudged.record.length).toBeLessThanOrEqual(RECORD_MAX);
+      expect(renderBrief([{ name: "проверенный узел", kind: "feature", fileRefs: [] }], nudged).split("\n").at(-1)).toBe(nudged.record);
+    }
   });
 });
