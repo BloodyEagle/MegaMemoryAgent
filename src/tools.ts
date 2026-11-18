@@ -41,6 +41,7 @@ import type {
   EdgeRow,
 } from "./types.js";
 import { buildNextHints, type NextHintsCard } from "./next-hints.js";
+import { timelineActivity } from "./timeline.js";
 import { renderBrief, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
@@ -615,6 +616,7 @@ export async function understand(
   const topK = input.top_k ?? 10;
   const maxTokens = input.max_tokens ?? 1500;
   const outputMode = input.mode ?? "compact";
+  const activity = timelineActivity(db);
   // E3/D0: opt-in режимы поддержаны только в compact — full/brief отвечают
   // прежней формой; молчаливое игнорирование флага скрыло бы его отсутствие.
   if (input.include_evidence && outputMode !== "compact") {
@@ -814,6 +816,7 @@ export async function understand(
       db,
       cards: nodes.map(({ node }) => ({ id: node.id, visibleSupports: 0 })),
       refuted: refutedForNext,
+      activity,
     });
 
     // Полный режим по тем же сырым строкам, что и в compact-ветке (см. ниже):
@@ -903,6 +906,7 @@ export async function understand(
         visibleSupports: m.edges.filter((e) => e.relation === "informed_by").length,
       })),
       refuted: refuted.map((r) => ({ name: r.name, reason: r.refuted_reason ?? null })),
+      activity,
     });
     const output: UnderstandOutput = {
       matches,
@@ -1126,6 +1130,7 @@ export async function understand(
       db,
       cards: compactList.flatMap(card => [{ id: card.id, kind: card.kind, visibleSupports: card.supports?.length ?? 0 }, ...(card.supports ?? []).map(support => ({ id: support.id }))]),
       refuted: refutedList.map(card => ({ name: card.name, reason: card.refuted_reason ?? null })),
+      activity,
     }),
     ...extra,
   });
@@ -1405,7 +1410,7 @@ export async function understand(
     name: r.name,
     reason: r.refuted_reason ?? null,
   }));
-  let next: NextHints = buildNextHints({ db, cards: nextCards, refuted: refutedForNext });
+  let next: NextHints = buildNextHints({ db, cards: nextCards, refuted: refutedForNext, activity });
 
   // ---- P3: сборка секции task_context (§12.3–§12.7) ----
   //

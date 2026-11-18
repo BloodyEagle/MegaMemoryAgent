@@ -660,6 +660,8 @@ export interface NextHints {
   skip: NextHintSkip[];
   followups: NextHintFollowup[];
   record: string;
+  /** Present only after the process-local read threshold is reached. */
+  unrecorded?: Pick<TimelineActivity, "reads_since_write" | "last_write_at">;
 }
 
 /**
