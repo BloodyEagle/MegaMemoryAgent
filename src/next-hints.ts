@@ -11,6 +11,7 @@ import type {
   NextHints,
   NodeRow,
   TimelineActivity,
+  UnderstandMeta,
 } from "./types.js";
 
 // ---- План 13 §2.1: блок next в ответе understand ----
@@ -27,6 +28,13 @@ export const MUST_READ_LIMIT = 3;
 
 /** Напоминать только после нескольких завершённых чтений. */
 export const UNRECORDED_READS_THRESHOLD = 3;
+
+/** Пустой ответ описывает состояние поиска, не отсутствие знаний о мире. */
+export const EMPTY_REASON_RECORD: Record<NonNullable<UnderstandMeta["reason"]>, string> = {
+  empty_base: "Память пуста — это не «знаний нет», а «здесь ещё ничего не записано»: после работы запиши вывод (create_concept + evidence).",
+  no_match: "По этому запросу совпадений нет — база не пуста: переформулируй или запиши найденное новым узлом.",
+  budget: "Бюджет исчерпан — это НЕ значит, что знаний нет: повтори understand с большим max_tokens или top_k.",
+};
 
 /** Форма записи факта: влезает в brief.LINE_MAX без обрезки. */
 export const RECORD_FACT =
@@ -78,6 +86,8 @@ export interface NextHintsInput {
   now?: Date;
   /** Завершённые вызовы текущего логгера, без чтения таблицы timeline. */
   activity?: TimelineActivity;
+  /** Причина пустого ответа — перед формой записи, без нуджа для пустой базы. */
+  emptyReason?: UnderstandMeta["reason"];
   /**
    * План 13.1 (F6): бюджет проверки support_check при сборе followups.
    * Дефолт — боевые DEFAULT_MAX_CHECK_*; тесты inject'ят малый лимит,
@@ -296,7 +306,8 @@ export function buildNextHints(input: NextHintsInput): NextHints {
   }
 
   const next: NextHints = { must_read: mustRead, skip, followups, record: buildRecord(cardsWithKind, refuted) };
-  if (input.activity && input.activity.reads_since_write >= UNRECORDED_READS_THRESHOLD) {
+  if (input.emptyReason) next.record = `${EMPTY_REASON_RECORD[input.emptyReason]} ${next.record}`;
+  if (input.emptyReason !== "empty_base" && input.activity && input.activity.reads_since_write >= UNRECORDED_READS_THRESHOLD) {
     const { reads_since_write, last_write_at } = input.activity;
     next.record += ` С последней записи ${reads_since_write} чтений — если это законченный вывод, запиши его.`;
     next.unrecorded = { reads_since_write, last_write_at };

@@ -609,6 +609,8 @@ function liveEvidenceSupports(db: KnowledgeDB, node: NodeRow): ConceptEvidenceSu
     .map((x) => evidenceSupportOf(db, x.row, x.edge.description ?? null));
 }
 
+const understandPresence = new WeakMap<KnowledgeDB, { hasNodes: boolean; writes: number; lastWriteAt: string | null }>();
+
 export async function understand(
   db: KnowledgeDB,
   input: UnderstandInput
@@ -617,6 +619,20 @@ export async function understand(
   const maxTokens = input.max_tokens ?? 1500;
   const outputMode = input.mode ?? "compact";
   const activity = timelineActivity(db);
+  const emptyReason = (hasContent: boolean, hadCandidates: boolean): UnderstandMeta["reason"] => {
+    if (hasContent) return undefined;
+    const cached = understandPresence.get(db);
+    if (activity && cached && cached.writes === activity.writes && cached.lastWriteAt === activity.last_write_at) {
+      if (!cached.hasNodes) return "empty_base";
+    } else {
+      const count = db.execSqlGet("SELECT COUNT(*) AS count FROM nodes WHERE removed_at IS NULL") as { count: number };
+      const hasNodes = count.count > 0;
+      // Recheck after every logged write (including deletion); uncoupled API calls do not cache.
+      if (activity) understandPresence.set(db, { hasNodes, writes: activity.writes, lastWriteAt: activity.last_write_at });
+      if (!hasNodes) return "empty_base";
+    }
+    return hadCandidates ? "budget" : "no_match";
+  };
   // E3/D0: opt-in режимы поддержаны только в compact — full/brief отвечают
   // прежней формой; молчаливое игнорирование флага скрыло бы его отсутствие.
   if (input.include_evidence && outputMode !== "compact") {
@@ -812,11 +828,13 @@ export async function understand(
       reason: db.getLatestEpistemicReason(node.id, "refuted"),
     }));
 
+    const reason = emptyReason(nodes.length > 0 || refutedNodes.length > 0, eligible.length > 0);
     const next: NextHints = buildNextHints({
       db,
       cards: nodes.map(({ node }) => ({ id: node.id, visibleSupports: 0 })),
       refuted: refutedForNext,
       activity,
+      emptyReason: reason,
     });
 
     // Полный режим по тем же сырым строкам, что и в compact-ветке (см. ниже):
@@ -839,6 +857,7 @@ export async function understand(
       stale_excluded: staleExcluded,
       inactive_excluded: inactiveExcluded,
       truncated: trunc,
+      ...(reason ? { reason } : {}),
     });
 
     /** Тот объект, который уйдёт по проводу (brief + next + meta + extra). */
@@ -898,6 +917,7 @@ export async function understand(
       return ctx;
     });
     // Full preserves every selected card and next action, refusing budgets that cannot fit.
+    const reason = emptyReason(matches.length > 0 || refuted.length > 0, eligible.length > 0);
     const fullNext = buildNextHints({
       db,
       cards: matches.map((m) => ({
@@ -907,6 +927,7 @@ export async function understand(
       })),
       refuted: refuted.map((r) => ({ name: r.name, reason: r.refuted_reason ?? null })),
       activity,
+      emptyReason: reason,
     });
     const output: UnderstandOutput = {
       matches,
@@ -918,6 +939,7 @@ export async function understand(
         tokens_estimated: 0,
         stale_excluded: staleExcluded,
         inactive_excluded: inactiveExcluded,
+        ...(reason ? { reason } : {}),
       },
       next: fullNext,
     };
@@ -1032,6 +1054,7 @@ export async function understand(
   }
 
   const top: CompactMatch[] = [];
+  let refutedShown = refutedAll;
   let nestedByHost = new Map<string, NestedSupportView[]>();
   let foldedIds = new Set<string>();
   // D0: секция свёрнутых технических якорей — заполняется проходом якорей
@@ -1070,10 +1093,16 @@ export async function understand(
       nestedByHost.has(m.id) ? { ...m, supports: nestedByHost.get(m.id) } : m
     );
 
+  const compactEmptyReason = (refutedList = refutedShown): UnderstandMeta["reason"] => emptyReason(
+    displayList().length > 0 || refutedList.length > 0 || collapsedAnchors.length > 0,
+    eligible.length > 0 || anchorEligible.length > 0 || refutedAll.length > 0
+  );
+
   const metaFor = (
     tokens: number,
     dropped: number,
-    truncated: boolean
+    truncated: boolean,
+    refutedList = refutedShown
   ): UnderstandMeta => ({
     returned: displayList().length,
     dropped,
@@ -1096,15 +1125,7 @@ export async function understand(
       : {}),
     // D0: честное число свёрнутых якорей этой выдачи.
     ...(collapseAnchors ? { anchor_collapsed: collapsedAnchors.length } : {}),
-    // Пустой ответ при непустом поиске — это не «ничего не нашлось»:
-    // причина называется, чтобы агент поднял бюджет или взял brief.
-    // Условие не зависит от truncated: иначе бюджет мерился бы без поля,
-    // которое реально уйдёт по проводу. D0: collapsed-якоря — содержимое
-    // ответа, поэтому пустой compact при непустой секции якорей не читается
-    // как no-match и причину budget не получает.
-    ...(displayList().length === 0 && eligible.length > 0 && collapsedAnchors.length === 0
-      ? { reason: "budget" as const }
-      : {}),
+    ...(compactEmptyReason(refutedList) ? { reason: compactEmptyReason(refutedList) } : {}),
   });
 
   /** Тот объект, который уйдёт по проводу (со всеми секциями, extra и next). */
@@ -1131,13 +1152,14 @@ export async function understand(
       cards: compactList.flatMap(card => [{ id: card.id, kind: card.kind, visibleSupports: card.supports?.length ?? 0 }, ...(card.supports ?? []).map(support => ({ id: support.id }))]),
       refuted: refutedList.map(card => ({ name: card.name, reason: card.refuted_reason ?? null })),
       activity,
+      emptyReason: meta.reason,
     }),
     ...extra,
   });
 
   /** Мера текущей формы ответа с заданным списком refuted (числа-заглушки). */
   const measureWith = (refutedList: CompactMatch[]): number => {
-    const payload = buildPayload(withNested(displayList()), refutedList, metaFor(0, 0, false));
+    const payload = buildPayload(withNested(displayList()), refutedList, metaFor(0, 0, false, refutedList));
     while (payload.next.followups.length > 0 && measure(payload) > maxTokens) {
       payload.next.followups.pop();
     }
@@ -1146,7 +1168,7 @@ export async function understand(
 
   // Ниже минимума — понятный отказ: пустой конверт (meta + instructions +
   // MCP-обёртка) сам стоит токенов.
-  const minBudget = measure(buildPayload([], [], metaFor(0, 0, false)));
+  const minBudget = measure(buildPayload([], [], metaFor(0, 0, false, [])));
   if (maxTokens < minBudget) {
     throw new Error(
       `understand: max_tokens=${maxTokens} ниже минимума ${minBudget} — ` +
@@ -1224,7 +1246,6 @@ export async function understand(
    * слот верхнего уровня для следующего кандидата (placeLoop повторно вызывается
    * после сокращения refuted — добор ограничен тем же циклом).
    */
-  let refutedShown = refutedAll;
   let truncated = false;
   let refutedCut = 0;
 
@@ -1410,7 +1431,10 @@ export async function understand(
     name: r.name,
     reason: r.refuted_reason ?? null,
   }));
-  let next: NextHints = buildNextHints({ db, cards: nextCards, refuted: refutedForNext, activity });
+  let next: NextHints = buildNextHints({
+    db, cards: nextCards, refuted: refutedForNext, activity,
+    emptyReason: metaFor(0, dropped, truncated).reason,
+  });
 
   // ---- P3: сборка секции task_context (§12.3–§12.7) ----
   //
