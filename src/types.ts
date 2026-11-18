@@ -544,12 +544,8 @@ export interface UnderstandMeta {
    * фактической выдачи.
    */
   truncated?: boolean;
-  /**
-   * Пустой compact при непустом результате поиска: в бюджет не поместилась
-   * ни одна карточка. Причина называется явно, чтобы пустой ответ не читался
-   * как «ничего не нашлось» — подними max_tokens или используй brief.
-   */
-  reason?: "budget";
+  /** Пустая база, запрос без совпадений или совпадения, не поместившиеся в бюджет. */
+  reason?: "empty_base" | "no_match" | "budget";
   /** E3 (include_evidence: true): сколько размещённых матчей несут дополнение. */
   evidence_matches?: number;
   /** E3 (include_evidence: true): суммарное число опор в дополнении (все живые informed_by). */
@@ -640,6 +636,13 @@ export interface NextHintFollowup {
   why: string;
 }
 
+/** Process-local activity since the last logged write. */
+export interface TimelineActivity {
+  reads_since_write: number;
+  writes: number;
+  last_write_at: string | null;
+}
+
 /**
  * План 13 §2.1: контракт действия в конце ответа understand. must_read — до 3
  * ссылок из file_refs узлов ответа; skip — целые файлы, покрытые карточками;
@@ -653,6 +656,8 @@ export interface NextHints {
   skip: NextHintSkip[];
   followups: NextHintFollowup[];
   record: string;
+  /** Present only after the process-local read threshold is reached. */
+  unrecorded?: Pick<TimelineActivity, "reads_since_write" | "last_write_at">;
 }
 
 /**

@@ -10,7 +10,7 @@ import {
   edgeDigestOf,
   statusDigestOf,
 } from "../support-baselines.js";
-import { buildNextHints, emptyNextHints, RECORD_FACT } from "../next-hints.js";
+import { buildNextHints, emptyNextHints, EMPTY_REASON_RECORD, RECORD_FACT } from "../next-hints.js";
 import type { UnderstandOutput } from "../types.js";
 
 // План 13 §2.1: блок next в ответе understand — машинно-исполнимый контракт
@@ -215,9 +215,9 @@ function wireTokensOf(payload: unknown): number {
 
 /**
  * Обратная совместимость: ответ без next один в один совпадает с базовой
- * линией 2.2.0; исключение — meta.tokens_estimated: next входит в ту же
- * wire-меру (K-03), поэтому число выросло и по-прежнему сходится с реальной
- * длиной wire-формы.
+ * линией 2.2.0; исключения — аддитивная причина пустоты и meta.tokens_estimated:
+ * next входит в ту же wire-меру (K-03), поэтому число выросло и сходится
+ * с реальной длиной wire-формы.
  */
 function expectCompatibleWith220(out: UnderstandOutput, captured: string): void {
   const old = JSON.parse(captured) as Record<string, unknown>;
@@ -252,6 +252,12 @@ function expectCompatibleWith220(out: UnderstandOutput, captured: string): void 
   const newTokens = freshMeta.tokens_estimated;
   delete oldMeta.tokens_estimated;
   delete freshMeta.tokens_estimated;
+  if (captured === CAPTURED.C2) {
+    expect(freshMeta.reason).toBe("no_match");
+    delete freshMeta.reason;
+  } else {
+    expect(freshMeta).not.toHaveProperty("reason");
+  }
   expect({ ...freshNoNext, meta: freshMeta }).toEqual({ ...old, meta: oldMeta });
   expect(newTokens).toBeGreaterThanOrEqual(oldTokens as number);
   expect(newTokens).toBe(wireTokensOf(out));
@@ -467,8 +473,10 @@ describe("План 13 §2.1: блок next в understand", () => {
         expect(record).toContain(part);
       }
       expect(record).not.toContain("kind=feature");
-      expect(record.length).toBeLessThanOrEqual(240);
     }
+    expect(out.meta!.reason).toBe("empty_base");
+    expect(out.next!.record).toBe(`${EMPTY_REASON_RECORD.empty_base} ${RECORD_FACT}`);
+    expect(emptyNextHints().record).toBe(RECORD_FACT);
   });
 
   it("бюджет max_tokens=500: skip режется, must_read и record остаются, мера сходится с wire-формой", async () => {

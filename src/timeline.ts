@@ -1,4 +1,7 @@
 import type { KnowledgeDB } from "./db.js";
+import type { TimelineActivity } from "./types.js";
+
+const loggers = new WeakMap<KnowledgeDB, TimelineLogger>();
 
 export interface TimelineLogger {
   log(entry: {
@@ -9,11 +12,28 @@ export interface TimelineLogger {
     is_error: boolean;
     affected_ids: string[];
   }): void;
+  activity(): TimelineActivity;
+}
+
+/** Activity is scoped to the logger attached to this database, never its timeline rows. */
+export function timelineActivity(db: KnowledgeDB): TimelineActivity | undefined {
+  return loggers.get(db)?.activity();
 }
 
 export function createTimelineLogger(db: KnowledgeDB): TimelineLogger {
-  return {
+  const activity: TimelineActivity = { reads_since_write: 0, writes: 0, last_write_at: null };
+  const logger: TimelineLogger = {
+    activity() {
+      return { ...activity };
+    },
     log(entry) {
+      if (entry.is_write) {
+        activity.reads_since_write = 0;
+        activity.writes += 1;
+        activity.last_write_at = new Date().toISOString();
+      } else {
+        activity.reads_since_write += 1;
+      }
       try {
         db.runWithRetry(
           () =>
@@ -33,4 +53,6 @@ export function createTimelineLogger(db: KnowledgeDB): TimelineLogger {
       }
     },
   };
+  loggers.set(db, logger);
+  return logger;
 }
