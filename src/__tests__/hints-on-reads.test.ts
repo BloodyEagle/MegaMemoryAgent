@@ -44,11 +44,16 @@ async function start(seed = true): Promise<Client> {
   return client;
 }
 
+function textContent(response: Response): { type: "text"; text: string } {
+  if (!Array.isArray(response.content) || response.content.length !== 1) throw new Error("Expected one text response");
+  const item: unknown = response.content[0];
+  if (!item || typeof item !== "object" || !("type" in item) || item.type !== "text"
+    || !("text" in item) || typeof item.text !== "string") throw new Error("Expected one text response");
+  return { type: "text", text: item.text };
+}
+
 function parse(response: Response): Payload {
-  expect(response.content).toHaveLength(1);
-  const item = response.content[0];
-  if (item.type !== "text") throw new Error("Expected one JSON text response");
-  return JSON.parse(item.text) as Payload;
+  return JSON.parse(textContent(response).text) as Payload;
 }
 
 function assertBudget(response: Response, cap: number): Payload {
@@ -82,8 +87,8 @@ describe("MCP-only record hints on reads", () => {
     const response = await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "orientation", max_tokens: 100 } });
     expect(response.isError).toBe(true);
     expect(response.meta).toEqual({ reason: "budget" });
-    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("MEGAMEMORY_ERROR") });
-    expect(response.content[0]).not.toHaveProperty("hint");
+    expect(textContent(response)).toMatchObject({ type: "text", text: expect.stringContaining("MEGAMEMORY_ERROR") });
+    expect(response.content).not.toHaveProperty("0.hint");
   });
 
   it("refuses rather than overflowing when the card fits but its hint does not", async () => {
@@ -95,8 +100,8 @@ describe("MCP-only record hints on reads", () => {
     const response = await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "full", max_tokens: cap } });
     expect(response.isError).toBe(true);
     expect(response.meta).toEqual({ reason: "budget" });
-    expect(response.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("MEGAMEMORY_ERROR") });
-    expect(response.content[0]).not.toHaveProperty("hint");
+    expect(textContent(response)).toMatchObject({ type: "text", text: expect.stringContaining("MEGAMEMORY_ERROR") });
+    expect(response.content).not.toHaveProperty("0.hint");
   });
 
   it("does not repeat the hint for an unchanged delta", async () => {
@@ -126,8 +131,8 @@ describe("MCP-only record hints on reads", () => {
     const source = await start();
     const missing = await source.callTool({ name: "get_concept", arguments: { id: "missing" } });
     expect(missing.isError).toBe(true);
-    expect(missing.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("not found") });
-    expect(missing.content[0]).not.toHaveProperty("hint");
+    expect(textContent(missing)).toMatchObject({ type: "text", text: expect.stringContaining("not found") });
+    expect(missing.content).not.toHaveProperty("0.hint");
     const batch = await source.callTool({ name: "get_concept", arguments: { ids: ["missing"], max_tokens: 1500 } });
     expect(assertBudget(batch, 1500).hint).toBeUndefined();
   });
