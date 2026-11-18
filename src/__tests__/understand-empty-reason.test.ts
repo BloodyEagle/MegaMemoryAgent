@@ -26,7 +26,16 @@ afterEach(async () => {
 });
 
 function seedBudget(): void {
-  addNode(db, "budget", { name: "Budget fixture", summary: "Budget matches a measured implementation detail. ".repeat(8) });
+  // D: минимальная сжатая карточка одного дешёвого узла помещается в любой
+  // успешный бюджет, поэтому сценарий «ни одна карточка не влезла» требует
+  // тяжёлого пула. Причины пустоты и форма record не менялись.
+  for (let index = 1; index <= 20; index += 1) {
+    addNode(db, `budget-heavy-${String(index).padStart(2, "0")}`, {
+      name: `Budget: правило нормализации адреса и проверки региона ${index}`,
+      summary: "Правило бюджета сохраняет исходный идентификатор записи, проверяет регион и муниципальное образование перед выбором адресного объекта, а неоднозначные совпадения требует читать в исходной реализации и тесте.".repeat(3),
+      file_refs: [`src/budget/rule-${index}.ts:120-185`, `src/budget/region-${index}.ts:41-98`],
+    });
+  }
 }
 
 describe("understand empty reasons", () => {
@@ -65,12 +74,14 @@ describe("understand empty reasons", () => {
       minimum = Number(String(error).match(/минимума (\d+)/)?.[1]);
     }
     expect(minimum).toBeGreaterThan(0);
-    const out = await understand(db, { query: "Budget", max_tokens: minimum + 20 });
+    // Порог бюджета поднят до нового дефолта: успешный ответ с reason=budget
+    // живёт в окне «конверт с кандидатами влезает, карточки — нет».
+    const out = await understand(db, { query: "Budget", max_tokens: 600 });
     expect(out.compact).toEqual([]);
     expect(out.meta!.reason).toBe("budget");
     expect(out.meta!.truncated).toBe(true);
     expect(out.next!.record).toBe(`${EMPTY_REASON_RECORD.budget} ${RECORD_FACT}`);
-    expect(out.meta!.tokens_estimated).toBeLessThanOrEqual(minimum + 20);
+    expect(out.meta!.tokens_estimated).toBeLessThanOrEqual(600);
     expect(out.meta!.tokens_estimated).toBe(measureMcpPayload(out));
   });
 

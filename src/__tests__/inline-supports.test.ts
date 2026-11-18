@@ -11,7 +11,8 @@ import { closeAndCleanup } from "./helpers/cleanup.js";
 // 2.1.7 F2: опоры вкладываются в свои решения. Контракт: множество id,
 // доступных агенту, не уменьшается — всё, что было на верхнем уровне, либо
 // осталось, либо вложено; порядок верхнего уровня не меняется; вложенная
-// опора не занимает слот top_k, но её токены посчитаны.
+// опора не занимает слот карточки, но её токены посчитаны. Discovery хранит
+// кандидатов отдельно: returned считает их, cards — верхние compact-карточки.
 
 let tmpDir: string;
 let db: KnowledgeDB;
@@ -55,7 +56,7 @@ function insertFixture(): void {
 }
 
 describe("2.1.7 F2: вложение опор в решения", () => {
-  it("8. решение и его опора в выдаче: опора вложена, returned −1, supports_inlined = 1", async () => {
+  it("8. решение и его опора в выдаче: cards −1, кандидаты сохранены, supports_inlined = 1", async () => {
     insertFixture();
     const result = await understand(db, { query: "ebusy race writer qmarker", top_k: 10 });
     const compact = result.compact!;
@@ -69,8 +70,11 @@ describe("2.1.7 F2: вложение опор в решения", () => {
     expect(dec!.supports![0].name).toBe("sup-ebusy");
     expect(dec!.supports![0].summary).toBe(trimSummary(SUPPORT_SUMMARY));
     expect(result.meta!.supports_inlined).toBe(1);
-    // верхний уровень оскудел ровно на вложенную опору
-    expect(result.meta!.returned).toBe(1);
+    // Верхний уровень оскудел ровно на вложенную опору, discovery — нет.
+    expect(result.meta!.cards).toBe(1);
+    expect(result.meta!.returned).toBe(result.candidates!.length);
+    expect(result.candidates!.map((candidate) => candidate.id).sort()).toEqual(["dec-ebusy", "sup-ebusy"]);
+    expect(result.meta!.dropped).toBe(0);
   });
 
   it("9. опора без решения в выдаче: остаётся на верхнем уровне как самостоятельный факт", async () => {
@@ -135,7 +139,9 @@ describe("2.1.7 F2: вложение опор в решения", () => {
     });
     const result = await understand(db, { query: "ebusy race qmarker", top_k: 4, max_tokens: 2600 });
     expect(result.meta!.supports_inlined).toBe(1);
-    expect(result.meta!.returned).toBe(3);
+    expect(result.meta!.cards).toBe(3);
+    expect(result.meta!.returned).toBe(result.candidates!.length);
+    expect(result.candidates!).toHaveLength(4);
     expect(result.compact!.length).toBe(3);
     // все четыре узла в ответе: три сверху, один вложен
     const union = new Set<string>();

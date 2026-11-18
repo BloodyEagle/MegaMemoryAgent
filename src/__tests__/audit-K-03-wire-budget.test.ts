@@ -350,7 +350,22 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
         expect(payload.next?.record).toContain("create_concept");
         expect(payload.next?.record).toContain("evidence");
         expect(payload.next?.record).toContain("informed_by");
-        if (payload.meta?.returned) expect(payload.next?.must_read).toEqual(output.next?.must_read);
+        const disclosedCards = payload.compact ?? payload.matches;
+        if (disclosedCards.length > 0 || mode === "brief" && payload.meta?.returned) {
+          expect(payload.next?.must_read).toEqual(output.next?.must_read);
+        } else {
+          // A discovery locator does not authorize silently shortened mandatory refs.
+          expect(payload.next?.must_read).toEqual([]);
+          expect(payload.meta?.reason).toBe("budget");
+        }
+        if (mode === undefined || mode === "compact") {
+          expect(payload.matches).toEqual([]);
+          expect(payload.meta?.cards).toBe(disclosedCards.length);
+          expect(payload.meta?.returned).toBe(payload.candidates?.length);
+          expect(payload.meta?.dropped).toBe(
+            (payload.candidates?.some((candidate) => candidate.id === "escaped-claim") || disclosedCards.length > 0) ? 0 : 1
+          );
+        }
       }
     }
   });
@@ -361,6 +376,13 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
     const rejected = await boundary.handlers.get("understand")!({ query: "emptyfloor", mode, max_tokens: floor - 1 });
     expect(rejected.isError).toBe(true);
     expect(rejected.content[0].text).toMatch(/max_tokens.*(?:минимум|minimum|cannot fit)/);
+    const exact = await boundary.handlers.get("understand")!({ query: "emptyfloor", mode, max_tokens: floor });
+    expect(exact.isError).not.toBe(true);
+    const payload = JSON.parse(exact.content[0].text) as UnderstandOutput;
+    expect(payload.meta?.tokens_estimated).toBe(floor);
+    expect(wireTokens(JSON.stringify(exact))).toBe(floor);
+    expect(payload.next?.record).toContain("create_concept");
+    expect(payload.next?.record).toContain("evidence");
   });
 
   it.each([undefined, "compact", "full", "brief"] as const)("D-05 actual %s MCP retains useful qualified content when it fits", async mode => {
@@ -402,17 +424,47 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
     }
   });
 
-  it("Q3: budgets refuted-only output including metadata and the MCP content envelope", async () => {
-    const { response, text, output } = await wireResponse((db) => {
+  it("Q3: refuted-only output retains reasons or explicitly refuses the mandatory floor", async () => {
+    const { response: generous, output } = await wireResponse((db) => {
       for (let i = 0; i < 8; i++) {
         addNode(db, `refuted-${i}`, { summary: `budgetneedle ${"text ".repeat(100)}` });
         db.setEpistemicStatus(`refuted-${i}`, "refuted", "An independent counterexample invalidates this claim", null);
       }
-    }, { query: "budgetneedle", top_k: 8, max_tokens: 500 });
-
-    expect.soft(wireTokens(text)).toBeLessThanOrEqual(500);
-    expect.soft(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(500);
-    expect(output.meta?.tokens_estimated).toBeGreaterThanOrEqual(wireTokens(JSON.stringify(response)));
+    }, { query: "budgetneedle", top_k: 8, max_tokens: 10000 });
+    expect(output.refuted).toHaveLength(8);
+    expect(output.meta?.tokens_estimated).toBe(wireTokens(JSON.stringify(generous)));
+    for (const card of output.refuted ?? []) {
+      expect(card.refuted_reason).toBe("An independent counterexample invalidates this claim");
+      expect(card.epistemic_status).toBe("refuted");
+    }
+    const handler = boundary.handlers.get("understand")!;
+    for (const max_tokens of [500, 700, 900, 1500]) {
+      const actual = await handler({ query: "budgetneedle", top_k: 8, max_tokens });
+      if (actual.isError) {
+        expect(actual.content[0].text).toMatch(/max_tokens.*(?:минимум|minimum|cannot fit)/);
+        continue;
+      }
+      const payload = JSON.parse(actual.content[0].text) as UnderstandOutput;
+      expect(wireTokens(JSON.stringify(actual))).toBeLessThanOrEqual(max_tokens);
+      expect(payload.meta?.tokens_estimated).toBe(wireTokens(JSON.stringify(actual)));
+      expect(payload.matches).toEqual([]);
+      expect(payload.compact).toEqual([]);
+      const visible = new Set([
+        ...(payload.candidates ?? []).map((candidate) => candidate.id),
+        ...(payload.refuted ?? []).map((card) => card.id),
+      ]);
+      expect(payload.meta?.dropped).toBe(8 - visible.size);
+      expect(payload.meta?.returned).toBe(payload.candidates?.length);
+      for (const card of payload.refuted ?? []) {
+        expect(card.refuted_reason).toBe("An independent counterexample invalidates this claim");
+        expect(card.epistemic_status).toBe("refuted");
+      }
+      if ((payload.meta?.dropped ?? 0) > 0) {
+        expect(payload.brief).toContain(`${payload.meta!.dropped} скрыто бюджетом`);
+        expect(payload.meta?.truncated).toBe(true);
+      }
+      expect(payload.next?.record).toContain("create_concept");
+    }
   });
 
   it.each([
@@ -426,10 +478,20 @@ describe("K-03: the actual pretty MCP response obeys the token cap", () => {
         file_refs: [`src/${wording.repeat(6)}.ts:10-30`],
       });
       for (let i = 1; i < ids.length; i++) db.insertEdge({ from_id: ids[0], to_id: ids[i], relation: "connects_to" });
-    }, { query: "multilingualneedle", top_k: 4, max_tokens: 700 });
+    }, { query: "multilingualneedle", top_k: 4, max_tokens: 700 }, true);
 
-    expect.soft(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(700);
-    expect(output.meta?.tokens_estimated).toBeGreaterThanOrEqual(wireTokens(JSON.stringify(response)));
+    if (response.isError) {
+      expect(response.content[0].text).toMatch(/max_tokens.*(?:минимум|minimum|cannot fit)/);
+    } else {
+      expect(wireTokens(JSON.stringify(response))).toBeLessThanOrEqual(700);
+      expect(output.meta?.tokens_estimated).toBe(wireTokens(JSON.stringify(response)));
+      const visible = new Set([
+        ...(output.candidates ?? []).map((candidate) => candidate.id),
+        ...(output.compact ?? []).map((card) => card.id),
+      ]);
+      expect(output.meta?.dropped).toBe(4 - visible.size);
+      if ((output.meta?.dropped ?? 0) > 0) expect(output.brief).toContain(`${output.meta!.dropped} скрыто бюджетом`);
+    }
   });
 
   it("budgets edges_between and the duplicated context edges", async () => {

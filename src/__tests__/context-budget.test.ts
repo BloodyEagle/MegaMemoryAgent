@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
-import { understand, estimateTokens, trimSummary, listRoots } from "../tools.js";
+import { understand, estimateTokens, trimSummary, listRoots, measureMcpPayload } from "../tools.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { closeAndCleanup } from "./helpers/cleanup.js";
 
@@ -59,9 +59,8 @@ describe("understand compact mode budget", () => {
     const db = freshDb();
     insertFatNodes(db, 20);
 
-    // Минимальный конверт считает сам сервер: ниже него он отказывает и
-    // называет цифру. Берём «минимум + запас» — в него гарантированно не
-    // влезает ни одна карточка, и это не зависит от того, есть ли модель.
+    // Пустой минимум считает сервер; небольшой запас всё ещё не позволяет
+    // разместить квалифицированную карточку независимо от наличия модели.
     let minBudget = 0;
     try {
       await understand(db, { query: "Слово", top_k: 20, max_tokens: 1 });
@@ -71,18 +70,35 @@ describe("understand compact mode budget", () => {
     }
     expect(minBudget).toBeGreaterThan(0);
 
-    const result = await understand(db, { query: "Слово", top_k: 20, max_tokens: minBudget + 20 });
+    // Пустой конверт дешевле честного ответа с reason/notice о потерях.
+    // Если запас ниже второго минимума, сервер должен явно отказать; повтор
+    // идёт ровно с названным минимумом, без льгот и искусственного floor.
+    let budget = minBudget + 20;
+    let result: Awaited<ReturnType<typeof understand>>;
+    try {
+      result = await understand(db, { query: "Слово", top_k: 20, max_tokens: budget });
+    } catch (error) {
+      expect(String(error)).toMatch(/cannot fit the instructions, qualification and loss notice \(minimum \d+\)/);
+      const honestMinimum = Number(String(error).match(/minimum (\d+)/)?.[1]);
+      expect(honestMinimum).toBeGreaterThan(budget);
+      budget = honestMinimum;
+      result = await understand(db, { query: "Слово", top_k: 20, max_tokens: budget });
+    }
 
     expect(result.meta).toBeDefined();
     // Бюджет — жёсткий потолок, а не пожелание: карточка сверх лимита не
     // отдаётся. Пустой ответ обязан называть причину, иначе он читается как
     // «ничего не нашлось» — это и было регрессом.
-    expect(result.compact!.length).toBe(0);
-    expect(result.meta!.returned).toBe(0);
+    expect(result.compact!).toHaveLength(0);
+    expect(result.meta!.cards).toBe(0);
+    expect(result.meta!.returned).toBe(result.candidates!.length);
     expect(result.meta!.truncated).toBe(true);
     expect(result.meta!.reason).toBe("budget");
-    expect(result.meta!.dropped).toBe(20);
-    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(minBudget + 20);
+    // Discovery не является карточкой, но видимый кандидат уже не dropped.
+    expect(result.meta!.dropped).toBe(20 - result.candidates!.length);
+    expect(result.next!.record).toBeTruthy();
+    expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(budget);
     // U6: the explorer derives "saved vs full" from this pair.
     expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);
   });
@@ -98,10 +114,18 @@ describe("understand compact mode budget", () => {
     });
 
     expect(result.meta).toBeDefined();
-    expect(result.meta!.returned).toBeGreaterThanOrEqual(1);
-    expect(result.meta!.returned).toBe(result.compact!.length);
-    expect(result.meta!.returned + result.meta!.dropped).toBe(20);
+    expect(result.candidates!).toHaveLength(20);
+    expect(result.meta!.returned).toBe(result.candidates!.length);
+    expect(result.meta!.cards).toBe(result.compact!.length);
+    expect(result.compact!).toHaveLength(3);
+    const visibleIds = new Set([
+      ...result.candidates!.map((candidate) => candidate.id),
+      ...result.compact!.map((card) => card.id),
+    ]);
+    expect(visibleIds.size + result.meta!.dropped).toBe(20);
+    expect(result.meta!.dropped).toBe(0);
     expect(result.meta!.reason).toBeUndefined();
+    expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
     expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(8000);
     // Every compact node is trimmed to <=240 chars.
     expect(result.compact!.every((m) => m.summary.length <= 240)).toBe(true);
@@ -177,18 +201,41 @@ describe("patches v1.1: zh budget (А6/В15) and edges_between (В14)", () => {
       });
     }
     const result = await understand(db, { query: "支付", top_k: 20, max_tokens: 500 });
-    // План 06 K-04 / план 13: карточка ~2000+ токенов в бюджет 500 не
-    // помещается целиком — честный ответ воронки: пустой список, усечение
-    // помечено, полный размер оценён. Ноль — валидный результат, «хоть одна
-    // карточка любой ценой» (эпоха v1.1) больше не переувеличивает бюджет.
-    expect(result.meta!.returned).toBe(0);
-    expect(result.meta!.dropped).toBe(20);
+    // Optional summary может уступить место минимальной квалифицированной
+    // карточке. Discovery и карточки считаются отдельно, wire-cap — без льгот.
+    expect(result.meta!.returned).toBe(result.candidates!.length);
+    expect(result.meta!.cards).toBe(result.compact!.length);
+    expect(result.compact!.length).toBeLessThanOrEqual(3);
+    const visibleIds = new Set([
+      ...result.candidates!.map((candidate) => candidate.id),
+      ...result.compact!.map((card) => card.id),
+    ]);
+    expect(visibleIds.size + result.meta!.dropped).toBe(20);
+    for (const card of result.compact!) {
+      expect(card.status).toBe("active");
+      expect(card.epistemic_status).toBe("open");
+      expect(card.status_scope).toBeNull();
+      expect(card.valid_until).toBeNull();
+      expect(card.expired).toBe(false);
+      expect(card.file_refs).toBeNull();
+      expect(card.id).toMatch(/^zh-\d{2}$/);
+      if (typeof card.summary === "string") {
+        expect(card.summary.length).toBeLessThanOrEqual(240);
+      } else {
+        // Optional presentation опущена целиком; квалификация выше неизменна.
+        expect(card).not.toHaveProperty("summary");
+      }
+    }
+    if (result.compact!.length === 0) {
+      expect(result.meta!.reason).toBe("budget");
+      expect(result.next!.record).toBeTruthy();
+    } else {
+      expect(result.meta!.reason).toBeUndefined();
+      if (result.meta!.dropped > 0) expect(result.brief).toBeTruthy();
+    }
     expect(result.meta!.estimated_full_tokens).toBeGreaterThan(500);
-    // План 13 §2.1: блок next присутствует в каждом ответе, и его record не
-    // режется никогда — кап соблюдается с точностью до этого постоянного
-    // минимума, а превышение помечается meta.truncated (мера остаётся честной).
-    const NEXT_FLOOR_TOKENS = 96;
-    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500 + NEXT_FLOOR_TOKENS);
+    expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500);
     expect(result.meta!.truncated).toBe(true);
   });
 

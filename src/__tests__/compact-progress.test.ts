@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { KnowledgeDB, isNodeExpired } from "../db.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { understand } from "../tools.js";
 const search = vi.hoisted(() => vi.fn());
@@ -22,54 +22,52 @@ function declaration(name: string): string {
   return text;
 }
 
-function place(ids: string[], supports: Record<string, string[]>, topK: number, budget = 100, initiallyFolded = false) {
-  const top: Array<{ id: string; name: string; status: string }> = initiallyFolded
-    ? ids.slice(0, 3).map(id => ({ id, name: id, status: "active" })) : [];
+function place(ids: string[], limit: number, rejected: string[] = [], initialTop: string[] = []) {
+  const placed = [...initialTop];
+  const visits: string[] = [];
+  const failed = new Set(rejected);
   const context = vm.createContext({
-    top, eligible: ids.map(id => ({ node: { id }, score: 1 })), topK,
-    nodeRowById: new Map(ids.map(id => [id, { summary: id, file_refs: null }])),
-    supportIdsOf: new Map(Object.entries(supports)),
-    compactMatch: (_db: unknown, node: { id: string }) => ({ id: node.id, name: node.id, status: "active" }),
-    db: {}, trimSummary: (s: string) => s, parseFileRefs: () => [], isUngrounded: () => false, isNodeExpired,
-    target: budget, refutedShown: [],
+    eligible: ids.map((id) => ({ node: { id } })),
+    displayList: () => placed.map((id) => ({ id })),
+    placeCard: (entry: { node: { id: string } }): boolean => {
+      visits.push(entry.node.id);
+      if (visits.length > ids.length) throw new Error("placement made no bounded progress");
+      if (failed.has(entry.node.id) || placed.includes(entry.node.id)) return false;
+      placed.push(entry.node.id);
+      return true;
+    },
+    limit,
   });
-  const placement = declaration("placeLoop").replace("while (idx < eligible.length) {", "while (idx < eligible.length) { if (++steps > eligible.length + 1) throw new Error('placement made no bounded progress');");
-  const script = `let nestedByHost = new Map(); let foldedIds = new Set(); let idx = ${initiallyFolded ? 3 : 0};
-let tokensEstimated = 0; let truncated = false; let steps = 0;
-const displayList = () => top.filter(m => !foldedIds.has(m.id));
-const measureWith = () => top.length * 10;
-${declaration("parseStatusScope")}
-${declaration("nodeQualification")}
-${declaration("foldSupports")}
-${initiallyFolded ? "foldSupports();" : ""}
-${placement}
-placeLoop();
-globalThis.result = { idx, steps, truncated, top: displayList(), nested: [...nestedByHost.values()].flat() };`;
+  // Exercise the actual production loop, with a controlled placement delegate.
+  // Folding, qualification and budget rollback are tested through public understand below.
+  const script = `${declaration("placeLoop")}\nplaceLoop(limit);`;
   vm.runInContext(ts.transpileModule(script, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context, { timeout: 100 });
-  return JSON.parse(JSON.stringify(context.result)) as { idx: number; steps: number; truncated: boolean; top: Array<{ id: string }>; nested: Array<{ id: string }> };
+  return { placed, visits };
 }
 
+beforeEach(() => {
+  vi.stubEnv("MEGAMEMORY_SEARCH", "fts");
+  search.mockReset();
+});
+afterEach(() => { vi.unstubAllEnvs(); });
+
 describe("D-01 bounded compact placement", () => {
-  it("already folded support with filled top_k terminates without another unchanged pass", () => {
-    const result = place(["host", "support", "a", "b"], { host: ["support"] }, 2, 100, true);
-    expect(result.top.map(n => n.id)).toEqual(["host", "a"]);
-    expect(result.nested.map(n => n.id)).toEqual(["support"]);
-    expect(result.idx).toBe(3);
-    expect(result.steps).toBeLessThanOrEqual(5);
+  it("an already filled limit delegates nothing and terminates", () => {
+    const result = place(["host", "support", "a", "b"], 2, [], ["host", "a"]);
+    expect(result.placed).toEqual(["host", "a"]);
+    expect(result.visits).toEqual([]);
   });
 
-  it("folding creates only genuinely available top-level slots", () => {
-    const result = place(["host", "s1", "s2", "a", "b"], { host: ["s1", "s2"] }, 2);
-    expect(result.top.map(n => n.id)).toEqual(["host", "a"]);
-    expect(result.nested.map(n => n.id)).toEqual(["s1", "s2"]);
-    expect(result.steps).toBeLessThanOrEqual(6);
+  it("a rejected expensive hit cannot block a cheaper later hit", () => {
+    const result = place(["expensive", "host", "a", "b"], 2, ["expensive"]);
+    expect(result.placed).toEqual(["host", "a"]);
+    expect(result.visits).toEqual(["expensive", "host", "a"]);
   });
 
-  it("a support chain stays depth one and candidates exhaust with bounded progress", () => {
-    const result = place(["host", "s1", "s2"], { host: ["s1"], s1: ["s2"] }, 3);
-    expect(result.top.map(n => n.id)).toEqual(["host", "s2"]);
-    expect(result.nested.map(n => n.id)).toEqual(["s1"]);
-    expect(result.idx).toBe(3);
+  it("an exhausted pool delegates each candidate at most once", () => {
+    const result = place(["host", "s1", "s2"], 3, ["s1", "s2"]);
+    expect(result.placed).toEqual(["host"]);
+    expect(result.visits).toEqual(["host", "s1", "s2"]);
   });
 
   it("public understand keeps the folded support at filled top_k", async () => {
@@ -82,7 +80,10 @@ describe("D-01 bounded compact placement", () => {
       const result = await understand(db, { query: "bounded placement", top_k: 2, max_tokens: 10000 });
       expect(result.compact?.map(n => n.id)).toEqual(["host", "a"]);
       expect(result.compact?.[0].supports?.map(n => n.id)).toEqual(["support"]);
-      expect(result.meta?.returned).toBe(2);
+      expect(result.meta?.returned).toBe(4);
+      expect(result.candidates?.map((candidate) => candidate.id)).toEqual(["host", "support", "a", "b"]);
+      expect(result.meta?.cards).toBe(2);
+      expect(result.meta?.dropped).toBe(0); // b remains discoverable without a card
       expect(result.meta?.supports_inlined).toBe(1);
     } finally { db.close(); }
   });
@@ -98,16 +99,76 @@ describe("D-01 bounded compact placement", () => {
       search.mockReturnValue(["wrong", "host", "support", "a", "b"].map(id => ({ id, similarity: 1 })));
       const result = await understand(db, { query: "trim and refill", top_k: 2, max_tokens: 1500 });
       expect(result.compact?.length).toBeLessThanOrEqual(2);
+      const host = result.compact?.find((card) => card.id === "host");
+      expect(host).toBeDefined();
+      expect(host?.supports?.map((support) => support.id)).toEqual(["support"]);
+      expect(host?.supports?.[0]).toMatchObject({ status: "active", epistemic_status: "open" });
+      expect(host?.supports?.[0]).not.toHaveProperty("supports");
+      // The atomic refuted card/reason is too large, but its locator remains
+      // explicitly refuted: it is not a shortened claim an agent may cite.
+      expect(result.refuted).toEqual([]);
+      const rejectedLocator = result.candidates?.find((candidate) => candidate.id === "wrong");
+      expect(rejectedLocator).toMatchObject({ id: "wrong", epistemic_status: "refuted" });
+      expect(rejectedLocator).not.toHaveProperty("summary_short");
+      const visible = new Set([
+        ...(result.candidates ?? []).map((candidate) => candidate.id),
+        ...(result.compact ?? []).flatMap((card) => [card.id, ...(card.supports ?? []).map((support) => support.id)]),
+        ...(result.anchors ?? []).map((anchor) => anchor.id),
+        ...(result.refuted ?? []).map((card) => card.id),
+      ]);
+      expect(result.meta?.returned).toBe(result.candidates?.length);
+      expect(result.meta?.cards).toBe(result.compact?.length);
+      expect(result.meta?.dropped).toBe(["wrong", "host", "support", "a", "b"].filter((id) => !visible.has(id)).length);
+      // Candidate-only is not dropped, but omission of the qualified refuted
+      // detail must still report truncation rather than silently look complete.
       expect(result.meta?.truncated).toBe(true);
       expect(result.meta?.tokens_estimated).toBeLessThanOrEqual(1500);
     } finally { db.close(); }
   });
 
-  it("budget cutoff stops and retains already placed content", () => {
-    const result = place(["host", "support", "a"], { host: ["support"] }, 3, 20);
-    expect(result.truncated).toBe(true);
-    expect(result.idx).toBe(2);
-    expect(result.nested.map(n => n.id)).toEqual(["support"]);
-    expect(result.steps).toBeLessThanOrEqual(4);
+  it("folding frees only real card slots and preserves depth-one supports", async () => {
+    const db = new KnowledgeDB(":memory:");
+    ensureSchema(db);
+    try {
+      for (const id of ["host", "s1", "s2", "a", "b"]) db.insertNode({ id, name: id, kind: "feature", summary: `Concrete evidence for ${id}.`, file_refs: [`src/${id}.ts`] });
+      for (const id of ["s1", "s2"]) db.insertEdge({ from_id: "host", to_id: id, relation: "informed_by", description: `The host uses measurement ${id}.` });
+      search.mockReturnValue(["host", "s1", "s2", "a", "b"].map((id) => ({ id, similarity: 1 })));
+      const result = await understand(db, { query: "multiple folded supports", top_k: 2, max_tokens: 10000 });
+      expect(result.compact?.map((card) => card.id)).toEqual(["host", "a"]);
+      expect(result.compact?.[0].supports?.map((support) => support.id)).toEqual(["s1", "s2"]);
+      for (const support of result.compact?.[0].supports ?? []) {
+        expect(support).not.toHaveProperty("supports");
+        expect(support).toMatchObject({ status: "active", epistemic_status: "open", file_refs: [`src/${support.id}.ts`] });
+      }
+      expect(result.meta?.cards).toBe(2);
+      expect(result.meta?.returned).toBe(5);
+      expect(result.meta?.supports_inlined).toBe(2);
+      expect(result.meta?.dropped).toBe(0);
+    } finally { db.close(); }
+  });
+
+  it("a support chain remains depth one in public understand", async () => {
+    const db = new KnowledgeDB(":memory:");
+    ensureSchema(db);
+    try {
+      for (const id of ["host", "s1", "s2"]) db.insertNode({ id, name: id, kind: "feature", summary: `Concrete evidence for ${id}.`, file_refs: [`src/${id}.ts`] });
+      db.insertEdge({ from_id: "host", to_id: "s1", relation: "informed_by", description: "The first measurement supports the host." });
+      db.insertEdge({ from_id: "s1", to_id: "s2", relation: "informed_by", description: "The second measurement supports the first." });
+      search.mockReturnValue(["host", "s1", "s2"].map((id) => ({ id, similarity: 1 })));
+      const result = await understand(db, { query: "support chain", top_k: 3, max_tokens: 10000 });
+      expect(result.compact?.map((card) => card.id)).toEqual(["host", "s2"]);
+      expect(result.compact?.[0].supports?.map((support) => support.id)).toEqual(["s1"]);
+      expect(result.compact?.[0].supports?.[0]).not.toHaveProperty("supports");
+      expect(result.compact?.[1].supports).toBeUndefined();
+      expect(result.meta?.supports_inlined).toBe(1);
+      expect(result.meta?.returned).toBe(3);
+      expect(result.meta?.dropped).toBe(0);
+    } finally { db.close(); }
+  });
+
+  it("all rejected placements exhaust the pool without repeating an unchanged pass", () => {
+    const result = place(["host", "support", "a"], 3, ["host", "support", "a"]);
+    expect(result.placed).toEqual([]);
+    expect(result.visits).toEqual(["host", "support", "a"]);
   });
 });

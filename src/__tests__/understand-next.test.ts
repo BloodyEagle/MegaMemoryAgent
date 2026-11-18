@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { auditFixture, type AuditFixture } from "./helpers/audit.js";
 import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
-import { estimateTokens, link, understand } from "../tools.js";
+import { estimateTokens, link, measureMcpPayload, understand } from "../tools.js";
 import {
   BASELINE_FORMAT_VERSION,
   claimDigestOf,
@@ -11,6 +11,7 @@ import {
   statusDigestOf,
 } from "../support-baselines.js";
 import { buildNextHints, emptyNextHints, EMPTY_REASON_RECORD, RECORD_FACT } from "../next-hints.js";
+import { renderDroppedText } from "../brief.js";
 import type { UnderstandOutput } from "../types.js";
 
 // План 13 §2.1: блок next в ответе understand — машинно-исполнимый контракт
@@ -214,60 +215,90 @@ function wireTokensOf(payload: unknown): number {
 }
 
 /**
- * Обратная совместимость: ответ без next один в один совпадает с базовой
- * линией 2.2.0; исключения — аддитивная причина пустоты и meta.tokens_estimated:
- * next входит в ту же wire-меру (K-03), поэтому число выросло и сходится
- * с реальной длиной wire-формы.
+ * Обратная совместимость: исторические поля раскрытых карточек остаются
+ * точными. D добавляет discovery и меняет счётчики глубины; next и новые
+ * секции входят в ту же wire-меру (K-03).
  */
 function expectCompatibleWith220(out: UnderstandOutput, captured: string): void {
-  const old = JSON.parse(captured) as Record<string, unknown>;
-  const fresh = JSON.parse(JSON.stringify(out)) as Record<string, unknown>;
-  // Additive qualification is expected; every historical payload field remains exact.
-  const freshCards = ((fresh.compact ?? []) as Array<Record<string, unknown>>).concat((fresh.refuted ?? []) as Array<Record<string, unknown>>);
-  for (const card of freshCards) {
+  type HistoricalCard = Record<string, unknown> & { id: string; supports?: HistoricalCard[] };
+  const old = JSON.parse(captured) as {
+    compact: HistoricalCard[];
+    refuted: HistoricalCard[];
+    edges_between: NonNullable<UnderstandOutput["edges_between"]>;
+    meta: NonNullable<UnderstandOutput["meta"]>;
+  };
+  const historicalById = new Map(
+    [...old.compact, ...old.compact.flatMap((card) => card.supports ?? []), ...old.refuted]
+      .map((card) => [card.id, card])
+  );
+  const checkDisclosed = (card: HistoricalCard): void => {
+    const historical = historicalById.get(card.id);
+    expect(historical, `unexpected disclosed node ${card.id}`).toBeDefined();
+    if (!historical) throw new Error(`Missing historical node ${card.id}`);
+    // Optional presentation may be squeezed; identity, refs and qualification may not.
     expect(card.status_scope).toBeNull();
     expect(card.valid_until).toBeNull();
     expect(card.expired).toBe(false);
-    delete card.status_scope;
-    delete card.valid_until;
-    delete card.expired;
+    for (const key of ["id", "kind", "status", "epistemic_status", "file_refs", "refuted_reason", "score", "similarity"]) {
+      if (key in historical) expect(card[key], `${card.id}.${key}`).toEqual(historical[key]);
+    }
+    if (typeof card.name === "string") {
+      const original = historical.name as string;
+      expect(card.name === original || card.name.startsWith("…") && original.endsWith(card.name.slice(1))).toBe(true);
+    }
+    if (card.summary !== undefined) {
+      const original = historical.summary as string;
+      expect(card.summary === original || typeof card.summary === "string" && card.summary.endsWith("…") && original.startsWith(card.summary.slice(0, -1))).toBe(true);
+    }
+    for (const key of ["children", "edges"]) {
+      if (card[key] !== undefined) expect(card[key], `${card.id}.${key}`).toEqual(historical[key]);
+    }
+    const expectedSupports = historical.supports ?? [];
+    expect((card.supports ?? []).map((support) => support.id)).toEqual(expectedSupports.map((support) => support.id));
+    for (const support of card.supports ?? []) {
+      expect(support).not.toHaveProperty("supports");
+      checkDisclosed(support);
+    }
+  };
+  const cards = (out.compact ?? []) as unknown as HistoricalCard[];
+  for (const card of [...cards, ...(out.refuted ?? []) as unknown as HistoricalCard[]]) checkDisclosed(card);
+  // Disclosure is still a rank-preserving subsequence of the historical top level.
+  const historicalOrder = old.compact.map((card) => card.id);
+  let previousRank = -1;
+  for (const card of cards) {
+    const rank = historicalOrder.indexOf(card.id);
+    expect(rank).toBeGreaterThan(previousRank);
+    previousRank = rank;
   }
-  const oldSupports = ((old.compact ?? []) as Array<{ supports?: Array<Record<string, unknown>> }>).flatMap(card => card.supports ?? []);
-  const freshSupports = ((fresh.compact ?? []) as Array<{ supports?: Array<Record<string, unknown>> }>).flatMap(card => card.supports ?? []);
-  for (const [index, support] of freshSupports.entries()) {
-    const legacy = oldSupports[index];
-    if (!legacy) continue;
-    expect(support.status_scope).toBeNull();
-    expect(support.valid_until).toBeNull();
-    expect(support.expired).toBe(false);
-    delete support.status_scope;
-    delete support.valid_until;
-    delete support.expired;
-  }
-  const freshNoNext = { ...fresh };
-  delete freshNoNext.next;
-  const oldMeta = { ...(old.meta as Record<string, unknown>) };
-  const freshMeta = { ...(freshNoNext.meta as Record<string, unknown>) };
-  const oldTokens = oldMeta.tokens_estimated;
-  const newTokens = freshMeta.tokens_estimated;
-  delete oldMeta.tokens_estimated;
-  delete freshMeta.tokens_estimated;
-  if (captured === CAPTURED.C2) {
-    expect(freshMeta.reason).toBe("no_match");
-    delete freshMeta.reason;
-  } else {
-    expect(freshMeta).not.toHaveProperty("reason");
-  }
-  expect({ ...freshNoNext, meta: freshMeta }).toEqual({ ...old, meta: oldMeta });
-  expect(newTokens).toBeGreaterThanOrEqual(oldTokens as number);
-  expect(newTokens).toBe(wireTokensOf(out));
+  expect((out.refuted ?? []).map((card) => card.id)).toEqual(old.refuted.map((card) => card.id));
+  const disclosedIds = new Set(cards.map((card) => card.id));
+  expect(out.edges_between).toEqual(old.edges_between.filter((edge) => disclosedIds.has(edge.from) && disclosedIds.has(edge.to)));
+  const candidateIds = new Set((out.candidates ?? []).map((candidate) => candidate.id));
+  for (const id of historicalById.keys()) expect(candidateIds.has(id), `missing discovery ${id}`).toBe(true);
+  expect(candidateIds.size).toBe(out.candidates?.length);
+  expect(out.matches).toEqual([]);
+  expect(out.meta?.returned).toBe(out.candidates?.length);
+  expect(out.meta?.cards).toBe(cards.length);
+  expect(cards.length).toBeLessThanOrEqual(3);
+  expect(out.meta?.dropped).toBe(0);
+  expect(out.meta?.stale_excluded).toBe(old.meta.stale_excluded);
+  expect(out.meta?.inactive_excluded).toBe(old.meta.inactive_excluded);
+  if (captured === CAPTURED.C2) expect(out.meta?.reason).toBe("no_match");
+  else expect(out.meta).not.toHaveProperty("reason");
+  expect(out.meta?.tokens_estimated).toBe(wireTokensOf(out));
 }
 
 describe("План 13 §2.1: блок next в understand", () => {
-  it("next присутствует; ключи compact-ответа ровно [matches, compact, refuted, edges_between, meta, next]", async () => {
+  it("compact несёт discovery и next; notice добавляется только при полностью скрытых совпадениях", async () => {
     seedEdges();
     const out = await understand(db, { query: "node сборки", top_k: 5, max_tokens: 1500 });
-    expect(Object.keys(out)).toEqual(["matches", "compact", "refuted", "edges_between", "meta", "next"]);
+    const requiredKeys = ["matches", "compact", "candidates", "anchors", "refuted", "edges_between", "meta", "next"];
+    expect(Object.keys(out).filter((key) => key !== "brief").sort()).toEqual(requiredKeys.sort());
+    if ((out.meta?.dropped ?? 0) > 0) expect(out.brief).toEqual(expect.any(String));
+    else expect(out).not.toHaveProperty("brief");
+    expect(out.matches).toEqual([]);
+    expect(out.meta?.returned).toBe(out.candidates?.length);
+    expect(out.meta?.cards).toBe(out.compact?.length);
     expect(Object.keys(out.next!)).toEqual(["must_read", "skip", "followups", "record"]);
     expect(Array.isArray(out.next!.must_read)).toBe(true);
     expect(Array.isArray(out.next!.skip)).toBe(true);
@@ -479,48 +510,73 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(emptyNextHints().record).toBe(RECORD_FACT);
   });
 
-  it("бюджет max_tokens=500: skip режется, must_read и record остаются, мера сходится с wire-формой", async () => {
+  it("бюджет ниже обязательного notice отказывает; точный честный floor сохраняет record и wire-меру", async () => {
     seedBudget();
     const extra = { instructions_stale: false, server_version: "2.3.0-test" };
-    const tight = await understand(db, {
-      query: "ответа wire", top_k: 5, max_tokens: 500, extra_payload: extra,
-    });
-    // Щедрый бюджет показывает, что skip и followups в этой базе есть вообще.
-    const generous = await understand(db, { query: "ответа wire", top_k: 5, max_tokens: 2500 });
+    const input = { query: "ответа wire", top_k: 5, extra_payload: extra };
+    const generous = await understand(db, { ...input, max_tokens: 2500 });
     expect(generous.next!.skip).toEqual([]);
-    expect(generous.next!.followups.map((f) => f.tool)).toEqual(["check_artifacts"]);
+    expect(generous.next!.followups.map((followup) => followup.tool)).toEqual(["check_artifacts"]);
 
-    expect(tight.next!.skip).toEqual([]); // порезан
-    expect(tight.next!.followups).toEqual([]); // порезан
-    // Cards that cannot fit together with their mandatory next block are omitted,
-    // not returned with cut references or a silently oversized response.
+    // Two matching IDs cannot be silently omitted: pay for the complete
+    // budget reason, record and loss notice before expecting a success.
+    const meta = { ...generous.meta!, returned: 0, cards: 0, dropped: 2, supports_inlined: 0, anchor_collapsed: 0, truncated: true, reason: "budget" as const };
+    const mandatory: UnderstandOutput = {
+      matches: [], compact: [], candidates: [], anchors: [], refuted: [], edges_between: [], meta,
+      next: { must_read: [], skip: [], followups: [], record: `${EMPTY_REASON_RECORD.budget} ${RECORD_FACT}` },
+      brief: renderDroppedText(meta),
+    };
+    const floor = measureMcpPayload({ ...mandatory, ...extra });
+    await expect(understand(db, { ...input, max_tokens: floor - 1 })).rejects.toThrow(/max_tokens.*(?:минимум|minimum|cannot fit)/);
+    const tight = await understand(db, { ...input, max_tokens: floor });
+    expect(tight.matches).toEqual([]);
     expect(tight.compact).toEqual([]);
-    expect(tight.meta!.returned).toBe(0);
-    expect(tight.meta!.dropped).toBe(2);
+    expect(tight.next!.skip).toEqual([]);
+    expect(tight.next!.followups).toEqual([]);
     expect(tight.next!.must_read).toEqual([]);
-    expect(tight.next!.record).toContain("create_concept");
-    expect(tight.next!.record).toContain("informed_by");
+    expect(tight.meta!.cards).toBe(0);
+    expect(tight.meta!.returned).toBe(tight.candidates!.length);
+    expect(tight.meta!.reason).toBe("budget");
+    const visible = new Set((tight.candidates ?? []).map((candidate) => candidate.id));
+    expect(tight.meta!.dropped).toBe(["budget-decision", "wire-fact"].filter((id) => !visible.has(id)).length);
+    expect(tight.brief).toBe(renderDroppedText(tight.meta!));
+    expect(tight.next!.record).toBe(`${EMPTY_REASON_RECORD.budget} ${RECORD_FACT}`);
     expect(tight.meta!.truncated).toBe(true);
-    // Мера считается по той же wire-форме, что уходит по проводу (K-03),
-    // включая extra_payload обработчика и блок next.
-    expect(tight.meta!.tokens_estimated).toBe(
-      wireTokensOf({ ...tight, ...extra })
-    );
+    expect(tight.meta!.tokens_estimated).toBe(wireTokensOf({ ...tight, ...extra }));
+    expect(tight.meta!.tokens_estimated).toBeLessThanOrEqual(floor);
   });
 
   it("бюджет: followups режутся раньше must_read и record", async () => {
     seedSmallBudget();
-    const generous = await understand(db, { query: "хранит", top_k: 5, max_tokens: 2500 });
-    expect(generous.next!.followups.map((f) => f.tool)).toEqual(["check_artifacts"]);
+    // Isolate one qualified card so its optional followup, rather than
+    // another match's loss notice, is the only competing instruction.
+    db.updateNode("b-fact", { summary: "Посторонний измеренный результат без поискового маркера." });
+    const input = { query: "хранит", top_k: 5 };
+    const generous = await understand(db, { ...input, max_tokens: 2500 });
+    expect(generous.compact).toHaveLength(1);
+    expect(generous.next!.followups.map((followup) => followup.tool)).toEqual(["check_artifacts"]);
     expect(generous.next!.followups[0].args).toEqual({ node_ids: ["b-dec"] });
 
-    const tight = await understand(db, { query: "хранит", top_k: 5, max_tokens: 520 });
-    expect(tight.next!.followups).toEqual([]); // порезан
-    // must_read не резался: все ссылки узлов ответа на месте
-    expect(tight.next!.must_read.map((m) => m.ref)).toContain("src/bdec.ts:5-15");
-    expect(tight.next!.must_read.length).toBeGreaterThanOrEqual(1);
-    expect(tight.next!.record.length).toBeGreaterThan(0); // остался
+    const minimal = JSON.parse(JSON.stringify(generous)) as UnderstandOutput;
+    minimal.compact = minimal.compact!.map(({ summary: _summary, children: _children, edges: _edges, ...card }) => ({ ...card, name: "" }));
+    minimal.candidates = [];
+    minimal.meta = { ...minimal.meta!, returned: 0, cards: 1, dropped: 0, truncated: true };
+    minimal.next!.followups = [];
+    delete minimal.brief;
+    const cap = measureMcpPayload(minimal);
+    expect(cap).toBeLessThan(generous.meta!.tokens_estimated);
+    const tight = await understand(db, { ...input, max_tokens: cap });
+    expect(tight.compact).toHaveLength(1);
+    expect(tight.compact![0]).toMatchObject({ id: "b-dec", status: "active", epistemic_status: "open", status_scope: null, valid_until: null, file_refs: ["src/bdec.ts:5-15"] });
+    expect(tight.next!.followups).toEqual([]);
+    expect(tight.next!.must_read).toEqual(generous.next!.must_read);
+    expect(tight.next!.must_read.map((hint) => hint.ref)).toEqual(["src/bdec.ts:5-15"]);
+    expect(tight.next!.record).toBe(generous.next!.record);
+    expect(tight.meta!.cards).toBe(1);
+    expect(tight.meta!.dropped).toBe(0); // no discovery row does not hide the disclosed card
     expect(tight.meta!.truncated).toBe(true);
+    expect(tight.meta!.tokens_estimated).toBe(wireTokensOf(tight));
+    expect(tight.meta!.tokens_estimated).toBeLessThanOrEqual(cap);
   });
 
   it("full-режим тоже завершается блоком next", async () => {
