@@ -127,8 +127,9 @@ describe("understand compact mode budget", () => {
     expect(result.meta!.reason).toBeUndefined();
     expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
     expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(8000);
-    // Every compact node is trimmed to <=240 chars.
-    expect(result.compact!.every((m) => m.summary.length <= 240)).toBe(true);
+    // Every compact node is trimmed to <=240 chars; summary may be omitted
+    // entirely when squeezed, an absent field is not an overlong one.
+    expect(result.compact!.every((m) => String(m.summary ?? "").length <= 240)).toBe(true);
   });
 
   it("full mode returns legacy shape with why/children", async () => {
