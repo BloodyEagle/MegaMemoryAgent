@@ -640,6 +640,13 @@ export interface NextHintFollowup {
   why: string;
 }
 
+/** Process-local activity since the last logged write. */
+export interface TimelineActivity {
+  reads_since_write: number;
+  writes: number;
+  last_write_at: string | null;
+}
+
 /**
  * План 13 §2.1: контракт действия в конце ответа understand. must_read — до 3
  * ссылок из file_refs узлов ответа; skip — целые файлы, покрытые карточками;
