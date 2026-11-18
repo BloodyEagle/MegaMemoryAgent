@@ -625,7 +625,7 @@ export async function understand(
     if (activity && cached && cached.writes === activity.writes && cached.lastWriteAt === activity.last_write_at) {
       if (!cached.hasNodes) return "empty_base";
     } else {
-      const count = db.execSqlGet("SELECT COUNT(*) AS count FROM nodes WHERE removed_at IS NULL") as { count: number };
+      const [count] = db.execSqlAll("SELECT COUNT(*) AS count FROM nodes WHERE removed_at IS NULL") as Array<{ count: number }>;
       const hasNodes = count.count > 0;
       // Recheck after every logged write (including deletion); uncoupled API calls do not cache.
       if (activity) understandPresence.set(db, { hasNodes, writes: activity.writes, lastWriteAt: activity.last_write_at });
