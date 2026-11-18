@@ -315,7 +315,7 @@ export interface UnderstandOutput {
 export interface UnderstandInput {
   query: string;
   top_k?: number;
-  /** Token budget for the answer (default 1500). */
+  /** Token budget for the answer (default 4000). */
   max_tokens?: number;
   /**
    * compact (default): trimmed per-node payload under the token budget;

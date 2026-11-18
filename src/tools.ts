@@ -616,7 +616,9 @@ export async function understand(
   input: UnderstandInput
 ): Promise<UnderstandOutput> {
   const topK = input.top_k ?? 10;
-  const maxTokens = input.max_tokens ?? 1500;
+  // GAR recall measured 6103–7460 tokens for five full candidates; 1500
+  // left only one useful card. Explicit budgets still take precedence.
+  const maxTokens = input.max_tokens ?? 4000;
   const outputMode = input.mode ?? "compact";
   let activity: ReturnType<typeof timelineActivity>;
   let dataVersion: number | undefined;
