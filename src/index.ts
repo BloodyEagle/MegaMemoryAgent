@@ -260,10 +260,10 @@ async function startMcpServer() {
   );
   const { z } = await import("zod");
   const { openStartupDatabase, autoMigrateIfNeeded, describeAutoMigration, describeSchemaRepair } = await import("./auto-migrate.js");
-  const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, trailSave, trailSaveWithPassport, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
+  const { understand, getConcept, createConcept, updateConcept, link, removeConcept, listRoots, listConflicts, resolveConflict, formatError, measureMcpPayload, trailSave, trailSaveWithPassport, trailGet, trailRefresh, trailExtend, slotSet, slotGet, slotRelease, slotList, taskAdd, taskDone, board } =
     await import("./tools.js");
   const { provenanceTrace, provenanceAudit } = await import("./provenance.js");
-  const { branchConceptToolArgs, getConceptBatch, getConceptProfile, MAX_CONTEXT_EPOCH_LENGTH } = await import(
+  const { branchConceptToolArgs, getConceptBatch, getConceptProfile, MAX_CONTEXT_EPOCH_LENGTH, ORIENTATION_DEFAULT_TOKENS, EVIDENCE_DEFAULT_TOKENS, BATCH_DEFAULT_TOKENS } = await import(
     "./concept-profile.js"
   );
   const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
@@ -272,6 +272,27 @@ async function startMcpServer() {
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
+  type ConceptReadOutput = import("./types.js").NodeWithContext | import("./types.js").ConceptProfileOutput | import("./types.js").ConceptDeltaOutput | import("./types.js").ConceptBatchOutput;
+  const conceptRecordHint = {
+    record: "Узел уже есть — уточняй его через update_concept, а не создавай второй; опоры к решению — evidence в том же вызове.",
+  };
+  const rootsRecordHint = {
+    record: "Это обзор; итог работы по конкретной ветке — отдельный узел, а не правка корня.",
+  };
+
+  // Подсказка — только MCP-поле: ядро карточки и HTTP-форма остаются прежними.
+  function conceptReadPayload(result: ConceptReadOutput, maxTokens?: number): ConceptReadOutput & { hint?: typeof conceptRecordHint } {
+    const nonempty = "batch" in result ? result.batch.some(item => item.status === "ok") : !("unchanged" in result && result.unchanged);
+    const payload = nonempty ? { ...result, hint: conceptRecordHint } : result;
+    const profile = "meta" in result ? result.meta.profile : "profile" in result ? result.profile : "full";
+    const target = maxTokens ?? ("batch" in result ? BATCH_DEFAULT_TOKENS : profile === "orientation" ? ORIENTATION_DEFAULT_TOKENS : profile === "evidence" ? EVIDENCE_DEFAULT_TOKENS : undefined);
+    const tokens = measureMcpPayload(payload);
+    if (target !== undefined && tokens > target) {
+      throw Object.assign(new Error(`get_concept: max_tokens=${target} cannot fit the required response with hint (minimum ${tokens}).`), { meta: { reason: "budget" } });
+    }
+    if ("meta" in payload) payload.meta.tokens_estimated = tokens;
+    return payload;
+  }
 
   // ---- Configuration ----
   // MCP-режим, как и serve, законно создаёт базу при первой установке.
@@ -500,7 +521,7 @@ async function startMcpServer() {
 
   server.tool(
     "get_concept",
-    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry no digests by default; include_evidence: true attaches current_digests and support_evidence (all live supports, confirm-ready) per match. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12). E1/E2: a plain single-id call returns the same card as before. profile=evidence returns full wording, rationales and confirm_supports-ready digests (never a trimmed claim — what did not fit is marked incomplete with the next step); profile=orientation returns identity, qualification and pointers under the budget; profile=full is the legacy card. max_tokens bounds the final serialized MCP content envelope in ESTIMATED tokens, including all metadata, continuation tokens and delta/unchanged fields; if the required minimum cannot fit, the call explicitly refuses with meta.reason=budget. tokens_estimated is the estimator result, not a provider-token guarantee; neighbor disclosure is capped (max_neighbors) with continuation tokens; a continuation pins the sample version — changed data yields version_conflict and a full re-read. Batch: pass ids (up to 25) for one call with ONE shared budget — per-id status/error/incompleteness are always visible, an unresolved id never disappears silently, budget_skipped items list the continuation. E4 delta (opt-in only): pass context_epoch + known_versions {id: version from meta.version} — ONLY if the client still holds that exact text in its context; a version match of the REQUESTED PROJECTION (all substantial state: status, expiry, refs, rationale, supports, artifacts, selected neighbors, format — never just the summary) returns a compact {unchanged, version, epoch, qualification-minimum} answer; a mismatch returns the full card with meta.version. Nothing (or a new epoch) means full issuance. unchanged is NOT code coverage: read the current source section before editing. Old single-id calls without new parameters keep the exact previous response.",
+    "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry no digests by default; include_evidence: true attaches current_digests and support_evidence (all live supports, confirm-ready) per match. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12). E1/E2: a plain single-id call returns the same card as before. profile=evidence returns full wording, rationales and confirm_supports-ready digests (never a trimmed claim — what did not fit is marked incomplete with the next step); profile=orientation returns identity, qualification and pointers under the budget; profile=full is the legacy card. max_tokens bounds the final serialized MCP content envelope in ESTIMATED tokens, including all metadata, continuation tokens and delta/unchanged fields; if the required minimum cannot fit, the call explicitly refuses with meta.reason=budget. tokens_estimated is the estimator result, not a provider-token guarantee; neighbor disclosure is capped (max_neighbors) with continuation tokens; a continuation pins the sample version — changed data yields version_conflict and a full re-read. Batch: pass ids (up to 25) for one call with ONE shared budget — per-id status/error/incompleteness are always visible, an unresolved id never disappears silently, budget_skipped items list the continuation. E4 delta (opt-in only): pass context_epoch + known_versions {id: version from meta.version} — ONLY if the client still holds that exact text in its context; a version match of the REQUESTED PROJECTION (all substantial state: status, expiry, refs, rationale, supports, artifacts, selected neighbors, format — never just the summary) returns a compact {unchanged, version, epoch, qualification-minimum} answer; a mismatch returns the full card with meta.version. Nothing (or a new epoch) means full issuance. unchanged is NOT code coverage: read the current source section before editing. Old single-id calls without new parameters keep the same card; successful nonempty MCP reads add hint.record, absent for unchanged and budget refusals.",
     {
       id: z.string().optional().describe("Exact concept ID to look up (e.g., 'auth-module' or 'database-config'). Обязателен для одиночного вызова; с ids/continuation не смешивается"),
       ids: z.array(z.string()).max(25).optional().describe("Пакетное чтение (E2): до 25 id одним вызовом с ОДНИМ общим бюджетом max_tokens; каждый элемент несёт статус ok/error/budget_skipped и свою ошибку/неполноту — неразрешённый id не исчезает молча, ошибка одного не маскирует соседей. Продолжение — meta.continuation (передай только continuation без ids)"),
@@ -516,6 +537,7 @@ async function startMcpServer() {
         const mode = branchConceptToolArgs(params);
         if (mode.mode === "batch") {
           const result = getConceptBatch(db, mode.input);
+          const payload = conceptReadPayload(result, mode.input.max_tokens);
           const okIds = result.batch.filter((i) => i.status === "ok").map((i) => i.resolved_id ?? i.id);
           timeline.log({
             tool: "get_concept",
@@ -525,10 +547,11 @@ async function startMcpServer() {
             is_error: false,
             affected_ids: okIds,
           });
-          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
         }
         if (mode.mode === "profile") {
           const result = getConceptProfile(db, mode.input);
+          const payload = conceptReadPayload(result, mode.input.max_tokens);
           const resolvedId =
             "id" in result ? result.id : mode.input.id;
           const deltaUnchanged =
@@ -545,9 +568,10 @@ async function startMcpServer() {
             is_error: false,
             affected_ids: resolvedId ? [resolvedId] : [],
           });
-          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
         }
         const result = getConcept(db, { id: mode.id });
+        const payload = conceptReadPayload(result);
         timeline.log({
           tool: "get_concept",
           params: { id: mode.id },
@@ -556,7 +580,7 @@ async function startMcpServer() {
           is_error: false,
           affected_ids: [result.id],
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
       } catch (err) {
         timeline.log({
           tool: "get_concept",
@@ -784,8 +808,17 @@ async function startMcpServer() {
         // 2.1.13 F3: бюджет считается по сериализованному ответу вместе с
         // тем, что обработчик добавляет сам (instructions_status, stats) —
         // оценка listRoots и фактическая выдача MCP не расходятся.
-        const extra = { ...instructionsStatus(VERSION), stats: db.getStats() };
+        const stats = db.getStats();
+        const extra = { ...instructionsStatus(VERSION), stats, ...(stats.nodes > 0 ? { hint: rootsRecordHint } : {}) };
         const result = listRoots(db, { max_tokens: params.max_tokens, extra_payload: extra });
+        const nonempty = !!(result.roots_compact?.length || result.slots?.length || result.board_top?.length);
+        const hinted = nonempty ? { ...result, ...extra } : { ...result, ...instructionsStatus(VERSION), stats };
+        const tokens = measureMcpPayload(hinted);
+        const target = params.max_tokens ?? 1500;
+        if (tokens > target) {
+          throw new Error(`list_roots: max_tokens=${target} cannot fit the required response with hint (minimum ${tokens}).`);
+        }
+        const payload = { ...hinted, meta: { ...hinted.meta, tokens_estimated: tokens } };
         const returned = result.meta?.returned ?? result.roots.length;
         timeline.log({
           tool: "list_roots",
@@ -801,7 +834,7 @@ async function startMcpServer() {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({ ...result, ...extra }, null, 2),
+              text: JSON.stringify(payload, null, 2),
             },
           ],
         };
