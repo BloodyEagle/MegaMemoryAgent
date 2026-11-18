@@ -27,7 +27,7 @@ import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
-import { understand } from "../tools.js";
+import { getConcept, understand } from "../tools.js";
 import {
   TASK_KINDS,
   isTestRef,
@@ -407,24 +407,32 @@ describe("P3: совместимость и границы", () => {
 
   it("expired-узел по умолчанию исключён; с include_stale в задаче остаётся квалифицированным", async () => {
     goldFixture();
-    const excluded = (await understand(db, {
+    // Настоящий тип ответа (UnderstandOutput из types.js) — без inline-приведения:
+    // отдельный тип в тесте дрейфует от кода молча.
+    const excluded = await understand(db, {
       query: GOLD_QUERY,
       mode: "compact",
       max_tokens: 4000,
       task: { goal: "объяснить", kind: "explain_decision" },
-    })) as unknown as { compact?: Array<{ id: string }>; meta?: { stale_excluded?: number } };
+    });
     expect((excluded.compact ?? []).some((c) => c.id === "expired-note")).toBe(false);
     expect(excluded.meta?.stale_excluded).toBeGreaterThan(0);
 
-    const included = (await understand(db, {
+    const included = await understand(db, {
       query: GOLD_QUERY,
       mode: "compact",
       max_tokens: 6000,
       include_stale: true,
       task: { goal: "объяснить", kind: "explain_decision", context_epoch: "expired-epoch" },
-    })) as unknown as { compact?: Array<{ id: string; expired?: boolean }>; task_context?: { served_earlier: Array<{ id: string }> } };
+    });
     const expiredCard = (included.compact ?? []).find((c) => c.id === "expired-note");
-    expect(expiredCard?.expired).toBe(true);
+    // Четвёртая карточка не выдаётся (CARDS_MAX=3): совпадение остаётся
+    // в candidates, его id разрешается через get_concept — покрытие
+    // достижимости сохраняется на новой глубине.
+    expect((included.candidates ?? []).some((c) => c.id === "expired-note")).toBe(true);
+    const resolved = getConcept(db, { id: "expired-note" });
+    expect(resolved.id).toBe("expired-note");
+    expect(resolved.valid_until).toBeTruthy();
     // Повторное включение в эпохе не сворачивает карточку с квалификациейexpired
     // без явного нового решения — служебная сверка остаётся видимой.
     await understand(db, {
@@ -434,14 +442,14 @@ describe("P3: совместимость и границы", () => {
       include_stale: true,
       task: { goal: "объяснить", kind: "explain_decision", context_epoch: "expired-epoch" },
     });
-    const again = (await understand(db, {
+    const again = await understand(db, {
       query: GOLD_QUERY,
       mode: "compact",
       max_tokens: 6000,
       include_stale: true,
       task: { goal: "объяснить", kind: "explain_decision", context_epoch: "expired-epoch" },
-    })) as unknown as { compact?: Array<{ id: string; expired?: boolean }>; task_context?: { served_earlier: Array<{ id: string }> } };
-    expect((again.compact ?? []).some((c) => c.id === "expired-note")).toBe(true);
+    });
+    expect((again.candidates ?? []).some((c) => c.id === "expired-note")).toBe(true);
     expect(again.task_context?.served_earlier.some((s) => s.id === "expired-note")).toBe(false);
   });
 });

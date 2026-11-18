@@ -9,8 +9,8 @@ import { closeAndCleanup } from "./helpers/cleanup.js";
 
 // D0 (план 20+21 v3 §9): убрать навигационный шум без миграции опор.
 //
-// Opt-in режим (collapse_ref_anchors: true, default off) уменьшает долю
-// технических ref-якорей на верхнем уровне compact-выдачи:
+// По умолчанию compact сворачивает технические ref-якоря; explicit false
+// сохраняет прежнюю форму, а path-запрос с диапазоном отключает default collapse:
 // - Технический якорь определяется по происхождению И текущей структуре
 //   (created_via='file_ref' + шаблонное саммари + имя = file_refs[0] — путь):
 //   отредактированная осмысленная карточка не прячется из-за старого
@@ -20,8 +20,9 @@ import { closeAndCleanup } from "./helpers/cleanup.js";
 //   informed_by_incoming).
 // - Прямой запрос по id (get_concept) разрешает опору во всех режимах —
 //   D0 не ломает resolution.
-// - Если найдены только якоря — не ложный no-match: collapsed-локаторы
-//   остаются содержимым ответа.
+// - Если найдены только якоря — не ложный no-match: хотя бы один остаётся
+//   квалифицированной compact-карточкой, остальные доступны через anchors
+//   и discovery.
 // - Счётчики честные: meta.anchor_collapsed; физические числа stats не
 //   подменяются числом показанных карточек.
 // - БД не меняется: состояние выводится из существующих данных (без
@@ -94,7 +95,7 @@ function insertFoldFixture(): void {
 }
 
 /** Сценарий 2: якоря в выдаче без своих зависимых решений (+ якорь-сирота). */
-function insertCollapsedFixture(): void {
+function insertCollapsedFixture(withMatchingClaim = true): void {
   db.insertNode({
     id: "dec-offtopic",
     name: "dec-offtopic",
@@ -105,12 +106,22 @@ function insertCollapsedFixture(): void {
   link(db, { from: "dec-offtopic", to: "anchor-retry", relation: "informed_by", description: RATIONALE });
   // Якорь без зависимых выводов.
   insertAnchor("anchor-orphan", "src/anchors/orphan.ts");
+  // Осмысленная карточка отделяет collapse-сценарий от anchor-only fallback.
+  // Своё зависимое решение по-прежнему не совпадает с ANCHORS_QUERY.
+  if (withMatchingClaim) {
+    db.insertNode({
+      id: "fact-anchor-index",
+      name: "fact-anchor-index",
+      kind: "feature",
+      summary: "The anchors index lists source locations without proving their claims.",
+    });
+  }
 }
 
-describe("D0: без флага — прежняя выдача", () => {
+describe("D0: collapse_ref_anchors: false — прежняя выдача", () => {
   it("якорь не свёрнут: обычная вложенная опора или карточка, секции anchors нет", async () => {
     insertFoldFixture();
-    const result = await understand(db, { query: QUERY });
+    const result = await understand(db, { query: QUERY, collapse_ref_anchors: false });
     // прежнее поведение: якорь и решение в одной выдаче вкладываются (2.1.7 F2)
     const dec = result.compact!.find((m) => m.id === "dec-retry");
     const asCard = result.compact!.some((m) => m.id === "anchor-retry");
@@ -126,10 +137,10 @@ describe("D0: без флага — прежняя выдача", () => {
   });
 });
 
-describe("D0: collapse_ref_anchors: true — верхний уровень без технических якорей", () => {
-  it("якорь с зависимым выводом в выдаче вкладывается в решение: компактно, с rationale, без шаблонного саммари", async () => {
+describe("D0: default collapse и explicit true — верхний уровень без технических якорей", () => {
+  it("по умолчанию якорь с зависимым выводом вкладывается в решение: компактно, с rationale, без шаблонного саммари", async () => {
     insertFoldFixture();
-    const result = await understand(db, { query: QUERY, collapse_ref_anchors: true });
+    const result = await understand(db, { query: QUERY });
     const dec = result.compact!.find((m) => m.id === "dec-retry")!;
     expect(dec).toBeDefined();
     const folded = dec.supports?.find((s) => s.id === "anchor-retry");
@@ -156,7 +167,9 @@ describe("D0: collapse_ref_anchors: true — верхний уровень бе�
       query: ANCHORS_QUERY,
       collapse_ref_anchors: true,
     });
-    // решение не совпало с запросом — в выдаче только якоря
+    // Зависимое решение не совпало с запросом; осмысленная карточка индекса
+    // оставляет якоря в collapsed-проекции, а не в anchor-only fallback.
+    expect(result.compact!.some((m) => m.id === "fact-anchor-index")).toBe(true);
     expect(result.compact!.some((m) => m.id === "dec-offtopic")).toBe(false);
     expect(result.compact!.some((m) => m.id === "anchor-retry")).toBe(false);
     const collapsed = result.anchors?.find((a) => a.id === "anchor-retry");
@@ -168,42 +181,69 @@ describe("D0: collapse_ref_anchors: true — верхний уровень бе�
       { from: "dec-offtopic", from_name: "dec-offtopic", rationale: RATIONALE },
     ]);
     // якорь-сирота — collapsed-локатор без блока зависимых
-    expect(result.anchors?.some((a) => a.id === "anchor-orphan")).toBe(true);
+    const orphan = result.anchors?.find((a) => a.id === "anchor-orphan");
+    expect(orphan).toBeDefined();
+    expect(orphan!.collapsed_anchor).toBe(true);
+    expect(orphan!.file_refs).toEqual(["src/anchors/orphan.ts"]);
+    expect(orphan!.informed_by_incoming ?? []).toHaveLength(0);
     expect(result.meta!.anchor_collapsed).toBe(2);
   });
 
-  it("только якоря в выдаче — не ложный no-match: collapsed-локаторы возвращаются, reason не budget", async () => {
-    insertCollapsedFixture();
+  it("только якоря — квалифицированная compact-карточка для UI и локаторы, не ложный no-match", async () => {
+    insertCollapsedFixture(false);
     const result = await understand(db, { query: ANCHORS_QUERY, collapse_ref_anchors: true });
-    expect(result.compact ?? []).toHaveLength(0);
-    expect(result.anchors!.length).toBe(2);
-    expect(result.meta!.anchor_collapsed).toBe(2);
-    // есть содержимое — причина «budget» не ставится
+    expect(result.compact!.length).toBeGreaterThan(0);
+    expect(result.compact!.length).toBeLessThanOrEqual(3);
+    for (const card of result.compact!) {
+      const node = db.getNode(card.id)!;
+      expect(card.name).toBe(node.name);
+      expect(card.summary).toBeTruthy();
+      expect(card.status).toBe("active");
+      expect(card.epistemic_status).toBe("open");
+      expect(card.file_refs).toEqual(JSON.parse(node.file_refs!));
+    }
+    const visibleIds = new Set([
+      ...result.candidates!.map((candidate) => candidate.id),
+      ...result.compact!.map((card) => card.id),
+      ...(result.anchors ?? []).map((anchor) => anchor.id),
+    ]);
+    expect([...visibleIds].sort()).toEqual(["anchor-orphan", "anchor-retry"]);
+    expect(result.meta!.cards).toBe(result.compact!.length);
+    expect(result.meta!.returned).toBe(result.candidates!.length);
+    expect(result.meta!.anchor_collapsed).toBe((result.anchors ?? []).length);
+    expect(result.meta!.dropped).toBe(0);
     expect(result.meta!.reason).toBeUndefined();
   });
 
-  it("якорь-сирота без зависимых выводов — компактный локатор, не исчезает", async () => {
-    insertCollapsedFixture();
+  it("якорь-сирота без зависимых выводов — самостоятельная квалифицированная карточка, не исчезает", async () => {
+    insertCollapsedFixture(false);
     const result = await understand(db, {
       query: "orphan.ts",
-      collapse_ref_anchors: true,
       top_k: 10,
     });
-    // результат не пуст и не «no-match»: локатор остаётся полезным
-    expect(result.anchors?.some((a) => a.id === "anchor-orphan")).toBe(true);
-    const orphan = result.anchors!.find((a) => a.id === "anchor-orphan")!;
-    expect(orphan.collapsed_anchor).toBe(true);
-    expect(orphan.file_refs).toEqual(["src/anchors/orphan.ts"]);
-    expect(orphan.informed_by_incoming ?? []).toHaveLength(0);
-    expect(result.meta!.anchor_collapsed).toBe(1);
+    // Bare path не включает range-only исключение из default collapse;
+    // карточку сохраняет anchor-only guarantee, а не путь запроса.
+    const orphan = result.compact!.find((a) => a.id === "anchor-orphan");
+    expect(orphan).toBeDefined();
+    expect(orphan!.name).toBe("src/anchors/orphan.ts");
+    expect(orphan!.summary).toContain("src/anchors/orphan.ts");
+    expect(orphan!.status).toBe("active");
+    expect(orphan!.epistemic_status).toBe("open");
+    expect(orphan!.file_refs).toEqual(["src/anchors/orphan.ts"]);
+    expect(orphan!.edges ?? []).toHaveLength(0);
+    expect(getConcept(db, { id: orphan!.id }).incoming_edges).toHaveLength(0);
+    expect(result.meta!.cards).toBe(1);
+    expect(result.meta!.anchor_collapsed).toBe(0);
+    expect(result.meta!.reason).toBeUndefined();
   });
 
   it("союз идентификаторов до и после collapse сохраняется — знание не теряется", async () => {
     insertFoldFixture();
-    const before = await understand(db, { query: QUERY });
+    const before = await understand(db, { query: QUERY, collapse_ref_anchors: false });
     const after = await understand(db, { query: QUERY, collapse_ref_anchors: true });
     const unionOf = (r: Awaited<ReturnType<typeof understand>>) => {
       const ids = new Set<string>();
+      for (const candidate of r.candidates ?? []) ids.add(candidate.id);
       for (const m of r.compact ?? []) {
         ids.add(m.id);
         for (const s of m.supports ?? []) ids.add(s.id);
@@ -242,7 +282,7 @@ describe("D0: collapse_ref_anchors: true — верхний уровень бе�
     const result = await understand(db, { query: ANCHORS_QUERY, collapse_ref_anchors: true });
     expect(result.meta!.anchor_collapsed).toBe((result.anchors ?? []).length);
     // физическое число узлов в базе включает якоря независимо от выдачи
-    expect(db.getStats().nodes).toBe(3);
+    expect(db.getStats().nodes).toBe(4);
   });
 
   it("resolution по id работает во всех режимах: get_concept находит якорь до и после collapse", async () => {
@@ -261,6 +301,14 @@ describe("D0: collapse_ref_anchors: true — верхний уровень бе�
       summary: "decision: единый кэш ускоряет сборку маркировка",
     });
     insertAnchor("anchor-cyr", "docs/отчёт-архитектуры.md");
+    // Осмысленный совпадающий индекс удерживает именно collapsed-проекцию,
+    // чтобы проверить кириллические refs и входящий rationale без fallback.
+    db.insertNode({
+      id: "fact-cyr-index",
+      name: "fact-cyr-index",
+      kind: "feature",
+      summary: "Индекс отчёт-архитектуры связывает документы с проверенными выводами.",
+    });
     link(db, {
       from: "dec-cyr",
       to: "anchor-cyr",
@@ -272,6 +320,7 @@ describe("D0: collapse_ref_anchors: true — верхний уровень бе�
       collapse_ref_anchors: true,
     });
     expect(result.compact!.some((m) => m.id === "dec-cyr")).toBe(false);
+    expect(result.compact!.some((m) => m.id === "fact-cyr-index")).toBe(true);
     const collapsed = result.anchors?.find((a) => a.id === "anchor-cyr");
     expect(collapsed).toBeDefined();
     expect(collapsed!.name).toBe("docs/отчёт-архитектуры.md");

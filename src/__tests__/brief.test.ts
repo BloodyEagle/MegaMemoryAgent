@@ -245,23 +245,23 @@ describe("План 13 §2.2: режим brief в understand", () => {
     expect(generous.next.record).toContain("create_concept kind=decision");
   });
 
-  it("дефолтный режим не изменился: без mode ответ — compact-форма с next", async () => {
+  it("без mode ответ — tiered compact, а не текстовый brief", async () => {
     seedBudget();
     const out = await understand(db, { query: "ответа wire", top_k: 5, max_tokens: 2500 });
-    expect(Object.keys(out)).toEqual([
-      "matches",
-      "compact",
-      "refuted",
-      "edges_between",
-      "meta",
-      "next",
-    ]);
-    expect("brief" in out).toBe(false);
+    expect(Object.keys(out).filter((key) => key !== "brief").sort()).toEqual([
+      "matches", "compact", "candidates", "anchors", "refuted", "edges_between", "meta", "next",
+    ].sort());
+    if ((out.meta?.dropped ?? 0) > 0) expect(out.brief).toEqual(expect.any(String));
+    else expect(out).not.toHaveProperty("brief");
     expect(out.matches).toEqual([]);
     expect(out.compact).toHaveLength(1);
     expect(out.compact![0].id).toBe("budget-decision");
     expect(typeof out.compact![0].summary).toBe("string");
-    expect(out.meta!.returned).toBe(1);
+    expect(out.compact![0].supports?.map((support) => support.id)).toEqual(["wire-fact"]);
+    expect(out.candidates?.map((candidate) => candidate.id).sort()).toEqual(["budget-decision", "wire-fact"]);
+    expect(out.meta!.returned).toBe(2);
+    expect(out.meta!.cards).toBe(1);
+    expect(out.meta!.dropped).toBe(0);
     expect(out.next!.record).toContain("запиши решение");
     // Мера compact-формы по-прежнему сходится с wire-формой (K-03).
     expect(out.meta!.tokens_estimated).toBe(wireTokensOf(out));

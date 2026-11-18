@@ -26,8 +26,10 @@ import { closeAndCleanup } from "./helpers/cleanup.js";
 //   get_concept (M3-1) — клиент не вычисляет хеши сам.
 // - Криптографические значения в подтверждаемой форме не сокращаются до
 //   display-префиксов.
-// - Бюджет: матч с доказательствами размещается целиком или снимается целиком —
-//   частичный набор доказательств не выдаётся; усечение честно в meta.
+// - Бюджет: карточка с доказательствами размещается целиком или снимается
+//   целиком; discovery-кандидат без evidence-карточки не является доказательством.
+//   Частичный набор доказательств не выдаётся; усечение честно в meta,
+//   а dropped считает только полностью скрытые узлы.
 //   Доказательства тяжёлые (полные hex-дайджесты опор), поэтому fixture-тесты
 //   флага явно поднимают max_tokens.
 
@@ -268,12 +270,40 @@ describe("E3: include_evidence: true — подтверждаемые верси
     if (filler) expect(filler.support_evidence).toEqual([]);
   });
 
-  it("бюджет: матч с доказательствами снимается ЦЕЛИКОМ — частичных наборов не выдаётся", async () => {
+  it("бюджет: evidence-карточка снимается ЦЕЛИКОМ, discovery-кандидат не является доказательством", async () => {
     insertFixture();
-    // Бюджет = размеру ответа БЕЗ доказательств: решение с ними в него уже
-    // не помещается, а дешёвая карточка (под опоры без опор) — помещается.
-    const plain = await understand(db, { query: QUERY });
-    const tight = plain.meta!.tokens_estimated;
+    // Порог измеряется по реальной форме: filler evidence-карточка и весь
+    // discovery должны помещаться, причём discovery занимает не более 25%.
+    const rich = await understand(db, {
+      query: QUERY,
+      include_evidence: true,
+      max_tokens: EVIDENCE_BUDGET,
+    });
+    const richDecision = rich.compact!.find((m) => m.id === "dec-refresh");
+    const richFiller = rich.compact!.find((m) => m.id === "fact-filler");
+    expect(richDecision).toBeDefined();
+    expect(richFiller).toBeDefined();
+    expect(rich.candidates!.map((candidate) => candidate.id).sort()).toEqual(["dec-refresh", "fact-filler"]);
+    const discoveryTokens =
+      measureMcpPayload({ candidates: rich.candidates }) - measureMcpPayload({ candidates: [] });
+    const fillerPayload = {
+      ...rich,
+      compact: [richFiller!],
+      edges_between: [],
+      meta: { ...rich.meta!, cards: 1, evidence_matches: 1, evidence_supports: 0, dropped: 0 },
+      next: { ...rich.next!, followups: [] },
+    };
+    const tight = Math.max(measureMcpPayload(fillerPayload), discoveryTokens * 4);
+    expect(measureMcpPayload(fillerPayload)).toBeLessThanOrEqual(tight);
+    expect(discoveryTokens).toBeLessThanOrEqual(Math.floor(tight / 4));
+    // Даже обязательное evidence-ядро решения без display-полей дороже
+    // tight: отсутствие полной карточки ниже не допускает частичный proof.
+    expect(measureMcpPayload({
+      compact: [{
+        current_digests: richDecision!.current_digests,
+        support_evidence: richDecision!.support_evidence,
+      }],
+    })).toBeGreaterThan(tight);
     const result = await understand(db, {
       query: QUERY,
       include_evidence: true,
@@ -287,8 +317,21 @@ describe("E3: include_evidence: true — подтверждаемые верси
     const filler = result.compact!.find((m) => m.id === "fact-filler");
     expect(filler).toBeDefined();
     expect(filler!.support_evidence).toEqual([]);
+    expect(filler!.current_digests!.claim).toBe(claimDigestOf(FILLER_SUMMARY));
+    // Решение остаётся locator-only кандидатом: подтверждать его этим нельзя.
+    const candidate = result.candidates!.find((m) => m.id === "dec-refresh");
+    expect(candidate).toBeDefined();
+    expect(candidate).not.toHaveProperty("current_digests");
+    expect(candidate).not.toHaveProperty("support_evidence");
+    expect(result.meta!.returned).toBe(result.candidates!.length);
+    expect(result.meta!.cards).toBe(result.compact!.length);
+    expect(result.meta!.evidence_matches).toBe(1);
+    expect(result.meta!.evidence_supports).toBe(0);
     expect(result.meta!.truncated).toBe(true);
-    expect(result.meta!.dropped).toBeGreaterThan(0);
+    // Candidate-only — не wholly hidden: снятие карточки не увеличивает dropped.
+    expect(result.meta!.dropped).toBe(0);
+    expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(tight);
   });
 
   it("токены с флагом измеряются по фактической wire-форме и больше ответа без флага", async () => {
