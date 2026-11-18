@@ -609,7 +609,7 @@ function liveEvidenceSupports(db: KnowledgeDB, node: NodeRow): ConceptEvidenceSu
     .map((x) => evidenceSupportOf(db, x.row, x.edge.description ?? null));
 }
 
-const understandPresence = new WeakMap<KnowledgeDB, { hasNodes: boolean; writes: number; lastWriteAt: string | null }>();
+const understandPresence = new WeakMap<KnowledgeDB, { hasNodes: boolean; writes: number; lastWriteAt: string | null; dataVersion: number }>();
 
 export async function understand(
   db: KnowledgeDB,
@@ -618,17 +618,19 @@ export async function understand(
   const topK = input.top_k ?? 10;
   const maxTokens = input.max_tokens ?? 1500;
   const outputMode = input.mode ?? "compact";
-  const activity = timelineActivity(db);
+  let activity: ReturnType<typeof timelineActivity>;
+  let dataVersion: number | undefined;
   const emptyReason = (hasContent: boolean, hadCandidates: boolean): UnderstandMeta["reason"] => {
     if (hasContent) return undefined;
+    dataVersion ??= (db.execSqlFirst("PRAGMA data_version") as { data_version: number }).data_version;
     const cached = understandPresence.get(db);
-    if (activity && cached && cached.writes === activity.writes && cached.lastWriteAt === activity.last_write_at) {
+    if (activity && cached && cached.writes === activity.writes && cached.lastWriteAt === activity.last_write_at && cached.dataVersion === dataVersion) {
       if (!cached.hasNodes) return "empty_base";
     } else {
       const [count] = db.execSqlAll("SELECT COUNT(*) AS count FROM nodes WHERE removed_at IS NULL") as Array<{ count: number }>;
       const hasNodes = count.count > 0;
-      // Recheck after every logged write (including deletion); uncoupled API calls do not cache.
-      if (activity) understandPresence.set(db, { hasNodes, writes: activity.writes, lastWriteAt: activity.last_write_at });
+      // Logger writes and commits from another connection both invalidate presence.
+      if (activity) understandPresence.set(db, { hasNodes, writes: activity.writes, lastWriteAt: activity.last_write_at, dataVersion });
       if (!hasNodes) return "empty_base";
     }
     return hadCandidates ? "budget" : "no_match";
@@ -697,6 +699,7 @@ export async function understand(
     topMatches = basicSearch(db, input.query, searchPool);
   }
 
+  activity = timelineActivity(db);
   // T4 will filter superseded/deprecated here unless include_inactive.
 
   // Resolve nodes once, in rank order. T4: superseded/deprecated nodes are
@@ -986,11 +989,13 @@ export async function understand(
         ...(input.reuse.negative !== undefined ? { negative: input.reuse.negative } : {}),
       })
     : undefined;
+  activity = timelineActivity(db);
 
   // P3: секция контекста под задачу — строится ПОСЛЕ размещения и снятия
   // повторов (см. ниже); объявления здесь, чтобы бюджетная мера buildPayload
   // видела добавку на общих основаниях (K-03).
   let taskContextView: TaskContextView | null = null;
+  let taskServedEarlier: TaskContextView["served_earlier"] = [];
 
   const edgesFor = (list: Array<{ id: string }>) =>
     list.length >= 2
@@ -1094,7 +1099,7 @@ export async function understand(
     );
 
   const compactEmptyReason = (refutedList = refutedShown): UnderstandMeta["reason"] => emptyReason(
-    displayList().length > 0 || refutedList.length > 0 || collapsedAnchors.length > 0,
+    displayList().length > 0 || refutedList.length > 0 || collapsedAnchors.length > 0 || taskServedEarlier.length > 0,
     eligible.length > 0 || anchorEligible.length > 0 || refutedAll.length > 0
   );
 
@@ -1400,7 +1405,6 @@ export async function understand(
   // причины refuted и неполнота не убираются никогда. Повторы эпохи — только
   // с ЯВНО переданным context_epoch клиента.
   let taskDuplicates: TaskContextView["duplicates_dropped"] = [];
-  let taskServedEarlier: TaskContextView["served_earlier"] = [];
   if (taskPlan) {
     const dedup = dedupeTaskDuplicates(db, compact);
     const epoch = applyTaskEpoch(db, taskPlan, compact);

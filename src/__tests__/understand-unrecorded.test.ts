@@ -4,7 +4,8 @@ import { ensureSchema } from "../migrate-schema.js";
 import { createConcept, measureMcpPayload, understand } from "../tools.js";
 import { RECORD_FACT, UNRECORDED_READS_THRESHOLD } from "../next-hints.js";
 import { createTimelineLogger, type TimelineLogger } from "../timeline.js";
-import { addNode, auditFixture, type AuditFixture } from "./helpers/audit.js";
+import { addNode, auditFixture, deferred, type AuditFixture } from "./helpers/audit.js";
+import * as search from "../search.js";
 
 let fixture: AuditFixture;
 let db: KnowledgeDB;
@@ -21,6 +22,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   await fixture.close();
 });
@@ -83,6 +85,26 @@ describe("understand unrecorded nudge", () => {
       expect(out.next!.unrecorded?.reads_since_write).toBe(UNRECORDED_READS_THRESHOLD);
       expect(out.meta!.tokens_estimated).toBe(measureMcpPayload(out));
     }
+  });
+
+  it("uses activity after a concurrent write completes during search", async () => {
+    reads(UNRECORDED_READS_THRESHOLD);
+    vi.stubEnv("MEGAMEMORY_SEARCH", "hybrid");
+    const started = deferred();
+    const resume = deferred();
+    const original = search.hybridSearch;
+    vi.spyOn(search, "hybridSearch").mockImplementation(async (...args) => {
+      started.resolve();
+      await resume.promise;
+      return original(...args);
+    });
+    const pending = understand(db, { query: "Activity" });
+    await started.promise;
+    logger.log({ tool: "create_concept", params: {}, result_summary: "created concurrently", is_write: true, is_error: false, affected_ids: [] });
+    resume.resolve();
+    const out = await pending;
+    expect(out.next).not.toHaveProperty("unrecorded");
+    expect(out.next!.record).toBe(RECORD_FACT);
   });
 
   it("preserves the complete record and nudge at max_tokens=500", async () => {

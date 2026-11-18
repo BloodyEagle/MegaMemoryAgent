@@ -101,6 +101,27 @@ describe("understand empty reasons", () => {
     expect(countReads.mock.calls.filter(([sql]) => sql.includes("COUNT(*) AS count FROM nodes"))).toHaveLength(2);
   });
 
+  it("rechecks cached presence after a write from another connection", async () => {
+    expect((await understand(db, { query: "zzmissingzz" })).meta!.reason).toBe("empty_base");
+    const other = fixture.db("knowledge.db");
+    addNode(other, "external", { summary: "External connection writes a concrete stored analysis result." });
+    expect((await understand(db, { query: "zzmissingzz" })).meta!.reason).toBe("no_match");
+    other.softDeleteNode("external", "removed externally");
+    expect((await understand(db, { query: "zzmissingzz" })).meta!.reason).toBe("empty_base");
+  });
+
+  it("does not call already-served task content a budget exclusion", async () => {
+    seedBudget();
+    const input = { query: "Budget", max_tokens: 20000, task: { kind: "find_definition" as const, goal: "Locate the stored fixture", context_epoch: "repeat-epoch" } };
+    expect((await understand(db, input)).compact!.length).toBeGreaterThan(0);
+    const repeat = await understand(db, input);
+    expect(repeat.compact).toEqual([]);
+    expect(repeat.task_context!.served_earlier.length).toBeGreaterThan(0);
+    expect(repeat.meta).not.toHaveProperty("reason");
+    expect(repeat.next!.record).toBe(RECORD_FACT);
+    expect(repeat.meta!.tokens_estimated).toBe(measureMcpPayload(repeat));
+  });
+
   it("suppresses the unrecorded reminder on an empty base even above threshold", async () => {
     for (let i = 0; i <= UNRECORDED_READS_THRESHOLD; i++) {
       logger.log({ tool: "understand", params: {}, result_summary: "empty", is_write: false, is_error: false, affected_ids: [] });
