@@ -352,8 +352,9 @@ export interface UnderstandInput {
    */
   include_evidence?: boolean;
   /**
-   * D0 (план 20+21 v3 §9): opt-in режим уменьшения доли технических
-   * ref-якорей на верхнем уровне compact-выдачи. Технический якорь — по
+   * D0: технические ref-якоря сворачиваются по умолчанию в compact.
+   * Явный false сохраняет отдельные карточки; запрос-путь сохраняет локатор.
+   * Технический якорь — по
    * происхождению И текущей структуре (created_via='file_ref' + шаблонное
    * саммари + имя = file_refs[0]); отредактированная осмысленная карточка не
    * прячется. Якорь с найденным зависимым выводом показывается компактно
@@ -514,16 +515,32 @@ export interface CompactMatch {
   support_evidence?: ConceptEvidenceSupport[];
 }
 
+/** Wire card may omit optional display text under budget pressure. */
+export type CompactCardView = Omit<CompactMatch, "summary"> & { summary?: string };
+
+/** Lightweight discovery entry; the exact id resolves through get_concept. */
+export interface UnderstandCandidate {
+  id: string;
+  name: string;
+  kind: NodeKind;
+  via?: "vector" | "fts" | "both";
+  score: number;
+  summary_short?: string;
+  epistemic_status?: string | null;
+}
+
 export interface UnderstandMeta {
+  /** Compact: visible candidates; full/brief retain their legacy count. */
   returned: number;
+  /** Compact cards, not candidate-only matches. */
+  cards?: number;
   dropped: number;
   tokens_estimated: number;
   /** U6: what the full-mode answer would have cost — drives "saved vs full". */
   estimated_full_tokens?: number;
   /**
-   * 2.1.7 F2: how many nodes were folded under their decisions instead of
-   * sitting on the top level. `returned` counts the top level only; the id
-   * set of the answer is preserved — folded nodes travel nested.
+   * 2.1.7 F2: nodes folded under their decisions; compact returned now
+   * counts discovery entries, while cards counts the top-level disclosure.
    */
   supports_inlined?: number;
   /**
@@ -560,11 +577,15 @@ export interface UnderstandMeta {
 
 export interface UnderstandOutput {
   matches: NodeWithContext[];
+  /** Compact discovery list; candidate-only entries are not dropped. */
+  candidates?: UnderstandCandidate[];
+  /** Text describing wholly hidden matches, absent when dropped is zero. */
+  brief?: string;
   /**
    * compact-mode rows (default mode). Present alongside `matches` being
    * empty/legacy for backward compatibility with older consumers.
    */
-  compact?: CompactMatch[];
+  compact?: CompactCardView[];
   /**
    * Plan 1 §5.3: refuted nodes found by the query, always returned regardless
    * of include_inactive — antiknowledge must not disappear behind a filter.
@@ -577,9 +598,9 @@ export interface UnderstandOutput {
    */
   edges_between?: Array<{ from: string; to: string; relation: string }>;
   /**
-   * D0 (collapse_ref_anchors: true): свёрнутые технические ref-якоря —
-   * компактные локаторы вместо карточек с шаблонным саммари. Только opt-in;
-   * без флага секции нет.
+   * D0: свёрнутые технические ref-якоря — компактные локаторы вместо
+   * карточек с шаблонным саммари. Включено по умолчанию в compact;
+   * явный collapse_ref_anchors=false отключает секцию.
    */
   anchors?: CollapsedAnchorView[];
   /**

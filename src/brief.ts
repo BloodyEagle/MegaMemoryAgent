@@ -1,5 +1,5 @@
 import { pluralRu } from "./next-hints.js";
-import type { NextHints } from "./types.js";
+import type { NextHints, UnderstandMeta } from "./types.js";
 
 // ---- План 13 §2.2: режим brief в understand ----
 //
@@ -21,6 +21,12 @@ import type { NextHints } from "./types.js";
  * next при этом несёт пустые списки и форму записи.
  */
 export const BRIEF_EMPTY_TEXT = "По запросу ничего не нашлось.";
+
+/** Report wholly hidden matches, not the difference between candidates and cards. */
+export function renderDroppedText(meta: Pick<UnderstandMeta, "returned" | "dropped">): string | undefined {
+  if (meta.dropped === 0) return undefined;
+  return `Показано ${meta.returned} совпадений из ${meta.returned + meta.dropped} (${meta.dropped} скрыто бюджетом) — уточни запрос или подними max_tokens.`;
+}
 
 /** Узел, лёгший в основу брифа: имя, вид и file_refs (главный — первый). */
 export interface BriefNodeInfo {

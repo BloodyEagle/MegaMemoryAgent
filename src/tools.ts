@@ -28,8 +28,10 @@ import type {
   ListConflictsOutput,
   ConflictGroup,
   CompactMatch,
+  CompactCardView,
   NestedSupportView,
   UnderstandMeta,
+  UnderstandCandidate,
   CurrentDigestsView,
   BriefOutput,
   NextHints,
@@ -42,7 +44,7 @@ import type {
 } from "./types.js";
 import { buildNextHints, type NextHintsCard } from "./next-hints.js";
 import { timelineActivity } from "./timeline.js";
-import { renderBrief, type BriefNodeInfo } from "./brief.js";
+import { renderBrief, renderDroppedText, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
 import {
@@ -523,7 +525,7 @@ function compactMatch(
     ...nodeQualification(db, node),
     // План 06 (K-04): «антизнание с причиной» и в compact — причина была
     // только в full-режиме, в компактной выдаче опровержение теряло смысл.
-    summary: trimSummary(node.summary),
+    summary: opts.withEvidence ? node.summary : trimSummary(node.summary),
     file_refs: fileRefs,
     // План 06 (K-03): RRF-score несёт 17 значащих цифр и дублируется в
     // similarity — в компактной выдаче обе округляются до 4 знаков,
@@ -665,7 +667,8 @@ export async function understand(
     ? parseTaskInput(input.task, process.cwd())
     : null;
   const includeEvidence = input.include_evidence ?? false;
-  const collapseAnchors = input.collapse_ref_anchors ?? false;
+  const pathQuery = /^[\w./-]+\.\w+:\d+-\d+$/.test(input.query.trim());
+  const collapseAnchors = outputMode === "compact" && (input.collapse_ref_anchors ?? !pathQuery);
 
   // План 06 (K-01): пул кандидатов шире top_k — фильтр актуальности
   // применяется ДО финальной нарезки. Раньше top_k резал выдачу поиска, и
@@ -801,6 +804,14 @@ export async function understand(
     const restPart = eligible.filter((e) => !isMandatoryCandidate(e.node));
     eligible.length = 0;
     eligible.push(...mandatoryPart, ...restPart);
+  }
+
+  // Stable partition: locator-like names are discovery, not the first knowledge card.
+  const isLocatorName = (name: string): boolean => /^[\w./-]+\.\w+:\d+-\d+$/.test(name);
+  if (outputMode === "compact" && !pathQuery) {
+    const knowledge = eligible.filter(({ node }) => !isLocatorName(node.name));
+    const locators = eligible.filter(({ node }) => isLocatorName(node.name));
+    eligible.splice(0, eligible.length, ...knowledge, ...locators);
   }
 
   // ---- План 13 §2.2: режим brief — до 8 строк текста плюс next, без карточек ----
@@ -974,6 +985,37 @@ export async function understand(
   // обрезанный объект без refuted и конверта — при max_tokens=500 восемь
   // refuted дали реальные 1469 токенов при tokens_estimated: 0.
 
+  const recallRows = [...eligible, ...refutedNodes].filter(
+    (entry, index, rows) => rows.findIndex((other) => other.node.id === entry.node.id) === index
+  );
+  const CARDS_MAX = Math.min(topK, 3);
+  const CANDIDATE_SOFT = 40;
+  const CANDIDATE_HARD = 90;
+  const candidateTarget = Math.floor(maxTokens / 4);
+  let candidates: UnderstandCandidate[] = [];
+  // Independently reproducible wire-ish cost, including pretty JSON and MCP escaping.
+  const candidateCost = (list: UnderstandCandidate[]): number =>
+    measureMcpPayload({ candidates: list }) - measureMcpPayload({ candidates: [] });
+  const tailName = (text: string, limit: number): string => {
+    if (text.length <= limit) return text;
+    let start = text.length - Math.max(0, limit - 1);
+    const low = text.charCodeAt(start);
+    if (low >= 0xdc00 && low <= 0xdfff) start += 1;
+    return limit > 0 ? "…" + text.slice(start) : "";
+  };
+  const discovery: UnderstandCandidate[] = recallRows.map(({ node, score, via }) => ({
+    id: node.id,
+    name: tailName(node.name, 60),
+    kind: node.kind as NodeKind,
+    ...(via ? { via } : {}),
+    score: Number(score.toFixed(4)),
+    // Refuted discovery is a locator, not a shortened rejected claim without its reason.
+    ...(node.epistemic_status === "refuted" ? {} : { summary_short: trimSummary(node.summary, 80) }),
+    ...(node.epistemic_status === "refuted" || node.epistemic_status === "abandoned"
+      ? { epistemic_status: node.epistemic_status }
+      : {}),
+  }));
+
   const extra = input.extra_payload ?? {};
 
   // P1.3 (план 20+21 v3 §10): opt-in reuse — квалификация паспортов по явному
@@ -996,7 +1038,6 @@ export async function understand(
   // P3: секция контекста под задачу — строится ПОСЛЕ размещения и снятия
   // повторов (см. ниже); объявления здесь, чтобы бюджетная мера buildPayload
   // видела добавку на общих основаниях (K-03).
-  let taskContextView: TaskContextView | null = null;
   let taskServedEarlier: TaskContextView["served_earlier"] = [];
 
   const edgesFor = (list: Array<{ id: string }>) =>
@@ -1061,126 +1102,131 @@ export async function understand(
   }
 
   const top: CompactMatch[] = [];
-  let refutedShown = refutedAll;
+  const refutedShown: CompactMatch[] = [];
   let nestedByHost = new Map<string, NestedSupportView[]>();
   let foldedIds = new Set<string>();
-  // D0: секция свёрнутых технических якорей — заполняется проходом якорей
-  // после размещения осмысленных карточек; секция участвует в той же
-  // бюджетной мере (K-03) и присутствует в ответе явно при включённом флаге.
-  let collapsedAnchors: CollapsedAnchorView[] = [];
+  const collapsedAnchors: CollapsedAnchorView[] = [];
+  let truncated = false;
+  let taskDuplicates: TaskContextView["duplicates_dropped"] = [];
 
-  // ---- D0: технические якоря не занимают верхний уровень (opt-in) ----
-  //
-  // Технический якорь — по происхождению И текущей структуре (stub.ts
-  // isTechnicalRefAnchor: created_via='file_ref' + шаблонное саммари + имя =
-  // file_refs[0]); отредактированная осмысленная карточка не прячется.
-  // Якоря изымаются из пула размещения ДО placeLoop: граница размещения
-  // `while (idx < eligible.length)` (контракт D-01, compact-progress) не
-  // меняется, placeLoop продолжает размещать осмысленные карточки в ранговом
-  // порядке; изъятые якоря разбираются отдельным проходом ниже — вложение в
-  // размещённый зависимый вывод либо collapsed-локатор в секции anchors.
-  // Изъятие — после построения supportIdsOf/candidateIds: fold-логика и
-  // обнаружение зависимых выводов видят якорей как кандидатов.
-  const anchorEligible = collapseAnchors
+  // Keep one anchor as a normal UI card when there is no meaningful hit at all.
+  const hasMeaningfulCandidates = eligible.some((entry) => !isTechnicalRefAnchor(entry.node));
+  const anchorEligible = collapseAnchors && hasMeaningfulCandidates
     ? eligible.filter((e) => isTechnicalRefAnchor(e.node))
     : [];
-  if (collapseAnchors && anchorEligible.length > 0) {
+  if (anchorEligible.length > 0) {
     const anchorIds = new Set(anchorEligible.map((e) => e.node.id));
     for (let i = eligible.length - 1; i >= 0; i -= 1) {
       if (anchorIds.has(eligible[i].node.id)) eligible.splice(i, 1);
     }
   }
 
-  /** The answer's top level: placed candidates minus the folded ones. */
   const displayList = (): CompactMatch[] => top.filter((m) => !foldedIds.has(m.id));
-
-  /** Display list with the folded supports attached — the serialized shape. */
   const withNested = (list: CompactMatch[]): CompactMatch[] =>
-    list.map((m) =>
-      nestedByHost.has(m.id) ? { ...m, supports: nestedByHost.get(m.id) } : m
-    );
-
-  const compactEmptyReason = (refutedList = refutedShown): UnderstandMeta["reason"] => emptyReason(
-    displayList().length > 0 || refutedList.length > 0 || collapsedAnchors.length > 0 || taskServedEarlier.length > 0,
-    eligible.length > 0 || anchorEligible.length > 0 || refutedAll.length > 0
-  );
-
-  const metaFor = (
-    tokens: number,
-    dropped: number,
-    truncated: boolean,
-    refutedList = refutedShown
-  ): UnderstandMeta => ({
-    returned: displayList().length,
-    dropped,
-    tokens_estimated: tokens,
-    estimated_full_tokens: estimatedFullTokens,
-    supports_inlined: foldedIds.size,
-    stale_excluded: staleExcluded,
-    inactive_excluded: inactiveExcluded,
-    truncated,
-    // E3: счётчики считаются из реально выданного набора (верхний уровень);
-    // вложенные опоры сами попадают в support_evidence своего решения.
-    ...(includeEvidence
-      ? {
-          evidence_matches: displayList().filter((m) => m.support_evidence !== undefined).length,
-          evidence_supports: displayList().reduce(
-            (s, m) => s + (m.support_evidence?.length ?? 0),
-            0
-          ),
-        }
-      : {}),
-    // D0: честное число свёрнутых якорей этой выдачи.
-    ...(collapseAnchors ? { anchor_collapsed: collapsedAnchors.length } : {}),
-    ...(compactEmptyReason(refutedList) ? { reason: compactEmptyReason(refutedList) } : {}),
-  });
-
-  /** Тот объект, который уйдёт по проводу (со всеми секциями, extra и next). */
-  const buildPayload = (
-    compactList: CompactMatch[],
-    refutedList: CompactMatch[],
-    meta: UnderstandMeta,
-    next?: NextHints
-  ) => ({
-    matches: [],
-    compact: compactList,
-    refuted: refutedList,
-    // D0: секция якорей — только в opt-in режиме; пустой список присутствует
-    // явно, чтобы отсутствие секции не читалось как «якорей нет».
-    ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
-    // P1.3: секция reuse — только в opt-in запросе.
-    ...(reuseView ? { passport_reuse: reuseView } : {}),
-    // P3: секция task_context — только в opt-in запросе.
-    ...(taskContextView ? { task_context: taskContextView } : {}),
-    edges_between: edgesFor(compactList),
-    meta,
-    next: next ?? buildNextHints({
-      db,
-      cards: compactList.flatMap(card => [{ id: card.id, kind: card.kind, visibleSupports: card.supports?.length ?? 0 }, ...(card.supports ?? []).map(support => ({ id: support.id }))]),
-      refuted: refutedList.map(card => ({ name: card.name, reason: card.refuted_reason ?? null })),
-      activity,
-      emptyReason: meta.reason,
-    }),
-    ...extra,
-  });
-
-  /** Мера текущей формы ответа с заданным списком refuted (числа-заглушки). */
-  const measureWith = (refutedList: CompactMatch[]): number => {
-    const payload = buildPayload(withNested(displayList()), refutedList, metaFor(0, 0, false, refutedList));
-    while (payload.next.followups.length > 0 && measure(payload) > maxTokens) {
-      payload.next.followups.pop();
-    }
-    return measure(payload);
+    list.map((m) => nestedByHost.has(m.id) ? { ...m, supports: nestedByHost.get(m.id) } : m);
+  const serializeCard = (card: CompactMatch): CompactCardView => {
+    if (card.summary !== "") return card;
+    const view: CompactCardView = { ...card };
+    delete view.summary;
+    return view;
+  };
+  const compactEmptyReason = (): UnderstandMeta["reason"] => {
+    if (displayList().length > 0 || refutedShown.length > 0 || taskServedEarlier.length > 0) return undefined;
+    // Discovery/anchors are locators, not a qualified knowledge card.
+    return emptyReason(false, recallRows.length > 0);
+  };
+  const metaFor = (tokens: number, floor = false): UnderstandMeta => {
+    const visible = new Set([
+      ...candidates.map((c) => c.id),
+      ...top.map((c) => c.id),
+      ...top.flatMap((card) => card.support_evidence?.map((support) => support.to) ?? []),
+      ...foldedIds,
+      ...collapsedAnchors.map((c) => c.id),
+      ...collapsedAnchors.flatMap((anchor) => anchor.informed_by_incoming?.map((dependent) => dependent.from) ?? []),
+      ...refutedShown.map((c) => c.id),
+      ...taskServedEarlier.map((c) => c.id),
+      ...taskDuplicates.map((c) => c.id),
+    ]);
+    const dropped = floor ? 0 : recallRows.filter(({ node }) => !visible.has(node.id)).length;
+    const reason = floor ? emptyReason(false, recallRows.length > 0) : compactEmptyReason();
+    return {
+      returned: floor ? 0 : candidates.length,
+      cards: floor ? 0 : displayList().length,
+      dropped,
+      tokens_estimated: tokens,
+      estimated_full_tokens: estimatedFullTokens,
+      supports_inlined: floor ? 0 : foldedIds.size,
+      stale_excluded: staleExcluded,
+      inactive_excluded: inactiveExcluded,
+      // A qualified card that did not fit is a budget loss even when its
+      // locator stays visible in candidates (single-hit fixtures keep dropped at 0).
+      truncated: floor ? false : truncated || dropped > 0 || reason === "budget",
+      ...(includeEvidence ? {
+        evidence_matches: displayList().filter((m) => m.support_evidence !== undefined).length,
+        evidence_supports: displayList().reduce((sum, m) => sum + (m.support_evidence?.length ?? 0), 0),
+      } : {}),
+      ...(collapseAnchors ? { anchor_collapsed: floor ? 0 : collapsedAnchors.length } : {}),
+      ...(reason ? { reason } : {}),
+    };
   };
 
-  // Ниже минимума — понятный отказ: пустой конверт (meta + instructions +
-  // MCP-обёртка) сам стоит токенов.
-  const minBudget = measure(buildPayload([], [], metaFor(0, 0, false, [])));
+  // One builder for placement, the final measurement and the returned wire view.
+  const buildPayload = (tokens = 0, includeExtra = true, floor = false): UnderstandOutput => {
+    const compact = floor ? [] : withNested(displayList());
+    const refuted = floor ? [] : refutedShown;
+    const meta = metaFor(tokens, floor);
+    const next = buildNextHints({
+      db,
+      cards: compact.flatMap((card): NextHintsCard[] => [
+        { id: card.id, kind: card.kind, visibleSupports: card.support_evidence?.length ?? card.supports?.length ?? 0 },
+        ...(card.supports ?? []).map((support) => ({ id: support.id })),
+      ]),
+      refuted: refuted.map((card) => ({ name: card.name, reason: card.refuted_reason ?? null })),
+      activity,
+      emptyReason: meta.reason,
+    });
+    const taskContext = taskPlan ? buildTaskContext(db, taskPlan, { compact, refuted, next }) : null;
+    if (taskContext) {
+      taskContext.duplicates_dropped = taskDuplicates;
+      taskContext.served_earlier = taskServedEarlier;
+    }
+    const brief = renderDroppedText(meta);
+    return {
+      matches: [],
+      compact: compact.map(serializeCard),
+      candidates: floor ? [] : candidates,
+      ...(collapseAnchors ? { anchors: floor ? [] : collapsedAnchors } : {}),
+      refuted,
+      edges_between: edgesFor(compact),
+      ...(reuseView ? { passport_reuse: reuseView } : {}),
+      ...(taskContext ? { task_context: taskContext } : {}),
+      meta,
+      next,
+      ...(brief ? { brief } : {}),
+      ...(includeExtra ? extra : {}),
+    };
+  };
+  const measuredPayload = (floor = false): { payload: UnderstandOutput; tokens: number } => {
+    const payload = buildPayload(0, true, floor);
+    let tokens = measure(payload);
+    // Only optional followups may be cut; refs, record and qualification are indivisible.
+    while (tokens > maxTokens && payload.next!.followups.length > 0) {
+      payload.next!.followups.pop();
+      payload.meta!.truncated = true;
+      if (payload.task_context) payload.task_context.cost_estimate.followup_calls = payload.next!.followups.length;
+      tokens = measure(payload);
+    }
+    return { payload, tokens };
+  };
+  const measureWith = (): number => measuredPayload().tokens;
+
+  // This is the actual empty envelope floor, not a fabricated floor with a loss notice.
+  const minBudget = measuredPayload(true).tokens;
   if (maxTokens < minBudget) {
     throw new Error(
       `understand: max_tokens=${maxTokens} ниже минимума ${minBudget} — ` +
-        `конверт ответа (meta, instructions, MCP-обёртка) сам этого стоит. ` +
-        `Подними max_tokens (по умолчанию 1500).`
+      `конверт ответа (meta, instructions, MCP-обёртка) сам этого стоит. ` +
+      `Подними max_tokens (по умолчанию 4000).`
     );
   }
 
@@ -1208,7 +1254,7 @@ export async function understand(
     const foldSet = new Set<string>();
     for (const h of top) {
       for (const sid of supportIdsOf.get(h.id) ?? []) {
-        if (sid !== h.id && inTop.has(sid)) foldSet.add(sid);
+        if (sid !== h.id && inTop.has(sid) && top.find((card) => card.id === sid)?.support_evidence === undefined) foldSet.add(sid);
       }
     }
     const nextNested = new Map<string, NestedSupportView[]>();
@@ -1220,10 +1266,10 @@ export async function understand(
         if (h.id === sup.id || foldSet.has(h.id)) continue;
         if (supportIdsOf.get(h.id)?.includes(sup.id)) {
           const bucket = nextNested.get(h.id) ?? [];
-          bucket.push({
+              bucket.push({
             id: sup.id,
             name: sup.name,
-            summary: trimSummary(row.summary),
+            summary: sup.summary,
             ...nodeQualification(db, row),
             file_refs: parseFileRefs(row.file_refs),
             ...(row.epistemic_status === "abandoned" ||
@@ -1243,256 +1289,253 @@ export async function understand(
   };
 
   let tokensEstimated = 0;
-  let idx = 0;
 
-  /**
-   * Размещение верхнего уровня: top_k ограничивает ВЕРХНИЙ уровень
-   * (вложенные опоры слотов не занимают), бюджет меряется по фактической
-   * форме ответа — с refuted, edges_between, meta и extra_payload. Складывание
-   * опор запускается после каждого размещения: сложившаяся опора освобождает
-   * слот верхнего уровня для следующего кандидата (placeLoop повторно вызывается
-   * после сокращения refuted — добор ограничен тем же циклом).
-   */
-  let truncated = false;
-  let refutedCut = 0;
-
-  const placeLoop = (): void => {
-    while (idx < eligible.length) {
-      if (foldedIds.has(eligible[idx].node.id)) {
-        idx += 1; // уже в ответе, вложенно
-        continue;
+  // Optional presentation gives way before a qualified card, its refs or evidence.
+  const squeezedCards = new Set<string>();
+  const squeezeCard = (card: CompactMatch, fits: () => boolean): boolean => {
+    if (fits()) return true;
+    const initial = JSON.stringify(card);
+    if (card.support_evidence === undefined) {
+      while (card.summary.length > 0 && !fits()) {
+        const limit = Math.max(0, card.summary.length - 24);
+        card.summary = limit === 0 ? "" : trimSummary(card.summary, limit);
+        if (card.summary === "…") card.summary = "";
       }
-      if (displayList().length >= topK) {
-        foldSupports();
-        if (displayList().length >= topK) break;
-      }
-      const candidate = compactMatch(db, eligible[idx].node, {
-        score: eligible[idx].score,
-        via: eligible[idx].via,
-        withContext: displayList().length < 3,
-        expired: eligible[idx].expired,
-        // E3: флаг едет с кандидатом (см. eligible) — граница размещения
-        // (контракт D-01) не ссылается на новые идентификаторы; enrichment
-        // выполняет compactMatch, мера видит добавку ДО принятия кандидата:
-        // матч размещается целиком или снимается целиком, частичный набор
-        // доказательств не выдаётся.
-        withEvidence: eligible[idx].evidence === true,
-      });
-      top.push(candidate);
-      const projected = measureWith(refutedShown);
-      // План 06 (K-03): кап держится и на первой ноде — гигантская карточка
-      // (длинные id/refs/рёбра) вылетает так же, как остальные; усечение
-      // помечается в meta, а пустой конверт ниже минимума отсечён выше.
-      if (projected > target) {
-        top.pop();
-        truncated = true; // бюджетное усечение, а не лимит top_k
-        break;
-      }
-      idx += 1;
-      tokensEstimated = projected;
-      if (foldSupports() > 0) tokensEstimated = measureWith(refutedShown);
+    }
+    if (!fits()) delete card.children;
+    if (!fits()) delete card.edges;
+    while (card.name.length > 0 && !fits()) {
+      card.name = tailName(card.name, Math.max(0, card.name.length - 8));
+    }
+    if (JSON.stringify(card) !== initial) {
+      squeezedCards.add(card.id);
+      truncated = true;
+    }
+    return fits();
+  };
+  const placeCard = (entry: typeof eligible[number]): boolean => {
+    if (top.some((card) => card.id === entry.node.id)) return false;
+    const previousNested = nestedByHost;
+    const previousFolded = foldedIds;
+    const previousTruncated = truncated;
+    const candidate = compactMatch(db, entry.node, {
+      score: entry.score,
+      via: entry.via,
+      withContext: true,
+      expired: entry.expired,
+      withEvidence: includeEvidence,
+    });
+    top.push(candidate);
+    // Enrichment is indivisible; never fold an evidence card into a weaker projection.
+    if (candidate.support_evidence === undefined) foldSupports();
+    const fits = (): boolean => {
+      if (candidate.support_evidence === undefined) foldSupports();
+      if (displayList().length > CARDS_MAX) return false;
+      return measureWith() <= target;
+    };
+    if (displayList().length > CARDS_MAX) {
+      top.pop();
+      nestedByHost = previousNested;
+      foldedIds = previousFolded;
+      return false;
+    }
+    const accepted = squeezeCard(candidate, fits);
+    if (!accepted) {
+      top.pop();
+      nestedByHost = previousNested;
+      foldedIds = previousFolded;
+      truncated = previousTruncated;
+      squeezedCards.delete(candidate.id);
+      return false;
+    }
+    return true;
+  };
+  const placeLoop = (limit: number): void => {
+    // A failed expensive hit cannot block a cheaper later candidate; every pass is bounded.
+    for (let idx = 0; idx < eligible.length && displayList().length < limit; idx += 1) {
+      placeCard(eligible[idx]);
     }
   };
 
-  placeLoop();
-
-  // План 06 (K-04): refuted участвует в бюджете. Пока честная мера выше
-  // цели — режем refuted с конца (ранг худший первым); причина остаётся у
-  // выживших. Усечённые считаются в dropped, сокращение помечается.
-  while (measureWith(refutedShown) > target && refutedShown.length > 0) {
-    refutedShown = refutedShown.slice(0, -1);
-    refutedCut += 1;
-    truncated = true;
+  // Priority 1: one meaningful qualified card (or one ordinary anchor for anchors-only).
+  placeLoop(Math.min(topK, 1));
+  if (collapseAnchors && !hasMeaningfulCandidates) {
+    const placed = new Set(top.map((card) => card.id));
+    anchorEligible.push(...eligible.filter((entry) => !placed.has(entry.node.id)));
+    for (let i = eligible.length - 1; i >= 0; i -= 1) {
+      if (!placed.has(eligible[i].node.id)) eligible.splice(i, 1);
+    }
   }
 
-  // Освободившиеся токены — ограниченный добор матчей.
-  placeLoop();
-
-  // ---- D0: проход технических якорей (opt-in) ----
-  //
-  // Якорь с размещённым зависимым выводом вкладывается в него компактно:
-  // без шаблонного саммари (шум), с rationale ребра и квалификацией/weak —
-  // состояние опоры видно вместе с якорем. Якорь без размещённого зависимого
-  // вывода едет в секцию anchors компактным локатором ВМЕСТЕ со своими живыми
-  // зависимыми выводами (входящие informed_by), rationale и weak-состоянием.
-  // Ни один якорь не исчезает молча: не поместившиеся в бюджет — dropped с
-  // truncated; если найдены только якоря, секция остаётся содержимым ответа,
-  // а не ложным no-match. Прямой запрос по id (get_concept) и
-  // provenance_trace разрешают якорь независимо от этого режима.
-  let anchorFolded = 0;
-  if (collapseAnchors) {
-    for (const { node } of anchorEligible) {
-      const host = top.find(
-        (h) => !foldedIds.has(h.id) && (supportIdsOf.get(h.id) ?? []).includes(node.id)
-      );
-      if (host) {
-        const bucket = nestedByHost.get(host.id) ?? [];
-        const edge = db
-          .getInformedByEdges(host.id, "ancestry", false)
-          .find((e) => e.to_id === node.id);
-        bucket.push({
-          id: node.id,
-          name: node.name,
-          collapsed_anchor: true,
-          rationale: edge?.description ?? null,
-          ...nodeQualification(db, node),
-          file_refs: parseFileRefs(node.file_refs),
-          ...(node.epistemic_status === "abandoned" ||
-          node.epistemic_status === "refuted" ||
-          isUngrounded(db, node)
-            ? { weak: true }
-            : {}),
-        });
-        nestedByHost.set(host.id, bucket);
-        foldedIds.add(node.id);
-        anchorFolded += 1;
-        continue;
+  const trimDiscovery = (list: UnderstandCandidate[], fits: () => boolean): void => {
+    for (let i = list.length - 1; i >= 0 && !fits(); i -= 1) {
+      if (list[i].summary_short !== undefined) truncated = true;
+      delete list[i].summary_short;
+    }
+    for (let i = list.length - 1; i >= 0 && !fits(); i -= 1) {
+      while (list[i].name.length > 0 && !fits()) {
+        list[i].name = tailName(list[i].name, Math.max(0, list[i].name.length - 8));
+        truncated = true;
       }
-      const dependents = db
-        .getEdgeRefsIn(node.id)
-        .filter((e) => e.relation === "informed_by")
-        .map((e) => ({ edge: e, row: db.getNode(e.from_id) }))
-        .filter(
-          (
-            x
-          ): x is {
-            edge: { from_id: string; relation: string; description: string | null };
-            row: NodeRow;
-          } => x.row !== undefined
-        )
-        .map((x) => ({
-          from: x.row.id,
-          from_name: x.row.name,
-          rationale: x.edge.description ?? null,
-          ...(x.row.epistemic_status === "abandoned" ||
-          x.row.epistemic_status === "refuted" ||
-          isUngrounded(db, x.row)
-            ? { weak: true }
-            : {}),
-        }));
-      collapsedAnchors.push({
+    }
+  };
+  // Priority 2: discovery from the full filtered bounded pool, including collapsed anchors.
+  candidates = discovery.map((entry) => ({ ...entry }));
+  for (const entry of candidates) {
+    if (candidateCost([entry]) > CANDIDATE_SOFT) delete entry.summary_short;
+    trimDiscovery([entry], () => candidateCost([entry]) <= CANDIDATE_HARD);
+  }
+  candidates = candidates.filter((entry) => candidateCost([entry]) <= CANDIDATE_HARD);
+  const discoverySnapshots = candidates.map((entry) => ({ ...entry }));
+  const fitsCandidateCap = (): boolean => candidateCost(candidates) <= candidateTarget;
+  trimDiscovery(candidates, fitsCandidateCap);
+  while (candidates.length > 0 && !fitsCandidateCap()) candidates.pop();
+  const discoveryFits = (): boolean => fitsCandidateCap() && measureWith() <= target;
+  // A minimal first card outranks discovery, not its optional presentation.
+  if (!discoveryFits()) {
+    for (const card of displayList()) {
+      squeezeCard(card, discoveryFits);
+      if (discoveryFits()) break;
+    }
+  }
+  trimDiscovery(candidates, discoveryFits);
+  while (candidates.length > 0 && !discoveryFits()) candidates.pop();
+  // Reclaim presentation for survivors after an indivisible entry was dropped.
+  // Add the name first, then optional summary; acceptance is measured each time.
+  for (const entry of candidates) {
+    const snapshot = discoverySnapshots.find((original) => original.id === entry.id);
+    if (!snapshot) continue;
+    const previousName = entry.name;
+    entry.name = snapshot.name;
+    if (!discoveryFits()) entry.name = previousName;
+    if (snapshot.summary_short !== undefined) {
+      entry.summary_short = snapshot.summary_short;
+      if (!discoveryFits()) delete entry.summary_short;
+    }
+  }
+
+  // Priority 3: second/third cards; discovery and the first card are not displaced.
+  placeLoop(CARDS_MAX);
+  for (const original of refutedAll) {
+    const card = { ...original };
+    refutedShown.push(card);
+    if (!squeezeCard(card, () => measureWith() <= target)) {
+      refutedShown.pop();
+      truncated = true;
+      squeezedCards.delete(card.id);
+    }
+  }
+
+  // Fold-aware retry can reclaim a slot; without more budget, a failed hit stays skipped.
+  for (const entry of eligible) {
+    if (top.some((card) => card.id === entry.node.id)) continue;
+    placeCard(entry);
+  }
+
+  // Collapsed anchors preserve qualification and rationales; each addition is measured.
+  for (const { node } of anchorEligible) {
+    const host = top.find((card) => !foldedIds.has(card.id) && supportIdsOf.get(card.id)?.includes(node.id));
+    if (host) {
+      const bucket = nestedByHost.get(host.id) ?? [];
+      const edge = db.getInformedByEdges(host.id, "ancestry", false).find((e) => e.to_id === node.id);
+      const support: NestedSupportView = {
         id: node.id,
         name: node.name,
-        kind: node.kind as NodeKind,
-        file_refs: parseFileRefs(node.file_refs),
         collapsed_anchor: true,
+        rationale: edge?.description ?? null,
         ...nodeQualification(db, node),
-        ...(dependents.length > 0 ? { informed_by_incoming: dependents } : {}),
-      });
-      if (measureWith(refutedShown) > target) {
-        collapsedAnchors.pop();
+        file_refs: parseFileRefs(node.file_refs),
+        ...(node.epistemic_status === "abandoned" || node.epistemic_status === "refuted" || isUngrounded(db, node)
+          ? { weak: true } : {}),
+      };
+      nestedByHost.set(host.id, [...bucket, support]);
+      foldedIds.add(node.id);
+      if (measureWith() > target) {
+        if (bucket.length > 0) nestedByHost.set(host.id, bucket);
+        else nestedByHost.delete(host.id);
+        foldedIds.delete(node.id);
         truncated = true;
-        break;
       }
+      continue;
+    }
+    const dependents = db.getEdgeRefsIn(node.id)
+      .filter((e) => e.relation === "informed_by")
+      .map((e) => ({ edge: e, row: db.getNode(e.from_id) }))
+      .filter((x): x is { edge: { from_id: string; relation: string; description: string | null }; row: NodeRow } => x.row !== undefined)
+      .map(({ edge, row }) => ({
+        from: row.id,
+        from_name: row.name,
+        rationale: edge.description ?? null,
+        ...(row.epistemic_status === "abandoned" || row.epistemic_status === "refuted" || isUngrounded(db, row)
+          ? { weak: true } : {}),
+      }));
+    collapsedAnchors.push({
+      id: node.id,
+      name: node.name,
+      kind: node.kind as NodeKind,
+      file_refs: parseFileRefs(node.file_refs),
+      collapsed_anchor: true,
+      ...nodeQualification(db, node),
+      ...(dependents.length > 0 ? { informed_by_incoming: dependents } : {}),
+    });
+    if (measureWith() > target) {
+      collapsedAnchors.pop();
+      truncated = true;
     }
   }
 
-  let compact = withNested(displayList());
-  // План 06 (K-01): счётчики не смешиваются — dropped считает усечённых
-  // (top_k/бюджет, включая порезанных refuted и не поместившиеся collapsed-
-  // якоря), фильтрованные живут в stale_excluded/inactive_excluded.
-  // eligible к этому моменту — осмысленные кандидаты (якоря изъяты сплайсом),
-  // поэтому база dropped не меняется; якорный термин добавляет не показанных
-  // (не вложенных и не свернутых) якорей.
-  let dropped =
-    eligible.length -
-    top.length +
-    refutedCut +
-    (collapseAnchors ? anchorEligible.length - anchorFolded - collapsedAnchors.length : 0);
-
-  // ---- P3 (§12.4/§12.9): снятие смысловых повторов и повторов эпохи ----
-  //
-  // Защищены от снятия: решения, refuted/abandoned, тесты, противоречия
-  // (contradicts) и карты со свёрнутыми опорами — противоречащие выводы,
-  // причины refuted и неполнота не убираются никогда. Повторы эпохи — только
-  // с ЯВНО переданным context_epoch клиента.
-  let taskDuplicates: TaskContextView["duplicates_dropped"] = [];
+  // Task helpers use the internal presentation, never a fabricated empty/full claim.
   if (taskPlan) {
-    const dedup = dedupeTaskDuplicates(db, compact);
-    const epoch = applyTaskEpoch(db, taskPlan, compact);
-    const removeIds = [...new Set([...dedup.removeIds, ...epoch.removeIds])];
-    if (removeIds.length > 0) {
-      for (const id of removeIds) {
-        const ti = top.findIndex((m) => m.id === id);
-        if (ti >= 0) top.splice(ti, 1);
-      }
-      compact = withNested(displayList());
-      dropped += removeIds.length;
-    }
+    const compact = withNested(displayList());
+    const readable = compact.filter((card) => card.summary.length > 0 && !squeezedCards.has(card.id));
+    const dedup = dedupeTaskDuplicates(db, readable);
+    const epoch = applyTaskEpoch(db, taskPlan, readable);
+    const removeIds = new Set([...dedup.removeIds, ...epoch.removeIds]);
     taskDuplicates = dedup.duplicates;
     taskServedEarlier = epoch.servedEarlier;
-  }
-
-  // Build final instructions from the placed top-level cards and nested supports.
-  // Placement measured this same next block before accepting each candidate.
-  const nextCards: NextHintsCard[] = [];
-  for (const m of compact) {
-    nextCards.push({ id: m.id, kind: m.kind, visibleSupports: m.supports?.length ?? 0 });
-    for (const s of m.supports ?? []) {
-      // Вложенная опора видна в ответе без собственных опор.
-      nextCards.push({ id: s.id });
+    for (let i = top.length - 1; i >= 0; i -= 1) {
+      if (removeIds.has(top[i].id)) top.splice(i, 1);
     }
   }
-  const refutedForNext = refutedShown.map((r) => ({
-    name: r.name,
-    reason: r.refuted_reason ?? null,
-  }));
-  let next: NextHints = buildNextHints({
-    db, cards: nextCards, refuted: refutedForNext, activity,
-    emptyReason: metaFor(0, dropped, truncated).reason,
-  });
 
-  // ---- P3: сборка секции task_context (§12.3–§12.7) ----
-  //
-  // Покрытие обязательных категорий считается по фактически выданному набору
-  // и плану чтения; цена — оценочная полная (карточки + followups + чтение).
-  // Состояние эпохи записывается ПОСЛЕ финальной меры (см. ниже) — факт выдачи.
-  if (taskPlan) {
-    taskContextView = buildTaskContext(db, taskPlan, { compact, refuted: refutedShown, next });
-    taskContextView.duplicates_dropped = taskDuplicates;
-    taskContextView.served_earlier = taskServedEarlier;
+  // A task epoch note can add metadata after deduplication. Reduce only optional
+  // presentation/discovery and later cards; rebuild qualification after each change.
+  const fitsFinal = (): boolean => measureWith() <= target;
+  for (const card of [...refutedShown, ...displayList()].reverse()) {
+    if (fitsFinal()) break;
+    squeezeCard(card, fitsFinal);
   }
-
-  // Placement already includes next; only optional followups may be shortened.
-  const measureWithNext = (): number =>
-    measure(buildPayload(compact, refutedShown, metaFor(0, dropped, truncated), next));
-  while (next.followups.length > 0 && measureWithNext() > target) {
-    next.followups.pop();
+  trimDiscovery(candidates, fitsFinal);
+  while (candidates.length > 0 && !fitsFinal()) candidates.pop();
+  while (collapsedAnchors.length > 0 && !fitsFinal()) {
+    collapsedAnchors.pop();
+    truncated = true;
+  }
+  while (refutedShown.length > 0 && !fitsFinal()) {
+    refutedShown.pop();
+    truncated = true;
+  }
+  // Keep the first card whenever its honest minimal response fits; no partial qualification.
+  while (top.length > 0 && !fitsFinal()) {
+    top.pop();
+    foldSupports();
     truncated = true;
   }
 
-  const edgesBetween = edgesFor(compact);
-  tokensEstimated = measure({
-    matches: [],
-    compact,
-    refuted: refutedShown,
-    ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
-    ...(reuseView ? { passport_reuse: reuseView } : {}),
-    ...(taskContextView ? { task_context: taskContextView } : {}),
-    edges_between: edgesBetween,
-    meta: metaFor(0, dropped, truncated),
-    next,
-    ...extra,
-  });
+  const final = measuredPayload();
+  tokensEstimated = final.tokens;
   if (tokensEstimated > maxTokens) {
-    throw new Error(`understand: max_tokens=${maxTokens} cannot fit the instructions and required references (minimum ${tokensEstimated}); increase the budget.`);
+    throw new Error(`understand: max_tokens=${maxTokens} cannot fit the instructions, qualification and loss notice (minimum ${tokensEstimated}); increase the budget.`);
   }
-  // P3: факт выдачи записывается в состояние эпохи ПОСЛЕ финальной меры —
-  // не выданный ответ не считается «уже в контексте клиента».
-  if (taskPlan) recordTaskEpoch(db, taskPlan, compact);
-  const payloadMeta = metaFor(tokensEstimated, dropped, truncated);
-  const payload = JSON.stringify({
-    matches: [],
-    compact,
-    refuted: refutedShown,
-    ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
-    ...(reuseView ? { passport_reuse: reuseView } : {}),
-    ...(taskContextView ? { task_context: taskContextView } : {}),
-    edges_between: edgesBetween,
-    meta: payloadMeta,
-    next,
-  });
-
+  const compact = withNested(displayList());
+  if (taskPlan) recordTaskEpoch(db, taskPlan, compact.filter((card) => card.summary.length > 0 && !squeezedCards.has(card.id)));
+  final.payload.meta!.tokens_estimated = tokensEstimated;
+  // The handler adds extra_payload separately; remove those fields only after measurement.
+  const output = buildPayload(tokensEstimated, false);
+  output.next = final.payload.next;
+  output.meta = final.payload.meta;
+  if (final.payload.task_context) output.task_context = final.payload.task_context;
+  const payload = JSON.stringify(output);
   db.insertUsage({
     tool: "understand",
     query: input.query,
@@ -1501,18 +1544,7 @@ export async function understand(
     returnedTokens: tokensEstimated,
     estimatedFullTokens,
   });
-
-  return {
-    matches: [],
-    compact,
-    refuted: refutedShown,
-    ...(collapseAnchors ? { anchors: collapsedAnchors } : {}),
-    ...(reuseView ? { passport_reuse: reuseView } : {}),
-    ...(taskContextView ? { task_context: taskContextView } : {}),
-    edges_between: edgesBetween,
-    meta: payloadMeta,
-    next,
-  };
+  return output;
 }
 
 export function getConcept(
