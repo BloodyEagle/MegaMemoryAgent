@@ -502,6 +502,8 @@ nodes; `no_match` means live nodes exist but none pass the search/filters; `budg
 candidates did not fit. In `compact`, `full`, and `brief`, the first explanatory sentence
 and the full `next.record` contract are mandatory and never trimmed; if the required
 envelope cannot fit, the request is refused with an explicit error asking for a larger budget.
+The record line rendered in `brief` has its own `RECORD_MAX = 400`; other lines keep
+`LINE_MAX = 240`. The full `next.record` is not clipped.
 
 **Stored kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest` · `task` · `journal`
 
