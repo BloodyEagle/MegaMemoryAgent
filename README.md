@@ -463,7 +463,7 @@ extras manually.
 
 | Tool | Description |
 |---|---|
-| `understand` | Budgeted hybrid retrieval in `compact` (default), `full`, or `brief`; filters inactive/expired facts and always returns the `next` action contract; `record` carries the support form (`[{ref\|node, why}]` → `informed_by`), with kind chosen by meaning and no links from `file_refs` alone. After ≥3 completed reads since the last logged write, `next.record` appends a conditional reminder and `next.unrecorded` reports the count; empty results distinguish `empty_base`, `no_match`, and `budget`. Opt-in (default off): `include_evidence: true` attaches confirm-ready versions to each match — `current_digests` (current and confirmed travel separately) plus `support_evidence` listing ALL live supports with full wording, edge rationale and claim/status/edge/artifacts digests; `collapse_ref_anchors: true` demotes template ref-anchors from the top level (folded compactly with rationale, or collapsed locators with their dependents; `meta.anchor_collapsed`; id/path resolution and provenance unaffected). P1 reuse (opt-in, compact only): `reuse: {task_type, files}` qualifies saved analysis passports explicitly by task type and verified scope — the `passport_reuse` section lists `covered`/`gaps` and a qualification (`reusable\|candidate\|stale_input\|incomplete\|unknown\|expired\|refuted_support\|broken\|wrong_repo`); no state raises trust silently, and a qualification is never code coverage. P3 task profile (opt-in, compact only): `task: {goal, kind, files?, context_epoch?}` embeds a `task_context` section into THIS answer — deterministic mandatory source categories per task kind, decisions/tests citing the explicit file scope boosted with score 0, hidden supports of placed decisions, semantic duplicates dropped WITHOUT dropping refuted reasons/contradictions/incompleteness, uncovered mandatory sources listed with a next step, and an approximate total-cost heuristic (never provider tokens); it never replaces `must_read`, never fills `next.skip`, never claims whole-file coverage; `context_epoch` is explicit client state that only collapses already-served non-mandatory cards (decisions/refuted/expired are never collapsed). |
+| `understand` | Budgeted hybrid retrieval in `compact` (default, `max_tokens: 4000`), `full`, or `brief`. Compact returns a bounded `candidates` list plus up to 3 fully qualified compact cards when the budget permits; `matches`/`compact` remain available, and `full` keeps its previous response form. Filters inactive/expired facts and always returns the `next` action contract; `record` carries the support form (`[{ref\|node, why}]` → `informed_by`), with kind chosen by meaning and no links from `file_refs` alone. After ≥3 completed reads since the last logged write, `next.record` appends a conditional reminder and `next.unrecorded` reports the count; empty results distinguish `empty_base`, `no_match`, and `budget`. In compact, `collapse_ref_anchors` defaults to `true` (`false` is supported): template ref-anchors are folded with rationale or shown as collapsed locators with dependents (`meta.anchor_collapsed`); path-like names are demoted unless the query is an exact full path; id/path resolution and provenance are unaffected. Opt-in `include_evidence: true` attaches `current_digests` and `support_evidence` with ALL live supports, untrimmed wording, edge rationale and claim/status/edge/artifacts digests; each card and its evidence are placed atomically or omitted, without counting candidate-only entries as dropped. P1 reuse (opt-in, compact only): `reuse: {task_type, files}` qualifies saved analysis passports explicitly by task type and verified scope — the `passport_reuse` section lists `covered`/`gaps` and a qualification (`reusable\|candidate\|stale_input\|incomplete\|unknown\|expired\|refuted_support\|broken\|wrong_repo`); no state raises trust silently, and a qualification is never code coverage. P3 task profile (opt-in, compact only): `task: {goal, kind, files?, context_epoch?}` embeds a `task_context` section into THIS answer — deterministic mandatory source categories per task kind, decisions/tests citing the explicit file scope boosted with score 0, hidden supports of placed decisions, semantic duplicates dropped WITHOUT dropping refuted reasons/contradictions/incompleteness, uncovered mandatory sources listed with a next step, and an approximate total-cost heuristic (never provider tokens); it never replaces `must_read`, never fills `next.skip`, never claims whole-file coverage; `context_epoch` is explicit client state that only collapses already-served non-mandatory cards (decisions/refuted/expired are never collapsed). |
 | `check_freshness` | P2 targeted freshness verification (explicit opt-in action, read-only): for changed or suspect sources — files, `HEAD:sha:path` blobs, `git:tag/commit/branch` refs — it checks the RELATED records through a rebuildable reverse index (node `file_refs`, artifact observations, passport scopes), not the whole graph. Content is verified by sha256 (mtime/size are never proof); git dirty state (staged/unstaged/untracked/rename) and HEAD ride the report as observations — a previous HEAD never proves the working tree unchanged. One physical source is hashed once per check; sources that change DURING the check report `unstable` — no stable snapshot is declared. The report carries `sources` (unchanged/changed/missing/unobserved/unstable/skipped/other_repo), `records` (fresh/stale_input/partial/unknown — a checked prefix is never presented as the whole graph), `summary.limitations`, and `expected_versions` to re-verify before applying an edit. It never writes to the database and never confirms supports; a freshness pass does not raise the passport reuse qualification. Optional pilot (P2.2): `symbols` resolves definitions through the token-economy-ts adapter (`adapter.graph_tool` or env `MEGAMEMORY_CODE_ADAPTER`; an ambiguous/missing symbol is explicit and requires reading — never the first match; line numbers are the current resolution, not identity), and `with_dependencies` walks the static import graph of changed sources (bounded by `max_deps`, declared scope only). |
 | `get_concept` | Exact-ID full context: parent, children, edges, trails/slots, support check, and current digests for confirmation. Budgeted profiles (`orientation`/`evidence`/`full`), batch `ids` (up to 25, one shared budget, per-id status/errors), capped neighbor disclosure with `continuation`. E4 delta (opt-in): `context_epoch` + `known_versions` — a version match of the requested projection returns a compact `unchanged` answer with the qualification minimum (never code coverage); a mismatch or a new epoch returns the full card. An old plain `{id}` call returns the exact previous response. |
 | `create_concept` | Atomically create a node and optional edges/evidence; supports `supersedes`, `valid_until`, duplicate refusal, and same-call evidence snapshots. |
@@ -490,6 +490,33 @@ extras manually.
 | `task_done` | Move a task to terminal `done` and clear its due date. |
 | `board` | Return open tasks sorted by rot and the done column with `count`, `returned`, `has_more`, and keyset `next_cursor` pagination. |
 
+### `understand`: compact recall and budget
+
+`max_tokens` defaults to **4000**; an explicit budget is respected. Compact `candidates`
+represent all search/filter survivors from the bounded retrieval pool (20 by default),
+subject to the list budget — not every node in the graph. Each entry carries an exact,
+untrimmed `id` for `get_concept`, plus `name`, `kind`, `via`, `score`, and optional
+`summary_short` (≤80 characters). Names are ≤60 characters, shortened from the left to
+retain the identifying tail. The soft target is 40 estimated tokens per candidate, with
+a hard cap of 90; `summary_short` is dropped before further shortening the name. IDs
+are never shortened. The entire candidate list uses at most 25% of `max_tokens`.
+
+After the mandatory envelope, budget priority is: the first fully qualified compact
+card → the candidate list → the second and third cards. At most 3 complete compact
+cards are placed, and only when they fit; `include_evidence` keeps ALL support wording
+and rationales untrimmed and places each card with its evidence atomically. `meta.returned`
+counts visible candidate entries, `meta.cards` counts compact cards, and `meta.dropped`
+counts wholly hidden matches, not matches available only as candidates. When `dropped > 0`,
+the budgeted text says exactly: «Показано N совпадений из M (K скрыто бюджетом) — уточни запрос или подними max_tokens.»
+Here N = `returned`, K = `dropped`, and M = N + K; candidate-only entries do not trigger it.
+
+In compact, `collapse_ref_anchors` defaults to `true`; explicit `false` remains supported.
+Path-like names are demoted for ordinary queries, not removed from candidates; an exact
+full-path query bypasses this demotion. The existing `matches`/`compact` card fields stay
+available. The UI displays only those cards (up to 3), not `candidates`; candidate display
+and expansion are a separate plan. `mode: "full"` keeps its previous form, without the
+candidate list.
+
 `understand` counts completed read calls since the last logged write in process memory,
 scoped to the database/logger; the current call is logged only after its response.
 At ≥3 reads, `next.unrecorded: {reads_since_write, last_write_at}` accompanies the exact
@@ -499,7 +526,8 @@ and for `empty_base`. Pure reading does not require a write: record a completed 
 
 Empty `understand` results carry `meta.reason`: `empty_base` means no live (non-deleted)
 nodes; `no_match` means live nodes exist but none pass the search/filters; `budget` means
-candidates did not fit. In `compact`, `full`, and `brief`, the first explanatory sentence
+matches exist but no minimal qualified card fits — never interpret it as `no_match`.
+In `compact`, `full`, and `brief`, the first explanatory sentence
 and the full `next.record` contract are mandatory and never trimmed; if the required
 envelope cannot fit, the request is refused with an explicit error asking for a larger budget.
 The record line rendered in `brief` has its own `RECORD_MAX = 400`; other lines keep
