@@ -24,7 +24,7 @@ const VERSION = JSON.parse(
 
 const HELP = buildHelp(VERSION);
 
-const KNOWN_COMMANDS = new Set(["install", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "expire", "telemetry-report", "--help", "-h", "--version", "-v"]);
+const KNOWN_COMMANDS = new Set(["install", "hooks", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "expire", "telemetry-report", "--help", "-h", "--version", "-v"]);
 
 function parseFlags(args: string[]): { port?: number; rawPort?: string; host?: string } {
   const portIdx = args.indexOf("--port");
@@ -53,6 +53,18 @@ switch (cmd) {
     // а не exit(0): CI и скрипты обязаны видеть, что установка не прошла.
     const outcome = await runInstall(commandArgs);
     process.exit(outcome.ok ? 0 : 1);
+    break;
+  }
+
+  case "hooks": {
+    try {
+      const { runHooks } = await import("./hooks.js");
+      runHooks(commandArgs);
+      process.exit(0);
+    } catch (err) {
+      errorBold(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
     break;
   }
 
