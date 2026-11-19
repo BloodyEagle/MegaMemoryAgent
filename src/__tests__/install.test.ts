@@ -2,6 +2,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { execFileSyncMock, execSyncMock } = vi.hoisted(() => ({
@@ -38,6 +39,37 @@ interface Sandbox {
 const sandboxes: Sandbox[] = [];
 const originalCwd = process.cwd();
 let originalExitCode: typeof process.exitCode;
+const realHomes = [...new Set([process.env.HOME, process.env.USERPROFILE, os.homedir()].filter((dir): dir is string => Boolean(dir)))];
+const realConfigPaths = [
+  ...realHomes.flatMap((home) => [
+    path.join(home, ".claude.json"), path.join(home, ".claude", "CLAUDE.md"),
+    path.join(home, ".codex", "config.toml"), path.join(home, ".codex", "AGENTS.md"),
+    path.join(home, ".config", "kilo", "kilo.jsonc"), path.join(home, ".config", "kilo", "AGENTS.md"),
+    path.join(home, ".kilocode", "mcp_settings.json"), path.join(home, ".kilocode", "settings", "mcp_settings.json"),
+    path.join(home, ".config", "opencode", "opencode.json"), path.join(home, ".config", "opencode", "AGENTS.md"),
+  ]),
+  ...[process.env.APPDATA, process.env.LOCALAPPDATA].filter((dir): dir is string => Boolean(dir)).flatMap((dir) => [
+    path.join(dir, "Code", "User", "globalStorage", "kilocode.kilo-code", "settings", "mcp_settings.json"),
+    path.join(dir, "Kilo", "kilo.jsonc"), path.join(dir, "opencode", "opencode.json"),
+  ]),
+  ...[process.env.CODEX_HOME, process.env.CLAUDE_CONFIG_DIR, process.env.OPENCODE_CONFIG_DIR, process.env.XDG_CONFIG_HOME]
+    .filter((dir): dir is string => Boolean(dir))
+    .flatMap((dir) => ["config.toml", "AGENTS.md", "CLAUDE.md", "opencode.json", "kilo/kilo.jsonc"].map((file) => path.join(dir, file))),
+];
+
+function configHashes(files: string[]): Record<string, string | null> {
+  return Object.fromEntries(files.map((file) => [file,
+    fs.existsSync(file) && fs.statSync(file).isFile()
+      ? createHash("sha256").update(fs.readFileSync(file)).digest("hex") : null,
+  ]));
+}
+
+function sandboxTree(root: string): string[] {
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const file = path.join(root, entry.name);
+    return entry.isDirectory() ? [file, ...sandboxTree(file)] : [file];
+  }).sort();
+}
 
 function makeSandbox(): Sandbox {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "megamemory-install-test-"));
@@ -90,6 +122,36 @@ afterEach(() => {
 });
 
 describe("runInstall", () => {
+  it.each(["kilo,opencode", "opencode,kilo", "kilo,claudecode"]) (
+    "rejects mixed --dry-run targets %s before any file operation", async (targets) => {
+      const sandbox = makeSandbox();
+      const kiloConfig = path.join(sandbox.workspaceDir, "kilo.jsonc");
+      const opencodeConfig = path.join(sandbox.opencodeDir, "opencode.json");
+      fs.writeFileSync(kiloConfig, '{"mcp": {}}\n', "utf8");
+      fs.writeFileSync(opencodeConfig, '{"theme": "dark"}\n', "utf8");
+      const tree = sandboxTree(sandbox.root);
+      const hashes = configHashes(tree);
+      const realHashes = configHashes(realConfigPaths);
+      const { runInstall } = await loadInstallModule(sandbox);
+      const writes = [
+        vi.spyOn(fs, "writeFileSync"), vi.spyOn(fs, "mkdirSync"),
+        vi.spyOn(fs, "copyFileSync"), vi.spyOn(fs, "renameSync"), vi.spyOn(fs, "symlinkSync"),
+      ];
+
+      const outcome = await runInstall(["--target", targets, "--dry-run"]);
+
+      expect(outcome).toMatchObject({ ok: false, succeeded: 0, skipped: [] });
+      expect(outcome.failed).toHaveLength(1);
+      expect(outcome.failed[0]).toMatchObject({ target: "install", name: "Install options" });
+      expect(outcome.failed[0].error).toContain("supported only with --target kilo");
+      expect(process.exitCode).toBe(1);
+      for (const write of writes) expect(write).not.toHaveBeenCalled();
+      expect(sandboxTree(sandbox.root)).toEqual(tree);
+      expect(configHashes(tree)).toEqual(hashes);
+      expect(configHashes(realConfigPaths)).toEqual(realHashes);
+    }
+  );
+
   it("merges a valid opencode config without removing unrelated keys", async () => {
     const sandbox = makeSandbox();
     const opencodeConfigPath = path.join(sandbox.opencodeDir, "opencode.json");
@@ -234,6 +296,7 @@ describe("runInstall", () => {
 
   it("keeps the claudecode install inside the $HOME sandbox", async () => {
     const sandbox = makeSandbox();
+    const realHashes = configHashes(realConfigPaths);
     const { runInstall } = await loadInstallModule(sandbox);
     await runInstall(["--target", "claudecode"]);
 
@@ -242,6 +305,7 @@ describe("runInstall", () => {
     const claudeMd = fs.readFileSync(path.join(sandbox.homeDir, ".claude", "CLAUDE.md"), "utf-8");
     expect(claudeMd).toContain(EXPECTED_STAMP);
     expect(JSON.parse(fs.readFileSync(path.join(sandbox.homeDir, ".claude.json"), "utf-8")).mcpServers.megamemory).toBeTruthy();
+    expect(configHashes(realConfigPaths)).toEqual(realHashes);
   });
 
   it("writes a version-stamped block with supersedes rules into a fresh AGENTS.md", async () => {

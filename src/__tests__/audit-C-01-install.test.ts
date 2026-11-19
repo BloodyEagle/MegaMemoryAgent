@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuditHarnessError, auditFixture, type AuditFixture } from "./helpers/audit.js";
 
@@ -12,7 +13,7 @@ let fixture: AuditFixture;
 beforeEach(() => { fixture = auditFixture(); });
 afterEach(async () => { await fixture.close(); });
 
-function runInstaller(home: ReturnType<AuditFixture["profile"]>, entry: "runInstall" | "CLI") {
+function runInstaller(home: ReturnType<AuditFixture["profile"]>, entry: "runInstall" | "CLI", target: "claudecode" | "kilo" = "claudecode") {
   if (!fs.existsSync(cli)) throw new AuditHarnessError("Build dist before running C-01 subprocess tests");
   const guard = fixture.file("installer-process-boundary.mjs");
   // Mock only the OS-command boundary, not the installer. No where/which,
@@ -47,8 +48,8 @@ for (const key of ["exec", "execFile", "spawn", "spawnSync", "fork"]) {
 syncBuiltinESMExports();
 `, "utf8");
   const args = entry === "CLI"
-    ? [cli, "install", "--target", "claudecode"]
-    : ["--input-type=module", "--eval", `const { runInstall } = await import(${JSON.stringify(install)}); await runInstall(["--target", "claudecode"]);`];
+    ? [cli, "install", "--target", target]
+    : ["--input-type=module", "--eval", `const { runInstall } = await import(${JSON.stringify(install)}); await runInstall(${JSON.stringify(["--target", target])});`];
   const result = spawnSync(process.execPath, ["--import", pathToFileURL(guard).href, ...args], {
     cwd: fixture.root,
     env: {
@@ -66,7 +67,59 @@ syncBuiltinESMExports();
   return result;
 }
 
+function profileState(root: string): Record<string, string> {
+  return Object.fromEntries(fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const file = path.join(root, entry.name);
+    return entry.isDirectory() ? [[file, "directory"], ...Object.entries(profileState(file))] :
+      [[file, createHash("sha256").update(fs.readFileSync(file)).digest("hex")]];
+  }));
+}
+
 describe("C-01 installer reports configuration failure to its caller", () => {
+  it("CLI warns with a usable Kilo snippet and changes no files when the config is missing", () => {
+    const profile = fixture.profile();
+    const before = profileState(fixture.root);
+
+    const result = runInstaller(profile, "CLI", "kilo");
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Kilo config not found. No files created.");
+    expect(result.stdout).toContain("./kilo.jsonc");
+    expect(result.stdout).toContain('"mcp"');
+    expect(result.stdout).toContain('"megamemory"');
+    expect(result.stdout).toContain('"megamemory_create_concept": "allow"');
+    expect(result.stdout).toContain('"instructions"');
+    expect(result.stdout).toContain(".kilo/rules/megamemory.md");
+    expect(result.stderr).not.toContain("failed:");
+    const after = profileState(fixture.root);
+    // The only extra file is the subprocess guard created by this harness.
+    delete after[fixture.file("installer-process-boundary.mjs")];
+    expect(after).toEqual(before);
+  });
+
+  it.each(["runInstall", "CLI"] as const)("%s rejects malformed Kilo JSONC without any generated files", (entry) => {
+    const profile = fixture.profile();
+    const config = fixture.file("kilo.jsonc");
+    const malformed = '{\n  // preserve this malformed user configuration\n  "mcp": {\n';
+    fs.writeFileSync(config, malformed, "utf8");
+    const before = profileState(fixture.root);
+
+    const result = runInstaller(profile, entry, "kilo");
+
+    expect(result.status).not.toBe(0);
+    expect(fs.readFileSync(config, "utf8")).toBe(malformed);
+    expect(result.stderr).toContain("Kilo config and workflow rules failed:");
+    expect(result.stderr).toContain("Left the existing file unchanged.");
+    expect(result.stdout).toContain("Done with issues. 1 step(s) failed:");
+    expect(result.stdout).toContain(config);
+    const after = profileState(fixture.root);
+    delete after[fixture.file("installer-process-boundary.mjs")];
+    expect(after).toEqual(before);
+    for (const generated of [".kilo", ".kilocode", ".agents", "AGENTS.md"]) {
+      expect(fs.existsSync(path.join(fixture.root, generated))).toBe(false);
+    }
+  });
+
   it.each(["runInstall", "CLI"] as const)("%s fails on malformed JSON without changing the profile", (entry) => {
     const profile = fixture.profile();
     const config = path.join(profile.home, ".claude.json");
