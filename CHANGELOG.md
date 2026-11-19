@@ -13,12 +13,18 @@
   для `./kilo.jsonc`, exit 0 и никаких созданных файлов.
 - Автоодобрение только восьми явных инструментов: `understand`, `list_roots`,
   `get_concept`, `create_concept`, `update_concept`, `link`, `check_freshness`,
-  `provenance_trace`; новый формат использует ключи с префиксом `megamemory_`.
-  Wildcard и деструктивные операции не добавляются. Ручная проверка
-  отсутствия диалога автоодобрения в Kilo пока не подтверждена опытом.
-- Правила Kilo содержат полный workflow в управляемом блоке
-  `megamemory-snippet`: `.kilo/rules/megamemory.md` или
-  `.kilocode/rules/megamemory.md`. JSONC правится через `jsonc-parser`,
+  `provenance_trace`; единая карта `KILO_APPROVAL_KEYS` задаёт `permission`
+  для нового формата (ключи с префиксом `megamemory_`) и `alwaysAllow` для legacy.
+  Wildcard и деструктивные операции не добавляются. T0 принят как эмпирически
+  неподтверждённый; ручная приёмка в Kilo с вызовом `create_concept` без диалога
+  подтверждения остаётся обязательной.
+- Полный workflow правил Kilo — в управляемом блоке `megamemory-snippet`.
+  Проектный новый конфиг сохраняет относительную ссылку `.kilo/rules/megamemory.md`;
+  глобальный новый `~/.config/kilo/kilo.jsonc` (приоритет 2) получает в `instructions`
+  абсолютный путь к `~/.config/kilo/rules/megamemory.md` с раскрытым домашним каталогом,
+  и установщик пишет файл по этому пути. Область правил следует выбранному конфигу,
+  не `--global`; legacy без изменений: проектный `.kilocode/rules/megamemory.md`.
+  JSONC правится через `jsonc-parser`,
   комментарии/висячие запятые и форматирование вне изменённых узлов
   сохраняются; перед изменением существующего файла — побайтовый бэкап
   `.bak-<timestamp>-<uuid>`, синтаксическая ошибка не меняет конфиг.
@@ -28,7 +34,8 @@
   управляемый обновляется с побайтовым бэкапом.
   `--global` переносит скилл в `~/.agents/skills`, указатель — в нативный
   `~/.config/kilo/AGENTS.md` и уже существующий `~/.codex/AGENTS.md`, не меняя
-  порядок выбора MCP-конфига. `--link` — opt-in: `ln -s` только Linux/macOS;
+  порядок выбора MCP-конфига или область правил.
+  `--link` — opt-in: `ln -s` только Linux/macOS;
   на Windows и при dry-run команда лишь печатается, существующая цель не заменяется.
 - Универсальное MCP `instructions` при инициализации: протокол с текущей
   версией длиной ≤400 символов про `understand`, `create_concept` с `evidence`,

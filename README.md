@@ -420,7 +420,8 @@ creates **no files**, including rules, skills and AGENTS.md. Add the fragment
 manually, then re-run install; it is not a universal snippet for other clients.
 
 The new format uses `mcp.megamemory` with `type: "local"` and a runtime-derived
-`command` argv array. `permission` explicitly sets these eight keys to `"allow"`:
+`command` argv array. One `KILO_APPROVAL_KEYS` map selects `permission` for the new
+format and `alwaysAllow` for legacy. `permission` sets these eight keys to `"allow"`:
 
 ```json
 {
@@ -439,13 +440,23 @@ Legacy configs keep `mcpServers.megamemory`, `command`/`args`, and an `alwaysAll
 array of the same eight **unprefixed** tool names. No wildcard permission is added;
 `remove_concept`, `resolve_conflict`, `merge`, `slot_release`, and `expire` are never
 added to auto-approval. Existing unrelated servers, server options and user settings
-are retained. Auto-approval is **not yet empirically confirmed**: verify in Kilo
-that `create_concept` runs without an approval dialog.
+are retained. **T0 is accepted as empirically unconfirmed**; manual acceptance in
+Kilo with a `create_concept` call without an approval dialog remains mandatory.
 
-New-format `instructions` gets `.kilo/rules/megamemory.md` once, preserving other
-entries. The full workflow is written to `.kilo/rules/megamemory.md` (new format)
-or `.kilocode/rules/megamemory.md` (legacy), in a managed block between
-`<!-- megamemory-snippet vX.Y.Z -->` and `<!-- /megamemory-snippet -->`.
+Rule scope follows the **selected config**, independently of `--global`:
+
+- Project new-format configs keep the relative `instructions` entry
+  `.kilo/rules/megamemory.md`; the full workflow is written to that project file.
+- Global new-format `~/.config/kilo/kilo.jsonc` (priority 2) gets an **absolute**
+  `instructions` entry pointing to `~/.config/kilo/rules/megamemory.md`, with `~`
+  expanded to the actual home directory. Install writes the full workflow there,
+  so the referenced file exists.
+- Legacy is unchanged: the full workflow stays in project
+  `.kilocode/rules/megamemory.md`; no `instructions` entry is added.
+
+The chosen new-format rule ref appears once in `instructions`; other entries are
+preserved. Rules use a managed block between `<!-- megamemory-snippet vX.Y.Z -->`
+and `<!-- /megamemory-snippet -->`.
 Re-running install replaces only that block; an existing file without markers
 gets an appended block and a warning. JSONC edits use `jsonc-parser`: comments,
 trailing commas and formatting outside changed nodes are preserved. Syntax errors
@@ -468,9 +479,10 @@ An existing skill without the MegaMemory-managed marker is left untouched with a
 warning; managed skills are updated only after creating an exact backup.
 With `--global`, the skill goes to `~/.agents/skills/megamemory/SKILL.md` and the
 pointer to native `~/.config/kilo/AGENTS.md`, plus `~/.codex/AGENTS.md` **only if it
-already exists**. This flag changes skill/instruction placement, not the strict
-MCP config selection order. `.agents/AGENTS.md` is not a native instruction entry
-point. No links are created by default; `--link` prints the exact `ln -s` command
+already exists**. This flag changes skill and AGENTS.md pointer placement, not the
+strict MCP config selection order or rule scope. `.agents/AGENTS.md` is not a
+native instruction entry point. No links are created by default; `--link` prints
+the exact `ln -s` command
 and runs it only on Linux/macOS, without replacing an existing destination.
 On Windows (including Git Bash) or in dry-run it only prints the command and a warning.
 
