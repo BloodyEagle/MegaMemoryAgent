@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.10.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.10.2-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -425,8 +425,8 @@ audit-run.
 **by design** — the anchor exists to carry the link and its digests, not to
 state a thought. Every node carries `created_via`
 (`agent | file_ref | import | auto`), and only hand-written nodes (`agent`) are
-ever counted as stubs: `stats` splits supports into anchors and claims with a
-separate `Stubs` counter, and `weak_links` raises `stub_support` only for
+ever counted as stubs: `stats` prints `Supports: N (anchors a, claims c)` and
+keeps a separate `Stubs` counter, and `weak_links` raises `stub_support` only for
 manual placeholder summaries. An anchor is never a stub, and a hand-written
 template summary is still rejected — the difference is the origin, not the text.
 
@@ -523,16 +523,16 @@ megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline bo
 - The structural baseline compares **graph navigation, not natural-language
   questions** — it requires two endpoints:
 
-  ```text
-  node "C:/p/agent-skills/skills/token-economy-ts/scripts/graph-tool.js" op=path from=src/a.ts to=src/b.ts root=.
-  python -I "C:/p/agent-skills/skills/token-economy-py/scripts/te.py" search "apply_catalog" --root "<project-root>"
-  node "C:/p/agent-skills/skills/token-economy-har/har.js" search "AbsentNeedle" --file "<own-artificial.har>" --json
-  ```
+```text
+node "C:/p/agent-skills/skills/token-economy-ts/scripts/graph-tool.js" op=path from=src/a.ts to=src/b.ts root=.
+python -I "C:/p/agent-skills/skills/token-economy-py/scripts/te.py" search "apply_catalog" --root "<project-root>"
+node "C:/p/agent-skills/skills/token-economy-har/har.js" search "AbsentNeedle" --file "<own-artificial.har>" --json
+```
 
-  PY search returns UTF-8 text, not JSON. A complete HAR no-match returns its
-  JSON payload with exit 1 and empty stderr; parse/regex/read errors exit 2.
-  TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 use separate CLI/output contracts — point
-  bench at the verified source package or an explicitly updated installation.
+PY search returns UTF-8 text, not JSON. A complete HAR no-match returns its
+JSON payload with exit 1 and empty stderr; parse/regex/read errors exit 2.
+TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 use separate CLI/output contracts — point
+bench at the verified source package or an explicitly updated installation.
 - `graph_metric=retrieval_wire_without_instructions` estimates the actual
   retrieval MCP content envelope. The bench path calls `understand` directly,
   so it **excludes** the runtime wrapper staleness fields

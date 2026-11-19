@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.10.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.10.2-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -434,8 +434,9 @@ GitHub API не трогается. Переехавший тег или уех�
 for … — created as a provenance support.»). Шаблон так и задуман: якорь
 существует, чтобы нести связь и её дайджесты, а не формулировать мысль. Каждый
 узел несёт `created_via` (`agent | file_ref | import | auto`), и заглушкой
-считается только ручной узел (`agent`): `stats` делит строку опор на якоря и
-claims со счётчиком `Stubs`, а `weak_links` показывает `stub_support` только
+считается только ручной узел (`agent`): `stats` печатает строку
+`Supports: N (anchors a, claims c)` и держит отдельный счётчик `Stubs`, а
+`weak_links` показывает `stub_support` только
 для ручных шаблонных саммари. Якорь никогда не признается заглушкой, а ручной
 шаблонный текст по-прежнему отбивается — различие по происхождению, а не по
 тексту.
@@ -532,16 +533,16 @@ megamemory bench --db .megamemory/knowledge.db --questions q.jsonl --baseline bo
 - Структурная baseline сравнивает **навигацию по графу, а не вопросы на
   естественном языке** — ей нужны два endpoint:
 
-  ```text
-  node "C:/p/agent-skills/skills/token-economy-ts/scripts/graph-tool.js" op=path from=src/a.ts to=src/b.ts root=.
-  python -I "C:/p/agent-skills/skills/token-economy-py/scripts/te.py" search "apply_catalog" --root "<project-root>"
-  node "C:/p/agent-skills/skills/token-economy-har/har.js" search "AbsentNeedle" --file "<own-artificial.har>" --json
-  ```
+```text
+node "C:/p/agent-skills/skills/token-economy-ts/scripts/graph-tool.js" op=path from=src/a.ts to=src/b.ts root=.
+python -I "C:/p/agent-skills/skills/token-economy-py/scripts/te.py" search "apply_catalog" --root "<project-root>"
+node "C:/p/agent-skills/skills/token-economy-har/har.js" search "AbsentNeedle" --file "<own-artificial.har>" --json
+```
 
-  PY search возвращает UTF-8 текст, не JSON. Полный HAR no-match возвращает
-  JSON с exit 1 и пустым stderr; ошибки чтения/regex/parse завершаются exit 2.
-  TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 используют разные CLI и форматы ответа —
-  направляйте bench на проверенный source-пакет или явно обновлённую копию.
+PY search возвращает UTF-8 текст, не JSON. Полный HAR no-match возвращает
+JSON с exit 1 и пустым stderr; ошибки чтения/regex/parse завершаются exit 2.
+TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 используют разные CLI и форматы ответа —
+направляйте bench на проверенный source-пакет или явно обновлённую копию.
 - `graph_metric=retrieval_wire_without_instructions` оценивает фактический
   MCP-конверт retrieval. Bench вызывает `understand` напрямую, поэтому **не
   включает** runtime-поля устаревания обёртки (`instructions_stale`,
