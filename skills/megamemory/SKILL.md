@@ -5,6 +5,8 @@ description: Use the megamemory knowledge graph before coding tasks and after ve
 
 # megamemory
 
+<!-- MegaMemory-managed file. Safe for megamemory install to update. -->
+
 1. Before analysing a task, call `understand` with a short relevant query. Memory is context, not proof of current source code: read the referenced source and respect stale, refuted, unknown and incomplete qualifications.
 2. An empty result does not mean there is no knowledge. Distinguish `reason=empty_base|no_match|budget`; refine the query or budget when appropriate, without inventing stored facts.
 3. After verifying a reusable finding or decision, use `create_concept` with a meaningful `kind` and `evidence: [{ref: "file:lines", why: "what supports the claim"}]`. Update existing nodes instead of duplicating them; use `link` for explicit relationships.

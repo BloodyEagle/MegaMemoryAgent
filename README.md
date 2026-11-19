@@ -464,6 +464,8 @@ target is refused before writes. Dry-run prints planned paths and byte sizes and
 writes nothing: no configs, backups, directories, rules, skills or symlinks.
 By default, the short skill is `.agents/skills/megamemory/SKILL.md`, and root
 `AGENTS.md` gets a managed **three-line** pointer to the skill and full workflow.
+An existing skill without the MegaMemory-managed marker is left untouched with a
+warning; managed skills are updated only after creating an exact backup.
 With `--global`, the skill goes to `~/.agents/skills/megamemory/SKILL.md` and the
 pointer to native `~/.config/kilo/AGENTS.md`, plus `~/.codex/AGENTS.md` **only if it
 already exists**. This flag changes skill/instruction placement, not the strict

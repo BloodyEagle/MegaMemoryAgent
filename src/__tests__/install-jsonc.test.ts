@@ -218,7 +218,7 @@ describe("Plan E T1 JSONC editing safety", () => {
     expect(fs.existsSync(path.join(workspace, ".agents"))).toBe(false);
   });
 
-  it.each(['{"mcp": []}', '{"mcp":{"megamemory":null}}', '{"permission":[]}', '{"instructions":"not-an-array"}', '{"instructions":[1]}'])("rejects malformed config shapes without any side effects: %s", async (original) => {
+  it.each(['{"mcp": []}', '{"mcp":{"megamemory":null}}', '{"permission":[]}', '{"instructions":"not-an-array"}', '{"instructions":null}', '{"instructions":[1]}'])("rejects malformed config shapes without any side effects: %s", async (original) => {
     writeFixture(path.join(workspace, "kilo.jsonc"), original);
     const before = treeSnapshot([root]);
     expect((await install()).ok).toBe(false);

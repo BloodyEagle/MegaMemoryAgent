@@ -147,6 +147,36 @@ describe("Plan E T5 native agents convention", () => {
     expect(fs.existsSync(path.join(home, ".config/kilo/AGENTS.md"))).toBe(false);
   });
 
+  it.each([false, true])("preserves an unmarked user skill without a backup or rewrite; global = %s", async (global) => {
+    writeFixture(path.join(workspace, "kilo.jsonc"), "{}\n");
+    const skill = path.join(global ? home : workspace, ".agents/skills/megamemory/SKILL.md");
+    const original = "---\nname: megamemory\ndescription: User-owned project workflow\n---\n\nKeep my custom skill byte-for-byte.\n";
+    writeFixture(skill, original);
+    expect((await install(...(global ? ["--global"] : []))).ok).toBe(true);
+    expect(fs.readFileSync(skill)).toEqual(Buffer.from(original));
+    expect(fs.readdirSync(path.dirname(skill))).toEqual(["SKILL.md"]);
+    expect(output.join("\n")).toContain("not marked as MegaMemory-managed. Left it untouched.");
+    const once = treeSnapshot([root]);
+    expect((await install(...(global ? ["--global"] : []))).ok).toBe(true);
+    expect(treeSnapshot([root])).toEqual(once);
+  });
+
+  it("updates a managed skill with an exact backup", async () => {
+    writeFixture(path.join(workspace, "kilo.jsonc"), "{}\n");
+    const skill = path.join(workspace, ".agents/skills/megamemory/SKILL.md");
+    const original = "---\nname: megamemory\ndescription: Old managed protocol\n---\n\n<!-- MegaMemory-managed file. Safe for megamemory install to update. -->\nOld protocol.\n";
+    writeFixture(skill, original);
+    expect((await install()).ok).toBe(true);
+    assertSkill(skill);
+    expect(fs.readFileSync(skill, "utf8")).not.toContain("Old protocol.");
+    const backups = fs.readdirSync(path.dirname(skill)).filter((name) => name.startsWith("SKILL.md.bak-"));
+    expect(backups).toHaveLength(1);
+    expect(fs.readFileSync(path.join(path.dirname(skill), backups[0]))).toEqual(Buffer.from(original));
+    const once = treeSnapshot([root]);
+    expect((await install()).ok).toBe(true);
+    expect(treeSnapshot([root])).toEqual(once);
+  });
+
   it.each([false, true])("global install writes HOME skill and native Kilo instructions; existing Codex = %s", async (codexExists) => {
     writeFixture(path.join(home, ".config/kilo/kilo.jsonc"), "{}\n");
     const kiloAgents = path.join(home, ".config/kilo/AGENTS.md");

@@ -803,7 +803,7 @@ function mergeKiloConfig(selected: KiloConfig, runtime: CommandRuntime): string 
     return updated;
   }
   if ("permission" in config && !isObject(config["permission"])) throw formatConfigReadError(selected.filePath, "'permission' must be an object");
-  const instructions = config["instructions"] ?? [];
+  const instructions = "instructions" in config ? config["instructions"] : [];
   if (!Array.isArray(instructions) || !instructions.every((item): item is string => typeof item === "string")) {
     throw formatConfigReadError(selected.filePath, "'instructions' must be an array of strings");
   }
@@ -893,7 +893,13 @@ function prepareAgentsConvention(options: InstallOptions): Array<{ filePath: str
     `Follow the [megamemory skill](${skillRef}): evidence, next.record and granular nodes.`,
     "Full workflow contract: `megamemory guide --workflow`.",
   ].join("\n"));
-  const files = [{ filePath: skillPath, content: skill }, { filePath: agentsPath, content: mergeKiloBlock(agentsPath, block) }];
+  const files = [{ filePath: agentsPath, content: mergeKiloBlock(agentsPath, block) }];
+  const existingSkill = fs.existsSync(skillPath) ? fs.readFileSync(skillPath, "utf8") : undefined;
+  if (existingSkill === undefined || existingSkill === skill || isManagedInstallFile(existingSkill)) {
+    files.unshift({ filePath: skillPath, content: skill });
+  } else {
+    warn(`Existing skill at ${pc.dim(skillPath)} is not marked as MegaMemory-managed. Left it untouched.`);
+  }
   const codexPath = path.join(homeDir(), ".codex", "AGENTS.md");
   if (options.global && fs.existsSync(codexPath)) files.push({ filePath: codexPath, content: mergeKiloBlock(codexPath, block) });
   return files;
