@@ -153,18 +153,29 @@ describe("hooks install/uninstall/status (T2 cases 7–15)", () => {
     const installed = fs.readFileSync(hook);
     hooks("install");
     expect(fs.readFileSync(hook)).toEqual(installed);
-    stage("foreign.ts");
-    const rejected = git(["commit", "-m", "no memory after foreign hook"]);
-    expect(rejected.status).toBe(1);
-    expect(rejected.stderr).toContain("memory: <id узлов>");
-    const result = git(["commit", "-m", "change\n\nmemory: abc123"]);
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.stderr).toContain("foreign ran");
     hooks("uninstall");
     expect(fs.readFileSync(hook)).toEqual(original);
     hooks("uninstall");
     expect(fs.readFileSync(hook)).toEqual(original);
     expect(fs.readFileSync(neighbor)).toEqual(neighborBytes);
+  });
+
+  it("executes a POSIX LF foreign hook and checks the memory gate independently of byte preservation", () => {
+    fs.writeFileSync(hook, "#!/bin/sh\nprintf 'foreign ran\\n' >&2\n", "utf8");
+    hooks("install");
+    stage("foreign.ts");
+    const rejected = git(["commit", "-m", "no memory after foreign hook"]);
+    expect(rejected.status).toBe(1);
+    expect(rejected.stderr).toContain("foreign ran");
+    expect(rejected.stderr).toContain("memory: <id узлов>");
+    const accepted = git(["commit", "-m", "change\n\nmemory: abc123"]);
+    expect(accepted.status, accepted.stderr).toBe(0);
+    expect(accepted.stderr).toContain("foreign ran");
+    stage("bypass.ts");
+    const bypassed = git(["commit", "--no-verify", "-m", "explicit bypass"]);
+    expect(bypassed.status, bypassed.stderr).toBe(0);
+    expect(bypassed.stderr).not.toContain("foreign ran");
+    expect(bypassed.stderr).not.toContain("memory: <id узлов>");
   });
 
   it.each(["relative", "absolute", "tilde"])("honors %s core.hooksPath from a subdirectory", (kind) => {
