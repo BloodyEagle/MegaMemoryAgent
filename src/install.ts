@@ -30,6 +30,7 @@ const KILO_ALLOWED_TOOLS = [
   "update_concept", "link", "check_freshness", "provenance_trace",
 ] as const;
 const KILO_RULE_REF = ".kilo/rules/megamemory.md";
+const KILO_APPROVAL_KEYS = { jsonc: "permission", legacy: "alwaysAllow" } as const;
 
 interface TargetConfig {
   label: string;
@@ -790,6 +791,17 @@ function editKiloConfig(text: string, jsonPath: Array<string | number>, value: u
   return applyEdits(text, edits);
 }
 
+function kiloRuleLocation(selected: KiloConfig): { filePath: string; ref: string } {
+  if (selected.format === "jsonc" && selected.priority === 2) {
+    const filePath = path.resolve(homeDir(), ".config", "kilo", "rules", "megamemory.md");
+    return { filePath, ref: filePath };
+  }
+  return {
+    filePath: path.join(process.cwd(), selected.format === "jsonc" ? ".kilo" : ".kilocode", "rules", "megamemory.md"),
+    ref: KILO_RULE_REF,
+  };
+}
+
 function mergeKiloConfig(selected: KiloConfig, runtime: CommandRuntime): string {
   const { text, config } = readKiloConfig(selected);
   const key = selected.format === "jsonc" ? "mcp" : "mcpServers";
@@ -798,21 +810,23 @@ function mergeKiloConfig(selected: KiloConfig, runtime: CommandRuntime): string 
   const options = managedServerOptions(servers, selected.filePath);
   let updated = text;
   if (selected.format === "legacy") {
-    const fields = { command: runtime.stdioCommand, args: runtime.stdioArgs, alwaysAllow: [...KILO_ALLOWED_TOOLS] };
+    const fields = { command: runtime.stdioCommand, args: runtime.stdioArgs, [KILO_APPROVAL_KEYS.legacy]: [...KILO_ALLOWED_TOOLS] };
     for (const [name, value] of Object.entries(fields)) updated = editKiloConfig(updated, [key, "megamemory", name], value);
     return updated;
   }
-  if ("permission" in config && !isObject(config["permission"])) throw formatConfigReadError(selected.filePath, "'permission' must be an object");
+  const approvalKey = KILO_APPROVAL_KEYS.jsonc;
+  if (approvalKey in config && !isObject(config[approvalKey])) throw formatConfigReadError(selected.filePath, `'${approvalKey}' must be an object`);
   const instructions = "instructions" in config ? config["instructions"] : [];
   if (!Array.isArray(instructions) || !instructions.every((item): item is string => typeof item === "string")) {
     throw formatConfigReadError(selected.filePath, "'instructions' must be an array of strings");
   }
   const fields = { type: "local", command: [runtime.stdioCommand, ...runtime.stdioArgs], enabled: options["enabled"] ?? true };
   for (const [name, value] of Object.entries(fields)) updated = editKiloConfig(updated, [key, "megamemory", name], value);
-  for (const tool of KILO_ALLOWED_TOOLS) updated = editKiloConfig(updated, ["permission", `megamemory_${tool}`], "allow");
-  const refs = instructions.map((item, index) => item === KILO_RULE_REF ? index : -1).filter((index) => index >= 0);
-  if (!("instructions" in config)) updated = editKiloConfig(updated, ["instructions"], [KILO_RULE_REF]);
-  else if (refs.length === 0) updated = editKiloConfig(updated, ["instructions", -1], KILO_RULE_REF);
+  for (const tool of KILO_ALLOWED_TOOLS) updated = editKiloConfig(updated, [approvalKey, `megamemory_${tool}`], "allow");
+  const ruleRef = kiloRuleLocation(selected).ref;
+  const refs = instructions.map((item, index) => item === ruleRef ? index : -1).filter((index) => index >= 0);
+  if (!("instructions" in config)) updated = editKiloConfig(updated, ["instructions"], [ruleRef]);
+  else if (refs.length === 0) updated = editKiloConfig(updated, ["instructions", -1], ruleRef);
   for (const index of refs.slice(1).reverse()) updated = editKiloConfig(updated, ["instructions", index], undefined);
   return updated;
 }
@@ -862,7 +876,7 @@ async function setupKiloConfig(runtime: CommandRuntime, options: InstallOptions)
     warn("Kilo config not found. No files created. Add the following new-format fragment to ./kilo.jsonc, then re-run install.");
     console.log(JSON.stringify({
       mcp: { megamemory: { type: "local", command: [runtime.stdioCommand, ...runtime.stdioArgs] } },
-      permission: Object.fromEntries(KILO_ALLOWED_TOOLS.map((tool) => [`megamemory_${tool}`, "allow"])),
+      [KILO_APPROVAL_KEYS.jsonc]: Object.fromEntries(KILO_ALLOWED_TOOLS.map((tool) => [`megamemory_${tool}`, "allow"])),
       instructions: [KILO_RULE_REF],
     }, null, 2));
     return;
@@ -870,13 +884,13 @@ async function setupKiloConfig(runtime: CommandRuntime, options: InstallOptions)
   info(`Found ${selected.filePath} (priority ${selected.priority}, ${selected.format === "jsonc" ? "new JSONC" : "legacy mcpServers"} format).`);
   for (const other of found.slice(1)) info(`Skipped ${other.filePath} (priority ${other.priority}): the first config wins.`);
   const config = mergeKiloConfig(selected, runtime);
-  const rulePath = path.join(process.cwd(), selected.format === "jsonc" ? ".kilo" : ".kilocode", "rules", "megamemory.md");
+  const { filePath: rulePath, ref: ruleRef } = kiloRuleLocation(selected);
   const rules = mergeKiloBlock(rulePath, kiloManagedBlock(buildWorkflowText()));
   const agents = prepareAgentsConvention(options);
   writeKiloFile(selected.filePath, config, options.dryRun);
   writeKiloFile(rulePath, rules, options.dryRun);
-  info(`${selected.format === "jsonc" ? "permission" : "alwaysAllow"}: ${KILO_ALLOWED_TOOLS.join(", ")}`);
-  if (selected.format === "jsonc") info(`instructions: ${KILO_RULE_REF}`);
+  info(`${KILO_APPROVAL_KEYS[selected.format]}: ${KILO_ALLOWED_TOOLS.join(", ")}`);
+  if (selected.format === "jsonc") info(`instructions: ${ruleRef}`);
   warn("Auto-approval is not empirically confirmed. Verify create_concept in Kilo without an approval dialog.");
   for (const file of agents) writeKiloFile(file.filePath, file.content, options.dryRun);
   await setupAgentsLink(options);

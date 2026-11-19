@@ -135,7 +135,17 @@ describe("Plan E T1 Kilo new config", () => {
     expect(config.mcp.megamemory).toEqual({ type: "local", command: ["node", expectedEntry], enabled: true });
     expect(execFileSyncMock).toHaveBeenCalled();
     assertPermissions(config, fs.readFileSync(selected, "utf8"));
-    expect(config.instructions).toEqual([ruleRef]);
+    const expectedRule = winner === "global" ? path.resolve(home, ".config/kilo/rules/megamemory.md") : ruleRef;
+    expect(config.instructions).toEqual([expectedRule]);
+    if (winner === "global") {
+      expect(path.isAbsolute(config.instructions[0])).toBe(true);
+      expect(fs.existsSync(config.instructions[0])).toBe(true);
+      expect(fs.existsSync(path.join(workspace, ".kilo/rules/megamemory.md"))).toBe(false);
+      const once = treeSnapshot([root]);
+      expect((await install()).ok).toBe(true);
+      expect(treeSnapshot([root])).toEqual(once);
+      expect(readConfig(selected).instructions.filter((ref) => ref === expectedRule)).toHaveLength(1);
+    }
     for (const [file, bytes] of untouched) {
       expect(fs.readFileSync(file)).toEqual(bytes);
       expect(fs.readdirSync(path.dirname(file)).filter((name) => name.startsWith(`${path.basename(file)}.bak-`))).toEqual([]);
@@ -143,7 +153,7 @@ describe("Plan E T1 Kilo new config", () => {
     }
     for (const file of candidates.slice(0, index)) expect(fs.existsSync(file)).toBe(false);
     expect(output.join("\n")).toMatch(/Skipped.*first config wins/);
-    expect(fs.existsSync(path.join(workspace, ".kilo/rules/megamemory.md"))).toBe(true);
+    expect(fs.existsSync(winner === "global" ? expectedRule : path.join(workspace, ruleRef))).toBe(true);
     expect(fs.existsSync(path.join(workspace, ".kilocode/rules/megamemory.md"))).toBe(false);
   });
 
