@@ -384,6 +384,7 @@ megamemory install --target opencode
 megamemory install --target claudecode
 megamemory install --target antigravity
 megamemory install --target codex
+megamemory install --target kilo
 ```
 
 There is deliberately no universal manual JSON snippet: the clients use different
@@ -401,6 +402,84 @@ The server resolves `.megamemory/knowledge.db` from the MCP process working dire
 non-empty `CODEX_HOME`, otherwise to `~/.codex`; OpenCode and Claude Code use their
 client-specific profile paths shown in the installer output.
 
+### Kilo installation
+
+`megamemory install --target kilo` edits **only the first existing MCP config**, in
+this strict order (the root file wins over `.kilo/kilo.jsonc`):
+
+1. `./kilo.jsonc`, then `./.kilo/kilo.jsonc` — project, new JSONC format.
+2. `~/.config/kilo/kilo.jsonc` — global, new JSONC format.
+3. `./.kilocode/mcp.json` — project, legacy format.
+4. `~/.kilocode/**/mcp_settings.json` — global legacy search, at most three
+   directory levels deep; the first match wins (including
+   `~/.kilocode/cli/global/settings/mcp_settings.json`).
+
+Other discovered configs are reported as skipped and left untouched. If none is
+found, install warns, prints a new-format fragment for `./kilo.jsonc`, exits 0 and
+creates **no files**, including rules, skills and AGENTS.md. Add the fragment
+manually, then re-run install; it is not a universal snippet for other clients.
+
+The new format uses `mcp.megamemory` with `type: "local"` and a runtime-derived
+`command` argv array. `permission` explicitly sets these eight keys to `"allow"`:
+
+```json
+{
+  "megamemory_understand": "allow",
+  "megamemory_list_roots": "allow",
+  "megamemory_get_concept": "allow",
+  "megamemory_create_concept": "allow",
+  "megamemory_update_concept": "allow",
+  "megamemory_link": "allow",
+  "megamemory_check_freshness": "allow",
+  "megamemory_provenance_trace": "allow"
+}
+```
+
+Legacy configs keep `mcpServers.megamemory`, `command`/`args`, and an `alwaysAllow`
+array of the same eight **unprefixed** tool names. No wildcard permission is added;
+`remove_concept`, `resolve_conflict`, `merge`, `slot_release`, and `expire` are never
+added to auto-approval. Existing unrelated servers, server options and user settings
+are retained. Auto-approval is **not yet empirically confirmed**: verify in Kilo
+that `create_concept` runs without an approval dialog.
+
+New-format `instructions` gets `.kilo/rules/megamemory.md` once, preserving other
+entries. The full workflow is written to `.kilo/rules/megamemory.md` (new format)
+or `.kilocode/rules/megamemory.md` (legacy), in a managed block between
+`<!-- megamemory-snippet vX.Y.Z -->` and `<!-- /megamemory-snippet -->`.
+Re-running install replaces only that block; an existing file without markers
+gets an appended block and a warning. JSONC edits use `jsonc-parser`: comments,
+trailing commas and formatting outside changed nodes are preserved. Syntax errors
+report the path and position without changing the config. Before modifying an
+existing file, install saves a byte-for-byte `<file>.bak-<timestamp>-<uuid>` backup;
+unchanged files are skipped.
+
+```bash
+megamemory install --target kilo --dry-run
+megamemory install --target kilo --global
+megamemory install --target kilo --link
+```
+
+`--dry-run`, `--global` and `--link` are **Kilo-only**; combining them with another
+target is refused before writes. Dry-run prints planned paths and byte sizes and
+writes nothing: no configs, backups, directories, rules, skills or symlinks.
+By default, the short skill is `.agents/skills/megamemory/SKILL.md`, and root
+`AGENTS.md` gets a managed **three-line** pointer to the skill and full workflow.
+With `--global`, the skill goes to `~/.agents/skills/megamemory/SKILL.md` and the
+pointer to native `~/.config/kilo/AGENTS.md`, plus `~/.codex/AGENTS.md` **only if it
+already exists**. This flag changes skill/instruction placement, not the strict
+MCP config selection order. `.agents/AGENTS.md` is not a native instruction entry
+point. No links are created by default; `--link` prints the exact `ln -s` command
+and runs it only on Linux/macOS, without replacing an existing destination.
+On Windows (including Git Bash) or in dry-run it only prints the command and a warning.
+
+**Universal MCP instructions.** At initialization, the server also sends a
+versioned protocol of at most 400 characters: call `understand`, record verified
+conclusions with `create_concept` + `evidence`, use `link`, and follow `next.record`;
+`empty_base`, `no_match` and `budget` do not prove absence of knowledge.
+Clients supporting MCP `instructions` can use it without installer rule files;
+it is a short safety net, not a replacement for the full workflow or proof that
+the agent received or followed it.
+
 **Workflow-wrapper freshness.** `install` puts
 `<!-- megamemory:instructions vX.Y.Z -->` on the managed block in `AGENTS.md` or
 `CLAUDE.md` and on installed command markdown. It does not stamp MCP config or the
@@ -413,6 +492,16 @@ additional scan candidate. The response carries the runtime wrapper staleness fi
 `instructions_stale`, `instructions_version`, and `server_version`. No managed
 instruction file means `false / null`; a version mismatch means re-run `install` for
 the relevant target after updating the package.
+
+**Kilo freshness scope.** The short Kilo `AGENTS.md` block starts with
+`<!-- megamemory:instructions vX.Y.Z -->`, followed by the plan's snippet marker,
+three instruction lines and the closing marker. The existing scanner recognizes
+the project stamp and compares its version normally; re-installing replaces the
+managed block from its first stamp through the closing marker without duplication.
+Kilo rules retain the snippet marker only. Those rules and global
+`~/.config/kilo/AGENTS.md` are still not scan candidates: the freshness fields
+validate the scanned project block, not every Kilo instruction file. A missing
+scan result is not proof of no rules.
 
 ### Upgrading an existing upstream database
 
@@ -470,7 +559,7 @@ extras manually.
 
 | Tool | Description |
 |---|---|
-| `understand` | Budgeted hybrid retrieval in `compact` (default, `max_tokens: 4000`), `full`, or `brief`. Compact returns a bounded `candidates` list plus up to 3 fully qualified compact cards when the budget permits; `matches`/`compact` remain available, and `full` keeps its previous response form. Filters inactive/expired facts and always returns the `next` action contract; `record` carries the support form (`[{ref\|node, why}]` → `informed_by`), with kind chosen by meaning and no links from `file_refs` alone. After ≥3 completed reads since the last logged write, `next.record` appends a conditional reminder and `next.unrecorded` reports the count; empty results distinguish `empty_base`, `no_match`, and `budget`. In compact, `collapse_ref_anchors` defaults to `true` (`false` is supported): template ref-anchors are folded with rationale or shown as collapsed locators with dependents (`meta.anchor_collapsed`); path-like names are demoted unless the query is an exact full path; id/path resolution and provenance are unaffected. Opt-in `include_evidence: true` attaches `current_digests` and `support_evidence` with ALL live supports, untrimmed wording, edge rationale and claim/status/edge/artifacts digests; each card and its evidence are placed atomically or omitted, without counting candidate-only entries as dropped. P1 reuse (opt-in, compact only): `reuse: {task_type, files}` qualifies saved analysis passports explicitly by task type and verified scope — the `passport_reuse` section lists `covered`/`gaps` and a qualification (`reusable\|candidate\|stale_input\|incomplete\|unknown\|expired\|refuted_support\|broken\|wrong_repo`); no state raises trust silently, and a qualification is never code coverage. P3 task profile (opt-in, compact only): `task: {goal, kind, files?, context_epoch?}` embeds a `task_context` section into THIS answer — deterministic mandatory source categories per task kind, decisions/tests citing the explicit file scope boosted with score 0, hidden supports of placed decisions, semantic duplicates dropped WITHOUT dropping refuted reasons/contradictions/incompleteness, uncovered mandatory sources listed with a next step, and an approximate total-cost heuristic (never provider tokens); it never replaces `must_read`, never fills `next.skip`, never claims whole-file coverage; `context_epoch` is explicit client state that only collapses already-served non-mandatory cards (decisions/refuted/expired are never collapsed). |
+| `understand` | Budgeted hybrid retrieval in `compact` (default, `max_tokens: 4000`), `full`, or `brief`. Compact returns a bounded `candidates` list plus up to 3 fully qualified compact cards when the budget permits; `matches`/`compact` remain available, and `full` keeps its previous response form. Filters inactive/expired facts and always returns the `next` action contract; `record` carries the support form (`[{ref\|node, why}]` → `informed_by`), with kind chosen by meaning and no links from `file_refs` alone. After ≥2 completed reads since the last logged write, `next.record` appends a conditional reminder and `next.unrecorded` reports the count; cross-session context may add `next.previous_session` (see below); empty results distinguish `empty_base`, `no_match`, and `budget`. In compact, `collapse_ref_anchors` defaults to `true` (`false` is supported): template ref-anchors are folded with rationale or shown as collapsed locators with dependents (`meta.anchor_collapsed`); path-like names are demoted unless the query is an exact full path; id/path resolution and provenance are unaffected. Opt-in `include_evidence: true` attaches `current_digests` and `support_evidence` with ALL live supports, untrimmed wording, edge rationale and claim/status/edge/artifacts digests; each card and its evidence are placed atomically or omitted, without counting candidate-only entries as dropped. P1 reuse (opt-in, compact only): `reuse: {task_type, files}` qualifies saved analysis passports explicitly by task type and verified scope — the `passport_reuse` section lists `covered`/`gaps` and a qualification (`reusable\|candidate\|stale_input\|incomplete\|unknown\|expired\|refuted_support\|broken\|wrong_repo`); no state raises trust silently, and a qualification is never code coverage. P3 task profile (opt-in, compact only): `task: {goal, kind, files?, context_epoch?}` embeds a `task_context` section into THIS answer — deterministic mandatory source categories per task kind, decisions/tests citing the explicit file scope boosted with score 0, hidden supports of placed decisions, semantic duplicates dropped WITHOUT dropping refuted reasons/contradictions/incompleteness, uncovered mandatory sources listed with a next step, and an approximate total-cost heuristic (never provider tokens); it never replaces `must_read`, never fills `next.skip`, never claims whole-file coverage; `context_epoch` is explicit client state that only collapses already-served non-mandatory cards (decisions/refuted/expired are never collapsed). |
 | `check_freshness` | P2 targeted freshness verification (explicit opt-in action, read-only): for changed or suspect sources — files, `HEAD:sha:path` blobs, `git:tag/commit/branch` refs — it checks the RELATED records through a rebuildable reverse index (node `file_refs`, artifact observations, passport scopes), not the whole graph. Content is verified by sha256 (mtime/size are never proof); git dirty state (staged/unstaged/untracked/rename) and HEAD ride the report as observations — a previous HEAD never proves the working tree unchanged. One physical source is hashed once per check; sources that change DURING the check report `unstable` — no stable snapshot is declared. The report carries `sources` (unchanged/changed/missing/unobserved/unstable/skipped/other_repo), `records` (fresh/stale_input/partial/unknown — a checked prefix is never presented as the whole graph), `summary.limitations`, and `expected_versions` to re-verify before applying an edit. It never writes to the database and never confirms supports; a freshness pass does not raise the passport reuse qualification. Optional pilot (P2.2): `symbols` resolves definitions through the token-economy-ts adapter (`adapter.graph_tool` or env `MEGAMEMORY_CODE_ADAPTER`; an ambiguous/missing symbol is explicit and requires reading — never the first match; line numbers are the current resolution, not identity), and `with_dependencies` walks the static import graph of changed sources (bounded by `max_deps`, declared scope only). |
 | `get_concept` | Exact-ID full context: parent, children, edges, trails/slots, support check, and current digests for confirmation. Budgeted profiles (`orientation`/`evidence`/`full`), batch `ids` (up to 25, one shared budget, per-id status/errors), capped neighbor disclosure with `continuation`. E4 delta (opt-in): `context_epoch` + `known_versions` — a version match of the requested projection returns a compact `unchanged` answer with the qualification minimum (never code coverage); a mismatch or a new epoch returns the full card. An old plain `{id}` call preserves the previous card and retrieval behavior; successful nonempty MCP reads may add the optional top-level `hint.record` (not on `unchanged` or `meta.reason = "budget"`). Web and CLI card shapes are unchanged. |
 | `create_concept` | Atomically create a node and optional edges/evidence; supports `supersedes`, `valid_until`, duplicate refusal, and same-call evidence snapshots. |
@@ -526,10 +615,21 @@ candidate list.
 
 `understand` counts completed read calls since the last logged write in process memory,
 scoped to the database/logger; the current call is logged only after its response.
-At ≥3 reads, `next.unrecorded: {reads_since_write, last_write_at}` accompanies the exact
+At ≥2 reads, `next.unrecorded: {reads_since_write, last_write_at}` accompanies the exact
 sentence appended once to `next.record`: «С последней записи N чтений — если это законченный вывод, запиши его.»
-The reminder and field are absent below 3, after a logged write (including deletion),
+The reminder and field are absent below 2, after a logged write (including deletion),
 and for `empty_base`. Pure reading does not require a write: record a completed conclusion with evidence.
+
+A separate cross-session signal examines at most the **last 200 `timeline` rows**,
+with a process-local cache. A gap **greater than 30 minutes** separates sessions;
+exactly 30 minutes does not. When a complete previous session can be established,
+the additive `next.previous_session: {had_understand, had_record, ended_at}` reports it.
+If it had a successful `understand` and no successful write, `next.record` also adds
+once: «В прошлой сессии после understand не было ни одной записи — если сейчас есть вывод, запиши его.»
+That sentence is absent if the previous session wrote; both the signal and reminder
+are absent for `empty_base`. An incomplete/invalid bounded sample cannot establish
+the previous session. Emitting the text proves neither that the agent saw it nor
+that it wrote knowledge; measuring exposure requires separate instrumentation.
 
 Empty `understand` results carry `meta.reason`: `empty_base` means no live (non-deleted)
 nodes; `no_match` means live nodes exist but none pass the search/filters; `budget` means
@@ -564,13 +664,13 @@ or a requirement to invent new knowledge.
 
 | Command | What it does |
 |---|---|
-| `megamemory install` | Configure an MCP client |
+| `megamemory install [--target kilo]` | Configure an MCP client; Kilo supports new JSONC/legacy configs and Kilo-only `--dry-run`, `--global`, `--link` |
 | `megamemory hooks install\|uninstall\|status [--repo PATH]` | Manage an optional local `commit-msg` gate for the `memory:` line; current directory by default, no database or network |
 | `megamemory serve [--port N]` | Web explorer (graph, search, node cards, Tokens panel, consolidate tab). **Loopback only** (`127.0.0.1`, IPv6: `--host ::1`) — a local tool for a human, not a network service; earlier releases listened on all interfaces — behavior changed |
 | `megamemory migrate [--dry-run\|--apply]` | Upgrade raw upstream v1.6.2 or repair fork migration objects; dry-run uses a disposable coherent snapshot, apply backs up and writes |
 | `megamemory repair-ids [--dry-run\|--apply]` | Rebuild empty/trailing-slash and affected descendant IDs; dry-run uses a disposable snapshot, apply is atomic |
 | `megamemory reembed [--batch N]` | Start/resume a model+preprocessing vector generation and republish eligible nodes into canonical/native projections |
-| `megamemory doctor` | Health check: schema, model, FTS, IDs, vectors, orphans, digests |
+| `megamemory doctor` | Health check: schema, model, FTS, IDs, vectors, orphans, digests; non-failing warning after ≥3 understand sessions and 0 writes in 14 days (silent on an empty base) |
 | `megamemory stats` | Graph and token statistics |
 | `megamemory eval` | recall@10 over `fixtures/eval.jsonl` |
 | `megamemory guide` | Print the agent onboarding text (what install writes to AGENTS.md, plus a session example); `guide --workflow` prints the full workflow contract (`docs/agent-workflow.md`) verbatim — UTF-8, no database, no network |
@@ -582,6 +682,15 @@ or a requirement to invent new knowledge.
 | `megamemory expire --scan [--json] [--repo PATH]` | Read-only review of expiry candidates (`scripts/report-journals.mjs` is a thin adapter over the same module); `--json` prints the versioned report for the `--report` apply path; `--scan --apply` is refused |
 | `megamemory telemetry-report [--file PATH] [--tariff-version VER] [--json]` | Offline aggregate of the local J0 telemetry JSONL (no database, no network): calls/outcomes, latency and session wall time p50/p95, memory-write categories, completeness counters. Provider tokens and money appear only from actually supplied client usage — otherwise explicit `unavailable` (never zeros); estimated wire bytes are separate fields, never merged with provider tokens; correctness is computed only against a predeclared oracle (whole-task experiment, J2/J3) |
 | `megamemory merge`, `conflicts`, `resolve` | Two-way merge of graphs across branches |
+
+### Memory recording warning
+
+On a nonempty base, `megamemory doctor` warns when the last **14 days** contain
+**at least 3 sessions with a successful `understand` and zero successful writes**.
+It points to `megamemory install --target kilo` and `next.record`. The warning does
+not add a problem or change the exit code; an empty base, fewer sessions or any
+successful write in the window suppress it. This is an activity signal, not proof
+of an installation failure or a guarantee that the agent saw a reminder.
 
 ### Git hooks
 
