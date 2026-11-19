@@ -8,6 +8,25 @@ import { countStubSupports } from "./stub.js";
 import { probeFtsHealth, type FtsHealth } from "./fts-health.js";
 import { computeHealth, formatHealthSummary } from "./health.js";
 import { digestPendingParents } from "./digest.js";
+import { sessionize, timelineTsString } from "./sessions.js";
+
+function noRecordsWarning(db: KnowledgeDB): string | undefined {
+  if (!db.execSqlFirst("SELECT 1 FROM nodes WHERE removed_at IS NULL LIMIT 1")) return undefined;
+  if (!db.execSqlFirst("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'timeline'")) return undefined;
+  const now = Date.now();
+  const rows = db.execSqlAll(
+    `SELECT timestamp, tool, is_write, is_error FROM timeline
+     WHERE timestamp >= ? AND timestamp < ? ORDER BY seq ASC`,
+    timelineTsString(now - 14 * 86_400_000), timelineTsString(now)
+  ) as Array<{ timestamp: string; tool: string; is_write: number; is_error: number }>;
+  if (rows.some((row) => row.is_write === 1 && row.is_error === 0)) return undefined;
+  const understandSessions = sessionize(rows).filter((session) =>
+    session.entries.some((row) => row.tool === "understand" && row.is_error === 0)
+  ).length;
+  if (understandSessions < 3) return undefined;
+  return `warn: ${understandSessions} сессии с understand и 0 записей за 14 дней — память читается, но не пополняется.\n` +
+    "      Проверь: megamemory install --target kilo и next.record в ответе understand.";
+}
 
 /**
  * F13 helper: turn probe counts into a drift message. Exported for tests —
@@ -465,6 +484,9 @@ export function runDoctor(db: KnowledgeDB): {
       `сводка активности недоступна: ${err instanceof Error ? err.message : String(err)}`
     );
   }
+
+  const warning = noRecordsWarning(db);
+  if (warning) add("memory recording", true, warning);
 
   return { checks, problems: checks.filter((c) => !c.ok).length };
 }

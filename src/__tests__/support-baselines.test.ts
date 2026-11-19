@@ -42,8 +42,11 @@ function createdId(result: { id?: string }): string {
 
 let tmpDir: string;
 let db: KnowledgeDB;
+let originalEnvAutoGround: string | undefined;
 
 beforeEach(() => {
+  originalEnvAutoGround = process.env.MEGAMEMORY_PROVENANCE_AUTO_GROUND;
+  delete process.env.MEGAMEMORY_PROVENANCE_AUTO_GROUND;
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-baselines-"));
   db = new KnowledgeDB(path.join(tmpDir, "knowledge.db"));
 });
@@ -52,6 +55,11 @@ beforeEach(() => {
 // close under AV/indexer pressure (helpers/cleanup.ts budgets 4 s and loses
 // that race, paying it per test). Temp dirs are the OS's to clean.
 afterEach(() => {
+  if (originalEnvAutoGround === undefined) {
+    delete process.env.MEGAMEMORY_PROVENANCE_AUTO_GROUND;
+  } else {
+    process.env.MEGAMEMORY_PROVENANCE_AUTO_GROUND = originalEnvAutoGround;
+  }
   db.close();
 });
 

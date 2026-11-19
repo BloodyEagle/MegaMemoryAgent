@@ -1,6 +1,6 @@
 {
   "name": "@bloodyeagle/megamemory",
-  "version": "2.9.0",
+  "version": "2.10.0",
   "description": "MCP server that gives coding agents persistent project understanding via a knowledge graph",
   "type": "module",
   "main": "dist/index.js",
@@ -11,6 +11,7 @@
     "dist/",
     "plugin/",
     "commands/",
+    "skills/",
     "web/",
     "docs/",
     "fixtures/eval.jsonl",
@@ -58,6 +59,7 @@
   "dependencies": {
     "@huggingface/transformers": "^4.3.2",
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "jsonc-parser": "^3.3.1",
     "libsql": "^0.5.22",
     "picocolors": "^1.1.1",
     "zod": "^3.24.2"

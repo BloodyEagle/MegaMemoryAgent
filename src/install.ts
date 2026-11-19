@@ -4,13 +4,33 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { randomUUID } from "node:crypto";
 import pc from "picocolors";
+import { applyEdits, findNodeAtLocation, getNodeValue, modify, parseTree, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { success, skip, error, info, heading, warn, multiSelect } from "./cli-utils.js";
 import { INSTRUCTIONS_STAMP_MARKER, instructionsStamp } from "./instructions.js";
 // F2 (2.1.5): the snippet lives in guide.ts — `megamemory guide` prints the
 // very same constant, so the printed text cannot drift from the written one.
-import { AGENTS_MD_END, AGENTS_MD_SNIPPET } from "./guide.js";
+import { AGENTS_MD_END, AGENTS_MD_SNIPPET, buildWorkflowText } from "./guide.js";
 
-export type InstallTarget = "opencode" | "claudecode" | "antigravity" | "codex";
+export type InstallTarget = "opencode" | "claudecode" | "antigravity" | "codex" | "kilo";
+
+interface InstallOptions {
+  dryRun: boolean;
+  global: boolean;
+  link: boolean;
+}
+
+interface KiloConfig {
+  filePath: string;
+  format: "jsonc" | "legacy";
+  priority: number;
+}
+
+const KILO_ALLOWED_TOOLS = [
+  "understand", "list_roots", "get_concept", "create_concept",
+  "update_concept", "link", "check_freshness", "provenance_trace",
+] as const;
+const KILO_RULE_REF = ".kilo/rules/megamemory.md";
+const KILO_APPROVAL_KEYS = { jsonc: "permission", legacy: "alwaysAllow" } as const;
 
 interface TargetConfig {
   label: string;
@@ -713,7 +733,216 @@ async function setupCodexConfig(runtime: CommandRuntime): Promise<void> {
   info(`Command: ${pc.cyan(JSON.stringify([runtime.stdioCommand, ...runtime.stdioArgs]))}`);
 }
 
-function createTargetConfigs(runtime: CommandRuntime): Record<InstallTarget, TargetConfig> {
+function findKiloConfigs(): KiloConfig[] {
+  const found: KiloConfig[] = [];
+  const candidates: KiloConfig[] = [
+    { filePath: path.join(process.cwd(), "kilo.jsonc"), format: "jsonc", priority: 1 },
+    { filePath: path.join(process.cwd(), ".kilo", "kilo.jsonc"), format: "jsonc", priority: 1 },
+    { filePath: path.join(homeDir(), ".config", "kilo", "kilo.jsonc"), format: "jsonc", priority: 2 },
+    { filePath: path.join(process.cwd(), ".kilocode", "mcp.json"), format: "legacy", priority: 3 },
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate.filePath) && fs.statSync(candidate.filePath).isFile()) found.push(candidate);
+  }
+  const visit = (dir: string, depth: number): void => {
+    if (!fs.existsSync(dir)) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    } catch (err) {
+      warn(`Cannot inspect legacy config directory ${dir}: ${err instanceof Error ? err.message : String(err)}; continuing config discovery.`);
+      return;
+    }
+    for (const entry of entries) {
+      const filePath = path.join(dir, entry.name);
+      if (entry.isFile() && entry.name === "mcp_settings.json") found.push({ filePath, format: "legacy", priority: 4 });
+      if (entry.isDirectory() && depth < 3) visit(filePath, depth + 1);
+    }
+  };
+  visit(path.join(homeDir(), ".kilocode"), 0);
+  return found;
+}
+
+function readKiloConfig(selected: KiloConfig): { text: string; config: Record<string, unknown> } {
+  const text = fs.readFileSync(selected.filePath, "utf8");
+  const errors: ParseError[] = [];
+  const tree = parseTree(text.replace(/^\uFEFF/, " "), errors, {
+    allowTrailingComma: selected.format === "jsonc", disallowComments: selected.format === "legacy",
+  });
+  if (errors.length > 0) {
+    const issue = errors[0];
+    const prefix = text.slice(0, issue.offset);
+    const line = prefix.split("\n").length;
+    const column = issue.offset - prefix.lastIndexOf("\n");
+    throw formatConfigReadError(selected.filePath, `${printParseErrorCode(issue.error)} at position ${issue.offset} (line ${line}, column ${column})`);
+  }
+  const config: unknown = tree ? getNodeValue(tree) : undefined;
+  if (!isObject(config)) throw formatConfigReadError(selected.filePath, "configuration root must be an object");
+  return { text, config };
+}
+
+function editKiloConfig(text: string, jsonPath: Array<string | number>, value: unknown): string {
+  const tree = parseTree(text.replace(/^\uFEFF/, " "), [], { allowTrailingComma: true });
+  const current = tree && findNodeAtLocation(tree, jsonPath);
+  if (current && JSON.stringify(getNodeValue(current)) === JSON.stringify(value)) return text;
+  // Formatting a modify range can include neighbouring user nodes. Apply only
+  // the structural edits so their comments, whitespace and EOL remain byte-identical.
+  const edits = modify(text.replace(/^\uFEFF/, " "), jsonPath, value, { getInsertionIndex: () => 0 });
+  return applyEdits(text, edits);
+}
+
+function kiloRuleLocation(selected: KiloConfig): { filePath: string; ref: string } {
+  if (selected.format === "jsonc" && selected.priority === 2) {
+    const filePath = path.resolve(homeDir(), ".config", "kilo", "rules", "megamemory.md");
+    return { filePath, ref: filePath };
+  }
+  return {
+    filePath: path.join(process.cwd(), selected.format === "jsonc" ? ".kilo" : ".kilocode", "rules", "megamemory.md"),
+    ref: KILO_RULE_REF,
+  };
+}
+
+function mergeKiloConfig(selected: KiloConfig, runtime: CommandRuntime): string {
+  const { text, config } = readKiloConfig(selected);
+  const key = selected.format === "jsonc" ? "mcp" : "mcpServers";
+  if (key in config && !isObject(config[key])) throw formatConfigReadError(selected.filePath, `'${key}' must be an object`);
+  const servers = isObject(config[key]) ? config[key] : {};
+  const options = managedServerOptions(servers, selected.filePath);
+  let updated = text;
+  if (selected.format === "legacy") {
+    const fields = { command: runtime.stdioCommand, args: runtime.stdioArgs, [KILO_APPROVAL_KEYS.legacy]: [...KILO_ALLOWED_TOOLS] };
+    for (const [name, value] of Object.entries(fields)) updated = editKiloConfig(updated, [key, "megamemory", name], value);
+    return updated;
+  }
+  const approvalKey = KILO_APPROVAL_KEYS.jsonc;
+  if (approvalKey in config && !isObject(config[approvalKey])) throw formatConfigReadError(selected.filePath, `'${approvalKey}' must be an object`);
+  const instructions = "instructions" in config ? config["instructions"] : [];
+  if (!Array.isArray(instructions) || !instructions.every((item): item is string => typeof item === "string")) {
+    throw formatConfigReadError(selected.filePath, "'instructions' must be an array of strings");
+  }
+  const fields = { type: "local", command: [runtime.stdioCommand, ...runtime.stdioArgs], enabled: options["enabled"] ?? true };
+  for (const [name, value] of Object.entries(fields)) updated = editKiloConfig(updated, [key, "megamemory", name], value);
+  for (const tool of KILO_ALLOWED_TOOLS) updated = editKiloConfig(updated, [approvalKey, `megamemory_${tool}`], "allow");
+  const ruleRef = kiloRuleLocation(selected).ref;
+  const refs = instructions.map((item, index) => item === ruleRef ? index : -1).filter((index) => index >= 0);
+  if (!("instructions" in config)) updated = editKiloConfig(updated, ["instructions"], [ruleRef]);
+  else if (refs.length === 0) updated = editKiloConfig(updated, ["instructions", -1], ruleRef);
+  for (const index of refs.slice(1).reverse()) updated = editKiloConfig(updated, ["instructions", index], undefined);
+  return updated;
+}
+
+function writeKiloFile(filePath: string, content: string, dryRun: boolean): void {
+  if (dryRun) {
+    info(`Dry-run: ${filePath} (${Buffer.byteLength(content, "utf8")} bytes); no files written.`);
+    return;
+  }
+  if (fs.existsSync(filePath)) {
+    const original = fs.readFileSync(filePath);
+    if (original.equals(Buffer.from(content, "utf8"))) {
+      skip(`Already up to date: ${pc.dim(filePath)}`);
+      return;
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backup = `${filePath}.bak-${timestamp}-${randomUUID()}`;
+    fs.copyFileSync(filePath, backup, fs.constants.COPYFILE_EXCL);
+    info(`Backup: ${pc.dim(backup)}`);
+  }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSyncAtomic(filePath, content);
+  success(`Updated ${pc.dim(filePath)}`);
+}
+
+function kiloManagedBlock(body: string): string {
+  return `<!-- megamemory-snippet v${PACKAGE_VERSION} -->\n${body.trim()}\n${AGENTS_MD_END}\n`;
+}
+
+function mergeKiloBlock(filePath: string, block: string): string {
+  if (!fs.existsSync(filePath)) return block;
+  const existing = fs.readFileSync(filePath, "utf8");
+  const start = /<!--\s*(?:megamemory-snippet(?:\s+v|:)|megamemory:instructions\s+v)[^\r\n]*-->/.exec(existing);
+  if (start) {
+    const end = existing.indexOf(AGENTS_MD_END, start.index + start[0].length);
+    if (end === -1) throw new Error(`Unclosed megamemory block in ${filePath}; left untouched.`);
+    return existing.slice(0, start.index) + block.trimEnd() + existing.slice(end + AGENTS_MD_END.length);
+  }
+  warn(`No megamemory markers in ${pc.dim(filePath)}; appending the managed block.`);
+  return existing.replace(/\r?\n*$/, "\n\n") + block;
+}
+
+async function setupKiloConfig(runtime: CommandRuntime, options: InstallOptions): Promise<void> {
+  const found = findKiloConfigs();
+  const selected = found[0];
+  if (!selected) {
+    warn("Kilo config not found. No files created. Add the following new-format fragment to ./kilo.jsonc, then re-run install.");
+    console.log(JSON.stringify({
+      mcp: { megamemory: { type: "local", command: [runtime.stdioCommand, ...runtime.stdioArgs] } },
+      [KILO_APPROVAL_KEYS.jsonc]: Object.fromEntries(KILO_ALLOWED_TOOLS.map((tool) => [`megamemory_${tool}`, "allow"])),
+      instructions: [KILO_RULE_REF],
+    }, null, 2));
+    return;
+  }
+  info(`Found ${selected.filePath} (priority ${selected.priority}, ${selected.format === "jsonc" ? "new JSONC" : "legacy mcpServers"} format).`);
+  for (const other of found.slice(1)) info(`Skipped ${other.filePath} (priority ${other.priority}): the first config wins.`);
+  const config = mergeKiloConfig(selected, runtime);
+  const { filePath: rulePath, ref: ruleRef } = kiloRuleLocation(selected);
+  const rules = mergeKiloBlock(rulePath, kiloManagedBlock(buildWorkflowText()));
+  const agents = prepareAgentsConvention(options);
+  writeKiloFile(selected.filePath, config, options.dryRun);
+  writeKiloFile(rulePath, rules, options.dryRun);
+  info(`${KILO_APPROVAL_KEYS[selected.format]}: ${KILO_ALLOWED_TOOLS.join(", ")}`);
+  if (selected.format === "jsonc") info(`instructions: ${ruleRef}`);
+  warn("Auto-approval is not empirically confirmed. Verify create_concept in Kilo without an approval dialog.");
+  for (const file of agents) writeKiloFile(file.filePath, file.content, options.dryRun);
+  await setupAgentsLink(options);
+}
+
+function prepareAgentsConvention(options: InstallOptions): Array<{ filePath: string; content: string }> {
+  const skillPath = path.join(options.global ? homeDir() : process.cwd(), ".agents", "skills", "megamemory", "SKILL.md");
+  const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "megamemory", "SKILL.md");
+  const skill = fs.readFileSync(source, "utf8");
+  const agentsPath = options.global ? path.join(homeDir(), ".config", "kilo", "AGENTS.md") : path.join(process.cwd(), "AGENTS.md");
+  const skillRef = options.global ? skillPath.replace(/\\/g, "/") : ".agents/skills/megamemory/SKILL.md";
+  const block = `${instructionsStamp(PACKAGE_VERSION)}\n` + kiloManagedBlock([
+    "Use megamemory before tasks and record verified conclusions afterwards.",
+    `Follow the [megamemory skill](${skillRef}): evidence, next.record and granular nodes.`,
+    "Full workflow contract: `megamemory guide --workflow`.",
+  ].join("\n"));
+  const files = [{ filePath: agentsPath, content: mergeKiloBlock(agentsPath, block) }];
+  const existingSkill = fs.existsSync(skillPath) ? fs.readFileSync(skillPath, "utf8") : undefined;
+  if (existingSkill === undefined || existingSkill === skill || isManagedInstallFile(existingSkill)) {
+    files.unshift({ filePath: skillPath, content: skill });
+  } else {
+    warn(`Existing skill at ${pc.dim(skillPath)} is not marked as MegaMemory-managed. Left it untouched.`);
+  }
+  const codexPath = path.join(homeDir(), ".codex", "AGENTS.md");
+  if (options.global && fs.existsSync(codexPath)) files.push({ filePath: codexPath, content: mergeKiloBlock(codexPath, block) });
+  return files;
+}
+
+async function setupAgentsLink(options: InstallOptions): Promise<void> {
+  if (!options.link) return;
+  const agentsPath = options.global ? path.join(homeDir(), ".config", "kilo", "AGENTS.md") : path.join(process.cwd(), "AGENTS.md");
+  const linkPath = path.join(options.global ? homeDir() : process.cwd(), ".agents", "AGENTS.md");
+  const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+  info(`Optional canonical link: ln -s ${quote(agentsPath)} ${quote(linkPath)}`);
+  if (options.dryRun || (process.platform !== "linux" && process.platform !== "darwin")) {
+    warn("Symlink not created: dry-run or unsupported environment. The native AGENTS.md already carries the instructions.");
+    return;
+  }
+  if (fs.existsSync(linkPath) || fs.lstatSync(path.dirname(linkPath)).isSymbolicLink()) {
+    warn(`Link destination already exists or has a symlink parent: ${linkPath}; left untouched.`);
+    return;
+  }
+  try {
+    const { execFileSync } = await import("child_process");
+    execFileSync("ln", ["-s", agentsPath, linkPath], { shell: false, stdio: "pipe", timeout: 10000 });
+    success(`Created optional link ${pc.dim(linkPath)}`);
+  } catch (err) {
+    warn(`Optional link was not created: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function createTargetConfigs(runtime: CommandRuntime, options: InstallOptions): Record<InstallTarget, TargetConfig> {
   return {
     opencode: {
       label: "opencode",
@@ -755,6 +984,13 @@ function createTargetConfigs(runtime: CommandRuntime): Record<InstallTarget, Tar
         { name: "MCP server config", critical: true, run: () => setupAntigravityConfig(runtime) },
       ],
     },
+    kilo: {
+      label: "Kilo",
+      description: "Existing JSONC/legacy MCP config, explicit permissions, workflow rules",
+      steps: [
+        { name: "Kilo config and workflow rules", critical: true, run: () => setupKiloConfig(runtime, options) },
+      ],
+    },
     codex: {
       label: "Codex",
       description: "MCP server, AGENTS.md",
@@ -766,7 +1002,7 @@ function createTargetConfigs(runtime: CommandRuntime): Record<InstallTarget, Tar
   };
 }
 
-const VALID_TARGETS: InstallTarget[] = ["opencode", "claudecode", "antigravity", "codex"];
+const VALID_TARGETS: InstallTarget[] = ["opencode", "claudecode", "antigravity", "codex", "kilo"];
 
 function parseTargets(args: string[]): InstallTarget[] {
   const selected = new Set<InstallTarget>();
@@ -803,7 +1039,8 @@ function parseTargets(args: string[]): InstallTarget[] {
       continue;
     }
 
-    throw new Error(`Unknown install option '${arg}'. Supported: --target <name>`);
+    if (arg === "--dry-run" || arg === "--global" || arg === "--link") continue;
+    throw new Error(`Unknown install option '${arg}'. Supported: --target <name>, --dry-run, --global, --link`);
   }
 
   return [...selected];
@@ -827,6 +1064,11 @@ async function chooseTargetsInteractively(): Promise<InstallTarget[]> {
       description: "MCP server config (workspace-level)",
     },
     {
+      label: "Kilo",
+      value: "kilo" as InstallTarget,
+      description: "Existing JSONC/legacy MCP config, permissions, workflow rules",
+    },
+    {
       label: "Codex",
       value: "codex" as InstallTarget,
       description: "MCP server, AGENTS.md",
@@ -844,7 +1086,8 @@ export async function runInstall(args: string[]): Promise<InstallOutcome> {
   console.log();
 
   const runtime = await detectGlobalCommand();
-  const targetConfigs = createTargetConfigs(runtime);
+  const options: InstallOptions = { dryRun: args.includes("--dry-run"), global: args.includes("--global"), link: args.includes("--link") };
+  const targetConfigs = createTargetConfigs(runtime, options);
 
   let targets: InstallTarget[];
   try {
@@ -864,6 +1107,13 @@ export async function runInstall(args: string[]): Promise<InstallOutcome> {
     warn("No targets selected. Nothing to do.");
     console.log();
     return { ok: true, succeeded: 0, failed: [], skipped: [] };
+  }
+
+  if ((options.dryRun || options.global || options.link) && targets.some((target) => target !== "kilo")) {
+    const message = "--dry-run, --global and --link are supported only with --target kilo; no files written.";
+    error(message);
+    process.exitCode = 1;
+    return { ok: false, succeeded: 0, failed: [{ target: "install", targetLabel: "install", name: "Install options", error: message }], skipped: [] };
   }
 
   const steps: StepResult[] = [];

@@ -679,6 +679,12 @@ export interface NextHints {
   record: string;
   /** Present only after the process-local read threshold is reached. */
   unrecorded?: Pick<TimelineActivity, "reads_since_write" | "last_write_at">;
+  /** Last complete observed session; omitted when its beginning is outside the timeline sample. */
+  previous_session?: {
+    had_understand: boolean;
+    had_record: boolean;
+    ended_at: string;
+  };
 }
 
 /**

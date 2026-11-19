@@ -5,6 +5,7 @@ import {
   DEFAULT_MAX_CHECK_EDGES,
   computeSupportCheck,
 } from "./support-baselines.js";
+import { parseTimelineTs, sessionize, timelineTsString } from "./sessions.js";
 import type {
   NextHintFollowup,
   NextHintRead,
@@ -26,8 +27,69 @@ import type {
 /** Больше трёх — это уже чтение, а не ориентация (план 13 §2.1). */
 export const MUST_READ_LIMIT = 3;
 
-/** Напоминать только после нескольких завершённых чтений. */
-export const UNRECORDED_READS_THRESHOLD = 3;
+/** Напоминать после двух завершённых чтений. */
+export const UNRECORDED_READS_THRESHOLD = 2;
+
+const PREVIOUS_SESSION_RECORD =
+  "В прошлой сессии после understand не было ни одной записи — если сейчас есть вывод, запиши его.";
+const TIMELINE_SAMPLE_LIMIT = 200;
+
+interface SessionHintRow {
+  seq: number;
+  timestamp: string;
+  tool: string;
+  is_write: number;
+  is_error: number;
+}
+
+interface SessionHintCache {
+  changes: number;
+  dataVersion: number;
+  rows: SessionHintRow[];
+  truncated: boolean;
+}
+
+const sessionHintCache = new WeakMap<KnowledgeDB, SessionHintCache>();
+
+function previousSession(db: KnowledgeDB, now: Date): NextHints["previous_session"] {
+  // total_changes sees this connection's inserts, updates and pruning; data_version
+  // also invalidates the process-local cache after commits from another connection.
+  const { changes } = db.execSqlFirst("SELECT total_changes() AS changes") as { changes: number };
+  const { data_version: dataVersion } = db.execSqlFirst("PRAGMA data_version") as { data_version: number };
+  let cached = sessionHintCache.get(db);
+  if (!cached || cached.changes !== changes || cached.dataVersion !== dataVersion) {
+    const rows = (db.execSqlAll(
+      "SELECT seq, timestamp, tool, is_write, is_error FROM timeline ORDER BY seq DESC LIMIT ?",
+      TIMELINE_SAMPLE_LIMIT
+    ) as SessionHintRow[]).reverse();
+    const truncated = rows.length === TIMELINE_SAMPLE_LIMIT && Boolean(db.execSqlFirst(
+      "SELECT 1 FROM timeline WHERE seq < ? LIMIT 1", rows[0].seq
+    ));
+    cached = { changes, dataVersion, rows, truncated };
+    sessionHintCache.set(db, cached);
+  }
+  // A malformed/out-of-order timestamp cannot establish a complete session.
+  let lastTs = -Infinity;
+  for (const row of cached.rows) {
+    const ts = parseTimelineTs(row.timestamp);
+    if (!Number.isFinite(ts) || ts < lastTs || ts > now.getTime()) return undefined;
+    lastTs = ts;
+  }
+  // Include the in-flight call when deciding whether the latest logged session
+  // is still current. Recompute this boundary even when the cached rows match.
+  const sessions = sessionize([
+    ...cached.rows,
+    { timestamp: timelineTsString(now.getTime()), tool: "understand", is_write: 0, is_error: 0 },
+  ]);
+  const previousIndex = sessions.length - 2;
+  if (previousIndex < 0 || (cached.truncated && previousIndex === 0)) return undefined;
+  const entries = sessions[previousIndex].entries;
+  return {
+    had_understand: entries.some((row) => row.tool === "understand" && row.is_error === 0),
+    had_record: entries.some((row) => row.is_write === 1 && row.is_error === 0),
+    ended_at: entries[entries.length - 1].timestamp,
+  };
+}
 
 /** Пустой ответ описывает состояние поиска, не отсутствие знаний о мире. */
 export const EMPTY_REASON_RECORD: Record<NonNullable<UnderstandMeta["reason"]>, string> = {
@@ -311,6 +373,15 @@ export function buildNextHints(input: NextHintsInput): NextHints {
     const { reads_since_write, last_write_at } = input.activity;
     next.record += ` С последней записи ${reads_since_write} чтений — если это законченный вывод, запиши его.`;
     next.unrecorded = { reads_since_write, last_write_at };
+  }
+  if (input.emptyReason !== "empty_base") {
+    const previous = previousSession(db, now);
+    if (previous) {
+      next.previous_session = previous;
+      if (previous.had_understand && !previous.had_record && !next.record.includes(PREVIOUS_SESSION_RECORD)) {
+        next.record += ` ${PREVIOUS_SESSION_RECORD}`;
+      }
+    }
   }
   return next;
 }
