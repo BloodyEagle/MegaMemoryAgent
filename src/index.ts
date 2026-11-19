@@ -22,6 +22,8 @@ const VERSION = JSON.parse(
   )
 ).version;
 
+const MCP_INSTRUCTIONS = `MegaMemory ${VERSION}: перед задачей вызови understand. После работы сохрани проверенный вывод через create_concept с evidence (ref/node и why); связи — link с description. Перед завершением выполни next.record из последнего ответа и перечисли созданные/обновлённые узлы. reason=empty_base|no_match|budget не значит «знаний нет»: читай актуальный код; при budget уточни запрос.`;
+
 const HELP = buildHelp(VERSION);
 
 const KNOWN_COMMANDS = new Set(["install", "hooks", "serve", "stats", "merge", "conflicts", "resolve", "repair-ids", "migrate", "reembed", "consolidate", "digest", "export", "doctor", "eval", "guide", "bench", "expire", "telemetry-report", "--help", "-h", "--version", "-v"]);
@@ -374,7 +376,7 @@ async function startMcpServer() {
   const server = new McpServer({
     name: "megamemory",
     version: VERSION,
-  });
+  }, { instructions: MCP_INSTRUCTIONS });
 
   // ---- J0 (план 20+21 v3 §15): локальная телеметрия на уровне ----
   // диспетчеризации инструментов. Opt-in через MEGAMEMORY_TELEMETRY_PATH —
