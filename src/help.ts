@@ -12,6 +12,7 @@ ${pc.bold(pc.cyan("megamemory"))} ${pc.green(`v${version}`)} ${pc.dim("— persi
 ${pc.bold("Commands:")}
   ${pc.cyan("(no command)")}    Start the MCP stdio server ${pc.dim("(invoked by your editor; global database/repository options apply)")}
   ${pc.cyan("install")}         Configure integrations ${pc.dim("[--target NAME[,NAME...]]; default: interactive")}
+  ${pc.cyan("hooks")}           Manage the local commit-msg memory gate ${pc.dim("install|uninstall|status [--repo PATH]; default: current directory; no database, no network")}
   ${pc.cyan("serve")}           Start the loopback-only web explorer ${pc.dim("[--port PORT] [--host HOST]; --db PATH")}
   ${pc.cyan("stats")}           Show graph statistics ${pc.dim("[--prune] [--funnel] [--health] [--window 7d|30d|all] [--json]; --db PATH")}
   ${pc.cyan("merge")}           Merge databases ${pc.dim("<FILE1> <FILE2> [--into FILE] [--left-label NAME] [--right-label NAME]")}

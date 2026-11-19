@@ -20,6 +20,16 @@ describe("AGENTS_MD_SNIPPET — онбординг провенанса (2.1.5 F
     expect(lines).toBeLessThanOrEqual(60);
   });
 
+  it("2.7.0 T3: memory: остаётся в строке After work, без обязательной записи нового узла", () => {
+    const afterWork = SNIPPET.split("\n").find((line) => line.startsWith("3. **After work:**"));
+    expect(afterWork).toContain("Commit and PR memory:");
+    expect(afterWork).toContain("`memory: <id>`");
+    expect(afterWork).toContain("`memory: нечего — <причина>`");
+    expect(afterWork).toContain("docs/commits.md");
+    expect(afterWork).toContain("lawfully record nothing");
+    expect(buildGuideText()).toContain(afterWork!);
+  });
+
   it("учит опорам при записи: evidence с why, file_refs не опора, автовывод — черновик", () => {
     expect(SNIPPET).toContain("evidence: [{node | ref, why}]");
     expect(SNIPPET).toContain("auto_ground");

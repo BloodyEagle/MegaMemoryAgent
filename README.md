@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.8.0-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.9.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -28,6 +28,13 @@ modules, patterns, decisions — not code symbols. Everything persists in a per-
 database at `.megamemory/knowledge.db`.
 
 ---
+
+## Contents
+
+- [MCP tools](#mcp-tools)
+- [CLI](#cli)
+  - [Git hooks](#git-hooks)
+- [Commit and PR templates](./docs/commits.md)
 
 ## What this fork changes
 
@@ -465,7 +472,7 @@ extras manually.
 |---|---|
 | `understand` | Budgeted hybrid retrieval in `compact` (default, `max_tokens: 4000`), `full`, or `brief`. Compact returns a bounded `candidates` list plus up to 3 fully qualified compact cards when the budget permits; `matches`/`compact` remain available, and `full` keeps its previous response form. Filters inactive/expired facts and always returns the `next` action contract; `record` carries the support form (`[{ref\|node, why}]` → `informed_by`), with kind chosen by meaning and no links from `file_refs` alone. After ≥3 completed reads since the last logged write, `next.record` appends a conditional reminder and `next.unrecorded` reports the count; empty results distinguish `empty_base`, `no_match`, and `budget`. In compact, `collapse_ref_anchors` defaults to `true` (`false` is supported): template ref-anchors are folded with rationale or shown as collapsed locators with dependents (`meta.anchor_collapsed`); path-like names are demoted unless the query is an exact full path; id/path resolution and provenance are unaffected. Opt-in `include_evidence: true` attaches `current_digests` and `support_evidence` with ALL live supports, untrimmed wording, edge rationale and claim/status/edge/artifacts digests; each card and its evidence are placed atomically or omitted, without counting candidate-only entries as dropped. P1 reuse (opt-in, compact only): `reuse: {task_type, files}` qualifies saved analysis passports explicitly by task type and verified scope — the `passport_reuse` section lists `covered`/`gaps` and a qualification (`reusable\|candidate\|stale_input\|incomplete\|unknown\|expired\|refuted_support\|broken\|wrong_repo`); no state raises trust silently, and a qualification is never code coverage. P3 task profile (opt-in, compact only): `task: {goal, kind, files?, context_epoch?}` embeds a `task_context` section into THIS answer — deterministic mandatory source categories per task kind, decisions/tests citing the explicit file scope boosted with score 0, hidden supports of placed decisions, semantic duplicates dropped WITHOUT dropping refuted reasons/contradictions/incompleteness, uncovered mandatory sources listed with a next step, and an approximate total-cost heuristic (never provider tokens); it never replaces `must_read`, never fills `next.skip`, never claims whole-file coverage; `context_epoch` is explicit client state that only collapses already-served non-mandatory cards (decisions/refuted/expired are never collapsed). |
 | `check_freshness` | P2 targeted freshness verification (explicit opt-in action, read-only): for changed or suspect sources — files, `HEAD:sha:path` blobs, `git:tag/commit/branch` refs — it checks the RELATED records through a rebuildable reverse index (node `file_refs`, artifact observations, passport scopes), not the whole graph. Content is verified by sha256 (mtime/size are never proof); git dirty state (staged/unstaged/untracked/rename) and HEAD ride the report as observations — a previous HEAD never proves the working tree unchanged. One physical source is hashed once per check; sources that change DURING the check report `unstable` — no stable snapshot is declared. The report carries `sources` (unchanged/changed/missing/unobserved/unstable/skipped/other_repo), `records` (fresh/stale_input/partial/unknown — a checked prefix is never presented as the whole graph), `summary.limitations`, and `expected_versions` to re-verify before applying an edit. It never writes to the database and never confirms supports; a freshness pass does not raise the passport reuse qualification. Optional pilot (P2.2): `symbols` resolves definitions through the token-economy-ts adapter (`adapter.graph_tool` or env `MEGAMEMORY_CODE_ADAPTER`; an ambiguous/missing symbol is explicit and requires reading — never the first match; line numbers are the current resolution, not identity), and `with_dependencies` walks the static import graph of changed sources (bounded by `max_deps`, declared scope only). |
-| `get_concept` | Exact-ID full context: parent, children, edges, trails/slots, support check, and current digests for confirmation. Budgeted profiles (`orientation`/`evidence`/`full`), batch `ids` (up to 25, one shared budget, per-id status/errors), capped neighbor disclosure with `continuation`. E4 delta (opt-in): `context_epoch` + `known_versions` — a version match of the requested projection returns a compact `unchanged` answer with the qualification minimum (never code coverage); a mismatch or a new epoch returns the full card. An old plain `{id}` call returns the exact previous response. |
+| `get_concept` | Exact-ID full context: parent, children, edges, trails/slots, support check, and current digests for confirmation. Budgeted profiles (`orientation`/`evidence`/`full`), batch `ids` (up to 25, one shared budget, per-id status/errors), capped neighbor disclosure with `continuation`. E4 delta (opt-in): `context_epoch` + `known_versions` — a version match of the requested projection returns a compact `unchanged` answer with the qualification minimum (never code coverage); a mismatch or a new epoch returns the full card. An old plain `{id}` call preserves the previous card and retrieval behavior; successful nonempty MCP reads may add the optional top-level `hint.record` (not on `unchanged` or `meta.reason = "budget"`). Web and CLI card shapes are unchanged. |
 | `create_concept` | Atomically create a node and optional edges/evidence; supports `supersedes`, `valid_until`, duplicate refusal, and same-call evidence snapshots. |
 | `update_concept` | Patch content or expiry and perform reasoned epistemic transitions; relevant text changes republish a current-generation vector or invalidate the old one. |
 | `link` | Add one of the eight typed relationships; `informed_by` requires a non-empty rationale and cannot close a provenance cycle. |
@@ -533,6 +540,18 @@ envelope cannot fit, the request is refused with an explicit error asking for a 
 The record line rendered in `brief` has its own `RECORD_MAX = 400`; other lines keep
 `LINE_MAX = 240`. The full `next.record` is not clipped.
 
+### MCP record hints
+
+MCP-only record hints on successful nonempty `get_concept` and `list_roots` responses
+are additive and use fixed text; empty results, `unchanged` and budget refusals carry
+no record hint (an empty `list_roots` preserves its legacy string hint). The additive
+hint counts toward the final `max_tokens` cap; a too-tight budget can be refused.
+The card/retrieval contract and the web/CLI response shape are otherwise preserved.
+`get_concept.hint.record` reads: «Узел уже есть — уточняй его через update_concept, а не создавай второй; опоры к решению — evidence в том же вызове.» The `list_roots` hint
+instead reminds the agent that this is an overview: record the result for a specific
+branch as a separate node, not by editing the root. A hint is not an automatic write
+or a requirement to invent new knowledge.
+
 **Stored kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest` · `task` · `journal`
 
 `create_concept` accepts the agent-authored values (`digest` remains for compatibility but is normally generated; `journal` is the explicit volatile-state kind with the default-term policy above); `task` is created only by `task_add`.
@@ -546,6 +565,7 @@ The record line rendered in `brief` has its own `RECORD_MAX = 400`; other lines 
 | Command | What it does |
 |---|---|
 | `megamemory install` | Configure an MCP client |
+| `megamemory hooks install\|uninstall\|status [--repo PATH]` | Manage an optional local `commit-msg` gate for the `memory:` line; current directory by default, no database or network |
 | `megamemory serve [--port N]` | Web explorer (graph, search, node cards, Tokens panel, consolidate tab). **Loopback only** (`127.0.0.1`, IPv6: `--host ::1`) — a local tool for a human, not a network service; earlier releases listened on all interfaces — behavior changed |
 | `megamemory migrate [--dry-run\|--apply]` | Upgrade raw upstream v1.6.2 or repair fork migration objects; dry-run uses a disposable coherent snapshot, apply backs up and writes |
 | `megamemory repair-ids [--dry-run\|--apply]` | Rebuild empty/trailing-slash and affected descendant IDs; dry-run uses a disposable snapshot, apply is atomic |
@@ -562,6 +582,40 @@ The record line rendered in `brief` has its own `RECORD_MAX = 400`; other lines 
 | `megamemory expire --scan [--json] [--repo PATH]` | Read-only review of expiry candidates (`scripts/report-journals.mjs` is a thin adapter over the same module); `--json` prints the versioned report for the `--report` apply path; `--scan --apply` is refused |
 | `megamemory telemetry-report [--file PATH] [--tariff-version VER] [--json]` | Offline aggregate of the local J0 telemetry JSONL (no database, no network): calls/outcomes, latency and session wall time p50/p95, memory-write categories, completeness counters. Provider tokens and money appear only from actually supplied client usage — otherwise explicit `unavailable` (never zeros); estimated wire bytes are separate fields, never merged with provider tokens; correctness is computed only against a predeclared oracle (whole-task experiment, J2/J3) |
 | `megamemory merge`, `conflicts`, `resolve` | Two-way merge of graphs across branches |
+
+### Git hooks
+
+Optional, explicit owner installation — separate from MCP-client `megamemory install`:
+
+```bash
+megamemory hooks install [--repo PATH]
+megamemory hooks status [--repo PATH]
+megamemory hooks uninstall [--repo PATH]
+```
+
+Omit `--repo` to use the current directory. `install` adds one managed block between
+`# >>> megamemory:commit-msg` and `# <<< megamemory:commit-msg` in the repository's
+`commit-msg` hook; repeated installation does not duplicate it. Existing foreign hook
+code is preserved (the block is appended with a warning), and `uninstall` removes
+only the managed block. `core.hooksPath` is honored, including creating the target
+directory when needed; `status` reports the path, override and installation state.
+The managed script uses LF line endings and POSIX sh, including Git for Windows.
+Appending to a foreign hook is accepted only with a recognized POSIX sh shebang
+and LF; a BOM, CRLF shebang, different interpreter, symlink or altered managed block
+causes an explicit refusal rather than an unsafe rewrite.
+
+For staged code files, the hook rejects a commit without a `memory:` line. Use
+`memory: <id>` for real nodes created or updated by the work, or
+`memory: нечего — <причина>` when there is legitimately no new verified knowledge.
+Pure reading and successful reuse need no invented record. Documentation-only commits
+do not require the line. Copy the same line into the PR description using the
+[commit and PR templates](./docs/commits.md); templates are installed manually,
+not written into other repositories automatically.
+
+This is a local message check: no database, model calls, network or automatic memory
+writes, and no proof that an ID is real or its evidence valid. It does not validate PRs.
+`git commit --no-verify` bypasses it, and an early exit in a foreign hook before the
+appended block can bypass it too. This is a reminder, not a guarantee of recorded work.
 
 ### Which commands never write to the database
 
