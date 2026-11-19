@@ -71,16 +71,28 @@ function withRawDatabase(dbPath: string, use: (raw: Database.Database) => void):
   }
 }
 
-/** libsql deletes -wal/-shm on close, but asynchronously: the native handle
- * is released after GC collection (see vitest.config execArgv) and the WAL
- * unlink follows it — nudge GC and poll briefly. */
+/** libsql releases native references after collection; give finalizers an
+ * event-loop turn on every poll without extending the three-second deadline. */
 async function waitUntilGone(p: string): Promise<void> {
-  globalThis.gc?.();
-  for (let i = 0; i < 30; i++) {
+  const deadline = performance.now() + 3_000;
+  let iterations = 0;
+  while (fs.existsSync(p) && performance.now() < deadline) {
+    iterations += 1;
+    globalThis.gc?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     if (!fs.existsSync(p)) return;
-    await new Promise((r) => setTimeout(r, 100));
+    const remaining = deadline - performance.now();
+    if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
   }
-  expect(fs.existsSync(p)).toBe(false);
+  const dbPath = p.replace(/-(?:wal|shm)$/, "");
+  const walPath = `${dbPath}-wal`;
+  let walSize: number | string = "absent";
+  try { walSize = fs.statSync(walPath).size; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") walSize = String(error);
+  }
+  const message = `Native cleanup: path=${p}, WAL size=${walSize}, SHM exists=${fs.existsSync(`${dbPath}-shm`)}, iterations=${iterations}`;
+  expect(fs.existsSync(p), message).toBe(false);
 }
 
 function listObjects(db: KnowledgeDB, names: string[]): Array<{ type: string; name: string }> {
@@ -454,9 +466,10 @@ describe("schema repair on open (plan 16)", () => {
     makeTmp();
     const dbPath = path.join(tmpDir, "knowledge.db");
     // 1st open: full repair of a fresh base
-    const db1 = track(new KnowledgeDB(dbPath));
+    let db1: KnowledgeDB | null = track(new KnowledgeDB(dbPath));
     expect((await autoMigrateIfNeeded(db1, dbPath)).repaired).toBe(true);
     db1.close();
+    db1 = null;
     openDbs.length = 0;
     await waitUntilGone(dbPath + "-wal");
 
@@ -464,21 +477,23 @@ describe("schema repair on open (plan 16)", () => {
     withRawDatabase(dbPath, (raw) => {
       raw.exec("DROP TRIGGER nodes_au");
     });
-    const db2 = track(new KnowledgeDB(dbPath));
+    let db2: KnowledgeDB | null = track(new KnowledgeDB(dbPath));
     expect((await autoMigrateIfNeeded(db2, dbPath)).repaired).toBe(true);
     db2.close();
+    db2 = null;
     openDbs.length = 0;
     await waitUntilGone(dbPath + "-wal");
     await waitUntilGone(dbPath + "-shm");
     const hashBefore = hashDb(dbPath);
 
     // 3rd open: the base is complete — nothing to repair, no file write
-    const db3 = track(new KnowledgeDB(dbPath));
+    let db3: KnowledgeDB | null = track(new KnowledgeDB(dbPath));
     const third = await autoMigrateIfNeeded(db3, dbPath);
     expect(third.repaired).toBe(false);
     expect(third.performed).toBe(false);
     expect(describeSchemaRepair(third)).toBeNull();
     db3.close();
+    db3 = null;
     openDbs.length = 0;
 
     await waitUntilGone(dbPath + "-wal");
