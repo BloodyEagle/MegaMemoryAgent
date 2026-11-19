@@ -387,12 +387,14 @@ export class KnowledgeDB {
    * про одну и ту же базу одно и то же; текст ошибки и класс не расходятся.
    */
   assertSchemaOpenable(): void {
-    const version = this.getUserVersion();
-    if (version !== 0) return;
-    const hasNodes = this.db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes'")
-      .get();
-    if (!hasNodes) return; // новая база — схема создаётся миграцией
+    // Read the version and table presence in one snapshot: another process may
+    // commit a fresh migration between two independent queries.
+    const state = this.db.prepare(
+      `SELECT (SELECT user_version FROM pragma_user_version) AS v,
+              EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes') AS has_nodes`
+    ).get() as { v: number; has_nodes: number };
+    if (state.v !== 0) return;
+    if (!state.has_nodes) return; // новая база — схема создаётся миграцией
     throw new UpstreamSchemaError(
       `База "${this.dbFile}" создана другой версией (user_version = 0 — сырая схема upstream без форк-колонок). ` +
         `Выполните \`megamemory migrate --apply --db "${this.dbFile}"\` — она поднимет схему и проставит версию.`
