@@ -46,6 +46,14 @@ function writeProjectFile(relative: string, content: string | Buffer): string {
 
 const TEN_LINES = Array.from({ length: 10 }, (_, i) => `// line ${i + 1}`).join("\n") + "\n";
 
+// Секундная гранулярность SQLite datetime('now') даёт гонку: файл, созданный
+// в ту же секунду, что запись узла, иногда выглядит «новее». Явное utimes
+// в прошлое делает ответ детерминированным: stale_refs в этих тестах не ждём.
+function pinMtimeToPast(abs: string): void {
+  const past = new Date(Date.now() - 60_000);
+  fs.utimesSync(abs, past, past);
+}
+
 async function query(id: string, extra: Partial<Parameters<typeof understand>[1]> = {}): Promise<Output> {
   return understand(db, { query: id, ...extra });
 }
@@ -124,7 +132,7 @@ describe("readRefLines (план 26 §2)", () => {
 
 describe("understand include_source (план 26 §2)", () => {
   it("attaches the verbatim range to the card: 11 lines, start_line 10", async () => {
-    writeProjectFile("src/x.ts", TEN_LINES + Array.from({ length: 10 }, (_, i) => `// tail ${i + 1}`).join("\n") + "\n");
+    pinMtimeToPast(writeProjectFile("src/x.ts", TEN_LINES + Array.from({ length: 10 }, (_, i) => `// tail ${i + 1}`).join("\n") + "\n"));
     seedNode("source-demo", ["src/x.ts:10-20"]);
     const output = await query("source-demo", { include_source: true });
     const cards = cardsOf(output);
@@ -138,7 +146,7 @@ describe("understand include_source (план 26 §2)", () => {
   });
 
   it("without the flag the answer carries no source at all", async () => {
-    writeProjectFile("src/x.ts", TEN_LINES);
+    pinMtimeToPast(writeProjectFile("src/x.ts", TEN_LINES));
     seedNode("source-off", ["src/x.ts:1-3"]);
     const output = await query("source-off");
     expect(JSON.stringify(output)).not.toContain('"source"');
@@ -147,7 +155,7 @@ describe("understand include_source (план 26 §2)", () => {
   });
 
   it("tokens grow exactly by the attached source cost plus its meta counter and stay within max_tokens", async () => {
-    writeProjectFile("src/x.ts", TEN_LINES);
+    pinMtimeToPast(writeProjectFile("src/x.ts", TEN_LINES));
     seedNode("source-cost", ["src/x.ts:1-10"]);
     const without = await query("source-cost");
     const withSource = await query("source-cost", { include_source: true });
@@ -167,7 +175,7 @@ describe("understand include_source (план 26 §2)", () => {
   });
 
   it("a ref without a range reports no_range and no card carries a source", async () => {
-    writeProjectFile("src/plain.ts", TEN_LINES);
+    pinMtimeToPast(writeProjectFile("src/plain.ts", TEN_LINES));
     seedNode("source-no-range", ["src/plain.ts"]);
     const output = await query("source-no-range", { include_source: true });
     expect(cardsOf(output)[0].source).toBeUndefined();
@@ -183,7 +191,7 @@ describe("understand include_source (план 26 §2)", () => {
   });
 
   it("a 2 MiB file reports too_large", async () => {
-    writeProjectFile("src/huge.ts", "x".repeat(2 * 1024 * 1024) + "\n");
+    pinMtimeToPast(writeProjectFile("src/huge.ts", "x".repeat(2 * 1024 * 1024) + "\n"));
     seedNode("source-huge", ["src/huge.ts:1-2"]);
     const output = await query("source-huge", { include_source: true });
     expect(cardsOf(output)[0].source).toBeUndefined();
@@ -198,7 +206,7 @@ describe("understand include_source (план 26 §2)", () => {
   });
 
   it("a budget too small for the source keeps the answer honest: no source, budget notice", async () => {
-    writeProjectFile("src/x.ts", TEN_LINES);
+    pinMtimeToPast(writeProjectFile("src/x.ts", TEN_LINES));
     seedNode("source-budget", ["src/x.ts:1-10"]);
     let minimum = 0;
     try {

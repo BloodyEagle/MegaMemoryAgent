@@ -541,6 +541,13 @@ export interface CompactMatch {
     lines: string[];
     truncated: boolean;
   };
+  /**
+   * План 26 §3: время записи узла (nodes.updated_at) — отдаётся ТОЛЬКО на
+   * карточках с расхождением mtime (см. UnderstandOutput.stale_refs), чтобы
+   * ответ без расхождений оставался байт-в-байт прежним. Агент сравнивает
+   * его с file_mtime из stale_refs; ось содержимого — check_freshness.
+   */
+  updated_at?: string;
 }
 
 /** Wire card may omit optional display text under budget pressure. */
@@ -614,6 +621,18 @@ export interface UnderstandMeta {
    * `missing`, `too_large` (>1 МиБ), `not_text` (не UTF-8 или `\0`).
    */
   source_skipped?: "budget" | "no_range" | "outside_root" | "missing" | "too_large" | "not_text";
+  /**
+   * План 26 §3: полное число расхождений mtime по file_refs возвращённых
+   * карточек; в stale_refs выдаётся не больше 3 записей. Ноль не отдаётся:
+   * ответ без расхождений байт-в-байт прежний.
+   */
+  stale_refs_total?: number;
+  /**
+   * План 26 §3: число file_refs возвращённых карточек, файл которых не
+   * открылся stat'ом. Не смешивается с расхождением: отсутствующий файл —
+   * не «изменился после записи».
+   */
+  stale_refs_missing?: number;
 }
 
 export interface UnderstandOutput {
@@ -644,6 +663,14 @@ export interface UnderstandOutput {
    * явный collapse_ref_anchors=false отключает секцию.
    */
   anchors?: CollapsedAnchorView[];
+  /**
+   * План 26 §3 (compact): расхождение записи с файлом — file_ref возвращённой
+   * карточки, чей mtime новее узла updated_at. Сигнал, а не приговор: mtime
+   * врёт после git checkout/распаковки; ось содержимого — check_freshness.
+   * Не больше 3 записей (meta.stale_refs_total — полное число); ответ без
+   * расхождений секции не несёт.
+   */
+  stale_refs?: Array<{ ref: string; node_id: string; recorded_at: string; file_mtime: string }>;
   /**
    * P1.3 (opt-in reuse): квалификация переиспользования проверенных разборов
    * (паспортов) для явного типа задачи и области. Без reuse-запроса секции
@@ -720,6 +747,11 @@ export interface NextHints {
   record: string;
   /** Present only after the process-local read threshold is reached. */
   unrecorded?: Pick<TimelineActivity, "reads_since_write" | "last_write_at">;
+  /**
+   * План 26 §3: одна строка, только когда stale_refs непуст — файл менялся
+   * после записи узла; перечитай ref, прежде чем опираться.
+   */
+  stale_warning?: string;
   /** Last complete observed session; omitted when its beginning is outside the timeline sample. */
   previous_session?: {
     had_understand: boolean;

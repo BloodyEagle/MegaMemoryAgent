@@ -704,6 +704,18 @@ fit leaves the card without `source`, and `meta.source_cards` counts the
 placed ones. Default is off — verbatim sources enlarge the resident context;
 ask for it when you would read that exact range anyway.
 
+**`stale_refs`: divergence between the record and the file.** Always-on in
+compact: every returned card's `file_refs` get a lazy `stat`, and a ref whose
+file mtime is **newer than the node's own `updated_at`** lands in
+`stale_refs` (`ref`, `node_id`, `recorded_at`, `file_mtime`; at most 3 entries,
+the full count in `meta.stale_refs_total`), the card carries its `updated_at`,
+and `next.stale_warning` says: «файл менялся после записи: перечитай ref,
+прежде чем опираться». This is a signal, not a verdict — mtime lies after
+`git checkout` and archive unpacking, and a missing file counts separately in
+`meta.stale_refs_missing` instead of pretending the file changed. The content
+axis stays `check_freshness` with digests. An answer without divergences has
+no section at all.
+
 ### MCP record hints
 
 Successful nonempty `get_concept` and `list_roots` responses may carry an
