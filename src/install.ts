@@ -11,12 +11,13 @@ import { INSTRUCTIONS_STAMP_MARKER, instructionsStamp } from "./instructions.js"
 // very same constant, so the printed text cannot drift from the written one.
 import { AGENTS_MD_END, AGENTS_MD_SNIPPET, buildWorkflowText } from "./guide.js";
 
-export type InstallTarget = "opencode" | "claudecode" | "antigravity" | "codex" | "kilo";
+export type InstallTarget = "opencode" | "claudecode" | "antigravity" | "codex" | "kilo" | "zcode";
 
 interface InstallOptions {
   dryRun: boolean;
   global: boolean;
   link: boolean;
+  uninstall: boolean;
 }
 
 interface KiloConfig {
@@ -79,6 +80,21 @@ const CLAUDE_CONFIG_PATH = path.join(homeDir(), ".claude.json");
 const CLAUDE_DIR = path.join(homeDir(), ".claude");
 const CLAUDE_MD_PATH = path.join(CLAUDE_DIR, "CLAUDE.md");
 const CLAUDE_COMMANDS_DIR = path.join(CLAUDE_DIR, "commands");
+
+// ZCode keeps MCP servers, hooks and per-skill toggles in one global config
+// (~/.zcode/cli/config.json); there is no workspace-level MCP file (plan 28
+// T0: confirmed against the live config and the zcode configuration guide).
+const ZCODE_DIR = path.join(homeDir(), ".zcode");
+const ZCODE_CONFIG_PATH = path.join(ZCODE_DIR, "cli", "config.json");
+const ZCODE_AGENTS_MD_PATH = path.join(ZCODE_DIR, "AGENTS.md");
+const ZCODE_SKILL_PATH = path.join(ZCODE_DIR, "skills", "megamemory", "SKILL.md");
+// Mirrors the wording of MCP_INSTRUCTIONS (src/index.ts) so the per-prompt
+// reminder cannot drift from the server instructions; index.ts cannot be
+// imported here (cycle), so the texts cross-reference each other in comments.
+const ZCODE_HOOK_CONTEXT = "MegaMemory: перед задачей вызови megamemory_understand, после работы запиши вывод через create_concept с evidence.";
+// Marker embedded in the hook script: the installer recognises its own
+// UserPromptSubmit entry by this substring (idempotency + uninstall).
+const ZCODE_HOOK_MARKER = "megamemory-user-prompt-hook";
 
 const ANTIGRAVITY_CONFIG_PATH = path.join(process.cwd(), "mcp_config.json");
 
@@ -942,6 +958,186 @@ async function setupAgentsLink(options: InstallOptions): Promise<void> {
   }
 }
 
+// --- ZCode (plan 28) -------------------------------------------------------
+
+/**
+ * ZCode config.json is user-owned JSONC: comments, key order and a BOM must
+ * survive, and only our own keys may change (plan 28 T1). Parse with
+ * jsonc-parser and edit text-level through editKiloConfig/writeKiloFile —
+ * the same byte-preserving helpers Kilo uses, despite the Kilo-flavoured
+ * names. Broken JSON refuses with path and position and never touches the
+ * file.
+ */
+function readZcodeConfig(filePath: string): { text: string; config: Record<string, unknown>; tree: ReturnType<typeof parseTree> } {
+  if (!fs.existsSync(filePath)) return { text: "{}\n", config: {}, tree: undefined };
+  const text = fs.readFileSync(filePath, "utf8");
+  const errors: ParseError[] = [];
+  const tree = parseTree(text.replace(/^\uFEFF/, " "), errors, { allowTrailingComma: true });
+  if (errors.length > 0 || !tree) {
+    if (errors.length > 0) {
+      const issue = errors[0];
+      const prefix = text.slice(0, issue.offset);
+      const line = prefix.split("\n").length;
+      const column = issue.offset - prefix.lastIndexOf("\n");
+      throw formatConfigReadError(filePath, `${printParseErrorCode(issue.error)} at position ${issue.offset} (line ${line}, column ${column})`);
+    }
+    throw formatConfigReadError(filePath, "configuration root could not be parsed");
+  }
+  const config: unknown = getNodeValue(tree);
+  if (!isObject(config)) throw formatConfigReadError(filePath, "configuration root must be an object");
+  return { text, config, tree };
+}
+
+async function setupZcodeConfig(runtime: CommandRuntime, dryRun: boolean): Promise<void> {
+  const { text, config } = readZcodeConfig(ZCODE_CONFIG_PATH);
+  if ("mcp" in config && !isObject(config.mcp)) throw formatConfigReadError(ZCODE_CONFIG_PATH, "'mcp' is present but is not an object");
+  const mcp = isObject(config.mcp) ? config.mcp : {};
+  if ("servers" in mcp && !isObject(mcp.servers)) throw formatConfigReadError(ZCODE_CONFIG_PATH, "'mcp.servers' is present but is not an object");
+  // Plan 28 T0: schema confirmed against a live working config —
+  // mcp.servers.<name> with { type, command, args, timeoutMs, enabled? }.
+  const record: Record<string, unknown> = { type: "stdio", command: runtime.stdioCommand, args: runtime.stdioArgs, timeoutMs: 60000 };
+  const servers = isObject(mcp.servers) ? mcp.servers : {};
+  const existing = isObject(servers.megamemory) ? servers.megamemory : undefined;
+  let updated = text;
+  if (existing) {
+    // The existing record belongs to the user: fill in missing fields only,
+    // never overwrite values they chose.
+    for (const [name, value] of Object.entries(record)) {
+      if (!(name in existing)) updated = editKiloConfig(updated, ["mcp", "servers", "megamemory", name], value);
+    }
+  } else {
+    updated = editKiloConfig(updated, ["mcp", "servers", "megamemory"], record);
+  }
+  writeKiloFile(ZCODE_CONFIG_PATH, updated, dryRun);
+  info(`Command: ${pc.cyan(JSON.stringify([runtime.stdioCommand, ...runtime.stdioArgs]))}`);
+}
+
+function setupZcodeRules(options: InstallOptions): void {
+  const target = options.global ? ZCODE_AGENTS_MD_PATH : path.join(process.cwd(), "AGENTS.md");
+  if (options.dryRun) {
+    const classification = !fs.existsSync(target)
+      ? "created"
+      : fs.readFileSync(target, "utf-8").includes(AGENTS_MD_MARKER) ? "replaced" : "appended";
+    info(`Dry-run: ${target} (workflow rules block would be ${classification}); no files written.`);
+  } else {
+    setupInstructionFile(target);
+  }
+  if (options.global) {
+    info("ZCode has no workspace-level MCP config; --global only moves the rules file.");
+  } else if (fs.existsSync(ZCODE_AGENTS_MD_PATH) && !fs.readFileSync(ZCODE_AGENTS_MD_PATH, "utf-8").includes("megamemory")) {
+    warn(`Global rules at ${pc.dim(ZCODE_AGENTS_MD_PATH)} contain no megamemory block; ZCode reads both files and project rules do not cover global sessions.`);
+  }
+}
+
+function setupZcodeSkill(dryRun: boolean): void {
+  const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "megamemory", "SKILL.md");
+  const skill = fs.readFileSync(source, "utf8");
+  const existing = fs.existsSync(ZCODE_SKILL_PATH) ? fs.readFileSync(ZCODE_SKILL_PATH, "utf8") : undefined;
+  if (existing !== undefined && existing !== skill && !isManagedInstallFile(existing)) {
+    warn(`Existing skill at ${pc.dim(ZCODE_SKILL_PATH)} is not marked as MegaMemory-managed. Left it untouched.`);
+    return;
+  }
+  writeKiloFile(ZCODE_SKILL_PATH, skill, dryRun);
+}
+
+function zcodeHookScript(): string {
+  // process hook (argv, no shell — portable across Windows/POSIX; ZCode hooks
+  // schema, plan 28 T4): stdout JSON with additionalContext injects one line.
+  return `process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:${JSON.stringify(ZCODE_HOOK_CONTEXT)}}}));/* ${ZCODE_HOOK_MARKER} */`;
+}
+
+function zcodeHookGroup(): Record<string, unknown> {
+  return {
+    hooks: [{
+      type: "process",
+      command: process.execPath,
+      args: ["-e", zcodeHookScript()],
+      timeoutMs: 10000,
+      statusMessage: "MegaMemory",
+    }],
+  };
+}
+
+function isMegamemoryHookGroup(group: unknown): boolean {
+  if (!isObject(group) || !Array.isArray(group.hooks)) return false;
+  for (const entry of group.hooks) {
+    if (!isObject(entry)) continue;
+    const args: unknown[] = Array.isArray(entry.args) ? entry.args : [];
+    if (args.some((arg) => typeof arg === "string" && arg.includes(ZCODE_HOOK_MARKER))) return true;
+  }
+  return false;
+}
+
+/**
+ * Installs (or refreshes) our UserPromptSubmit hook: one line of context on
+ * every prompt (plan 28 T4). Configuration-file hooks run only with
+ * hooks.enabled: true; the rest of the hooks config is never touched.
+ */
+function setupZcodeHook(dryRun: boolean): void {
+  const { text, config } = readZcodeConfig(ZCODE_CONFIG_PATH);
+  if ("hooks" in config && !isObject(config.hooks)) throw formatConfigReadError(ZCODE_CONFIG_PATH, "'hooks' is present but is not an object");
+  const hooks = isObject(config.hooks) ? config.hooks : {};
+  if ("events" in hooks && !isObject(hooks.events)) throw formatConfigReadError(ZCODE_CONFIG_PATH, "'hooks.events' is present but is not an object");
+  const events = isObject(hooks.events) ? hooks.events : {};
+  if ("UserPromptSubmit" in events && !Array.isArray(events.UserPromptSubmit)) throw formatConfigReadError(ZCODE_CONFIG_PATH, "'hooks.events.UserPromptSubmit' must be an array");
+  const groups = Array.isArray(events.UserPromptSubmit) ? events.UserPromptSubmit : [];
+  if (groups.some(isMegamemoryHookGroup)) {
+    skip("Prompt hook already up to date");
+    return;
+  }
+  const group = zcodeHookGroup();
+  let updated = editKiloConfig(text, ["hooks", "enabled"], true);
+  updated = groups.length > 0
+    ? editKiloConfig(updated, ["hooks", "events", "UserPromptSubmit", -1], group)
+    : editKiloConfig(updated, ["hooks", "events", "UserPromptSubmit"], [group]);
+  if (hooks.enabled === false) warn("hooks.enabled was false; configuration-file hooks run only with hooks.enabled: true.");
+  writeKiloFile(ZCODE_CONFIG_PATH, updated, dryRun);
+  info("UserPromptSubmit hook injects a one-line MegaMemory reminder into every prompt.");
+}
+
+/**
+ * Removes only our own UserPromptSubmit entry (recognised by ZCODE_HOOK_MARKER)
+ * via offset surgery on the parse tree: foreign hooks, comments and key order
+ * stay byte-identical. Returns false when the hook is not installed — the file
+ * is never written in that case.
+ */
+function uninstallZcodeHook(): boolean {
+  const { text, config, tree } = readZcodeConfig(ZCODE_CONFIG_PATH);
+  const hooks = isObject(config.hooks) ? config.hooks : {};
+  const events = isObject(hooks.events) ? hooks.events : {};
+  if (!Array.isArray(events.UserPromptSubmit)) return false;
+  const groups = events.UserPromptSubmit;
+  const listNode = tree ? findNodeAtLocation(tree, ["hooks", "events", "UserPromptSubmit"]) : undefined;
+  if (!listNode?.children) return false;
+  const targets = groups
+    .map((group, index) => ({ group, index }))
+    .filter(({ group }) => isMegamemoryHookGroup(group))
+    .map(({ index }) => index)
+    .sort((a, b) => b - a);
+  if (targets.length === 0) return false;
+  // BOM is replaced by a same-length space, so parse-tree offsets stay valid.
+  let updated = text.replace(/^\uFEFF/, " ");
+  for (const index of targets) {
+    const node = listNode.children[index];
+    if (!node) throw formatConfigReadError(ZCODE_CONFIG_PATH, `hook entry ${index} could not be located for removal`);
+    let start = node.offset;
+    let end = node.offset + node.length;
+    // Eat the trailing separator when our entry is not the last element;
+    // otherwise eat the preceding comma and whitespace. Install always
+    // appends, so our entry is the last one and the back-scan reverses the
+    // insertion byte-for-byte.
+    const after = updated.slice(end).match(/^\s*/)?.[0].length ?? 0;
+    if (updated.charAt(end + after) === ",") {
+      end = end + after + 1;
+    } else {
+      while (start > 0 && /[\s,]/.test(updated.charAt(start - 1))) start -= 1;
+    }
+    updated = updated.slice(0, start) + updated.slice(end);
+  }
+  writeKiloFile(ZCODE_CONFIG_PATH, updated, false);
+  return true;
+}
+
 function createTargetConfigs(runtime: CommandRuntime, options: InstallOptions): Record<InstallTarget, TargetConfig> {
   return {
     opencode: {
@@ -999,10 +1195,20 @@ function createTargetConfigs(runtime: CommandRuntime, options: InstallOptions): 
         { name: "Global AGENTS.md", run: () => setupInstructionFile(CODEX_AGENTS_MD_PATH) },
       ],
     },
+    zcode: {
+      label: "ZCode",
+      description: "MCP server, prompt hook, workflow rules, skill",
+      steps: [
+        { name: "MCP server config", critical: true, run: () => setupZcodeConfig(runtime, options.dryRun) },
+        { name: "Prompt hook (UserPromptSubmit)", run: () => setupZcodeHook(options.dryRun) },
+        { name: "Workflow rules", run: () => setupZcodeRules(options) },
+        { name: "Skill", run: () => setupZcodeSkill(options.dryRun) },
+      ],
+    },
   };
 }
 
-const VALID_TARGETS: InstallTarget[] = ["opencode", "claudecode", "antigravity", "codex", "kilo"];
+const VALID_TARGETS: InstallTarget[] = ["opencode", "claudecode", "antigravity", "codex", "kilo", "zcode"];
 
 function parseTargets(args: string[]): InstallTarget[] {
   const selected = new Set<InstallTarget>();
@@ -1039,8 +1245,8 @@ function parseTargets(args: string[]): InstallTarget[] {
       continue;
     }
 
-    if (arg === "--dry-run" || arg === "--global" || arg === "--link") continue;
-    throw new Error(`Unknown install option '${arg}'. Supported: --target <name>, --dry-run, --global, --link`);
+    if (arg === "--dry-run" || arg === "--global" || arg === "--link" || arg === "--uninstall") continue;
+    throw new Error(`Unknown install option '${arg}'. Supported: --target <name>, --dry-run, --global, --link, --uninstall`);
   }
 
   return [...selected];
@@ -1073,6 +1279,11 @@ async function chooseTargetsInteractively(): Promise<InstallTarget[]> {
       value: "codex" as InstallTarget,
       description: "MCP server, AGENTS.md",
     },
+    {
+      label: "ZCode",
+      value: "zcode" as InstallTarget,
+      description: "MCP server, prompt hook, workflow rules, skill",
+    },
   ]);
 
   return selected.filter((value): value is InstallTarget =>
@@ -1086,7 +1297,7 @@ export async function runInstall(args: string[]): Promise<InstallOutcome> {
   console.log();
 
   const runtime = await detectGlobalCommand();
-  const options: InstallOptions = { dryRun: args.includes("--dry-run"), global: args.includes("--global"), link: args.includes("--link") };
+  const options: InstallOptions = { dryRun: args.includes("--dry-run"), global: args.includes("--global"), link: args.includes("--link"), uninstall: args.includes("--uninstall") };
   const targetConfigs = createTargetConfigs(runtime, options);
 
   let targets: InstallTarget[];
@@ -1109,11 +1320,43 @@ export async function runInstall(args: string[]): Promise<InstallOutcome> {
     return { ok: true, succeeded: 0, failed: [], skipped: [] };
   }
 
-  if ((options.dryRun || options.global || options.link) && targets.some((target) => target !== "kilo")) {
-    const message = "--dry-run, --global and --link are supported only with --target kilo; no files written.";
+  if (options.uninstall && (targets.length !== 1 || targets[0] !== "zcode" || options.dryRun || options.global || options.link)) {
+    const message = "--uninstall поддержан только для --target zcode (без других флагов); файлы не тронуты.";
     error(message);
     process.exitCode = 1;
     return { ok: false, succeeded: 0, failed: [{ target: "install", targetLabel: "install", name: "Install options", error: message }], skipped: [] };
+  }
+
+  if ((options.dryRun || options.global) && targets.some((target) => target !== "kilo" && target !== "zcode")) {
+    const message = "--dry-run and --global are supported only with --target kilo,zcode; no files written.";
+    error(message);
+    process.exitCode = 1;
+    return { ok: false, succeeded: 0, failed: [{ target: "install", targetLabel: "install", name: "Install options", error: message }], skipped: [] };
+  }
+  if (options.link && targets.some((target) => target !== "kilo")) {
+    const message = "--link is supported only with --target kilo; no files written.";
+    error(message);
+    process.exitCode = 1;
+    return { ok: false, succeeded: 0, failed: [{ target: "install", targetLabel: "install", name: "Install options", error: message }], skipped: [] };
+  }
+
+  if (options.uninstall) {
+    let removed: boolean;
+    try {
+      removed = uninstallZcodeHook();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      error(`Uninstall failed: ${msg}`);
+      process.exitCode = 1;
+      return { ok: false, succeeded: 0, failed: [{ target: "zcode", targetLabel: "ZCode", name: "Uninstall prompt hook", error: msg }], skipped: [] };
+    }
+    if (removed) {
+      success(`Хук megamemory снят из ${pc.dim(ZCODE_CONFIG_PATH)}; MCP-сервер, правила и скилл остались на месте.`);
+    } else {
+      info(`Хук не установлен; ${pc.dim(ZCODE_CONFIG_PATH)} не менялся.`);
+    }
+    console.log();
+    return { ok: true, succeeded: removed ? 1 : 0, failed: [], skipped: [] };
   }
 
   const steps: StepResult[] = [];
@@ -1183,6 +1426,11 @@ export async function runInstall(args: string[]): Promise<InstallOutcome> {
     if (targets.includes("codex")) {
       console.log(
         pc.dim(`  Restart Codex so it reloads ${pc.cyan(CODEX_CONFIG_PATH)}.`)
+      );
+    }
+    if (targets.includes("zcode")) {
+      console.log(
+        pc.dim(`  Restart ZCode so it reloads ${pc.cyan(ZCODE_CONFIG_PATH)}.`)
       );
     }
   } else {
