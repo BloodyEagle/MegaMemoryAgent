@@ -123,7 +123,7 @@ function printTable(report: BenchReport): void {
     ...(showFiles
       ? ["files".padStart(8), "r(files)".padStart(9)]
       : []),
-    ...(showTop ? ["files(top)".padStart(10)] : []),
+    ...(showTop ? ["files(top)".padStart(10), "answer".padStart(8)] : []),
     ...(showFiles
       ? ["t(graph)".padStart(9), "t(files)".padStart(9)]
       : []),
@@ -149,7 +149,7 @@ function printTable(report: BenchReport): void {
             fmtRatio(q.ratio_files).padStart(9),
           ]
         : []),
-      ...(showTop ? [fmtNum(q.baseline_files_top_tokens ?? 0).padStart(10)] : []),
+      ...(showTop ? [fmtNum(q.baseline_files_top_tokens ?? 0).padStart(10), fmtNum(q.answer_tokens).padStart(8)] : []),
       ...(showFiles
         ? [fmtMs(q.time_to_graph_ms).padStart(9), fmtMs(q.time_to_baseline_ms).padStart(9)]
         : []),
@@ -174,7 +174,8 @@ function printSummary(report: BenchReport): void {
     lines.push(
       `  files : median r ${fmtRatio(report.files.median_ratio)}` +
         (report.files_top_n > 0
-          ? ` · median r(top) ${fmtRatio(report.files.median_ratio_top ?? null)}`
+          ? ` · median r(top) ${fmtRatio(report.files.median_ratio_top ?? null)}` +
+            ` · answer/resident ${fmtRatio(report.resident_ratio)}`
           : "") +
         ` · graph ${fmtNum(report.files.graph_tokens)} tok vs ${fmtNum(report.files.baseline_tokens)} tok` +
         (report.files.baseline_top_tokens !== undefined
@@ -199,6 +200,13 @@ function printSummary(report: BenchReport): void {
       ? "n/a"
       : `${report.hit_rate_at_1.toFixed(2)} (${report.hits_at_1}/${report.expected_total})`;
   console.log(`  hit_rate: ${hitRate} · hit_rate@1: ${hitRateAt1}`);
+  // План 26 §4: resident_ratio — прокси по сериализованному ответу, не замер
+  // реального окна модели; печатается только там, где есть знаменатель.
+  if (report.files_top_n > 0) {
+    console.log(
+      `  resident_ratio: ${fmtRatio(report.resident_ratio)} · proxy: serialized answer vs files-top baseline, not the model window`
+    );
+  }
   console.log(
     `  stale_hits: ${report.stale_hits}${formatIdList(report.stale_ids)}` +
       ` · unknown_supports: ${report.unknown_supports}${formatIdList(report.unknown_support_ids)}`
@@ -323,7 +331,7 @@ export async function runBenchCli(args: string[]): Promise<void> {
     });
     console.log(
       `  megamemory bench — ${questions!.length} questions, baseline: ${baseline}` +
-        (filesTopN > 0 ? `, files-top: ${filesTopN}` : "")
+        (filesTopN > 0 ? `, files-top: ${filesTopN}, resident: proxy` : "")
     );
     console.log("");
     printTable(report);

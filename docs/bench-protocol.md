@@ -176,6 +176,16 @@ local functional checks are valid, and `economy_status` stays `not_measured`.
   because a live agent reads two or three files. Run with `--files-top 3` and read
   `r(files-top)`: the baseline over the first three unique files in the output order.
   `r(files-top) ≤ r(files)` always.
+- **`resident_ratio` is a proxy, never a window measurement.** `answer_tokens`
+  per question is the same serialized answer the `graph` metric already counts;
+  `resident_ratio = sum(answer_tokens) / sum(baseline_files_top_tokens)` says how
+  much of the honest files-top baseline the answer itself occupies. It is computed
+  over serialized MCP answers and does **not** measure the model's live context
+  window — the CLI marks it `resident: proxy` in the header and prints the label
+  `answer/resident` next to the files-top summary. `null` when the denominator is
+  zero (`--baseline te`, no `--files-top`, or no resolvable files), never
+  `Infinity`. Read it next to `hit_rate`: a small resident_ratio with a poor
+  hit_rate is not a saving.
 - **`refs: resolved N/M`** — how many unique `file_refs` pointed at existing files.
   Line suffixes (`src/db.ts:9`) resolve to the same file; a ref is tried against
   `ref_roots` (per question), `--ref-root PATH` (repeatable), the git root, then the

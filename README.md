@@ -580,6 +580,17 @@ with worse quality is not a saving.** For a live agent A/B comparison, see
   tokens and ×50 ratios no live agent would ever pay. Run with `--files-top 3`
   and read `r(files-top)`: the baseline over the first three unique files in
   the output order. `r(files-top) ≤ r(files)` always.
+- **`answer` / `answer/resident` — a proxy, not the model window.** The
+  `answer` column (next to `files(top)`) is the cost of the graph's own
+  serialized reply — the same number `graph` shows. With `--files-top N` the
+  header is marked `resident: proxy` and the summary prints
+  `answer/resident` and `resident_ratio` =
+  sum(answers) / sum(files-top baselines): how much of the honest baseline the
+  answer itself occupies in the session. It is computed over serialized
+  answers and never claims to measure the model's live context window; `null`
+  when the denominator is zero (`--baseline te`, no `--files-top`, or no
+  resolvable files) — never `Infinity`. A small resident_ratio with a poor
+  `hit_rate` is still not a saving.
 - **`refs: resolved N/M (roots: …)`** — how many of the `M` unique `file_refs`
   pointed at files that actually exist. Refs with line suffixes resolve to the
   same file; a ref is tried against the question's `ref_roots`, then
