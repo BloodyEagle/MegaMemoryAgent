@@ -77,10 +77,11 @@ describe("MCP initialize instructions", () => {
     expect(expected).toContain(`MegaMemory ${packageVersion}`);
     expect(expected.length).toBeLessThanOrEqual(400);
     expect(expected).toContain("проверенный вывод");
-    for (const name of ["understand", "create_concept", "evidence", "link", "next.record", "empty_base", "no_match", "budget"]) {
+    for (const name of ["understand", "create_concept", "evidence", "link", "next.record", "include_source", "stale_warning"]) {
       expect(expected).toContain(name);
     }
-    expect(expected).toContain("empty_base|no_match|budget");
+    // Пояснение причин пустой выдачи дублирует meta.reason ответа — в тексте ему не место.
+    expect(expected).not.toContain("reason=");
     for (const name of ["remove_concept", "merge", "resolve_conflict", "expire", "consolidate"]) {
       expect(expected).not.toContain(name);
     }

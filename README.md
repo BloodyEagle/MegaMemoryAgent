@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.11.0-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.11.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -195,11 +195,13 @@ to a non-empty `CODEX_HOME`, otherwise to `~/.codex`; OpenCode and Claude Code
 use their client-specific profile paths shown in the installer output.
 
 **Universal MCP instructions.** At initialization, the server also sends a
-versioned protocol of at most 400 characters: call `understand`, record verified
-conclusions with `create_concept` + `evidence`, use `link`, and follow
-`next.record`. Clients supporting MCP `instructions` can use it without
-installer rule files; it is a short safety net, not a replacement for the full
-workflow or proof that the agent received or followed it.
+versioned protocol of at most 400 characters: call `understand` (with
+`include_source: true` when code is needed; on `stale_warning` re-read the
+ref), record verified conclusions with `create_concept` + `evidence`, use
+`link`, and follow `next.record`. Clients supporting MCP `instructions` can
+use it without installer rule files; it is a short safety net, not a
+replacement for the full workflow or proof that the agent received or
+followed it.
 
 **Workflow-wrapper freshness.** `install` stamps its managed blocks with
 `<!-- megamemory:instructions vX.Y.Z -->` in `AGENTS.md` / `CLAUDE.md` and on
