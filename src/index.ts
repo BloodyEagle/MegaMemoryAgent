@@ -25,7 +25,7 @@ const VERSION = JSON.parse(
   )
 ).version;
 
-const MCP_INSTRUCTIONS = `MegaMemory ${VERSION}: перед задачей вызови understand. После работы сохрани проверенный вывод через create_concept с evidence (ref/node и why); связи — link с description. Перед завершением выполни next.record из последнего ответа и перечисли созданные/обновлённые узлы. reason=empty_base|no_match|budget не значит «знаний нет»: читай актуальный код; при budget уточни запрос.`;
+const MCP_INSTRUCTIONS = `MegaMemory ${VERSION}: перед задачей вызови understand. Нужен код — include_source: true; stale_warning = файл менялся после записи, перечитай ref. После работы сохрани проверенный вывод через create_concept с evidence (ref/node, why), связи — link с description. Перед завершением выполни next.record и перечисли созданные/обновлённые узлы.`;
 
 const HELP = buildHelp(VERSION);
 
