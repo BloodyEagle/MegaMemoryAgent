@@ -43,7 +43,8 @@ ${pc.bold("Global and MCP options:")}
 
 ${pc.bold("Command options:")}
   ${pc.cyan("--target")} ${pc.dim("NAME[,NAME...]")}  install target(s), repeatable
-                ${pc.dim("(opencode | claudecode | antigravity | codex | kilo; absent: interactive selection)")}
+                ${pc.dim("(opencode | claudecode | antigravity | codex | kilo | zcode; absent: interactive selection)")}
+  ${pc.cyan("--uninstall")}     install --target zcode: remove the megamemory prompt hook only ${pc.dim("(MCP server, rules and skill stay; absent hook is a no-op; other flags are refused)")}
   ${pc.cyan("--port")} ${pc.dim("PORT")}     serve port ${pc.dim("(default: 4321)")}
   ${pc.cyan("--host")} ${pc.dim("HOST")}     serve address ${pc.dim("(default: 127.0.0.1; allowed: 127.0.0.1 or ::1)")}
   ${pc.cyan("--prune")}         stats: apply timeline retention cleanup before reporting

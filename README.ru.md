@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.11.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.12.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -178,6 +178,7 @@ megamemory install --target claudecode
 megamemory install --target antigravity
 megamemory install --target codex
 megamemory install --target kilo
+megamemory install --target zcode
 ```
 
 Универсального ручного JSON-фрагмента намеренно **нет**: клиенты используют
@@ -192,6 +193,7 @@ megamemory install --target kilo
 | Antigravity | workspace-запись в `mcp_config.json` с `command` и `args` |
 | Codex | TOML-таблица `[mcp_servers.megamemory]` |
 | Kilo | новый JSONC `mcp.megamemory` или legacy `mcpServers` (см. ниже) |
+| ZCode | `~/.zcode/cli/config.json` → `mcp.servers` с `type: "stdio"`, `command`, `args` (только глобально) |
 
 Сервер разрешает `.megamemory/knowledge.db` относительно рабочей директории
 MCP-процесса; `--db PATH` / `--db=PATH` в argv сервера имеет приоритет над
@@ -309,6 +311,32 @@ Kilo сохраняют только маркер сниппета; rules и г�
 `~/.config/kilo/AGENTS.md` в список проверки **не входят** — поля свежести
 проверяют найденный проектный блок, а не все файлы инструкций Kilo. Отсутствие
 результата сканирования не доказывает отсутствия правил.
+
+### Установка для ZCode
+
+`megamemory install --target zcode` пишет один **глобальный** конфиг
+`~/.zcode/cli/config.json` — проектного MCP-файла у ZCode нет. Схема
+подтверждена живым рабочим конфигом (план 28, T0): `mcp.servers` с
+`{ "type": "stdio", "command", "args", "timeoutMs" }`. Существующая запись
+`megamemory` принадлежит пользователю: дополняются только отсутствующие поля,
+чужие серверы, комментарии и порядок ключей сохраняются; битый JSONC — отказ с
+путём и позицией, файл не меняется. Перед первым изменением создаётся
+байт-в-байт бэкап `config.json.bak-<timestamp>-<uuid>`.
+
+Установка также добавляет хук `UserPromptSubmit` — одна строка-напоминание в
+контекст каждого хода (хукам из файла конфигурации нужен `hooks.enabled: true`)
+— и требует **перезапуска ZCode**. `install --target zcode --uninstall` снимает
+**только этот хук** (чужие хуки, комментарии и MCP-сервер остаются; при полной
+записи megamemory конфиг восстанавливается байт-в-байт; без `--target zcode`
+флаг отклоняется явно). Правила попадают в управляемый версионированный блок
+проектного `AGENTS.md` (`--global` переносит их в `~/.zcode/AGENTS.md`; если
+глобальный файл есть, а блока megamemory в нём нет — предупреждение, ZCode
+читает оба файла), скилл — в `~/.zcode/skills/megamemory/SKILL.md`
+(frontmatter `description` держится в пределах 1024 символов, иначе ZCode
+молча не покажет скилл). `--dry-run` печатает планируемые пути и ничего не
+пишет; список разрешений инструментов не пишется (схема permissions не
+подтверждена). Инъекция контекста хуком опирается на документированную схему
+hooks и требует живой приёмки на реальной машине.
 
 ### Обновление существующей базы upstream
 
@@ -767,7 +795,7 @@ collapsed-локаторами с зависимыми выводами (`meta.a
 
 | Команда | Назначение |
 |---|---|
-| `megamemory install [--target kilo]` | Настроить MCP-клиент; Kilo поддерживает новый JSONC/legacy и флаги `--dry-run`, `--global`, `--link` только для Kilo |
+| `megamemory install [--target kilo\|zcode]` | Настроить MCP-клиент; Kilo: новый JSONC/legacy и `--dry-run`/`--global`/`--link`; ZCode: глобальный `config.json` + prompt hook с `--dry-run`/`--global`, `--uninstall` снимает только хук |
 | `megamemory hooks install\|uninstall\|status [--repo PATH]` | Управлять необязательным локальным `commit-msg`-гейтом строки `memory:`; по умолчанию текущий каталог, без базы и сети |
 | `megamemory serve [--port N]` | Веб-обозреватель: граф, поиск, карточки узлов, панель Tokens, вкладка consolidate. **Только loopback** (`127.0.0.1`, IPv6: `--host ::1`) — локальный инструмент для человека, не сетевой сервис |
 | `megamemory migrate [--dry-run\|--apply]` | Обновить сырую базу upstream v1.6.2 или починить fork-объекты миграции; dry-run работает на одноразовом согласованном снимке, apply делает бэкап и пишет |

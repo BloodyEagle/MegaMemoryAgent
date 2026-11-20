@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.11.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.12.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -173,6 +173,7 @@ megamemory install --target claudecode
 megamemory install --target antigravity
 megamemory install --target codex
 megamemory install --target kilo
+megamemory install --target zcode
 ```
 
 There is deliberately **no universal manual JSON snippet**: the clients use
@@ -187,6 +188,7 @@ workflow files; if configuring by hand, register the stdio command
 | Antigravity | a workspace `mcp_config.json` entry with `command` and `args` |
 | Codex | a `[mcp_servers.megamemory]` TOML table |
 | Kilo | new JSONC `mcp.megamemory` or legacy `mcpServers` (see below) |
+| ZCode | `~/.zcode/cli/config.json` → `mcp.servers` with `type: "stdio"`, `command`, `args` (global only) |
 
 The server resolves `.megamemory/knowledge.db` from the MCP process working
 directory; `--db PATH` / `--db=PATH` in server argv takes precedence over
@@ -294,6 +296,33 @@ order or rule scope. `.agents/AGENTS.md` is not a native instruction entry
 point. `--link` runs `ln -s` only on Linux/macOS without replacing an existing
 destination; on Windows (including Git Bash) and in dry-run it only prints the
 command with a warning.
+
+### ZCode installation
+
+`megamemory install --target zcode` writes one **global** config,
+`~/.zcode/cli/config.json` — ZCode has no workspace-level MCP file. The schema
+was confirmed against a live working config (plan 28 T0): `mcp.servers` with
+`{ "type": "stdio", "command", "args", "timeoutMs" }`. An existing
+`megamemory` record belongs to the user: only missing fields are filled in,
+foreign servers, comments and key order are preserved; a broken JSONC file
+refuses with the path and position and stays untouched. Before the first
+modification install saves a byte-for-byte `config.json.bak-<timestamp>-<uuid>`
+backup.
+
+The install also adds a `UserPromptSubmit` hook — a one-line context reminder
+on every prompt (configuration-file hooks require `hooks.enabled: true`) — and
+needs a **ZCode restart** afterwards. `install --target zcode --uninstall`
+removes **only that hook** (foreign hooks, comments and the MCP server stay;
+the config restores byte-identically when the megamemory record pre-existed;
+without `--target zcode` the flag is refused). Rules go to the managed
+versioned block in the project `AGENTS.md` (`--global` moves them to
+`~/.zcode/AGENTS.md`; a global file without a megamemory block gets a warning,
+since ZCode reads both files), the skill to
+`~/.zcode/skills/megamemory/SKILL.md` (frontmatter `description` stays within
+the 1024-character limit, otherwise ZCode silently hides the skill).
+`--dry-run` prints the planned paths and writes nothing; no tool allowlist is
+written (no confirmed permissions schema). Hook injection relies on the
+documented hooks schema and still requires live acceptance on a real machine.
 
 **Kilo freshness scope.** The short Kilo `AGENTS.md` block starts with the
 `megamemory:instructions` stamp and is recognized by the scanner normally.
@@ -757,7 +786,7 @@ only by `task_add`.
 
 | Command | What it does |
 |---|---|
-| `megamemory install [--target kilo]` | Configure an MCP client; Kilo supports new JSONC/legacy configs and Kilo-only `--dry-run`, `--global`, `--link` |
+| `megamemory install [--target kilo\|zcode]` | Configure an MCP client; Kilo: new JSONC/legacy configs with `--dry-run`/`--global`/`--link`; ZCode: global `config.json` + prompt hook with `--dry-run`/`--global`, `--uninstall` removes the hook only |
 | `megamemory hooks install\|uninstall\|status [--repo PATH]` | Manage an optional local `commit-msg` gate for the `memory:` line; current directory by default, no database or network |
 | `megamemory serve [--port N]` | Web explorer (graph, search, node cards, Tokens panel, consolidate tab). **Loopback only** (`127.0.0.1`, IPv6: `--host ::1`) — a local tool for a human, not a network service |
 | `megamemory migrate [--dry-run\|--apply]` | Upgrade raw upstream v1.6.2 or repair fork migration objects; dry-run uses a disposable coherent snapshot, apply backs up and writes |
