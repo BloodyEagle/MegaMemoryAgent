@@ -627,6 +627,20 @@ with worse quality is not a saving.** For a live agent A/B comparison, see
 | `task_done` | Move a task to terminal `done` and clear its due date. |
 | `board` | Return open tasks sorted by rot and the done column with `count`, `returned`, `has_more`, and keyset `next_cursor` pagination. |
 
+All 26 tools register by default. The `MEGAMEMORY_TOOLS` environment variable
+narrows the surface at registration time — the `tools/list` result reflects the
+filter honestly, there is no dynamic registration: unset or `all` keeps all 26
+(the default does not change); `core` keeps the eight tools of the
+read → write → link → confirm → verify loop (`understand`, `get_concept`,
+`create_concept`, `update_concept`, `link`, `confirm_supports`,
+`check_freshness`, `provenance_trace`); a comma-separated list keeps exactly
+the named tools (`understand,link`). Unknown names warn on stderr and are
+skipped, never fatal. The rest (`trail_*`, `slot_*`, `task_*`, `board`,
+`list_*`, `resolve_conflict`, `remove_concept`, `provenance_audit`/
+`provenance_history`, `check_artifacts`) are available in `all` or an explicit
+list. `megamemory install` does not write this variable into MCP entries — new
+installs keep every tool.
+
 ### `understand`: compact recall and budget
 
 `max_tokens` defaults to **4000**; an explicit budget is respected. Compact

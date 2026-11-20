@@ -22,7 +22,7 @@ function publicCreateSchema() {
       if (name === "EvidenceWhySchema") whyExpression = node.initializer!.getText(ast);
       if (name === "EvidenceItemSchema") itemExpression = node.initializer!.getText(ast);
     }
-    if (ts.isCallExpression(node) && node.expression.getText(ast) === "server.tool" && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === "create_concept") createExpression = node.arguments[2].getText(ast);
+    if (ts.isCallExpression(node) && node.expression.getText(ast) === "tool" && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === "create_concept") createExpression = node.arguments[2].getText(ast);
     ts.forEachChild(node, visit);
   }
   visit(ast);

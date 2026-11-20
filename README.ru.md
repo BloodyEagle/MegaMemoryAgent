@@ -637,6 +637,20 @@ TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 используют разные CLI и фор�
 | `task_done` | Переводит задачу в терминальный `done` и снимает due date. |
 | `board` | Возвращает открытые задачи по rot и колонку done с `count`, `returned`, `has_more` и keyset-пагинацией через `next_cursor`. |
 
+По умолчанию регистрируются все 26 инструментов. Переменная окружения
+`MEGAMEMORY_TOOLS` сужает поверхность до регистрации — состав `tools/list`
+честно отражает фильтр, динамической регистрации нет: не задано или `all` —
+все 26 (дефолт не меняется); `core` — восемь инструментов цикла
+«прочитал → записал → связал → подтвердил → проверил» (`understand`,
+`get_concept`, `create_concept`, `update_concept`, `link`, `confirm_supports`,
+`check_freshness`, `provenance_trace`); список через запятую — ровно
+перечисленные имена (`understand,link`). Неизвестное имя — предупреждение в
+stderr и пропуск, не падение. Остальные (`trail_*`, `slot_*`, `task_*`,
+`board`, `list_*`, `resolve_conflict`, `remove_concept`,
+`provenance_audit`/`provenance_history`, `check_artifacts`) доступны в `all`
+или явным списком. `megamemory install` не пишет эту переменную в MCP-запись —
+новые установки получают все инструменты.
+
 ### `understand`: compact recall и бюджет
 
 `max_tokens` по умолчанию — **4000**; явно переданный бюджет соблюдается.
