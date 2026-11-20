@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.11.0-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.11.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -200,12 +200,13 @@ MCP-процесса; `--db PATH` / `--db=PATH` в argv сервера имее�
 свои профильные пути, которые установщик показывает в выводе.
 
 **Универсальные MCP-инструкции.** При инициализации сервер также передаёт
-протокол с текущей версией длиной не более 400 символов: вызвать `understand`,
-записать проверенный вывод через `create_concept` + `evidence`, использовать
-`link` и выполнить `next.record`. Клиенты с поддержкой MCP `instructions`
-могут получить его без файлов правил установщика; это короткая страховка,
-а не замена полного workflow и не доказательство, что агент получил или
-выполнил инструкции.
+протокол с текущей версией длиной не более 400 символов: вызвать `understand`
+(с `include_source: true`, когда нужен код; на `stale_warning` перечитать
+ref), записать проверенный вывод через `create_concept` + `evidence`,
+использовать `link` и выполнить `next.record`. Клиенты с поддержкой MCP
+`instructions` могут получить его без файлов правил установщика; это
+короткая страховка, а не замена полного workflow и не доказательство, что
+агент получил или выполнил инструкции.
 
 **Свежесть workflow-обёртки.** `install` ставит штамп
 `<!-- megamemory:instructions vX.Y.Z -->` на управляемые блоки в `AGENTS.md` /
