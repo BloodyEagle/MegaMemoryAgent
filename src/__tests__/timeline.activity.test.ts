@@ -60,12 +60,15 @@ describe("timeline process-local activity", () => {
     expect(timelineActivity(db)).toEqual(fresh.activity());
   });
 
-  it("every server.tool handler contains timeline.log without starting the server", () => {
+  it("every tool registration handler contains timeline.log without starting the server", () => {
     const source = fs.readFileSync(new URL("../index.ts", import.meta.url), "utf8");
     const ast = ts.createSourceFile("index.ts", source, ts.ScriptTarget.Latest, true);
     const handlers: ts.CallExpression[] = [];
     function visit(node: ts.Node): void {
-      if (ts.isCallExpression(node) && node.expression.getText(ast) === "server.tool") handlers.push(node);
+      // Регистрации идут через локальный хелпер tool(name, desc, shape, handler)
+      // (план 26 §1, фильтр MEGAMEMORY_TOOLS); конструкция та же, что была
+      // у прямых server.tool(...) вызовов.
+      if (ts.isCallExpression(node) && node.expression.getText(ast) === "tool") handlers.push(node);
       ts.forEachChild(node, visit);
     }
     visit(ast);

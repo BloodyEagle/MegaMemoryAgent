@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.10.2-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.11.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -590,6 +590,16 @@ TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 используют разные CLI и фор�
   ×50, которых в жизни не бывает. Гоняйте с `--files-top 3` и читайте
   `r(files-top)`: baseline по первым трём уникальным файлам в порядке выдачи.
   Всегда `r(files-top) ≤ r(files)`.
+- **`answer` / `answer/resident` — прокси, не окно модели.** Колонка `answer`
+  (рядом с `files(top)`) — стоимость собственного сериализованного ответа
+  графа, то же число, что показывает `graph`. С `--files-top N` шапка
+  помечена `resident: proxy`, а в итоге печатаются `answer/resident` и
+  `resident_ratio` = сумма ответов / сумма files-top-baseline: какую долю
+  честного baseline занимает сам ответ в сессии. Это прокси по
+  сериализованным ответам, а **не** замер реального окна модели; `null` при
+  нулевом знаменателе (`--baseline te`, без `--files-top` или без
+  разрешившихся файлов) — никогда не `Infinity`. Малый resident_ratio с
+  плохим `hit_rate` — по-прежнему не экономия.
 - **`refs: resolved N/M (roots: …)`** — сколько из `M` уникальных `file_refs`
   указало на реально существующие файлы. Рефы с суффиксом строки резолвятся в
   тот же файл; реф перебирается по корням вопроса `ref_roots`, затем
@@ -636,6 +646,20 @@ TS 1.1.0 / PY 1.2.1 / HAR 1.0.1 используют разные CLI и фор�
 | `task_add` | Создаёт открытую task-концепцию с необязательной разбираемой датой due. |
 | `task_done` | Переводит задачу в терминальный `done` и снимает due date. |
 | `board` | Возвращает открытые задачи по rot и колонку done с `count`, `returned`, `has_more` и keyset-пагинацией через `next_cursor`. |
+
+По умолчанию регистрируются все 26 инструментов. Переменная окружения
+`MEGAMEMORY_TOOLS` сужает поверхность до регистрации — состав `tools/list`
+честно отражает фильтр, динамической регистрации нет: не задано или `all` —
+все 26 (дефолт не меняется); `core` — восемь инструментов цикла
+«прочитал → записал → связал → подтвердил → проверил» (`understand`,
+`get_concept`, `create_concept`, `update_concept`, `link`, `confirm_supports`,
+`check_freshness`, `provenance_trace`); список через запятую — ровно
+перечисленные имена (`understand,link`). Неизвестное имя — предупреждение в
+stderr и пропуск, не падение. Остальные (`trail_*`, `slot_*`, `task_*`,
+`board`, `list_*`, `resolve_conflict`, `remove_concept`,
+`provenance_audit`/`provenance_history`, `check_artifacts`) доступны в `all`
+или явным списком. `megamemory install` не пишет эту переменную в MCP-запись —
+новые установки получают все инструменты.
 
 ### `understand`: compact recall и бюджет
 
@@ -690,6 +714,29 @@ collapsed-локаторами с зависимыми выводами (`meta.a
 увеличить бюджет. Строка записи в тексте `brief` имеет собственный
 `RECORD_MAX = 400`, остальные строки сохраняют `LINE_MAX = 240`. Полный
 `next.record` не обрезается.
+
+**Исходник в карточке (opt-in).** С `include_source: true` (только compact)
+размещённая карточка может нести verbatim-`source` по первому читаемому
+`file_ref` с диапазоном строк — один вызов вместо отдельного Read. Диапазон
+режется только хвостом (`truncated: true`), середина не вырезается; ссылка без
+диапазона, путь вне корня сервера, отсутствующий файл, файл больше 1 МиБ и
+не-UTF-8 содержимое исходника не дают — `meta.source_skipped` называет
+причину. Бюджет источника вычитается из `max_tokens` до раскладки карточек:
+не поместилось — карточка отдаётся без `source`, `meta.source_cards` считает
+размещённые. По умолчанию выключено — verbatim-исходники увеличивают
+остаточный контекст; просите, когда точный диапазон и так собирались читать.
+
+**`stale_refs`: расхождение записи с файлом.** Работает всегда в compact:
+по `file_refs` каждой возвращённой карточке делается ленивый `stat`, и ссылка,
+чей mtime **новее собственного `updated_at` узла**, попадает в `stale_refs`
+(`ref`, `node_id`, `recorded_at`, `file_mtime`; не больше 3 записей, полное
+число — `meta.stale_refs_total`), карточка несёт свой `updated_at`, а
+`next.stale_warning` говорит: «файл менялся после записи: перечитай ref,
+прежде чем опираться». Это сигнал, а не приговор — mtime врёт после
+`git checkout` и распаковки архива, а отсутствующий файл считается отдельно в
+`meta.stale_refs_missing`, а не выдаётся за «изменился». Ось содержимого
+остаётся за `check_freshness` с digest'ами. Ответ без расхождений секции
+не несёт вовсе.
 
 ### MCP-подсказки записи
 

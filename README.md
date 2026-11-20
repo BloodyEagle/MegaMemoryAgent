@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.10.2-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.11.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -580,6 +580,17 @@ with worse quality is not a saving.** For a live agent A/B comparison, see
   tokens and ×50 ratios no live agent would ever pay. Run with `--files-top 3`
   and read `r(files-top)`: the baseline over the first three unique files in
   the output order. `r(files-top) ≤ r(files)` always.
+- **`answer` / `answer/resident` — a proxy, not the model window.** The
+  `answer` column (next to `files(top)`) is the cost of the graph's own
+  serialized reply — the same number `graph` shows. With `--files-top N` the
+  header is marked `resident: proxy` and the summary prints
+  `answer/resident` and `resident_ratio` =
+  sum(answers) / sum(files-top baselines): how much of the honest baseline the
+  answer itself occupies in the session. It is computed over serialized
+  answers and never claims to measure the model's live context window; `null`
+  when the denominator is zero (`--baseline te`, no `--files-top`, or no
+  resolvable files) — never `Infinity`. A small resident_ratio with a poor
+  `hit_rate` is still not a saving.
 - **`refs: resolved N/M (roots: …)`** — how many of the `M` unique `file_refs`
   pointed at files that actually exist. Refs with line suffixes resolve to the
   same file; a ref is tried against the question's `ref_roots`, then
@@ -626,6 +637,20 @@ with worse quality is not a saving.** For a live agent A/B comparison, see
 | `task_add` | Create an open task concept with an optional parseable due date. |
 | `task_done` | Move a task to terminal `done` and clear its due date. |
 | `board` | Return open tasks sorted by rot and the done column with `count`, `returned`, `has_more`, and keyset `next_cursor` pagination. |
+
+All 26 tools register by default. The `MEGAMEMORY_TOOLS` environment variable
+narrows the surface at registration time — the `tools/list` result reflects the
+filter honestly, there is no dynamic registration: unset or `all` keeps all 26
+(the default does not change); `core` keeps the eight tools of the
+read → write → link → confirm → verify loop (`understand`, `get_concept`,
+`create_concept`, `update_concept`, `link`, `confirm_supports`,
+`check_freshness`, `provenance_trace`); a comma-separated list keeps exactly
+the named tools (`understand,link`). Unknown names warn on stderr and are
+skipped, never fatal. The rest (`trail_*`, `slot_*`, `task_*`, `board`,
+`list_*`, `resolve_conflict`, `remove_concept`, `provenance_audit`/
+`provenance_history`, `check_artifacts`) are available in `all` or an explicit
+list. `megamemory install` does not write this variable into MCP entries — new
+installs keep every tool.
 
 ### `understand`: compact recall and budget
 
@@ -678,6 +703,29 @@ required envelope cannot fit, the request is refused with an explicit error
 asking for a larger budget. The record line rendered in `brief` has its own
 `RECORD_MAX = 400`; other lines keep `LINE_MAX = 240`. The full `next.record`
 is not clipped.
+
+**Source in the card (opt-in).** With `include_source: true` (compact only)
+each placed card can carry a verbatim `source` taken from its first readable
+`file_ref` with a line range — one call instead of a separate Read. The range
+is cut tail-only (`truncated: true`), never mid-file; a ref without a range, a
+path outside the server root, a missing file, a file over 1 MiB and non-UTF-8
+content yield no source — `meta.source_skipped` names the reason. The source
+budget is subtracted from `max_tokens` before card placement: what does not
+fit leaves the card without `source`, and `meta.source_cards` counts the
+placed ones. Default is off — verbatim sources enlarge the resident context;
+ask for it when you would read that exact range anyway.
+
+**`stale_refs`: divergence between the record and the file.** Always-on in
+compact: every returned card's `file_refs` get a lazy `stat`, and a ref whose
+file mtime is **newer than the node's own `updated_at`** lands in
+`stale_refs` (`ref`, `node_id`, `recorded_at`, `file_mtime`; at most 3 entries,
+the full count in `meta.stale_refs_total`), the card carries its `updated_at`,
+and `next.stale_warning` says: «файл менялся после записи: перечитай ref,
+прежде чем опираться». This is a signal, not a verdict — mtime lies after
+`git checkout` and archive unpacking, and a missing file counts separately in
+`meta.stale_refs_missing` instead of pretending the file changed. The content
+axis stays `check_freshness` with digests. An answer without divergences has
+no section at all.
 
 ### MCP record hints
 

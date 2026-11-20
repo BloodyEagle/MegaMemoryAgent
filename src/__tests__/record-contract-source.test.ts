@@ -8,7 +8,7 @@ const ast = ts.createSourceFile("index.ts", source, ts.ScriptTarget.Latest, true
 function createTool(): ts.CallExpression {
   let found: ts.CallExpression | undefined;
   function visit(node: ts.Node): void {
-    if (ts.isCallExpression(node) && node.expression.getText(ast) === "server.tool" &&
+    if (ts.isCallExpression(node) && node.expression.getText(ast) === "tool" &&
         ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === "create_concept") {
       found = node;
     }

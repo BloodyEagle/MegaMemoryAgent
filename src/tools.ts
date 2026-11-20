@@ -68,6 +68,8 @@ import { activeArtifactRows, artifactsDigestOf } from "./artifacts.js";
 import { STUB_CHECK_KINDS, STUB_REJECTION_MESSAGE, isStubSummary, isTechnicalRefAnchor } from "./stub.js";
 import { validationState } from "./validation.js";
 import { readExpiryConfig, journalDefaultExpiry } from "./expiry.js";
+import { readRefLines, type SourceSkipReason } from "./source-reader.js";
+import { parseRef } from "./refs.js";
 import {
   applyTaskEpoch,
   buildTaskContext,
@@ -661,12 +663,21 @@ export async function understand(
       "understand: task поддержан только в mode=compact — full/brief отвечают прежней формой, task-профиль туда не встраивается."
     );
   }
+  if (input.include_source && outputMode !== "compact") {
+    throw new Error(
+      "understand: include_source поддержан только в mode=compact — full/brief не несят verbatim-исходников."
+    );
+  }
   // P3 (план 20+21 v3 §12): контекст под задачу. Валидация входа — ДО всякой
   // работы; без task прежнее поведение байт-в-байт.
   const taskPlan = input.task
     ? parseTaskInput(input.task, process.cwd())
     : null;
   const includeEvidence = input.include_evidence ?? false;
+  // План 26 §2: verbatim-исходник в карточках. По умолчанию выключено —
+  // прежний ответ байт-в-байт; дефолт включать нельзя (остаточный контекст).
+  const includeSource = input.include_source ?? false;
+  const sourceMaxLines = Math.min(Math.max(Math.trunc(input.source_max_lines ?? 60), 1), 200);
   const pathQuery = /^[\w./-]+\.\w+:\d+-\d+$/.test(input.query.trim());
   const collapseAnchors = outputMode === "compact" && (input.collapse_ref_anchors ?? !pathQuery);
 
@@ -1107,6 +1118,13 @@ export async function understand(
   let foldedIds = new Set<string>();
   const collapsedAnchors: CollapsedAnchorView[] = [];
   let truncated = false;
+  // План 26 §2: причина, по которой карточка осталась без исходника.
+  // Объявлено до metaFor — floor-замер читает его через buildPayload.
+  let sourceSkipped: UnderstandMeta["source_skipped"];
+  // План 26 §3: расхождение записи с файлом (mtime) — сигнал, не приговор.
+  let staleRefsShown: NonNullable<UnderstandOutput["stale_refs"]> = [];
+  let staleRefsTotal = 0;
+  let staleRefsMissing = 0;
   let taskDuplicates: TaskContextView["duplicates_dropped"] = [];
 
   // Keep one anchor as a normal UI card when there is no meaningful hit at all.
@@ -1166,6 +1184,12 @@ export async function understand(
         evidence_supports: displayList().reduce((sum, m) => sum + (m.support_evidence?.length ?? 0), 0),
       } : {}),
       ...(collapseAnchors ? { anchor_collapsed: floor ? 0 : collapsedAnchors.length } : {}),
+      ...(includeSource ? {
+        source_cards: floor ? 0 : displayList().filter((m) => m.source !== undefined).length,
+        ...(sourceSkipped !== undefined ? { source_skipped: sourceSkipped } : {}),
+      } : {}),
+      ...(staleRefsTotal > 0 ? { stale_refs_total: staleRefsTotal } : {}),
+      ...(staleRefsMissing > 0 ? { stale_refs_missing: staleRefsMissing } : {}),
       ...(reason ? { reason } : {}),
     };
   };
@@ -1185,6 +1209,10 @@ export async function understand(
       activity,
       emptyReason: meta.reason,
     });
+    // План 26 §3: одна строка, только при непустых stale_refs.
+    if (staleRefsShown.length > 0) {
+      next.stale_warning = "файл менялся после записи: перечитай ref, прежде чем опираться";
+    }
     const taskContext = taskPlan ? buildTaskContext(db, taskPlan, { compact, refuted, next }) : null;
     if (taskContext) {
       taskContext.duplicates_dropped = taskDuplicates;
@@ -1196,6 +1224,7 @@ export async function understand(
       compact: compact.map(serializeCard),
       candidates: floor ? [] : candidates,
       ...(collapseAnchors ? { anchors: floor ? [] : collapsedAnchors } : {}),
+      ...(staleRefsShown.length > 0 ? { stale_refs: staleRefsShown } : {}),
       refuted,
       edges_between: edgesFor(compact),
       ...(reuseView ? { passport_reuse: reuseView } : {}),
@@ -1230,7 +1259,53 @@ export async function understand(
     );
   }
 
-  const target = maxTokens;
+  // ---- План 26 §2: verbatim-исходник в карточках (include_source) ----
+  //
+  // Бюджет источника — ДО раскладки карточек: стоимость блоков для первых
+  // CARDS_MAX кандидатов вычитается из max_tokens, остаток идёт на карточки.
+  // Источники прикрепляются после раскладки — только узлам, которые реально
+  // в выдаче; не влезло — карточка отдаётся без source (source_skipped:
+  // "budget"), а не наоборот. Читается первый file_ref с локатором, который
+  // реально открывается; причины отказа — SourceSkipReason.
+  const sourceRoot = process.cwd();
+  type SourceBlock = NonNullable<CompactMatch["source"]>;
+  const sourceBlocks = new Map<string, SourceBlock>();
+  // Стоимость мерится на глубине card.source (compact[0].source), а не
+  // верхнего уровня: pretty-JSON добавляет отступы с глубиной, резерв с
+  // меньшей глубиной занижал бы стоимость прикреплённого блока.
+  const sourceBlockCost = (block: SourceBlock): number =>
+    measure({ compact: [{ source: block }] }) - measure({ compact: [{}] });
+  const readNodeSource = (
+    node: NodeRow
+  ): { state: "attached"; block: SourceBlock } | { state: "unavailable"; reason?: SourceSkipReason } => {
+    const refs = parseFileRefs(node.file_refs) ?? [];
+    if (refs.length === 0) return { state: "unavailable" }; // нет ссылок — не «пропуск»
+    let firstFailure: SourceSkipReason | undefined;
+    for (const ref of refs) {
+      const result = readRefLines(sourceRoot, ref, sourceMaxLines);
+      if (result.ok) {
+        return {
+          state: "attached",
+          block: { ref, start_line: result.start_line, lines: result.lines, truncated: result.truncated },
+        };
+      }
+      if (firstFailure === undefined) firstFailure = result.reason;
+    }
+    return { state: "unavailable", reason: firstFailure ?? "no_range" };
+  };
+  let sourceReserve = 0;
+  if (includeSource) {
+    for (const entry of eligible.slice(0, CARDS_MAX)) {
+      const block = readNodeSource(entry.node);
+      if (block.state === "attached") {
+        sourceBlocks.set(entry.node.id, block.block);
+        sourceReserve += sourceBlockCost(block.block);
+      } else if (block.reason !== undefined && sourceSkipped === undefined) {
+        sourceSkipped = block.reason;
+      }
+    }
+  }
+  let target = Math.max(maxTokens - sourceReserve, minBudget);
 
   /**
    * Fold pass — recomputed from scratch, so repeated calls (after each
@@ -1432,6 +1507,107 @@ export async function understand(
     placeCard(entry);
   }
 
+  // План 26 §2: источники прикрепляются после раскладки — только узлам,
+  // которые реально в выдаче. Зарезервированный блок едет как есть; карточка
+  // вне резерва (добор после fold-aware retry) читается под полный бюджет.
+  // После прикрепления резерв потрачен — бюджет снова полный max_tokens,
+  // иначе финальные циклы ужали бы карточки под ещё неврахованный источник.
+  if (includeSource) {
+    for (const card of top) {
+      if (card.source !== undefined) continue;
+      const reserved = sourceBlocks.get(card.id);
+      if (reserved !== undefined) {
+        card.source = reserved;
+      } else {
+        const row = nodeRowById.get(card.id);
+        if (!row) continue;
+        const block = readNodeSource(row);
+        if (block.state !== "attached") {
+          if (block.reason !== undefined && sourceSkipped === undefined) sourceSkipped = block.reason;
+          continue;
+        }
+        card.source = block.block;
+      }
+      if (measureWith() > maxTokens) {
+        delete card.source;
+        if (sourceSkipped === undefined) sourceSkipped = "budget";
+        truncated = true;
+      }
+    }
+    // Страховка: если комбинация прикреплений всё равно перелила, источники
+    // снимаются ЦЕЛИКОМ с хвоста — середина диапазона не вырезается.
+    while (measureWith() > maxTokens) {
+      const carrier = [...top].reverse().find((card) => card.source !== undefined);
+      if (!carrier) break;
+      delete carrier.source;
+      if (sourceSkipped === undefined) sourceSkipped = "budget";
+      truncated = true;
+    }
+    target = maxTokens;
+  }
+
+  // ---- План 26 §3: stale_refs — расхождение записи с файлом вместо молчания ----
+  //
+  // Ленивая проверка ТОЛЬКО file_refs возвращённых карточек (compact):
+  // расхождение = file mtime > nodes.updated_at. Это сигнал, а не приговор —
+  // mtime врёт после git checkout/распаковки; ось содержимого —
+  // check_freshness с digest'ами. Ошибки stat (нет файла) — отдельный счётчик
+  // stale_refs_missing, не смешиваются с расхождением. Ответ без расхождений
+  // остаётся байт-в-байт прежним: ни секции, ни updated_at на карточках.
+  // Кэш mtime — на один вызов understand: долгоживущий процесс-кэш прятал бы
+  // правки файлов, случившиеся между запросами той же сессии.
+  {
+    const mtimeCache = new Map<string, number>();
+    const statMtimeMs = (abs: string): number | null => {
+      const cached = mtimeCache.get(abs);
+      if (cached !== undefined) return cached;
+      try {
+        const ms = fs.statSync(abs).mtimeMs;
+        mtimeCache.set(abs, ms);
+        return ms;
+      } catch {
+        return null;
+      }
+    };
+    const recordedMs = (row: NodeRow): number | null => {
+      if (!row.updated_at) return null;
+      const parsed = Date.parse(row.updated_at.includes("T") ? row.updated_at : row.updated_at.replace(" ", "T") + "Z");
+      return Number.isNaN(parsed) ? null : parsed;
+    };
+    const staleAll: NonNullable<UnderstandOutput["stale_refs"]> = [];    for (const card of [...displayList(), ...refutedShown]) {
+      const row = nodeRowById.get(card.id) ?? db.getNode(card.id);
+      if (!row) continue;
+      const refs = card.file_refs ?? [];
+      if (refs.length === 0) continue;
+      const recorded = recordedMs(row);
+      if (recorded === null) continue;
+      let cardStale = false;
+      for (const ref of refs) {
+        const parsed = parseRef(ref);
+        // git-формы и ссылки без локатора stat'ом не проверяются — файловой
+        // оси у них нет; содержимое проверяет check_freshness.
+        if (parsed.kind !== "file" || parsed.locator === null) continue;
+        const mtime = statMtimeMs(path.resolve(sourceRoot, parsed.path));
+        if (mtime === null) {
+          staleRefsMissing += 1;
+          continue;
+        }
+        if (mtime > recorded) {
+          cardStale = true;
+          staleAll.push({
+            ref,
+            node_id: card.id,
+            recorded_at: row.updated_at,
+            file_mtime: new Date(mtime).toISOString(),
+          });
+        }
+      }
+      if (cardStale) card.updated_at = row.updated_at;
+    }
+    staleRefsTotal = staleAll.length;
+    staleRefsShown = staleAll.slice(0, 3);
+  }
+
   // Collapsed anchors preserve qualification and rationales; each addition is measured.
   for (const { node } of anchorEligible) {
     const host = top.find((card) => !foldedIds.has(card.id) && supportIdsOf.get(card.id)?.includes(node.id));
@@ -1513,6 +1689,12 @@ export async function understand(
   }
   while (refutedShown.length > 0 && !fitsFinal()) {
     refutedShown.pop();
+    truncated = true;
+  }
+  // План 26 §3: предупреждение о расхождении — вспомогательный сигнал; на
+  // тесном бюджете оно уступает карточкам (знание важнее предупреждения).
+  while (staleRefsShown.length > 0 && !fitsFinal()) {
+    staleRefsShown.pop();
     truncated = true;
   }
   // Keep the first card whenever its honest minimal response fits; no partial qualification.

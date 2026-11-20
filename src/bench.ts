@@ -200,6 +200,12 @@ export interface QuestionResult {
   query: string;
   lang?: string;
   graph_tokens: number;
+  /**
+   * План 26 §4: тот же ответ, что уже посчитан — meta.tokens_estimated.
+   * Числитель resident_ratio: сколько ответа остаётся в окне сессии
+   * (прокси по сериализованному ответу, не замер реального окна модели).
+   */
+  answer_tokens: number;
   baseline_files_tokens: number | null;
   /** baseline over the first filesTopN unique files in output order (null when filesTopN = 0) */
   baseline_files_top_tokens: number | null;
@@ -318,6 +324,14 @@ export interface BenchReport {
   graph_metric: "retrieval_wire_without_instructions";
   instructions_scope: "excluded";
   economy_status: "not_measured";
+  /**
+   * План 26 §4: sum(answer_tokens) / sum(baseline_files_top_tokens) — доля
+   * файлов-top, которую занимает сам ответ графа. Прокси по сериализованному
+   * ответу: это не замер реального окна модели. null при нулевом знаменателе
+   * (нет baseline_files_top — режим te или files-top выключен, или все файлы
+   * отсутствуют), не Infinity.
+   */
+  resident_ratio: number | null;
   quality_summary: {
     total: number;
     graph: Record<BenchQuality, number>;
@@ -938,6 +952,7 @@ export async function runBench(
       query: q.query,
       lang: q.lang,
       graph_tokens: graphTokens,
+      answer_tokens: graphTokens,
       baseline_files_tokens: baselineFiles,
       baseline_files_top_tokens: baselineFilesTop,
       baseline_te_tokens: baselineTe,
@@ -1040,6 +1055,12 @@ export async function runBench(
   const staleIdsUnion = [...new Set(results.flatMap((q) => q.stale_ids))];
   const unknownIdsUnion = [...new Set(results.flatMap((q) => q.unknown_support_ids))];
 
+  // План 26 §4: числитель — сам ответ графа, знаменатель — files-top baseline.
+  // Нулевой знаменатель даёт null, не Infinity: доли без знаменателя не существует.
+  const answerTotal = results.reduce((s, q) => s + q.answer_tokens, 0);
+  const baselineTopTotal = results.reduce((s, q) => s + (q.baseline_files_top_tokens ?? 0), 0);
+  const residentRatio = baselineTopTotal > 0 ? answerTotal / baselineTopTotal : null;
+
   return {
     mode,
     questions: results,
@@ -1067,6 +1088,7 @@ export async function runBench(
     graph_metric: "retrieval_wire_without_instructions",
     instructions_scope: "excluded",
     economy_status: "not_measured",
+    resident_ratio: residentRatio,
     quality_summary: {
       total: results.length,
       graph: {

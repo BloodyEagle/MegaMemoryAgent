@@ -383,6 +383,20 @@ export interface UnderstandInput {
     negative?: { query: string; tool?: string; options?: Record<string, string> };
   };
   /**
+   * План 26 §2 (2.11.0): opt-in verbatim-исходник в компактных карточках.
+   * По умолчанию выключено — прежний ответ байт-в-байт (у CodeGraph это
+   * измеренный минус: обработанных токенов меньше, остаточный контекст
+   * в сессии +80%). Диапазон берётся из file_ref узла; только compact,
+   * с full/brief — явная ошибка.
+   */
+  include_source?: boolean;
+  /**
+   * План 26 §2: потолок строк источника на карточку (по умолчанию 60,
+   * максимум 200). Хвост диапазона режется с truncated: true, середина
+   * не вырезается.
+   */
+  source_max_lines?: number;
+  /**
    * P3 (план 20+21 v3 §12): opt-in контекст под задачу. Явная цель и тип
    * задачи → детерминированные правила отбора: обязательные категории
    * источников (решения, инварианты, отрицательные результаты, тесты),
@@ -513,6 +527,27 @@ export interface CompactMatch {
    * display-префиксами.
    */
   support_evidence?: ConceptEvidenceSupport[];
+  /**
+   * План 26 §2 (include_source: true, только compact): verbatim-исходник по
+   * первому читаемому file_ref с локатором. Диапазон режется только хвостом
+   * (truncated: true), середина не вырезается; бюджет источника вычитается
+   * из max_tokens до раскладки карточек — не влезло, карточка отдаётся без
+   * source (meta.source_skipped). Отдаётся только узлам, которые есть в
+   * выдаче.
+   */
+  source?: {
+    ref: string;
+    start_line: number;
+    lines: string[];
+    truncated: boolean;
+  };
+  /**
+   * План 26 §3: время записи узла (nodes.updated_at) — отдаётся ТОЛЬКО на
+   * карточках с расхождением mtime (см. UnderstandOutput.stale_refs), чтобы
+   * ответ без расхождений оставался байт-в-байт прежним. Агент сравнивает
+   * его с file_mtime из stale_refs; ось содержимого — check_freshness.
+   */
+  updated_at?: string;
 }
 
 /** Wire card may omit optional display text under budget pressure. */
@@ -573,6 +608,31 @@ export interface UnderstandMeta {
    * подменяется: считаются только свёрнутые в этой выдаче.
    */
   anchor_collapsed?: number;
+  /**
+   * План 26 §2 (include_source: true): сколько размещённых карточек несут
+   * верbatim-исходник.
+   */
+  source_cards?: number;
+  /**
+   * План 26 §2 (include_source: true): причина, по которой хотя бы одна
+   * карточка осталась без исходника. `budget` — стоимость источника не
+   * поместилась в max_tokens (карточка отдана без source); остальные —
+   * причины readRefLines: `no_range` (ссылка без диапазона), `outside_root`,
+   * `missing`, `too_large` (>1 МиБ), `not_text` (не UTF-8 или `\0`).
+   */
+  source_skipped?: "budget" | "no_range" | "outside_root" | "missing" | "too_large" | "not_text";
+  /**
+   * План 26 §3: полное число расхождений mtime по file_refs возвращённых
+   * карточек; в stale_refs выдаётся не больше 3 записей. Ноль не отдаётся:
+   * ответ без расхождений байт-в-байт прежний.
+   */
+  stale_refs_total?: number;
+  /**
+   * План 26 §3: число file_refs возвращённых карточек, файл которых не
+   * открылся stat'ом. Не смешивается с расхождением: отсутствующий файл —
+   * не «изменился после записи».
+   */
+  stale_refs_missing?: number;
 }
 
 export interface UnderstandOutput {
@@ -603,6 +663,14 @@ export interface UnderstandOutput {
    * явный collapse_ref_anchors=false отключает секцию.
    */
   anchors?: CollapsedAnchorView[];
+  /**
+   * План 26 §3 (compact): расхождение записи с файлом — file_ref возвращённой
+   * карточки, чей mtime новее узла updated_at. Сигнал, а не приговор: mtime
+   * врёт после git checkout/распаковки; ось содержимого — check_freshness.
+   * Не больше 3 записей (meta.stale_refs_total — полное число); ответ без
+   * расхождений секции не несёт.
+   */
+  stale_refs?: Array<{ ref: string; node_id: string; recorded_at: string; file_mtime: string }>;
   /**
    * P1.3 (opt-in reuse): квалификация переиспользования проверенных разборов
    * (паспортов) для явного типа задачи и области. Без reuse-запроса секции
@@ -679,6 +747,11 @@ export interface NextHints {
   record: string;
   /** Present only after the process-local read threshold is reached. */
   unrecorded?: Pick<TimelineActivity, "reads_since_write" | "last_write_at">;
+  /**
+   * План 26 §3: одна строка, только когда stale_refs непуст — файл менялся
+   * после записи узла; перечитай ref, прежде чем опираться.
+   */
+  stale_warning?: string;
   /** Last complete observed session; omitted when its beginning is outside the timeline sample. */
   previous_session?: {
     had_understand: boolean;

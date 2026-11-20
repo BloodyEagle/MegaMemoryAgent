@@ -9,8 +9,16 @@ function understandRegistration(): Registration {
   const ast = ts.createSourceFile("index.ts", source, ts.ScriptTarget.Latest, true);
   let registration: Registration | undefined;
   function visit(node: ts.Node): void {
-    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
-      && node.expression.name.text === "tool"
+    if (!ts.isCallExpression(node)) {
+      ts.forEachChild(node, visit);
+      return;
+    }
+    // Регистрации идут через локальный хелпер tool(name, desc, shape, handler)
+    // (план 26 §1, фильтр MEGAMEMORY_TOOLS); прежняя форма server.tool(...)
+    // тоже допускается — конструкция и ассерты одни и те же.
+    const calleeName = ts.isIdentifier(node.expression) ? node.expression.text
+      : ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : undefined;
+    if (calleeName === "tool"
       && node.arguments[0] && ts.isStringLiteral(node.arguments[0])
       && node.arguments[0].text === "understand") {
       const description = node.arguments[1];

@@ -12,6 +12,9 @@ import { createTelemetryLogger, telemetryPathFromEnv, wrapToolHandler } from "./
 import { instructionsStatus } from "./instructions.js";
 import { commandIndex } from "./cli-flags.js";
 import { NODE_KINDS } from "./types.js";
+import { parseToolSurface } from "./tool-surface.js";
+import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 
 // ---- CLI routing ----
 
@@ -405,6 +408,20 @@ async function startMcpServer() {
     };
   }
 
+  // ---- MEGAMEMORY_TOOLS: поверхность из 26 инструментов (план 26 §1) ----
+  // Фильтр ДО регистрации: состав tools/list честно отражает поверхность,
+  // динамической регистрации нет. Дефолт не меняется: без переменной — все 26.
+  const surface = parseToolSurface(process.env.MEGAMEMORY_TOOLS);
+  const tool = <Args extends ZodRawShapeCompat>(
+    name: string,
+    desc: string,
+    shape: Args,
+    handler: ToolCallback<Args>
+  ): void => {
+    if (!surface.enabled.has(name)) return;
+    server.tool(name, desc, shape, handler);
+  };
+
   // ---- Zod schemas ----
   const NodeKindEnum = z.enum(NODE_KINDS);
   const RelationEnum = z.enum([
@@ -435,9 +452,9 @@ async function startMcpServer() {
 
   // ---- Register tools ----
 
-  server.tool(
+  tool(
     "understand",
-    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Default max_tokens is 4000; explicit budgets are respected. mode:'compact' returns candidates representing all search/filter survivors in a bounded retrieval pool (default 20), subject to the list budget, plus up to 3 fully qualified compact cards only when they fit; matches/compact remain available. Candidate entries carry exact untrimmed id (use get_concept to expand), name <=60 chars shortened from the left to preserve the tail, kind, via, score, and optional summary_short <=80 chars. Soft target 40, hard cap 90 estimated tokens per entry: drop summary_short before further shortening name; never shorten id. The candidate list uses at most 25% of max_tokens. After the mandatory envelope, budget priority is the first fully qualified compact card, candidates, then the second/third cards. meta.returned counts visible candidates; meta.cards counts compact cards; meta.dropped counts wholly hidden matches, not candidate-only entries. If dropped > 0, budgeted text says 'Показано N совпадений из M (K скрыто бюджетом) — уточни запрос или подними max_tokens.' (N=returned, K=dropped, M=N+K). If no minimal qualified card fits, meta.reason is budget, not no_match; no cards are guaranteed independently of budget. The UI displays only cards (up to 3), not candidates; candidate display/expansion is a separate plan. mode:'full' keeps the legacy form with why/children/edges on every node and no candidates. Every result mode carries next: execute must_read (up to 3 refs) before editing, treat skip as an empty legacy field, run followups with the supplied args, and use record after the work; refs and summaries never prove whole-file coverage. mode:'brief' returns up to 8 text lines plus the same next contract, without cards. Opt-in (default off): include_evidence attaches confirm-ready versions to each compact card — current_digests (claim is the CURRENT wording for expected_claim_digest; confirmed_claim/confirmed_at document the snapshot separately) plus support_evidence listing ALL live supports (even ones the query missed) with untrimmed wording, edge rationale and claim/status/edge/artifacts digests the server computed — a digest never replaces reading the full wording before confirming; a card and its evidence are placed atomically or omitted, without counting candidate-only entries as dropped. collapse_ref_anchors defaults to true in compact (false supported): demotes technical ref-anchors from the top level (origin AND structure predicate; a meaningful edited card is not treated as a template anchor), folded compactly next to their dependent conclusion with rationale, or as collapsed locators in anchors with dependents; meta.anchor_collapsed counts them. Path-like names are demoted unless the query is an exact full path; they remain in candidates, id/path resolution and provenance keep working, and anchors-only results are never empty no-match. The MCP wrapper also adds the top-level staleness fields instructions_stale, instructions_version, and server_version; they are included in max_tokens. Opt-in task (P3, default off) embeds a task_context section into THIS answer — no extra mandatory call: deterministic rules pick mandatory source categories for the explicit task kind (decisions, supports, refuted, tests, dependents), boost decisions/tests citing the explicit file scope (score 0 — explicit scope pick, not similarity), drop semantic duplicates WITHOUT dropping refuted reasons/contradictions/incompleteness, include hidden supports of placed decisions, list uncovered mandatory sources with a next step when the budget cannot fit them, and estimate the approximate TOTAL cost (cards + followups + required reading, heuristic bytes/3 — not provider tokens). task_context never replaces must_read, never fills next.skip, never claims whole-file coverage; context_epoch is explicit client state (in-memory, per process) that only collapses already-served non-mandatory cards.",
+    "Query the project knowledge graph. Call this before starting any task to load relevant context about concepts, features, and architecture. Default max_tokens is 4000; explicit budgets are respected. mode:'compact' returns candidates representing all search/filter survivors in a bounded retrieval pool (default 20), subject to the list budget, plus up to 3 fully qualified compact cards only when they fit; matches/compact remain available. Candidate entries carry exact untrimmed id (use get_concept to expand), name <=60 chars shortened from the left to preserve the tail, kind, via, score, and optional summary_short <=80 chars. Soft target 40, hard cap 90 estimated tokens per entry: drop summary_short before further shortening name; never shorten id. The candidate list uses at most 25% of max_tokens. After the mandatory envelope, budget priority is the first fully qualified compact card, candidates, then the second/third cards. meta.returned counts visible candidates; meta.cards counts compact cards; meta.dropped counts wholly hidden matches, not candidate-only entries. If dropped > 0, budgeted text says 'Показано N совпадений из M (K скрыто бюджетом) — уточни запрос или подними max_tokens.' (N=returned, K=dropped, M=N+K). If no minimal qualified card fits, meta.reason is budget, not no_match; no cards are guaranteed independently of budget. The UI displays only cards (up to 3), not candidates; candidate display/expansion is a separate plan. mode:'full' keeps the legacy form with why/children/edges on every node and no candidates. Every result mode carries next: execute must_read (up to 3 refs) before editing, treat skip as an empty legacy field, run followups with the supplied args, and use record after the work; refs and summaries never prove whole-file coverage. mode:'brief' returns up to 8 text lines plus the same next contract, without cards. Opt-in (default off): include_evidence attaches confirm-ready versions to each compact card — current_digests (claim is the CURRENT wording for expected_claim_digest; confirmed_claim/confirmed_at document the snapshot separately) plus support_evidence listing ALL live supports (even ones the query missed) with untrimmed wording, edge rationale and claim/status/edge/artifacts digests the server computed — a digest never replaces reading the full wording before confirming; a card and its evidence are placed atomically or omitted, without counting candidate-only entries as dropped. collapse_ref_anchors defaults to true in compact (false supported): demotes technical ref-anchors from the top level (origin AND structure predicate; a meaningful edited card is not treated as a template anchor), folded compactly next to their dependent conclusion with rationale, or as collapsed locators in anchors with dependents; meta.anchor_collapsed counts them. Path-like names are demoted unless the query is an exact full path; they remain in candidates, id/path resolution and provenance keep working, and anchors-only results are never empty no-match. The MCP wrapper also adds the top-level staleness fields instructions_stale, instructions_version, and server_version; they are included in max_tokens. Opt-in task (P3, default off) embeds a task_context section into THIS answer — no extra mandatory call: deterministic rules pick mandatory source categories for the explicit task kind (decisions, supports, refuted, tests, dependents), boost decisions/tests citing the explicit file scope (score 0 — explicit scope pick, not similarity), drop semantic duplicates WITHOUT dropping refuted reasons/contradictions/incompleteness, include hidden supports of placed decisions, list uncovered mandatory sources with a next step when the budget cannot fit them, and estimate the approximate TOTAL cost (cards + followups + required reading, heuristic bytes/3 — not provider tokens). task_context never replaces must_read, never fills next.skip, never claims whole-file coverage; context_epoch is explicit client state (in-memory, per process) that only collapses already-served non-mandatory cards. Always-on in compact: stale_refs lists returned cards whose file_refs have an mtime NEWER than the node's own update — a divergence signal, not a verdict (git checkout and archive unpacking also bump mtime; the content axis is check_freshness) — next.stale_warning says to re-read the ref before relying on it, meta.stale_refs_total/stale_refs_missing carry the full counts; an answer without divergences stays byte-identical.",
     {
       query: z.string().describe("Natural language query describing what you want to understand about the project"),
       top_k: z.number().int().min(1).max(50).optional().describe("Number of top results to return (default: 10)"),
@@ -447,6 +464,8 @@ async function startMcpServer() {
       include_stale: z.boolean().optional().describe("Вернуть и просроченные факты (valid_until в прошлом) — с пометкой expired: true (по умолчанию исключены, meta.stale_excluded считает исключённых)"),
       include_evidence: z.boolean().optional().describe("E3, opt-in (по умолчанию выключено): каждый компактный матч несёт current_digests (claim — текущая формулировка для expected_claim_digest; confirmed_claim/confirmed_at — документация снимка, отдельно) и support_evidence — ВСЕ живые опоры, включая не найденные поиском: полная формулировка (не обрезается), rationale ребра и готовые дайджесты confirm_supports (claim/status/edge/artifacts, полные hex — общие экспорты сервера, считать хеши самому не нужно). Полный digest не заменяет чтение полной формулировки и rationale перед подтверждением. Матч с доказательствами размещается целиком или не размещается (meta.dropped/truncated честные); счётчики — meta.evidence_matches/evidence_supports. Поддержан только в mode=compact"),
       collapse_ref_anchors: z.boolean().optional().describe("В mode=compact по умолчанию true, явный false поддержан: уменьшает долю технических ref-якорей на верхнем уровне. Технический якорь — по происхождению И текущей структуре (created_via='file_ref' + шаблонное саммари + имя = file_refs[0]); отредактированная осмысленная карточка не считается шаблонным якорем. Якорь с найденным зависимым выводом показывается компактно вместе с rationale и состоянием опоры (вложение или секция anchors с informed_by_incoming); без зависимых — компактный локатор. Имена-пути понижаются в ранжировании, кроме запроса по точному полному пути; из candidates узлы не удаляются, id остаётся точным. Если найдены только якоря, это не пустой no_match. Счётчик — meta.anchor_collapsed; хранение не меняется: get_concept по id/пути и provenance_trace разрешают опору во всех режимах. Поддержан только в mode=compact; форма full не меняется"),
+      include_source: z.boolean().optional().describe("Опция (по умолчанию выключено — прежний ответ байт-в-байт): компактная карточка несёт verbatim-исходник по первому читаемому file_ref с локатором — один вызов вместо отдельного Read. Диапазон режется только хвостом (truncated: true), середина не вырезается; файл >1 МиБ, не UTF-8, без диапазона или вне корня — исходника нет (meta.source_skipped с причиной). Стоимость источника вычитается из max_tokens до раскладки карточек: не влезло — карточка отдаётся без source, source_cards считает размещённые. Поддержан только в mode=compact; с full/brief — явная ошибка"),
+      source_max_lines: z.number().int().min(1).max(200).optional().describe("Потолок строк verbatim-исходника на карточку при include_source: true (по умолчанию 60, максимум 200); хвост диапазона режется с truncated: true"),
       reuse: z.object({
         task_type: z.string().min(1).describe("Явный тип задачи — тот же, что в passport у trail_save; reuse ищется по нему, не по похожести запроса"),
         files: z.array(z.string()).optional().describe("Запрошенная область (файлы/ссылки) — сверяется с областью паспорта: хеши целых файлов, новые файлы в области дают gap"),
@@ -533,7 +552,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "get_concept",
     "Look up a concept by its exact ID. Returns the concept with its full context including children, edges, incoming edges, and parent. Unlike 'understand' which uses semantic search, this does exact ID matching. Use this when you know the specific concept ID. The answer carries current_digests — the node's digests ready to pass into confirm_supports (claim: ВСЕГДА текущий дайджест живой формулировки — после правки перечитай и подтверждай новым значением; confirmed_claim/confirmed_at — какая версия была подтверждена ранее, это документация снимка, а не подтверждаемое значение; status: always current). Compact understand answers carry no digests by default; include_evidence: true attaches current_digests and support_evidence (all live supports, confirm-ready) per match. Read-only: get_concept writes nothing to the graph or snapshots; service call telemetry (timeline) is recorded separately and does not affect provenance (plan-4-fixes-6 F12). E1/E2: a plain single-id call returns the same card as before. profile=evidence returns full wording, rationales and confirm_supports-ready digests (never a trimmed claim — what did not fit is marked incomplete with the next step); profile=orientation returns identity, qualification and pointers under the budget; profile=full is the legacy card. max_tokens bounds the final serialized MCP content envelope in ESTIMATED tokens, including all metadata, continuation tokens and delta/unchanged fields; if the required minimum cannot fit, the call explicitly refuses with meta.reason=budget. tokens_estimated is the estimator result, not a provider-token guarantee; neighbor disclosure is capped (max_neighbors) with continuation tokens; a continuation pins the sample version — changed data yields version_conflict and a full re-read. Batch: pass ids (up to 25) for one call with ONE shared budget — per-id status/error/incompleteness are always visible, an unresolved id never disappears silently, budget_skipped items list the continuation. E4 delta (opt-in only): pass context_epoch + known_versions {id: version from meta.version} — ONLY if the client still holds that exact text in its context; a version match of the REQUESTED PROJECTION (all substantial state: status, expiry, refs, rationale, supports, artifacts, selected neighbors, format — never just the summary) returns a compact {unchanged, version, epoch, qualification-minimum} answer; a mismatch returns the full card with meta.version. Nothing (or a new epoch) means full issuance. unchanged is NOT code coverage: read the current source section before editing. Old single-id calls without new parameters keep the same card; successful nonempty MCP reads add hint.record, absent for unchanged and budget refusals.",
     {
@@ -611,7 +630,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "create_concept",
     "Add an agent-authored concept to the knowledge graph. The usual agent-authored kinds are feature, module, pattern, config, decision, and component; journal is the explicit kind for volatile state notes (\"PR open now\") and gets an automatic expiry (MEGAMEMORY_EXPIRY_JOURNAL_DAYS / config expiry.journal_days, default 90 days) when valid_until is omitted — pass valid_until explicitly for a deliberate date, or null to forbid auto-expiry (a journal without a term still carries a warning and is never presented as safe); digest remains accepted for compatibility but is normally generated by the digest command, while task nodes are created by task_add. journal is not a decision substitute: a decision keeps its mandatory supports. Call this after completing work and include parameter names, defaults, file locations, and rationale. For any claim that rests on code — decision, pattern or feature — pass evidence items with exactly one of ref or node and a non-empty why; file_refs alone creates no link; supports and their informed_by edges are created atomically, while input.edges never confirms a support snapshot. Reused evidence is confirmed only when expect supplies the versions actually read (claim_digest and status_digest; artifacts_digest may also be pinned); a newly created ref anchor can be confirmed immediately. Automatic grounding applies only to kind=decision, only when provenance.auto_ground is explicitly enabled (default off), and only from non-empty why + file_refs when neither evidence nor an informed_by input edge was supplied; auto-derived supports are not confirmed. A node is ungrounded exactly when it has no live outgoing informed_by edge, no non-empty file_refs array, and no current validated status_scope with an artifact. With provenance.require_support enabled, an unsupported decision is rejected.",
     {
@@ -692,7 +711,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "update_concept",
     "Update an existing concept in the knowledge graph. Call this after completing a task that changed existing features or components. Only include fields that changed.",
     {
@@ -738,7 +757,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "link",
     "Create a relationship between two existing concepts. Для informed_by рационал обязателен: «из from следует to, потому что <конкретно>». Связь без рационала нечитаема и потому бесполезна.",
     {
@@ -777,7 +796,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "remove_concept",
     "Soft-delete a concept from the knowledge graph. The concept and its removal reason are preserved in history. На узле, на котором держатся активные решения (входящие informed_by), удаление отклоняется — в отказе три шага на выбор: замена через преемника, опровержение (update → refuted) или force: true. Цепочки с участием узла помечаются stale с указанием причины.",
     {
@@ -811,7 +830,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "list_roots",
     "Return the budgeted startup overview. The payload is always compact: roots is an empty compatibility field; roots_compact contains id/name/kind/child_count/valid_until, slots contains current role holders, and board_top contains up to five open tasks by rot. Under max_tokens the priority is slots, then board_top, then roots; meta reports returned/dropped roots and every truncated section. Unlike understand, this tool has no next block. The MCP wrapper adds stats plus the top-level staleness fields instructions_stale, instructions_version, and server_version, and all of them count toward max_tokens.",
     {
@@ -866,7 +885,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "list_conflicts",
     "List all unresolved merge conflicts in the knowledge graph, grouped by merge_group. Each group contains competing versions with full data. Call this when the user runs /merge to begin AI-assisted conflict resolution.",
     {},
@@ -896,7 +915,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "resolve_conflict",
     "Resolve a merge conflict after verifying it against the current codebase. The resolved object is required by the wire schema. For concept conflicts its summary/why/file_refs are written; for edge-only groups resolved is ignored and prefer=left|right is required. Do not blindly pick a concept side: resolved content must state the verified current truth.",
     {
@@ -942,7 +961,7 @@ async function startMcpServer() {
 
   // ---- Provenance tools (plan 3 §4.2) ----
 
-  server.tool(
+  tool(
     "provenance_trace",
     "Прежде чем отвечать на вопрос «почему/на каком основании», вызови provenance_trace. Ответ на «почему» без трассировки считается необоснованным. Обход по informed_by в одну сторону: ancestry — «на чём стоит этот вывод», impact — «кто на него опирается». Контракты: (1) обход идёт только по informed_by, по живым рёбрам (retrospective добавляет надгробия), весь ответ — один снапшот БД; (2) удалённый узел терминален — сквозь него не считают и не разворачивают, в ретроспективе он виден заглушкой; (3) depth=0 возвращает только корень, допустимый диапазон 0–20; total_within_depth считает узлы в пределах глубины, причина неполноты — truncated_by: depth | nodes | scan | null; (4) in_paths — число путей от корня до узла в показанном подграфе, а не число подтверждений; при потолке помечается in_paths_capped (текстово «≥ 100000»), путь через неразрешённый цикл даёт in_paths: null и запись в weak_links с id компоненты — число не выдумывается; (5) лимиты ограничивают и выдачу, и работу: max_nodes (корень не занимает слот) и бюджет сканирования max_scan_nodes (по умолчанию 5000) — при его срабатывании truncated_by = «scan» и total_within_depth — нижняя оценка (total_exact: false); тот же бюджет ограничивает проверку опор решений — проверяются первые по id, запись support_check_truncated сообщает checked/total. Слабые звенья идут первыми: refuted/abandoned, циклы (по компонентам: id, ребро-свидетель, needs_merge, «компонента закрыта для записи»), рёбра без рационала, решения без опор (no_support), с отсутствующими (missing_support) или только ungrounded-опорами — такие записи несут числовые count и sample (первые ≤5 id), note не длиннее 300 символов. weak_links целиком не превышают 8 КБ: при превышении записи режутся по приоритету и добавляется маркер weak_links_truncated (shown/total). completeness различает «связей нет» (complete) и «связи скрыты» (has_hidden), усечённый обход помечается truncated. Снимок обоснования: решение несёт блок support_check — сверку живых опор с подтверждённым снимком; состояния unchanged/changed (причины per опоры: summary|status|rationale|removed; отдельный сигнал artifact_changed — наблюдённое состояние внешних артефактов опоры, записанное check_artifacts, разошлось с подтверждённым снимком: саммари могло остаться прежним, изменился источник; снимается повторным подтверждением после проверки)/unknown/incomplete, unknown и incomplete чистотой не считаются; изменение опоры не стирается добавлением новых рёбер; цепочка версий подтверждённых опор — provenance_history. Подтверждение — отдельный вызов confirm_supports с digest'ами прочитанных формулировок: трассировка несёт их сама — current_digests у корня (claim решения — всегда ТЕКУЩАЯ формулировка: после правки перечитай и подтверждай новым digest'ом, подтверждённая ранее версия видна в confirmed_claim) и supports[] (полные claim/status/edge digest'ы живых опор, максимум 50; supports_count при усечении — полное число опор); в компактном understand дайджестов по умолчанию нет — include_evidence: true добавляет current_digests решения и support_evidence всех живых опор. Ни одна мутация (link/update/merge) снимок не пишет и не обновляет. Контракт «чтение не пишет» (plan-4-fixes-6 F12): provenance_trace и get_concept не пишут ничего в граф и снимки; служебная телеметрия вызовов (timeline) ведётся отдельно и на провенанс не влияет; проверка опор ограничена бюджетом max_check_edges/max_check_bytes, inner-узлы с оборванной проверкой видны в inner_nodes_incomplete, а completeness деградирует до truncated.",
     {
@@ -990,7 +1009,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "provenance_audit",
     "«Что рассыплется, если это неверно»: обратный обход (impact) по informed_by с подсветкой узлов, у которых epistemic_status != validated (поле at_risk). depth допускает 0–20; 0 возвращает только корень. Каждый прогон пишется в provenance_audit_runs с ретеншном — последние 200 на узел, не старше 90 дней, чтобы ретроспектива «что мы знали тогда» не врала после того, как граф уехал. Контракт записи: этот журнал — единственное, что audit пишет; граф, узлы и снимки опор он не трогает (plan-4-fixes-6 F12).",
     {
@@ -1040,7 +1059,7 @@ async function startMcpServer() {
 
   // ---- Support baseline confirmation (plan 4 v8) ----
 
-  server.tool(
+  tool(
     "confirm_supports",
     "Записать снимок обоснования решения: сверить digest'ы формулировок, которые агент прочитал, с текущими и атомарно записать опоры. Дайджесты НЕ нужно считать руками: get_concept несёт current_digests (дайджест решения), provenance_trace несёт current_digests и supports[] — полные claim/status/edge digest'ы каждой живой опоры; в компактном understand дайджестов по умолчанию нет — include_evidence: true добавляет current_digests решения и support_evidence всех живых опор. items подтверждает ровно перечисленные опоры — живые опоры вне списка остаются unknown, «подтверждены по умолчанию» не бывают. Для каждой опоры обязателен expected_status_digest (status_digest опоры, который агент читал): подтверждение без него и с несовпадающим — отказ; агент не подтверждает статус, который не видел. ПУСТОЙ список = «подтверждаю, что опор нет» (валидное состояние, отличное от «не проверялось»): прежние строки снимка не стираются, а помечаются superseded — «была подтверждена, потом снята» остаётся отличимым от «опор никогда не было» (признак had_supports в support_check). Любое расхождение ожидаемого с текущим — отказ version_conflict, ничего не записывается: перечитай опоры через provenance_trace/get_concept и повтори с актуальными digest'ами. Ни link, ни update_concept, ни merge снимок не пишут — подтверждение только этим вызовом (единственное исключение: create_concept с evidence подтверждает переданные в том же вызове версии; рёбра из edges снимок не создают). Автоматические рёбра при подтверждении получают accepted_at, created_via не переписывается.",
     {
@@ -1089,7 +1108,7 @@ async function startMcpServer() {
 
   // ---- Support revision history (2.1.3 F1) ----
 
-  server.tool(
+  tool(
     "provenance_history",
     "Цепочка версий подтверждённых опор решения: какую версию агент подтверждал, какая была до неё, какая после — для разбора инцидента задним числом. По каждой паре «решение—опора»: confirmed_at, source (agent — первое подтверждение / import — перенос при merge / superseded — версия вытеснена повторным подтверждением или удалением), reason (confirmed/reconfirmed/removed/edge_relinked), превью digest'ов (12 символов) и признак «это текущая версия». Без support_id возвращается максимум 50 пар в детерминированном порядке; pairs_truncated=true означает, что пары за пределом скрыты. limit ограничивает ревизии отдельно для каждой пары (по умолчанию 20, максимум 100), revisions_truncated помечает усечение. Тел узлов нет — только версии. Чтение не пишет ничего.",
     {
@@ -1129,7 +1148,7 @@ async function startMcpServer() {
 
   // ---- Artifact digests (2.1.3 F2) ----
 
-  server.tool(
+  tool(
     "check_artifacts",
     "Проверить внешние артефакты узлов (файлы, git-blob'ы и git:-ссылки из file_refs): посчитать sha256 содержимого или разрешить git:tag|commit|branch в sha коммита и записать наблюдение. MCP-вызов не принимает cwd/repo на каждый call. Относительные file/git-blob refs сначала разрешаются от закреплённого repo_path наблюдения, иначе от cwd запущенного сервера. Для git:-refs startup --repo (по умолчанию каталог базы) передаётся как явный корень на каждом MCP-вызове, поэтому он имеет приоритет над сохранённым pin и записывается обратно в repo_path. ЯВНЫЙ вызов — ничего не читается и не хешируется само: ни чтение узла, ни трассировка файлы не трогают. Расхождение «наблюдение vs подтверждённый снимок» всплывает в support_check как artifact_changed и в weak_links отдельным типом — это НЕ support_changed: саммари опоры могло остаться прежним, изменился источник. ВАЖНО: unchanged в support_check означает «совпадает с подтверждённым снимком», а не «файл только что прочитан» — файлы читает только явный check_artifacts. Порядок работы для снимка: check_artifacts по опорам → прочитать digest'ы → confirm_supports (он сохранит текущее состояние артефактов в снимок; передача expected_artifacts_digest из supports[] защищает от чужого check_artifacts между чтением и подтверждением — расхождение даст version_conflict). Отсутствующий файл или неразрешившийся ref — запись missing, не падение. Ссылки, снятые с узла (file_refs), из digest'а выпадают как история — состав наблюдений часть версии. kind=url не поддерживается: сетевые запросы из MCP-сервера — отдельное решение.",
     {
@@ -1172,7 +1191,7 @@ async function startMcpServer() {
   // чтение: НЕ пишет наблюдения (это check_artifacts), НЕ подтверждает опоры
   // (это confirm_supports), НЕ меняет граф. Отчёт несёт затронутое/проверенное/
   // неизвестное, причины неполноты и expected_versions.
-  server.tool(
+  tool(
     "check_freshness",
     "Адресная перепроверка свежести: по изменившимся (или подозрительным) источникам — файлам, git-blob'ам, git:-ссылкам — проверить СВЯЗАННЫЕ записи через восстановимый обратный индекс (узлы с file_refs, наблюдения артефактов, паспорта trail_save), а не весь граф. Сравнение по sha256 содержимого с записанными версиями (наблюдения check_artifacts, хеши областей паспортов); mtime/size не являются доказательством; git-состояние working tree (staged/unstaged/untracked/rename) и HEAD едут в отчёте как наблюдение — прежний HEAD не доказывает неизменность working tree. Один физический источник хешируется один раз за проверку; источники, менявшиеся ВО ВРЕМЯ проверки, получают статус unstable — стабильный снимок не объявляется. Отчёт: sources (unchanged/changed/missing/unobserved/unstable/skipped/other_repo), records (fresh/stale_input/partial/unknown — префикс не выдаётся за весь граф), summary (affected/checked/unknown/truncated + limitations), expected_versions — сверь их повторно перед применением правки. НЕ пишет в БД и не подтверждает опоры: reuse-квалификация не поднимается. Опционально (P2.2, пилот): symbols — разрешение определений через adapter token-economy-ts (конфиг: adapter.graph_tool или env MEGAMEMORY_CODE_ADAPTER); неоднозначное/пропавшее определение даёт явный ambiguous/missing и требует чтения; with_dependencies — обход import-графа изменённых источников через adapter (ограничен max_deps, static scope объявлен явно).",
     {
@@ -1234,7 +1253,7 @@ async function startMcpServer() {
 
   // ---- Workflow tools (plan 2, schema v6) ----
 
-  server.tool(
+  tool(
     "trail_save",
     "Save a reasoning chain: an ordered list of concept ids plus a mandatory author summary of WHY the conclusion follows. Member meaning is fingerprinted at save time; reads compare against the current state and mark the chain stale/broken when the ground shifted. Use after a non-trivial decision. P1 passport (opt-in): pass passport (task_type, goal, scope_files, checks, completeness) to record a versioned analysis passport alongside the chain — the durable core is the trail itself (member fingerprints + WHY), the versioned body is journaled with the save event; reuse later matches passports by EXPLICIT task_type and verified scope (never by query similarity). A passport is not code coverage: reuse answers carry covered[]/gaps[]/qualification and the agent still reads current code sections.",
     {
@@ -1303,7 +1322,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "trail_get",
     "Read a reasoning chain with its freshness verdict: fresh (member meaning unchanged), stale (a member's summary/epistemic status/informed_by changed or was removed), broken (a member was hard-deleted). Stale members carry a per-member reason. include_passport: true (P1, opt-in) also returns the versioned analysis passport body recorded at trail_save (or null when the journal entry was pruned by retention — qualification then honestly degrades to unknown).",
     {
@@ -1336,7 +1355,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "trail_refresh",
     "Re-snapshot the fingerprints of every chain member after you verified the chain still holds. Refuses on a broken chain (a member was hard-deleted) — rebuild it instead. Plan 04 K-09: refresh не оживляет непригодных участников — опровергнутый, заброшенный, просроченный или удалённый член цепочки не переснимается, и цепочка остаётся stale; refresh обновляет только снимок годных членов, пригодность рассуждения он не «чинит».",
     {
@@ -1368,7 +1387,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "trail_extend",
     "Append new members to the end of an existing reasoning chain; their current meaning is fingerprinted at append time.",
     {
@@ -1401,7 +1420,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "slot_set",
     "Take a named role slot (handoff, entrypoint, queue, ...) with a node — the role's single live pointer. If another node held it, that old holder loses only the slot and a new-holder → old-holder supersedes edge records the handoff; the old node's lifecycle/status is not changed. Re-taking by the same node is a no-op. Slots are scoped per project.",
     {
@@ -1434,7 +1453,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "slot_get",
     "Read who currently holds a role slot.",
     { role: z.string().describe("Role name") },
@@ -1464,7 +1483,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "slot_release",
     "Release a role slot. The previous holder node is NOT touched — releasing a role never revokes or deletes the handoff history.",
     { role: z.string().describe("Role name") },
@@ -1494,7 +1513,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "slot_list",
     "List all role slots of the project with their current holders.",
     {},
@@ -1524,7 +1543,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "task_add",
     "Add a task card to the board. Tasks live in the open column and rot over time: rot = age + isolation penalty + overdue penalty — the board surfaces what is burning, not what is fresh.",
     {
@@ -1557,7 +1576,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "task_done",
     "Close a task: it moves to the terminal done column and its due date is cleared — a closed task never hangs overdue.",
     { id: z.string().describe("Task concept id") },
@@ -1587,7 +1606,7 @@ async function startMcpServer() {
     }
   );
 
-  server.tool(
+  tool(
     "board",
     "Show the task board: the open column sorted by rot (overdue > isolated > oldest) and the terminal done column fresh-first, paginated by done_cursor/done_limit. Done count is the total; returned, has_more and next_cursor describe the current page. Call this instead of guessing what to work on next.",
     {
