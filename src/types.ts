@@ -383,6 +383,20 @@ export interface UnderstandInput {
     negative?: { query: string; tool?: string; options?: Record<string, string> };
   };
   /**
+   * План 26 §2 (2.11.0): opt-in verbatim-исходник в компактных карточках.
+   * По умолчанию выключено — прежний ответ байт-в-байт (у CodeGraph это
+   * измеренный минус: обработанных токенов меньше, остаточный контекст
+   * в сессии +80%). Диапазон берётся из file_ref узла; только compact,
+   * с full/brief — явная ошибка.
+   */
+  include_source?: boolean;
+  /**
+   * План 26 §2: потолок строк источника на карточку (по умолчанию 60,
+   * максимум 200). Хвост диапазона режется с truncated: true, середина
+   * не вырезается.
+   */
+  source_max_lines?: number;
+  /**
    * P3 (план 20+21 v3 §12): opt-in контекст под задачу. Явная цель и тип
    * задачи → детерминированные правила отбора: обязательные категории
    * источников (решения, инварианты, отрицательные результаты, тесты),
@@ -513,6 +527,20 @@ export interface CompactMatch {
    * display-префиксами.
    */
   support_evidence?: ConceptEvidenceSupport[];
+  /**
+   * План 26 §2 (include_source: true, только compact): verbatim-исходник по
+   * первому читаемому file_ref с локатором. Диапазон режется только хвостом
+   * (truncated: true), середина не вырезается; бюджет источника вычитается
+   * из max_tokens до раскладки карточек — не влезло, карточка отдаётся без
+   * source (meta.source_skipped). Отдаётся только узлам, которые есть в
+   * выдаче.
+   */
+  source?: {
+    ref: string;
+    start_line: number;
+    lines: string[];
+    truncated: boolean;
+  };
 }
 
 /** Wire card may omit optional display text under budget pressure. */
@@ -573,6 +601,19 @@ export interface UnderstandMeta {
    * подменяется: считаются только свёрнутые в этой выдаче.
    */
   anchor_collapsed?: number;
+  /**
+   * План 26 §2 (include_source: true): сколько размещённых карточек несут
+   * верbatim-исходник.
+   */
+  source_cards?: number;
+  /**
+   * План 26 §2 (include_source: true): причина, по которой хотя бы одна
+   * карточка осталась без исходника. `budget` — стоимость источника не
+   * поместилась в max_tokens (карточка отдана без source); остальные —
+   * причины readRefLines: `no_range` (ссылка без диапазона), `outside_root`,
+   * `missing`, `too_large` (>1 МиБ), `not_text` (не UTF-8 или `\0`).
+   */
+  source_skipped?: "budget" | "no_range" | "outside_root" | "missing" | "too_large" | "not_text";
 }
 
 export interface UnderstandOutput {

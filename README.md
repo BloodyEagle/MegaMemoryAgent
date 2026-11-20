@@ -693,6 +693,17 @@ asking for a larger budget. The record line rendered in `brief` has its own
 `RECORD_MAX = 400`; other lines keep `LINE_MAX = 240`. The full `next.record`
 is not clipped.
 
+**Source in the card (opt-in).** With `include_source: true` (compact only)
+each placed card can carry a verbatim `source` taken from its first readable
+`file_ref` with a line range — one call instead of a separate Read. The range
+is cut tail-only (`truncated: true`), never mid-file; a ref without a range, a
+path outside the server root, a missing file, a file over 1 MiB and non-UTF-8
+content yield no source — `meta.source_skipped` names the reason. The source
+budget is subtracted from `max_tokens` before card placement: what does not
+fit leaves the card without `source`, and `meta.source_cards` counts the
+placed ones. Default is off — verbatim sources enlarge the resident context;
+ask for it when you would read that exact range anyway.
+
 ### MCP record hints
 
 Successful nonempty `get_concept` and `list_roots` responses may carry an
