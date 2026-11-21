@@ -13,6 +13,11 @@ import {
   projectClaude,
   zcodeAgents,
 } from "./install-paths.js";
+// План 32: устаревание — это направление (блок СТАРШЕ сервера), а не любое
+// несовпадение версий: блок, написанный более новым билдом (клиент обновился,
+// сервер в открытой сессии ещё старый), не тревога — действие рестарт клиента,
+// а не install (он идемпотентен и сигнал не гасит).
+import { compareVersions } from "./version-compare.js";
 
 // ---- Instructions staleness signal (plan 3 step 7) ----
 //
@@ -104,7 +109,11 @@ export function instructionsCandidates(): string[] {
 }
 
 export interface InstructionsStatus {
-  /** true = the found instructions block was written by another version. */
+  /**
+   * true = the found instructions block is OLDER than the running server
+   * (plan 32). A block newer than the server is not stale — the client was
+   * updated first, the action is a client restart, not `install`.
+   */
   instructions_stale: boolean;
   /** Version from the stamp, null when nothing stamped was found. */
   instructions_version: string | null;
@@ -118,6 +127,10 @@ export interface InstructionsStatus {
  * the server keep running) at any moment. No instructions file at all ->
  * stale: false, version: null: a user who never installed the snippet must
  * not be warned about it.
+ *
+ * План 32: версии сравниваются по порядку, а не на равенство. stale — только
+ * блок старше сервера; блок новее — не устаревание (рестарт клиента, а не
+ * install); непарсящаяся версия (vNext, мусор) — консервативно stale.
  */
 export function instructionsStatus(
   serverVersion: string,
@@ -133,8 +146,9 @@ export function instructionsStatus(
     }
     const version = extractInstructionsVersion(content);
     if (version !== null) {
+      const order = compareVersions(version, serverVersion);
       return {
-        instructions_stale: version !== serverVersion,
+        instructions_stale: order === null ? true : order < 0,
         instructions_version: version,
         server_version: serverVersion,
       };

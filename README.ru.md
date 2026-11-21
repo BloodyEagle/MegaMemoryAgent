@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.12.3-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.12.4-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -227,10 +227,14 @@ ref), записать проверенный вывод через `create_conc
 пути), затем файлы правил Kilo `.kilo/rules/megamemory.md` и
 `~/.config/kilo/rules/megamemory.md`.
 Ответ несёт `instructions_stale`, `instructions_version` и `server_version`;
-нет управляемого файла инструкций — `false / null`, несовпадение версий после
-обновления пакета — повторите `install` для нужной цели. Управляемый блок без
-сравнимой версии (маркер без версии, legacy-форма `megamemory-snippet:`)
-сообщается как stale с `version: null`.
+нет управляемого файла инструкций — `false / null`. Сигнал поднимается только
+когда найденный блок **старше** запущенного сервера (с 2.12.4): обновите пакет,
+повторите `install` для нужной цели и перезапустите клиент — сервер в открытой
+сессии держит прежний билд до рестарта. Блок **новее** сервера (клиент
+обновился раньше) — не устаревание: перезапустите клиент вместо повторного
+`install`. Непарсящаяся версия штампа консервативно сообщается как stale, а
+управляемый блок без сравнимой версии (маркер без версии, legacy-форма
+`megamemory-snippet:`) сообщается как stale с `version: null`.
 
 ### Установка для Kilo
 

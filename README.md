@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.12.3-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.12.4-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -222,8 +222,13 @@ global Kilo `~/.config/kilo/AGENTS.md`, global ZCode `~/.zcode/AGENTS.md`,
 then the Kilo rule files `.kilo/rules/megamemory.md` and
 `~/.config/kilo/rules/megamemory.md`. The response carries
 `instructions_stale`, `instructions_version` and `server_version`; no managed
-instruction file means `false / null`, a version mismatch means re-run
-`install` for the relevant target after updating the package. A managed block
+instruction file means `false / null`. The flag fires only when the found
+block is **older** than the running server (2.12.4): update the package,
+re-run `install` for the relevant target, then restart the client — the
+server in an open session keeps its build until the restart. A block
+**newer** than the server (the client was updated first) is not stale:
+restart the client instead of re-running `install`. A stamp version that
+does not parse is conservatively reported as stale, and a managed block
 without a comparable version (marker without a version, legacy
 `megamemory-snippet:` form) is reported as stale with `version: null`.
 

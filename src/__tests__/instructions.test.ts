@@ -189,6 +189,62 @@ describe("версия из маркера сниппета kilo-правил (�
 });
 
 /**
+ * План 32: устаревание — направление (блок старше сервера), а не любое
+ * несовпадение. Блок новее сервера — не тревога: клиент обновился раньше,
+ * сервер в открытой сессии ещё старый; действие — рестарт клиента, а не
+ * install (идемпотентен, сигнал не гасит).
+ */
+describe("instructionsStatus — направление сигнала (план 32)", () => {
+  it("блок новее сервера — stale false", () => {
+    const file = tmpFile(`${instructionsStamp("2.13.0")}\n## Project Knowledge Graph\n`);
+
+    expect(instructionsStatus("2.12.4", [file])).toEqual({
+      instructions_stale: false,
+      instructions_version: "2.13.0",
+      server_version: "2.12.4",
+    });
+  });
+
+  it("версия штампа не разбирается (vNext) — консервативно stale true", () => {
+    const file = tmpFile(`${instructionsStamp("vNext")}\n## Project Knowledge Graph\n`);
+
+    expect(instructionsStatus("2.12.4", [file])).toEqual({
+      instructions_stale: true,
+      instructions_version: "vNext",
+      server_version: "2.12.4",
+    });
+  });
+
+  it("равные версии — stale false (бывшее равенство после перехода на порядок)", () => {
+    const file = tmpFile(`${instructionsStamp("2.12.4")}\n## Project Knowledge Graph\n`);
+
+    expect(instructionsStatus("2.12.4", [file])).toEqual({
+      instructions_stale: false,
+      instructions_version: "2.12.4",
+      server_version: "2.12.4",
+    });
+  });
+
+  it("порядок кандидатов не меняется: вердикт по первому файлу со штампом (регресс планов 29/30)", () => {
+    const project = tmpFile(`${instructionsStamp("2.11.0")}\n## Project Knowledge Graph\n`);
+    const global = tmpFile(`${instructionsStamp("2.13.0")}\n## Project Knowledge Graph\n`);
+
+    // проектный (старый штамп) раньше глобального (новый) — старый побеждает
+    expect(instructionsStatus("2.12.4", [project, global])).toEqual({
+      instructions_stale: true,
+      instructions_version: "2.11.0",
+      server_version: "2.12.4",
+    });
+    // и наоборот: побеждает первый в списке, а не «самая свежая версия»
+    expect(instructionsStatus("2.12.4", [global, project])).toEqual({
+      instructions_stale: false,
+      instructions_version: "2.13.0",
+      server_version: "2.12.4",
+    });
+  });
+});
+
+/**
  * Таблица «цель install → пути правил, которые она пишет» (план 29 §5.1/5.2,
  * план 30 §4.3). Функция, а не константа: пути читают env в момент вызова,
  * и таблица обязана собираться после изоляции HOME/USERPROFILE/CODEX_HOME
