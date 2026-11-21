@@ -16,7 +16,9 @@ const SNIPPET = AGENTS_MD_SNIPPET.trimStart();
 
 describe("AGENTS_MD_SNIPPET — онбординг провенанса (2.1.5 F1)", () => {
   it("2.7.0 T3: memory: остаётся в строке After work, без обязательной записи нового узла", () => {
-    const afterWork = SNIPPET.split("\n").find((line) => line.startsWith("3. **After work:**"));
+    // план 31: нумерованный список → абзацы-триггеры; строка ищется по новому
+    // началу «**After verified work:**» (прежде — «3. **After work:**»)
+    const afterWork = SNIPPET.split("\n").find((line) => line.startsWith("**After verified work:**"));
     expect(afterWork).toContain("Commit and PR memory:");
     expect(afterWork).toContain("`memory: <id>`");
     expect(afterWork).toContain("`memory: нечего — <причина>`");
@@ -41,8 +43,8 @@ describe("AGENTS_MD_SNIPPET — онбординг провенанса (2.1.5 F
     expect(SNIPPET).toContain("support_check.state");
     // unknown и incomplete — НЕ «всё хорошо»
     expect(SNIPPET).toMatch(/`unknown` and `incomplete` are NOT/);
-    // truncated_by — обход неполный, «опор больше нет» не выводится
-    expect(SNIPPET).toContain("truncated_by: depth|nodes|scan");
+    // truncated_by (обход неполный) с плана 31 живёт в docs/agent-workflow.md —
+    // ассерт перенесён в тест «указатель живой и знание перенесено»
   });
 
   it("учит реакции на instructions_stale", () => {
@@ -148,10 +150,11 @@ describe("megamemory guide (2.1.5 F2)", () => {
 });
 
 describe("документация про bench (2.1.5 F5)", () => {
-  it("строка про bench из сниппета присутствует в выводе guide — один источник текста", () => {
-    const benchLine = SNIPPET.split("\n").find((l) => l.includes("megamemory bench"));
+  it("строка про bench есть в выводе guide — один источник текста (план 31: bench уехал из сниппета в раздел измерения)", () => {
+    const guide = buildGuideText();
+    const benchLine = guide.split("\n").find((l) => l.includes("megamemory bench"));
     expect(benchLine).toBeDefined();
-    expect(buildGuideText()).toContain(benchLine!);
+    expect(guide).toContain("--baseline files");
   });
 
   it("--help перечисляет bench и флаг --baseline со всеми тремя значениями", () => {
