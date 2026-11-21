@@ -42,10 +42,18 @@ export function instructionsStamp(version: string): string {
  * Extract the package version from a stamp written by install. Returns null
  * when the content carries no versioned stamp. The leading "v" is stripped:
  * the stamp reads `v2.0.0-fork.1`, the field reports `2.0.0-fork.1`.
+ *
+ * План 29: файлы правил kilo несут другой маркер —
+ * `<!-- megamemory-snippet v<версия> -->` (kiloManagedBlock в install.ts).
+ * Его версия сравнивается так же; маркер без версии (и legacy-форма
+ * `megamemory-snippet:`) под regex не подходит и уходит в legacy-ветку
+ * ниже — stale: true, version: null.
  */
 export function extractInstructionsVersion(content: string): string | null {
-  const match = content.match(/<!--\s*megamemory:instructions\s+v?(\S+?)\s*-->/);
-  return match ? match[1] : null;
+  const stamp = content.match(/<!--\s*megamemory:instructions\s+v?(\S+?)\s*-->/);
+  if (stamp) return stamp[1];
+  const snippet = content.match(/<!--\s*megamemory-snippet\s+v?(\d\S*?)\s*-->/);
+  return snippet ? snippet[1] : null;
 }
 
 /**
