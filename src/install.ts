@@ -7,6 +7,23 @@ import pc from "picocolors";
 import { applyEdits, findNodeAtLocation, getNodeValue, modify, parseTree, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { success, skip, error, info, heading, warn, multiSelect } from "./cli-utils.js";
 import { INSTRUCTIONS_STAMP_MARKER, instructionsStamp } from "./instructions.js";
+// План 29: пути инструкций берутся из одного источника с детектором
+// instructions_stale (instructionsCandidates) — списки больше не могут
+// разъезжаться при добавлении новой цели.
+import {
+  agentsCanonical,
+  claudeAgents,
+  claudeDir,
+  codexAgents,
+  homeDir,
+  kiloAgents,
+  kiloConfigDir,
+  kiloRules,
+  opencodeAgents,
+  opencodeConfigDir,
+  zcodeAgents,
+  zcodeDir,
+} from "./install-paths.js";
 // F2 (2.1.5): the snippet lives in guide.ts — `megamemory guide` prints the
 // very same constant, so the printed text cannot drift from the written one.
 import { AGENTS_MD_END, AGENTS_MD_SNIPPET, buildWorkflowText } from "./guide.js";
@@ -65,28 +82,20 @@ interface CommandRuntime {
   stdioArgs: string[];
 }
 
-const OPENCODE_CONFIG_DIR =
-  process.env.OPENCODE_CONFIG_DIR ??
-  path.join(
-    process.env.XDG_CONFIG_HOME ?? path.join(homeDir(), ".config"),
-    "opencode"
-  );
+const OPENCODE_CONFIG_DIR = opencodeConfigDir();
 const OPENCODE_CONFIG_PATH = path.join(OPENCODE_CONFIG_DIR, "opencode.json");
-const OPENCODE_AGENTS_MD_PATH = path.join(OPENCODE_CONFIG_DIR, "AGENTS.md");
 const OPENCODE_TOOL_DIR = path.join(OPENCODE_CONFIG_DIR, "tool");
 const OPENCODE_COMMANDS_DIR = path.join(OPENCODE_CONFIG_DIR, "commands");
 
 const CLAUDE_CONFIG_PATH = path.join(homeDir(), ".claude.json");
-const CLAUDE_DIR = path.join(homeDir(), ".claude");
-const CLAUDE_MD_PATH = path.join(CLAUDE_DIR, "CLAUDE.md");
+const CLAUDE_DIR = claudeDir();
 const CLAUDE_COMMANDS_DIR = path.join(CLAUDE_DIR, "commands");
 
 // ZCode keeps MCP servers, hooks and per-skill toggles in one global config
 // (~/.zcode/cli/config.json); there is no workspace-level MCP file (plan 28
 // T0: confirmed against the live config and the zcode configuration guide).
-const ZCODE_DIR = path.join(homeDir(), ".zcode");
+const ZCODE_DIR = zcodeDir();
 const ZCODE_CONFIG_PATH = path.join(ZCODE_DIR, "cli", "config.json");
-const ZCODE_AGENTS_MD_PATH = path.join(ZCODE_DIR, "AGENTS.md");
 const ZCODE_SKILL_PATH = path.join(ZCODE_DIR, "skills", "megamemory", "SKILL.md");
 // Mirrors the wording of MCP_INSTRUCTIONS (src/index.ts) so the per-prompt
 // reminder cannot drift from the server instructions; index.ts cannot be
@@ -128,16 +137,6 @@ const MANAGED_FILE_MARKER = "MegaMemory-managed file. Safe for megamemory instal
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * os.homedir() ignores $HOME on Windows (it reads USERPROFILE), so the test
- * sandbox leaked into the real user profile — install tests rewrote the real
- * ~/.claude.json and ~/.claude/CLAUDE.md. Honor $HOME explicitly: prod runs
- * are unaffected (Git Bash sets it to the same value), sandboxes are airtight.
- */
-function homeDir(): string {
-  return process.env.HOME ?? os.homedir();
 }
 
 function stripJsonComments(text: string): string {
@@ -754,7 +753,7 @@ function findKiloConfigs(): KiloConfig[] {
   const candidates: KiloConfig[] = [
     { filePath: path.join(process.cwd(), "kilo.jsonc"), format: "jsonc", priority: 1 },
     { filePath: path.join(process.cwd(), ".kilo", "kilo.jsonc"), format: "jsonc", priority: 1 },
-    { filePath: path.join(homeDir(), ".config", "kilo", "kilo.jsonc"), format: "jsonc", priority: 2 },
+    { filePath: path.join(kiloConfigDir(), "kilo.jsonc"), format: "jsonc", priority: 2 },
     { filePath: path.join(process.cwd(), ".kilocode", "mcp.json"), format: "legacy", priority: 3 },
   ];
   for (const candidate of candidates) {
@@ -809,13 +808,11 @@ function editKiloConfig(text: string, jsonPath: Array<string | number>, value: u
 
 function kiloRuleLocation(selected: KiloConfig): { filePath: string; ref: string } {
   if (selected.format === "jsonc" && selected.priority === 2) {
-    const filePath = path.resolve(homeDir(), ".config", "kilo", "rules", "megamemory.md");
+    const filePath = kiloRules(true, "jsonc");
     return { filePath, ref: filePath };
   }
-  return {
-    filePath: path.join(process.cwd(), selected.format === "jsonc" ? ".kilo" : ".kilocode", "rules", "megamemory.md"),
-    ref: KILO_RULE_REF,
-  };
+  const filePath = kiloRules(false, selected.format);
+  return { filePath, ref: KILO_RULE_REF };
 }
 
 function mergeKiloConfig(selected: KiloConfig, runtime: CommandRuntime): string {
@@ -916,7 +913,7 @@ function prepareAgentsConvention(options: InstallOptions): Array<{ filePath: str
   const skillPath = path.join(options.global ? homeDir() : process.cwd(), ".agents", "skills", "megamemory", "SKILL.md");
   const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "megamemory", "SKILL.md");
   const skill = fs.readFileSync(source, "utf8");
-  const agentsPath = options.global ? path.join(homeDir(), ".config", "kilo", "AGENTS.md") : path.join(process.cwd(), "AGENTS.md");
+  const agentsPath = kiloAgents(options.global);
   const skillRef = options.global ? skillPath.replace(/\\/g, "/") : ".agents/skills/megamemory/SKILL.md";
   const block = `${instructionsStamp(PACKAGE_VERSION)}\n` + kiloManagedBlock([
     "Use megamemory before tasks and record verified conclusions afterwards.",
@@ -930,15 +927,15 @@ function prepareAgentsConvention(options: InstallOptions): Array<{ filePath: str
   } else {
     warn(`Existing skill at ${pc.dim(skillPath)} is not marked as MegaMemory-managed. Left it untouched.`);
   }
-  const codexPath = path.join(homeDir(), ".codex", "AGENTS.md");
+  const codexPath = codexAgents();
   if (options.global && fs.existsSync(codexPath)) files.push({ filePath: codexPath, content: mergeKiloBlock(codexPath, block) });
   return files;
 }
 
 async function setupAgentsLink(options: InstallOptions): Promise<void> {
   if (!options.link) return;
-  const agentsPath = options.global ? path.join(homeDir(), ".config", "kilo", "AGENTS.md") : path.join(process.cwd(), "AGENTS.md");
-  const linkPath = path.join(options.global ? homeDir() : process.cwd(), ".agents", "AGENTS.md");
+  const agentsPath = kiloAgents(options.global);
+  const linkPath = agentsCanonical(options.global);
   const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
   info(`Optional canonical link: ln -s ${quote(agentsPath)} ${quote(linkPath)}`);
   if (options.dryRun || (process.platform !== "linux" && process.platform !== "darwin")) {
@@ -1013,7 +1010,7 @@ async function setupZcodeConfig(runtime: CommandRuntime, dryRun: boolean): Promi
 }
 
 function setupZcodeRules(options: InstallOptions): void {
-  const target = options.global ? ZCODE_AGENTS_MD_PATH : path.join(process.cwd(), "AGENTS.md");
+  const target = zcodeAgents(options.global);
   if (options.dryRun) {
     const classification = !fs.existsSync(target)
       ? "created"
@@ -1024,8 +1021,8 @@ function setupZcodeRules(options: InstallOptions): void {
   }
   if (options.global) {
     info("ZCode has no workspace-level MCP config; --global only moves the rules file.");
-  } else if (fs.existsSync(ZCODE_AGENTS_MD_PATH) && !fs.readFileSync(ZCODE_AGENTS_MD_PATH, "utf-8").includes("megamemory")) {
-    warn(`Global rules at ${pc.dim(ZCODE_AGENTS_MD_PATH)} contain no megamemory block; ZCode reads both files and project rules do not cover global sessions.`);
+  } else if (fs.existsSync(zcodeAgents(true)) && !fs.readFileSync(zcodeAgents(true), "utf-8").includes("megamemory")) {
+    warn(`Global rules at ${pc.dim(zcodeAgents(true))} contain no megamemory block; ZCode reads both files and project rules do not cover global sessions.`);
   }
 }
 
@@ -1145,7 +1142,7 @@ function createTargetConfigs(runtime: CommandRuntime, options: InstallOptions): 
       description: "MCP server, AGENTS.md, skill plugin, commands",
       steps: [
         { name: "MCP server config", critical: true, run: () => setupOpencodeMcpConfig(runtime) },
-        { name: "Global AGENTS.md", run: () => setupInstructionFile(OPENCODE_AGENTS_MD_PATH) },
+        { name: "Global AGENTS.md", run: () => setupInstructionFile(opencodeAgents()) },
         { name: "Skill tool plugin", run: () => setupToolPlugin() },
         {
           name: "Bootstrap command",
@@ -1162,7 +1159,7 @@ function createTargetConfigs(runtime: CommandRuntime, options: InstallOptions): 
       description: "MCP server, CLAUDE.md, commands",
       steps: [
         { name: "MCP server config", critical: true, run: () => setupClaudeConfig(runtime) },
-        { name: "Global CLAUDE.md", run: () => setupInstructionFile(CLAUDE_MD_PATH) },
+        { name: "Global CLAUDE.md", run: () => setupInstructionFile(claudeAgents()) },
         {
           name: "Bootstrap command",
           run: () => setupCommand(CLAUDE_COMMANDS_DIR, "bootstrap-memory.md", "bootstrap command"),
@@ -1208,7 +1205,7 @@ function createTargetConfigs(runtime: CommandRuntime, options: InstallOptions): 
   };
 }
 
-const VALID_TARGETS: InstallTarget[] = ["opencode", "claudecode", "antigravity", "codex", "kilo", "zcode"];
+export const VALID_TARGETS: InstallTarget[] = ["opencode", "claudecode", "antigravity", "codex", "kilo", "zcode"];
 
 function parseTargets(args: string[]): InstallTarget[] {
   const selected = new Set<InstallTarget>();
