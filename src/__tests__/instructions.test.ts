@@ -206,6 +206,9 @@ describe("instructionsCandidates (план 29)", () => {
     if (process.platform === "win32") {
       fs.symlinkSync(path.join(home, "no-such-dir"), path.join(home, ".agents"), "junction");
     } else {
+      // POSIX symlinkSync требует существующий родительский каталог (на CI
+      // упало с ENOENT — junction Windows его создаёт сам).
+      fs.mkdirSync(path.join(home, ".agents"), { recursive: true });
       fs.symlinkSync(path.join(home, "no-such-file"), path.join(home, ".agents", "AGENTS.md"));
     }
     for (const [key, value] of Object.entries({
