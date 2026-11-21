@@ -73,13 +73,52 @@ export function claudeAgents(): string {
 }
 
 /**
- * Глобальный AGENTS.md Codex. Сознательно без $CODEX_HOME: непустой
- * CODEX_HOME устанавливается правильно, но кандидатом скана не является
- * (README «Workflow-wrapper freshness») — кодекс-цель пишет туда же, куда
- * и раньше; расширение скана на $CODEX_HOME — отдельное решение.
+ * Активный каталог профиля Codex: непустая (после trim) $CODEX_HOME, иначе
+ * ~/.codex. Значение используется как есть — пути с пробелами и кириллицей
+ * допустимы (B-10, аудит 2026-11-12). Единственный источник резолва: и
+ * install (config.toml + AGENTS.md цели codex), и скан инструкций обязаны
+ * видеть один и тот же активный профиль.
+ */
+export function codexHome(): string {
+  return process.env.CODEX_HOME && process.env.CODEX_HOME.trim() !== ""
+    ? process.env.CODEX_HOME
+    : path.join(homeDir(), ".codex");
+}
+
+/**
+ * AGENTS.md активного профиля Codex — путь записи цели codex (install) и
+ * первый кандидат скана. До плана 30 детектор читал только codexAgents():
+ * при непустой $CODEX_HOME установка писала блок в активный профиль, а
+ * instructions_version оставался null навсегда — instructions_stale не
+ * поднимался и после npm update агент молча работал по старому блоку.
+ */
+export function codexAgentsTarget(): string {
+  return path.join(codexHome(), "AGENTS.md");
+}
+
+/**
+ * Дефолтный ~/.codex/AGENTS.md, без $CODEX_HOME. Цель codex сюда НЕ пишет
+ * (путь записи — codexAgentsTarget()); в скане это fallback после активного
+ * профиля: у части пользователей блок остался в ~/.codex от установки до
+ * появления переменной, и без него они получали бы null при живом блоке.
+ * Путь kilo --global (prepareAgentsConvention в install.ts) продолжает
+ * писать именно сюда — поведение записи kilo не менялось (план 30).
  */
 export function codexAgents(): string {
   return path.join(homeDir(), ".codex", "AGENTS.md");
+}
+
+/**
+ * Кандидаты скана Codex в порядке приоритета: активный
+ * $CODEX_HOME/AGENTS.md при заданной переменной, затем ~/.codex/AGENTS.md.
+ * Когда переменная пуста или не задана, пути совпадают — дедуп оставляет
+ * один; перекрёстный дедуп с остальными целями остаётся в
+ * instructionsCandidates (по realpath).
+ */
+export function codexAgentsCandidates(): string[] {
+  const active = codexAgentsTarget();
+  const fallback = codexAgents();
+  return active === fallback ? [fallback] : [active, fallback];
 }
 
 /**
