@@ -60,7 +60,7 @@ a new node and not a stub: create a support node only for a thought a link canno
 
 **State claims expire:** "merged", "PR open", "shipped" need \`valid_until\`; otherwise \`state_claim_without_expiry\` warns — a warning, not a refusal. After a restart, compaction or project switch, change \`context_epoch\` and clear \`known_versions\`.
 
-**Stale instructions:** \`instructions_stale: true\` means this block came from another build — run \`megamemory install\`.
+**Stale instructions:** \`instructions_stale: true\` means this block is older than the running server — run \`megamemory install\`, then restart the client.
 
 Full contract, every flag and rare procedure: \`megamemory guide --workflow\`.
 ${AGENTS_MD_END}
