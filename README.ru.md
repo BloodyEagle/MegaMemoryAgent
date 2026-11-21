@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.12.0-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.12.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -213,14 +213,22 @@ ref), записать проверенный вывод через `create_conc
 **Свежесть workflow-обёртки.** `install` ставит штамп
 `<!-- megamemory:instructions vX.Y.Z -->` на управляемые блоки в `AGENTS.md` /
 `CLAUDE.md` и на устанавливаемые markdown-команды (не на MCP-конфиг и не на
-плагин OpenCode). При каждом `list_roots` и `understand` сервер ищет первый
-штампованный управляемый **файл инструкций** в таком порядке: проектный
+плагин OpenCode); файлы правил Kilo несут маркер сниппета
+`<!-- megamemory-snippet vX.Y.Z -->`, чья версия сравнивается так же
+(2.12.1). При каждом `list_roots` и `understand` сервер ищет первый
+управляемый **файл инструкций** с версией в таком порядке: проектный
 `AGENTS.md`, проектный `CLAUDE.md`, `AGENTS.md` OpenCode,
-`~/.claude/CLAUDE.md`, затем `~/.codex/AGENTS.md` (custom `CODEX_HOME`
-устанавливается правильно, но дополнительным кандидатом проверки не является).
+`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (custom `CODEX_HOME`
+устанавливается правильно, но дополнительным кандидатом проверки не является),
+глобальный `~/.config/kilo/AGENTS.md`, глобальный `~/.zcode/AGENTS.md`,
+`~/.agents/AGENTS.md` (дедуплицируется со своей симлинк-целью по реальному
+пути), затем файлы правил Kilo `.kilo/rules/megamemory.md` и
+`~/.config/kilo/rules/megamemory.md`.
 Ответ несёт `instructions_stale`, `instructions_version` и `server_version`;
 нет управляемого файла инструкций — `false / null`, несовпадение версий после
-обновления пакета — повторите `install` для нужной цели.
+обновления пакета — повторите `install` для нужной цели. Управляемый блок без
+сравнимой версии (маркер без версии, legacy-форма `megamemory-snippet:`)
+сообщается как stale с `version: null`.
 
 ### Установка для Kilo
 
@@ -306,11 +314,16 @@ MegaMemory-managed остаётся нетронутым с предупрежд
 только печатается с предупреждением.
 
 **Область проверки Kilo.** Короткий блок Kilo в `AGENTS.md` начинается со
-штампа `megamemory:instructions` и распознаётся сканером штатно. Файлы правил
-Kilo сохраняют только маркер сниппета; rules и глобальный
-`~/.config/kilo/AGENTS.md` в список проверки **не входят** — поля свежести
-проверяют найденный проектный блок, а не все файлы инструкций Kilo. Отсутствие
-результата сканирования не доказывает отсутствия правил.
+штампа `megamemory:instructions` и распознаётся сканером штатно. С 2.12.1
+глобальный `~/.config/kilo/AGENTS.md`, оба файла правил Kilo
+(`.kilo/rules/megamemory.md` и `~/.config/kilo/rules/megamemory.md`) и
+канонический `~/.agents/AGENTS.md` тоже входят в список проверки: файлы
+правил распознаются по маркеру `megamemory-snippet`, чья версия сравнивается
+как штамп. Вне проверки остаются legacy-файл правил
+`.kilocode/rules/megamemory.md`, `SKILL.md` и установленные
+`commands/*.md` — у скилла версии нет, а штампованные команды и
+legacy-путь правил не являются кандидатами скана. Маркер без версии
+сообщается как stale с `version: null`.
 
 ### Установка для ZCode
 

@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.12.0-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.12.1-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -207,15 +207,22 @@ followed it.
 
 **Workflow-wrapper freshness.** `install` stamps its managed blocks with
 `<!-- megamemory:instructions vX.Y.Z -->` in `AGENTS.md` / `CLAUDE.md` and on
-installed command markdown (not on MCP config or the OpenCode plugin). On every
-`list_roots` and `understand`, the server scans the first stamped managed
-**instruction file** in this order: project `AGENTS.md`, project `CLAUDE.md`,
-OpenCode `AGENTS.md`, `~/.claude/CLAUDE.md`, then `~/.codex/AGENTS.md`
-(a custom `CODEX_HOME` is installed correctly but is not an additional scan
-candidate). The response carries `instructions_stale`, `instructions_version`
-and `server_version`; no managed instruction file means `false / null`, a
-version mismatch means re-run `install` for the relevant target after updating
-the package.
+installed command markdown (not on MCP config or the OpenCode plugin); Kilo
+rule files carry the snippet marker `<!-- megamemory-snippet vX.Y.Z -->`,
+whose version is compared the same way (2.12.1). On every `list_roots` and
+`understand`, the server scans the first managed **instruction file** with a
+version in this order: project `AGENTS.md`, project `CLAUDE.md`, OpenCode
+`AGENTS.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (a custom
+`CODEX_HOME` is installed correctly but is not an additional scan candidate),
+global Kilo `~/.config/kilo/AGENTS.md`, global ZCode `~/.zcode/AGENTS.md`,
+`~/.agents/AGENTS.md` (deduplicated against its symlink target by real path),
+then the Kilo rule files `.kilo/rules/megamemory.md` and
+`~/.config/kilo/rules/megamemory.md`. The response carries
+`instructions_stale`, `instructions_version` and `server_version`; no managed
+instruction file means `false / null`, a version mismatch means re-run
+`install` for the relevant target after updating the package. A managed block
+without a comparable version (marker without a version, legacy
+`megamemory-snippet:` form) is reported as stale with `version: null`.
 
 ### Kilo installation
 
@@ -326,10 +333,15 @@ documented hooks schema and still requires live acceptance on a real machine.
 
 **Kilo freshness scope.** The short Kilo `AGENTS.md` block starts with the
 `megamemory:instructions` stamp and is recognized by the scanner normally.
-Kilo rules keep the snippet marker only; Kilo rules files and the global
-`~/.config/kilo/AGENTS.md` are **not** scan candidates — the freshness fields
-validate the scanned project block, not every Kilo instruction file. A missing
-scan result is not proof of no rules.
+Since 2.12.1 the global `~/.config/kilo/AGENTS.md`, both Kilo rule files
+(`.kilo/rules/megamemory.md` and `~/.config/kilo/rules/megamemory.md`) and the
+canonical `~/.agents/AGENTS.md` are scan candidates too: the rule files are
+recognized by their `megamemory-snippet` marker, whose version is compared
+like the stamp. The legacy rule file `.kilocode/rules/megamemory.md`,
+`SKILL.md` and the installed `commands/*.md` stay outside the scan — the
+skill carries no version, and the stamped commands and the legacy rules path
+are not scan candidates. A marker without a
+version is reported as stale with `version: null`.
 
 ### Upgrading an existing upstream database
 

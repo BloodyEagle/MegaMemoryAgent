@@ -1,6 +1,18 @@
 import fs from "fs";
-import os from "os";
-import path from "path";
+// План 29: пути инструкций берутся из install-paths.ts — того же источника,
+// которым пользуется install. Рукописный список кандидатов отставал от целей
+// установщика: zcode и kilo не детектировались вовсе.
+import {
+  agentsCanonical,
+  claudeAgents,
+  codexAgents,
+  kiloAgents,
+  kiloRules,
+  opencodeAgents,
+  projectAgents,
+  projectClaude,
+  zcodeAgents,
+} from "./install-paths.js";
 
 // ---- Instructions staleness signal (plan 3 step 7) ----
 //
@@ -30,30 +42,59 @@ export function instructionsStamp(version: string): string {
  * Extract the package version from a stamp written by install. Returns null
  * when the content carries no versioned stamp. The leading "v" is stripped:
  * the stamp reads `v2.0.0-fork.1`, the field reports `2.0.0-fork.1`.
+ *
+ * План 29: файлы правил kilo несут другой маркер —
+ * `<!-- megamemory-snippet v<версия> -->` (kiloManagedBlock в install.ts).
+ * Его версия сравнивается так же; маркер без версии (и legacy-форма
+ * `megamemory-snippet:`) под regex не подходит и уходит в legacy-ветку
+ * ниже — stale: true, version: null.
  */
 export function extractInstructionsVersion(content: string): string | null {
-  const match = content.match(/<!--\s*megamemory:instructions\s+v?(\S+?)\s*-->/);
-  return match ? match[1] : null;
+  const stamp = content.match(/<!--\s*megamemory:instructions\s+v?(\S+?)\s*-->/);
+  if (stamp) return stamp[1];
+  const snippet = content.match(/<!--\s*megamemory-snippet\s+v?(\d\S*?)\s*-->/);
+  return snippet ? snippet[1] : null;
 }
 
 /**
  * Where install may have written the instructions block: the project-level
  * files first (they shadow the global ones), then the global instruction
- * files of every install target. Mirrors the paths install.ts writes to,
- * including the OPENCODE_CONFIG_DIR override.
+ * files of every install target (plan 29 — the list is assembled from the
+ * same install-paths.ts functions install writes with, so a new target
+ * cannot drift away silently).
+ *
+ * ~/.agents/AGENTS.md is a symlink to the kilo rules file it points at:
+ * dedup by realpath keeps it from being read twice per MCP response (on a
+ * missing or broken link realpathSync throws — the literal path stays in
+ * the list as is).
  */
 export function instructionsCandidates(): string[] {
-  const home = os.homedir();
-  const xdg = process.env.XDG_CONFIG_HOME ?? path.join(home, ".config");
-  const opencodeDir = process.env.OPENCODE_CONFIG_DIR ?? path.join(xdg, "opencode");
-  const cwd = process.cwd();
-  return [
-    path.join(cwd, "AGENTS.md"),
-    path.join(cwd, "CLAUDE.md"),
-    path.join(opencodeDir, "AGENTS.md"),
-    path.join(home, ".claude", "CLAUDE.md"),
-    path.join(home, ".codex", "AGENTS.md"),
+  const paths = [
+    projectAgents(),
+    projectClaude(),
+    opencodeAgents(),
+    claudeAgents(),
+    codexAgents(),
+    kiloAgents(true),
+    zcodeAgents(true),
+    agentsCanonical(true),
+    kiloRules(false, "jsonc"),
+    kiloRules(true, "jsonc"),
   ];
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+  for (const candidate of paths) {
+    let key = candidate;
+    try {
+      key = fs.realpathSync(candidate);
+    } catch {
+      // не существует (в том числе битая ссылка) — сравниваем по литеральному пути
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push(candidate);
+  }
+  return candidates;
 }
 
 export interface InstructionsStatus {
