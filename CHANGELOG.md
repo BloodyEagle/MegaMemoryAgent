@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.12.3 (2026-11-21)
+
+### Changed
+
+- Сниппет `AGENTS.md`/`CLAUDE.md` (пишет `megamemory install`, печатает
+  `megamemory guide`) возвращён к роли «ядро + указатель» (план 31): блок
+  вырос до 8 610 символов (~2 150 токенов в контексте каждой сессии каждого
+  клиента) и составлял 53% полного договора `docs/agent-workflow.md`, обходя
+  лимит «≤60 строк» длиной абзацев (до 4 557 символов в одном). Новый блок —
+  2 875 символов, 25 строк, форма «триггер „когда“ → что сделать»: Before a
+  task / When reading code / When memory and code disagree / After verified
+  work / Claims resting on code / After reading a support / State claims
+  expire / Stale instructions. Ни одно нормативное правило не потеряно:
+  опоры и `evidence`, подтверждение версий (`confirm_supports`,
+  `support_check.state`, «never computed by hand»), `valid_until` и
+  `state_claim_without_expiry`, `supersedes`, `instructions_stale`,
+  `auto_ground`, git-опоры — дословно. Уехавшее операционное знание
+  (`MEGAMEMORY_TOOLS`, режимы `compact`/`full`/`brief`, бюджет `max_tokens`,
+  стартовая форма `list_roots`, `reembed`, полный enum связей, примеры
+  узлов, `megamemory bench`) дописано в `docs/agent-workflow.md` — «удалено
+  вместо перенесено» закрыто тестом терминов.
+- Гард объёма сниппета переведён со строк на символы: ≤3 000 символов
+  и ≤35 строк (строки — вторичная защита); проверка «ядро на месте»
+  (12 маркеров нормативных правил) роняет сокращение, выпилившее правило,
+  тестом, а не поведением агента.
+
 ## 2.12.2 (2026-11-21)
 
 ### Fixed

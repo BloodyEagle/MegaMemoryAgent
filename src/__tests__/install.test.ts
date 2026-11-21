@@ -4,6 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AGENTS_MD_SNIPPET } from "../guide.js";
 
 const { execFileSyncMock, execSyncMock } = vi.hoisted(() => ({
   execFileSyncMock: vi.fn(() => {
@@ -317,8 +318,10 @@ describe("runInstall", () => {
     expect(agents).toContain(EXPECTED_STAMP);
     expect(agents).toContain("/megamemory-snippet");
     expect(agents).toContain("supersedes");
-    expect(agents).toContain("max_tokens");
-    expect(agents).toContain("reembed");
+    // план 31: контракт установщика — в файл записан AGENTS_MD_SNIPPET целиком;
+    // max_tokens/reembed уехали из сниппета в docs/agent-workflow.md
+    // (греп-тест «термины в workflow-документе» в guide.test.ts)
+    expect(agents).toContain(AGENTS_MD_SNIPPET.trimStart());
   });
 
   it("stamps every generated command file with the package.json version (step 7.4.2)", async () => {

@@ -15,13 +15,10 @@ function plain(text: string): string {
 const SNIPPET = AGENTS_MD_SNIPPET.trimStart();
 
 describe("AGENTS_MD_SNIPPET — онбординг провенанса (2.1.5 F1)", () => {
-  it("весь блок не длиннее 60 строк — сниппет живёт в контексте каждой сессии", () => {
-    const lines = SNIPPET.split("\n").length;
-    expect(lines).toBeLessThanOrEqual(60);
-  });
-
   it("2.7.0 T3: memory: остаётся в строке After work, без обязательной записи нового узла", () => {
-    const afterWork = SNIPPET.split("\n").find((line) => line.startsWith("3. **After work:**"));
+    // план 31: нумерованный список → абзацы-триггеры; строка ищется по новому
+    // началу «**After verified work:**» (прежде — «3. **After work:**»)
+    const afterWork = SNIPPET.split("\n").find((line) => line.startsWith("**After verified work:**"));
     expect(afterWork).toContain("Commit and PR memory:");
     expect(afterWork).toContain("`memory: <id>`");
     expect(afterWork).toContain("`memory: нечего — <причина>`");
@@ -46,8 +43,8 @@ describe("AGENTS_MD_SNIPPET — онбординг провенанса (2.1.5 F
     expect(SNIPPET).toContain("support_check.state");
     // unknown и incomplete — НЕ «всё хорошо»
     expect(SNIPPET).toMatch(/`unknown` and `incomplete` are NOT/);
-    // truncated_by — обход неполный, «опор больше нет» не выводится
-    expect(SNIPPET).toContain("truncated_by: depth|nodes|scan");
+    // truncated_by (обход неполный) с плана 31 живёт в docs/agent-workflow.md —
+    // ассерт перенесён в тест «указатель живой и знание перенесено»
   });
 
   it("учит реакции на instructions_stale", () => {
@@ -57,10 +54,74 @@ describe("AGENTS_MD_SNIPPET — онбординг провенанса (2.1.5 F
 
   it("сохраняет ключевые слова прежнего сниппета (install.test.ts опирается на них)", () => {
     expect(SNIPPET).toContain("supersedes");
-    expect(SNIPPET).toContain("max_tokens");
-    expect(SNIPPET).toContain("reembed");
     expect(SNIPPET).toContain("## Project Knowledge Graph");
     expect(SNIPPET.trimEnd().endsWith(AGENTS_MD_END)).toBe(true);
+  });
+});
+
+describe("гвард объёма, формы и ядра сниппета (план 31)", () => {
+  it("объём: ≤3000 символов и ≤35 строк — считаем символы, строки обходились длиной абзаца", () => {
+    // План 31: прежний лимит «≤60 строк» пропускал абзацы по 4 557 символов —
+    // контракт держит объём в символах; строки — вторичная защита от
+    // «одной гигантской строки».
+    expect(SNIPPET.length, `SNIPPET.length = ${SNIPPET.length}`).toBeLessThanOrEqual(3000);
+    const lines = SNIPPET.split("\n").length;
+    expect(lines, `строк = ${lines}`).toBeLessThanOrEqual(35);
+  });
+
+  it("ядро на месте: сокращение не имеет права выпилить правило", () => {
+    const markers = [
+      "indistinguishable from a guess",
+      "one short relevant",
+      "support_check",
+      "valid_until",
+      "state_claim_without_expiry",
+      "evidence: [{",
+      "not a stub",
+      "confirm_supports(",
+      "instructions_stale",
+      "supersedes",
+      "lawfully record nothing",
+      "megamemory guide --workflow",
+    ];
+    for (const marker of markers) {
+      expect(SNIPPET, marker).toContain(marker);
+    }
+  });
+
+  it("указатель живой и знание перенесено: уехавшие термины есть в docs/agent-workflow.md", () => {
+    expect(buildGuideText()).toContain("megamemory guide --workflow");
+    const doc = fs.readFileSync(path.join(PROJECT_ROOT, "docs", "agent-workflow.md"), "utf-8");
+    const terms = [
+      "MEGAMEMORY_TOOLS",
+      "`compact`",
+      "`full`",
+      "`brief`",
+      "collapse_ref_anchors",
+      "include_source",
+      "max_tokens",
+      "roots_compact",
+      "`slots`",
+      "board_top",
+      "truncated_by: depth|nodes|scan",
+      "reembed",
+      "auth-token-refresh",
+      "configured_by",
+      "megamemory bench",
+    ];
+    for (const term of terms) {
+      expect(doc, term).toContain(term);
+    }
+  });
+
+  it("форма — триггеры: каждый абзац блока начинается с условия «когда»", () => {
+    // Блок читается как «когда → что сделать», а не как проза-мануал:
+    // строка без «когда» — кандидат на выброс из контекста каждой сессии.
+    const paragraphs = SNIPPET.split(/\n{2,}/).filter((p) => p.startsWith("**"));
+    expect(paragraphs.length).toBeGreaterThanOrEqual(8);
+    for (const paragraph of paragraphs) {
+      expect(paragraph, paragraph.slice(0, 40)).toMatch(/^\*\*(Before|When|After|Claims|State|Stale)/);
+    }
   });
 });
 
@@ -89,10 +150,11 @@ describe("megamemory guide (2.1.5 F2)", () => {
 });
 
 describe("документация про bench (2.1.5 F5)", () => {
-  it("строка про bench из сниппета присутствует в выводе guide — один источник текста", () => {
-    const benchLine = SNIPPET.split("\n").find((l) => l.includes("megamemory bench"));
+  it("строка про bench есть в выводе guide — один источник текста (план 31: bench уехал из сниппета в раздел измерения)", () => {
+    const guide = buildGuideText();
+    const benchLine = guide.split("\n").find((l) => l.includes("megamemory bench"));
     expect(benchLine).toBeDefined();
-    expect(buildGuideText()).toContain(benchLine!);
+    expect(guide).toContain("--baseline files");
   });
 
   it("--help перечисляет bench и флаг --baseline со всеми тремя значениями", () => {
@@ -145,8 +207,6 @@ describe("документация про дайджесты и вложенны
     const guide = buildGuideText();
     expect(guide).toContain("current_digests");
     expect(guide).toContain("never computed by hand");
-    // сниппет остаётся в объёме: одна строка изменилась, блок не разросся
-    expect(SNIPPET.split("\n").length).toBeLessThanOrEqual(60);
   });
 
   it("оба README объясняют падение hit_rate@1 из-за вложенных опор", () => {
@@ -170,8 +230,6 @@ describe("сниппет: файл — это ref, а не узел (2.1.9 F3)",
     expect(SNIPPET).toContain('evidence: [{ref: "src/x.ts:120-180", why}]');
     expect(SNIPPET).toMatch(/not\s*\n\s*a new node/);
     expect(SNIPPET).toContain("a thought a link cannot express");
-    // лимит объёма сохранён
-    expect(SNIPPET.split("\n").length).toBeLessThanOrEqual(60);
   });
 
   it("16. guide печатает ту же строку — один источник текста", () => {
@@ -187,8 +245,6 @@ describe("срок годности и git-опоры в документаци�
     expect(SNIPPET).toContain("State claims expire");
     expect(SNIPPET).toContain('evidence: [{ref: "git:tag:v2.1.11", why}]');
     expect(SNIPPET).toContain("git:commit:<sha>");
-    // лимит 60 строк сохранён (20)
-    expect(SNIPPET.split("\n").length).toBeLessThanOrEqual(60);
   });
 
   it("19. оба README содержат раздел срока годности и пример git:-опоры", () => {
@@ -233,11 +289,9 @@ describe("документация 2.1.13 (F7)", () => {
     expect(ru).toContain("не сетевой сервис");
   });
 
-  it("38. guide содержит фразу про предупреждение (сниппет <= 60 строк)", () => {
+  it("38. guide содержит фразу про предупреждение", () => {
     expect(SNIPPET).toContain("state_claim_without_expiry");
     expect(SNIPPET).toContain("a warning, not a refusal");
-    const lines = SNIPPET.split("\n").length;
-    expect(lines).toBeLessThanOrEqual(60);
   });
 });
 
@@ -262,7 +316,6 @@ describe("сниппет согласован с workflow-договором (п
     expect(SNIPPET).toContain("lawfully record nothing");
     expect(SNIPPET).toContain("not an automatic refutation");
     // нормативное ядро доверия сохранено целиком (проверки выше в этом файле)
-    expect(SNIPPET.split("\n").length).toBeLessThanOrEqual(60);
   });
 });
 

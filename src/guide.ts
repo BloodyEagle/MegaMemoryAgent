@@ -23,77 +23,46 @@ export const AGENTS_MD_END = "<!-- /megamemory-snippet -->";
 /**
  * The onboarding block `megamemory install` writes into AGENTS.md / CLAUDE.md.
  *
- * 2.1.5: besides the basic loop this now teaches provenance (F1) — supports on
- * write, version confirmation, support_check states, stale instructions — and
- * points at `megamemory bench` (F5.3), so the agent knows "does this memory
- * help" is a question answered by a number, not an argument.
+ * План 31 (2.12.3): блок вернулся к роли «ядро + указатель» — триггеры
+ * «когда → что сделать», не мануал. Все операционные подробности (режимы,
+ * бюджеты, стартовая форма list_roots, reembed, enum связей, примеры узлов,
+ * bench) живут в docs/agent-workflow.md и печатаются
+ * `megamemory guide --workflow`. Ни одно нормативное правило не удалено:
+ * сокращение держится тестом «ядро на месте».
  *
- * Volume cap: the whole block must stay <= 60 lines (it lives in the context
- * of every session; a bloated block gets ignored). Guarded by a test.
+ * Volume cap: ≤ 3000 символов и ≤ 35 строк; считаем символы, потому что
+ * строки обходились длиной абзаца (2 955 и 4 557 символов внутри «60 строк»).
+ * Guarded by a test.
  *
  * План 20+21 v3 (W1): пункты workflow согласованы с полным договором
- * docs/agent-workflow.md (печатается `megamemory guide --workflow`): память
- * даёт проверенные решения, структурный инструмент и исходники — актуальное
- * поведение; чистое чтение и успешный reuse не обязаны ничего записывать.
+ * docs/agent-workflow.md: память даёт проверенные решения, структурный
+ * инструмент и исходники — актуальное поведение; чистое чтение и успешный
+ * reuse не обязаны ничего записывать.
  */
 export const AGENTS_MD_SNIPPET = `
 ${AGENTS_MD_STAMP}
 ## Project Knowledge Graph
 
-You have access to a project knowledge graph via the \`megamemory\` MCP server and skill tool. You have no implicit memory of this project between sessions, so this graph is your only continuity for concepts, architecture, decisions, and relationships. A decision recorded without supports is, a month later, indistinguishable from a guess — record the evidence with it.
+You have no memory of this project between sessions: this graph is your continuity. A decision recorded without supports is, a month later, indistinguishable from a guess.
 
-**Workflow: one relevant query → structural reading → verified record. Full contract: \`megamemory guide --workflow\`.**
+**Before a task:** one short relevant \`understand\` for what you are about to change, then qualify the answer (\`support_check.state\`, \`valid_until\`, \`refuted_reason\`, status/scope). \`list_roots\` is an on-demand overview, not a mandatory ritual. Memory unavailable: work as usual, never invent remembered facts or retry in a loop.
 
-1. **Available memory:** start with one short relevant \`understand\` (action \`query\`) for the task; qualify it — supports/\`support_check\`, \`valid_until\`/expired, \`refuted_reason\`, status/scope. \`list_roots\` is an on-demand graph overview, not a mandatory ritual. If MegaMemory is unavailable, continue with your usual navigation — never invent remembered facts or retry connecting in a loop. The tool surface can be narrowed with the \`MEGAMEMORY_TOOLS\` env (\`all\` | \`core\` | comma list): \`core\` keeps the read→write→link→confirm→verify loop, unset keeps all 26.
-2. **Current code:** verify structure and behavior with the structural skill and fresh sources; read small files whole, large files by outline then exact ranges — an analysis is not one line around a hit. Don't run the same search through both tools as a ritual. \`compact\` is default, \`full\` is verbose, \`brief\` is ≤8 lines. \`next\`: read every \`must_read\` (mandatory sources, not whole-file coverage), run every \`followup\` exactly; \`skip\` is empty; refs/summaries never prove coverage. Opt-in noise control: \`collapse_ref_anchors: true\` demotes template ref-anchors to compact locators (with their dependents and rationale) — direct id/path lookups and provenance still resolve them. Opt-in \`include_source: true\` (compact) puts the verbatim ref range into the card — ask for it when you would read that exact range anyway, not as a ritual: the source budget is reserved before card layout. Always-on \`stale_refs\` flags a cited file whose mtime is newer than the node's own update — re-read the ref before relying on it (a signal, not a verdict; git checkout also bumps mtime; content truth is \`check_freshness\`).
-3. **After work:** record only new verified knowledge, a fix of an old node, or needed history (action \`record\`); pure reading and successful reuse lawfully record nothing — \`record\` is an action form, not a must-create. Reuse of saved analysis (passport via \`trail_save\` + \`understand.reuse\`) answers with an explicit qualification (covered/gaps) — never silent trust, and a delta \`unchanged\` is not code coverage. After compaction/restart/project switch, change \`context_epoch\` AND clear \`known_versions\`: a new epoch alone does not invalidate old versions on the stateless server. After code changes, targeted re-verification is the explicit \`check_freshness\` call (related conclusions/passports via a reverse index, not the whole graph; file/blob SHA-256 versus git-ref commit SHA in \`expected_versions[].sha256\` to re-check before editing) — it writes no knowledge, observations or confirmations and never raises reuse trust; it may write the derived freshness index cache, and MCP writes service call telemetry. On code/memory divergence investigate first (scope, versions, rationale): current code is the fact of implementation, not an automatic refutation of the decision. Commit and PR memory: \`memory: <id>\` or \`memory: нечего — <причина>\`; templates: \`docs/commits.md\`.
+**When reading code:** verify with the structural skill and fresh sources — small files whole, large ones by outline then exact ranges. Run every \`next.must_read\` and \`next.followup\`; refs and summaries are not whole-file coverage. \`stale_refs\` marks a cited file newer than the node — re-read the ref before relying on it.
 
-Be specific in summaries: parameters, defaults, files, rationale. One idea — one node; update instead of duplicating. Replacement = new \`create_concept\` with \`supersedes: [old_id]\`; disproved = \`update_concept\` → \`refuted\`; \`remove_concept\` = truly gone and no longer needed. Max 3 levels.
+**When memory and code disagree:** investigate scope, versions and rationale first. Current code is the fact of implementation, not an automatic refutation of the decision.
 
-Good node: \`auth-token-refresh\` (decision) — "Silent refresh 30 s before token expiry, because 401s on /expired broke long jobs; lives in src/auth/refresh.ts."
-Bad node: \`auth\` — "Everything about auth." — a vague label no query can retrieve.
+**After verified work:** record only new knowledge, a fix of an old node, or needed history — pure reading and successful reuse lawfully record nothing. One idea — one node, at most 3 levels. Replacement is \`supersedes\`, never deletion; an empty search retries with \`include_inactive: true\`. Commit and PR memory: \`memory: <id>\` or \`memory: нечего — <причина>\` (docs/commits.md).
 
-4. **Budget:** \`max_tokens\` bounds actual MCP content: retrieval, mandatory \`next\`, and wrapper staleness fields (\`instructions_stale\`/\`instructions_version\`/\`server_version\`) — not initialize-level instructions. Too-small required envelopes are refused.
-5. **Startup shape:** \`list_roots\` has \`roots_compact\` (\`child_count\`/\`valid_until\`), \`slots\`, \`board_top\`, optional \`hint\`, \`meta\` truncation/drop fields, \`stats\`, and wrapper staleness fields; legacy \`roots\` is empty. Check \`meta.truncated\`.
-6. **Freshness:** when a decision replaces an older one, pass \`supersedes: [old_id]\` to
-   \`create_concept\` instead of deleting. If a search finds nothing, retry with
-   \`include_inactive: true\` — the concept may be marked superseded.
-7. **Digests:** \`digest\` nodes summarize any parent with 5+ eligible children — read the digest first, siblings second; generation is automatic/CLI, manual digest is compatibility-only.
-8. **Embedding model changed?** Run \`megamemory reembed\`: vector search starts with the first valid current-generation row; FTS covers nodes not published yet.
-9. **Supports:** for any claim resting on code — decision, solution or fact — pass \`evidence: [{node | ref, why}]\` in the same call
-   that creates it; \`why\` names what exactly in the support backs the conclusion — not a
-   retelling. A support on a file is a ref — \`evidence: [{ref: "src/x.ts:120-180", why}]\` — not
-   a new node: create a support node only for a thought a link cannot express. The ref creates
-   an anchor (a file-named node with a template summary) — that is a support, not a stub.
-   \`file_refs\` alone are not supports: the server derives them only with auto_ground
-   enabled (off by default). Auto-derived supports are not confirmed evidence — a draft, not a check.
-   A git object is a ref too: \`evidence: [{ref: "git:tag:v2.1.11", why}]\` (also \`git:commit:<sha>\`,
-   \`git:branch:<name>\`) — the anchor resolves to a commit sha with LOCAL git; a moved tag flips
-   \`check_artifacts\` to \`changed\`.
-   Relations (full enum): \`connects_to | depends_on | implements | calls | configured_by | supersedes | contradicts | informed_by\`; \`informed_by\` requires a rationale saying what in the target supports the source. Recommendation: do not use \`journal\` as decision evidence; the server currently permits it (not a technical ban).
-10. **Confirm versions:** after reading a support, confirm it: \`confirm_supports(decision_id,
-    expected_claim_digest, items:[{support_id, expected_claim_digest, expected_status_digest,
-    expected_edge_digest}])\` — digests travel in server answers (\`get_concept.current_digests\`,
-    \`provenance_trace.supports[]\`; compact \`understand\` adds them only with \`include_evidence: true\`,
-    which also lists every live support with its full wording) — never computed by hand.
-    \`support_check.state\`: \`unchanged\` = same as you confirmed
-    (it does NOT mean the file was just read back — only an explicit \`check_artifacts\` reads
-    artifacts; \`unchanged\` compares observations against the confirmed snapshot);
-    \`changed\` = diverged (see \`reasons\`); \`unknown\` = never checked; \`incomplete\` = the check hit
-    its budget. \`unknown\` and \`incomplete\` are NOT "all good". On \`changed\`: re-read the support,
-    confirm again, or mark the decision \`refuted\` via \`update_concept\` / replace it via
-    \`create_concept.supersedes\` — never leave it hanging. \`truncated_by: depth|nodes|scan\` in a
-    trace means the traversal was partial — never conclude "no more supports exist".
-11. **Stale instructions:** if \`list_roots\`/\`understand\` returns \`instructions_stale: true\`, run
-    \`megamemory install\` (it refreshes this block) and treat in-project instructions as possibly outdated.
-12. **Asked "does this memory help?"** — don't argue, measure: \`megamemory bench\` (\`--baseline files\`/\`te\`/\`both\`);
-    read \`ratio\` with \`hit_rate\` — cheap but wrong is not savings. Rare procedures: \`megamemory guide --workflow\`, \`docs/capabilities.md\`.
-13. **State claims expire:** a statement about the world AS IT WAS ("merged", "PR open",
-    "release shipped") MUST carry \`valid_until\` (ISO date) — it drops out of answers after
-    that date (\`include_stale: true\` returns it marked \`expired\`). Architecture and
-    conventions stay dateless; \`journal\` alone gets a configured default term when
-    \`valid_until\` is omitted on create. A state-claim summary without a date gets a
-    \`state_claim_without_expiry\` warning in the response — a warning, not a refusal: set the date or reword it as durable knowledge.
+**Claims resting on code:** pass \`evidence: [{node | ref, why}]\` in the call that creates the node; \`why\` names what exactly backs it — e.g. \`evidence: [{ref: "src/x.ts:120-180", why}]\`. A file ref is an anchor (a file-named node with a template summary) — a support, not
+a new node and not a stub: create a support node only for a thought a link cannot express. \`file_refs\` alone are not supports; supports derived by \`auto_ground\` are a draft, not a check. Git refs work too: \`evidence: [{ref: "git:tag:v2.1.11", why}]\`, \`git:commit:<sha>\`.
+
+**After reading a support:** \`confirm_supports(decision_id, expected_claim_digest, items: [{support_id, expected_claim_digest, expected_status_digest, expected_edge_digest}])\` with the digests the server returned (\`current_digests\`, \`provenance_trace.supports[]\`) — never computed by hand. \`unknown\` and \`incomplete\` are NOT "all good"; on \`changed\` re-read and confirm, or mark the decision \`refuted\`.
+
+**State claims expire:** "merged", "PR open", "shipped" need \`valid_until\`; otherwise \`state_claim_without_expiry\` warns — a warning, not a refusal. After a restart, compaction or project switch, change \`context_epoch\` and clear \`known_versions\`.
+
+**Stale instructions:** \`instructions_stale: true\` means this block came from another build — run \`megamemory install\`.
+
+Full contract, every flag and rare procedure: \`megamemory guide --workflow\`.
 ${AGENTS_MD_END}
 `;
 
