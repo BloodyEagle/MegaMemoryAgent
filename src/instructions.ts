@@ -5,7 +5,7 @@ import fs from "fs";
 import {
   agentsCanonical,
   claudeAgents,
-  codexAgents,
+  codexAgentsCandidates,
   kiloAgents,
   kiloRules,
   opencodeAgents,
@@ -67,6 +67,12 @@ export function extractInstructionsVersion(content: string): string | null {
  * dedup by realpath keeps it from being read twice per MCP response (on a
  * missing or broken link realpathSync throws — the literal path stays in
  * the list as is).
+ *
+ * План 30: Codex развёрнут в codexAgentsCandidates() — активный
+ * $CODEX_HOME/AGENTS.md раньше ~/.codex/AGENTS.md (fallback для блоков,
+ * оставшихся с установки до появления переменной). До этого детектор читал
+ * только ~/.codex и при непустой переменной не видел блок, который цель
+ * codex кладёт в активный профиль.
  */
 export function instructionsCandidates(): string[] {
   const paths = [
@@ -74,7 +80,7 @@ export function instructionsCandidates(): string[] {
     projectClaude(),
     opencodeAgents(),
     claudeAgents(),
-    codexAgents(),
+    ...codexAgentsCandidates(),
     kiloAgents(true),
     zcodeAgents(true),
     agentsCanonical(true),

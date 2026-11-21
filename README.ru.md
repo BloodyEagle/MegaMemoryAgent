@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.12.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.12.2-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -198,8 +198,9 @@ megamemory install --target zcode
 Сервер разрешает `.megamemory/knowledge.db` относительно рабочей директории
 MCP-процесса; `--db PATH` / `--db=PATH` в argv сервера имеет приоритет над
 `MEGAMEMORY_DB_PATH`. Для Codex `install` пишет `config.toml` и `AGENTS.md` в
-непустой `CODEX_HOME`, иначе в `~/.codex`; OpenCode и Claude Code используют
-свои профильные пути, которые установщик показывает в выводе.
+непустой `CODEX_HOME`, иначе в `~/.codex`, и скан свежести ниже читает тот же
+путь (с фолбэк-кандидатом `~/.codex/AGENTS.md`); OpenCode и Claude Code
+используют свои профильные пути, которые установщик показывает в выводе.
 
 **Универсальные MCP-инструкции.** При инициализации сервер также передаёт
 протокол с текущей версией длиной не более 400 символов: вызвать `understand`
@@ -218,8 +219,9 @@ ref), записать проверенный вывод через `create_conc
 (2.12.1). При каждом `list_roots` и `understand` сервер ищет первый
 управляемый **файл инструкций** с версией в таком порядке: проектный
 `AGENTS.md`, проектный `CLAUDE.md`, `AGENTS.md` OpenCode,
-`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (custom `CODEX_HOME`
-устанавливается правильно, но дополнительным кандидатом проверки не является),
+`~/.claude/CLAUDE.md`, активный `$CODEX_HOME/AGENTS.md` (с 2.12.2;
+`~/.codex/AGENTS.md` остаётся фолбэк-кандидатом для блоков, оставшихся с
+установок до появления переменной),
 глобальный `~/.config/kilo/AGENTS.md`, глобальный `~/.zcode/AGENTS.md`,
 `~/.agents/AGENTS.md` (дедуплицируется со своей симлинк-целью по реальному
 пути), затем файлы правил Kilo `.kilo/rules/megamemory.md` и
@@ -937,8 +939,9 @@ Runtime controls, которые читает сама MegaMemory:
 
 Пути профилей установщика задают `OPENCODE_CONFIG_DIR` (иначе
 `XDG_CONFIG_HOME/opencode`, а XDG-фолбэк — `~/.config`), `CODEX_HOME` (иначе
-`~/.codex`) и `HOME`. Они выбирают файлы, которые пишет `install`, но не меняют
-runtime графа. Соседний `megamemory.config.json` дополнительно поддерживает
+`~/.codex`) и `HOME`. Они выбирают файлы, которые пишет `install` и читает
+скан свежести инструкций, но не меняют runtime графа. Соседний
+`megamemory.config.json` дополнительно поддерживает
 `provenance.require_support`, `provenance.auto_ground` и `dedupe.threshold`.
 
 ---

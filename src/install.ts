@@ -15,6 +15,8 @@ import {
   claudeAgents,
   claudeDir,
   codexAgents,
+  codexAgentsTarget,
+  codexHome,
   homeDir,
   kiloAgents,
   kiloConfigDir,
@@ -110,18 +112,15 @@ const ANTIGRAVITY_CONFIG_PATH = path.join(process.cwd(), "mcp_config.json");
 // B-10 (аудит 2026-11-12): постоянный профиль Codex — активный CODEX_HOME,
 // если переменная задана непустым (после trim) значением; значение
 // используется как есть — пути с пробелами и кириллицей допустимы. Иначе —
-// прежний homeDir()/.codex. CODEX_HOME и раньше учитывался при
-// staging-вызове Codex CLI, но целевые пути считались только от HOME:
-// установщик писал конфигурацию не в активный профиль и сообщал ложный
-// успех. Один resolved target используется для config.toml, AGENTS.md и
-// сообщений установки; изолированный staging-каталог для CLI-вызова —
-// отдельный временный CODEX_HOME (см. setupCodexConfig).
-const CODEX_DIR =
-  process.env.CODEX_HOME && process.env.CODEX_HOME.trim() !== ""
-    ? process.env.CODEX_HOME
-    : path.join(homeDir(), ".codex");
+// прежний homeDir()/.codex. Резолв переехал в install-paths.ts (план 30):
+// тот же codexHome()/codexAgentsTarget() читает и скан инструкций, поэтому
+// цель codex и детектор больше не расходятся в путях. Один resolved target
+// используется для config.toml, AGENTS.md и сообщений установки;
+// изолированный staging-каталог для CLI-вызова — отдельный временный
+// CODEX_HOME (см. setupCodexConfig).
+const CODEX_DIR = codexHome();
 const CODEX_CONFIG_PATH = path.join(CODEX_DIR, "config.toml");
-const CODEX_AGENTS_MD_PATH = path.join(CODEX_DIR, "AGENTS.md");
+const CODEX_AGENTS_MD_PATH = codexAgentsTarget();
 
 const AGENTS_MD_MARKER = "## Project Knowledge Graph";
 // F8.2 / plan 3 step 7.2: versioned block markers — repeated installs UPDATE

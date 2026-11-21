@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.12.1-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.12.2-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -193,7 +193,9 @@ workflow files; if configuring by hand, register the stdio command
 The server resolves `.megamemory/knowledge.db` from the MCP process working
 directory; `--db PATH` / `--db=PATH` in server argv takes precedence over
 `MEGAMEMORY_DB_PATH`. For Codex, `install` writes `config.toml` and `AGENTS.md`
-to a non-empty `CODEX_HOME`, otherwise to `~/.codex`; OpenCode and Claude Code
+to a non-empty `CODEX_HOME`, otherwise to `~/.codex`, and the freshness scan
+below reads the same path (with `~/.codex/AGENTS.md` kept as a fallback
+candidate); OpenCode and Claude Code
 use their client-specific profile paths shown in the installer output.
 
 **Universal MCP instructions.** At initialization, the server also sends a
@@ -212,8 +214,9 @@ rule files carry the snippet marker `<!-- megamemory-snippet vX.Y.Z -->`,
 whose version is compared the same way (2.12.1). On every `list_roots` and
 `understand`, the server scans the first managed **instruction file** with a
 version in this order: project `AGENTS.md`, project `CLAUDE.md`, OpenCode
-`AGENTS.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (a custom
-`CODEX_HOME` is installed correctly but is not an additional scan candidate),
+`AGENTS.md`, `~/.claude/CLAUDE.md`, the active `$CODEX_HOME/AGENTS.md` (since
+2.12.2; `~/.codex/AGENTS.md` stays a fallback candidate for blocks left over
+from installs made before the variable existed),
 global Kilo `~/.config/kilo/AGENTS.md`, global ZCode `~/.zcode/AGENTS.md`,
 `~/.agents/AGENTS.md` (deduplicated against its symlink target by real path),
 then the Kilo rule files `.kilo/rules/megamemory.md` and
@@ -929,8 +932,9 @@ Runtime controls read by MegaMemory itself:
 
 Installer/profile location controls are `OPENCODE_CONFIG_DIR` (otherwise
 `XDG_CONFIG_HOME/opencode`, with `~/.config` as the XDG fallback), `CODEX_HOME`
-(otherwise `~/.codex`), and `HOME`. These choose files written by `install`;
-they do not change the graph runtime. The adjacent `megamemory.config.json`
+(otherwise `~/.codex`), and `HOME`. These choose the files written by `install`
+and read by the instructions-staleness scan; they do not change the graph
+runtime. The adjacent `megamemory.config.json`
 additionally supports `provenance.require_support`, `provenance.auto_ground`,
 and `dedupe.threshold`.
 
