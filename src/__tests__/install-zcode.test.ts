@@ -14,10 +14,15 @@ vi.mock("child_process", () => ({ execFileSync: execFileSyncMock, execSync: exec
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const expectedEntry = path.join(projectRoot, "dist", "index.js");
+const packageVersion = (JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf8")) as { version: string }).version;
 const realHomes = [...new Set([os.homedir(), process.env.HOME, process.env.USERPROFILE].filter((value): value is string => Boolean(value)))];
+// План 29: детектор инструкций читает больше домашних файлов — снапшот
+// реального профиля расширен соответственно (изоляция HOME на Windows).
 const realConfigPaths = realHomes.flatMap((home) => [
   ".zcode/cli/config.json", ".zcode/AGENTS.md", ".zcode/skills/megamemory",
-  ".claude.json", ".codex/config.toml", ".config/opencode/opencode.json",
+  ".claude.json", ".claude/CLAUDE.md", ".codex/config.toml", ".codex/AGENTS.md",
+  ".config/opencode/opencode.json", ".config/kilo/kilo.jsonc", ".config/kilo/AGENTS.md", ".config/kilo/rules",
+  ".agents/AGENTS.md", ".agents/skills/megamemory",
 ].map((relative) => path.join(home, relative)));
 
 function treeSnapshot(roots: string[]): Record<string, string> {
@@ -212,6 +217,55 @@ describe("Plan 28 ZCode target", () => {
     const description = /^description:\s*(.+)$/m.exec(skill)?.[1];
     expect(description).toBeDefined();
     expect(description!.length).toBeLessThanOrEqual(1024);
+  });
+});
+
+describe("Plan 29 instructions detection", () => {
+  it("zcode --global: instructions_status видит ~/.zcode/AGENTS.md и сигналит о чужой версии", async () => {
+    const outcome = await install("--global");
+    expect(outcome.ok).toBe(true);
+    // cwd — каталог без AGENTS.md: проектного файла нет, работает глобальный.
+    expect(fs.existsSync(path.join(workspace, "AGENTS.md"))).toBe(false);
+    const { instructionsStatus } = await import("../instructions.js");
+    expect(instructionsStatus(packageVersion)).toEqual({
+      instructions_stale: false,
+      instructions_version: packageVersion,
+      server_version: packageVersion,
+    });
+
+    // Правка штампа на чужую версию — stale: true с версией из штампа.
+    const rules = path.join(home, ".zcode", "AGENTS.md");
+    const stamped = fs.readFileSync(rules, "utf8");
+    fs.writeFileSync(rules, stamped.replace(`v${packageVersion}`, "v2.11.0"), "utf8");
+    expect(instructionsStatus(packageVersion)).toEqual({
+      instructions_stale: true,
+      instructions_version: "2.11.0",
+      server_version: packageVersion,
+    });
+  });
+
+  it("kilo --global: instructions_status видит ~/.config/kilo/AGENTS.md и файл правил", async () => {
+    writeFixture(path.join(home, ".config", "kilo", "kilo.jsonc"), "{}\n");
+    const { runInstall } = await import("../install.js");
+    expect((await runInstall(["--target", "kilo", "--global"])).ok).toBe(true);
+
+    const { instructionsStatus } = await import("../instructions.js");
+    // Глобальный AGENTS.md kilo начинается со штампа megamemory:instructions.
+    expect(instructionsStatus(packageVersion)).toEqual({
+      instructions_stale: false,
+      instructions_version: packageVersion,
+      server_version: packageVersion,
+    });
+
+    // Файл правил kilo несёт только маркер сниппета — версия читается из него
+    // (до плана 29 такой файл всегда был stale: true, version: null).
+    const rules = path.join(home, ".config", "kilo", "rules", "megamemory.md");
+    expect(fs.readFileSync(rules, "utf8")).toContain(`<!-- megamemory-snippet v${packageVersion} -->`);
+    expect(instructionsStatus(packageVersion, [rules])).toEqual({
+      instructions_stale: false,
+      instructions_version: packageVersion,
+      server_version: packageVersion,
+    });
   });
 });
 
