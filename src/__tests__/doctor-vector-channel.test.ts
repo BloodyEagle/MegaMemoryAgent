@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -35,6 +35,12 @@ function check(target: KnowledgeDB, name: string): DoctorCheck {
   expect(found, `check "${name}" missing`).toBeDefined();
   return found!;
 }
+
+beforeEach(() => {
+  // CI-окружение заставляет fts глобально; не-fts случаи фиксируют hybrid,
+  // чтобы строка doctor следовала именно состоянию канала.
+  vi.stubEnv("MEGAMEMORY_SEARCH", "hybrid");
+});
 
 afterEach(async () => {
   vi.unstubAllEnvs();

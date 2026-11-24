@@ -159,6 +159,19 @@ export function embeddingModelCheck(
       detail: `${MODEL_NAME} (dim=${db.getVectorGeneration()!.dim}, vectors ${vectors.have}/${vectors.total}, vector search on)`,
     };
   }
+  // F10 priority over the configured text-only mode: an unknown or foreign
+  // model stamp is latent mixed-vector-space damage. `MEGAMEMORY_SEARCH=fts`
+  // merely stops serving it; the stamp must still fail doctor for CI.
+  const recorded = db.getMetaValue("embed_model");
+  if (recorded && recorded !== MODEL_NAME) {
+    return {
+      name: EMBEDDING_MODEL_CHECK,
+      ok: false,
+      detail: recorded === "unknown"
+        ? `model unknown · vectors ${vectors.have}/${vectors.total} · run 'megamemory reembed'`
+        : `${recorded} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`,
+    };
+  }
   if (channel.state === "partial") {
     return {
       name: EMBEDDING_MODEL_CHECK,
@@ -188,17 +201,12 @@ export function embeddingModelCheck(
         detail: "MEGAMEMORY_SEARCH=fts — keyword search only (configured)",
       };
     case "model_mismatch": {
-      // F10: unknown-model vectors are a problem, not a note — exit 1 makes CI
-      // and the acceptance flow catch a mixed vector space before it is served.
-      const model = db.getMetaValue("embed_model");
       return {
         name: EMBEDDING_MODEL_CHECK,
         ok: false,
-        detail: model === "unknown"
-          ? `model unknown · vectors ${vectors.have}/${vectors.total} · run 'megamemory reembed'`
-          : model
-            ? `${model} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`
-            : "not recorded — run 'megamemory migrate --apply'",
+        detail: recorded
+          ? `${recorded} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`
+          : "not recorded — run 'megamemory migrate --apply'",
       };
     }
   }
