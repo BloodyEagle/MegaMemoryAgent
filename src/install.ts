@@ -1406,6 +1406,11 @@ export async function runInstall(args: string[]): Promise<InstallOutcome> {
   const failed = steps.filter((s) => !s.ok);
   if (failed.length === 0) {
     console.log(`  ${pc.green(pc.bold("Done."))}`);
+    if (!options.dryRun) {
+      console.log(
+        pc.dim(`  Semantic search is off until this project's base has a vector generation: run ${pc.cyan("megamemory reembed")} in the project once.`)
+      );
+    }
     if (targets.includes("opencode")) {
       console.log(
         pc.dim(`  Restart opencode, then run ${pc.cyan("/user:bootstrap-memory")} in your project.`)

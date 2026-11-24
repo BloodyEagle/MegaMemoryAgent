@@ -5,6 +5,8 @@ import { fileURLToPath } from "url";
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENTS_MD_SNIPPET } from "../guide.js";
+import type { VectorChannelState } from "../embeddings.js";
+import { cleanupDir } from "./helpers/cleanup.js";
 
 const { execFileSyncMock, execSyncMock } = vi.hoisted(() => ({
   execFileSyncMock: vi.fn(() => {
@@ -48,6 +50,8 @@ const realConfigPaths = [
     path.join(home, ".config", "kilo", "kilo.jsonc"), path.join(home, ".config", "kilo", "AGENTS.md"),
     path.join(home, ".kilocode", "mcp_settings.json"), path.join(home, ".kilocode", "settings", "mcp_settings.json"),
     path.join(home, ".config", "opencode", "opencode.json"), path.join(home, ".config", "opencode", "AGENTS.md"),
+    path.join(home, ".zcode", "cli", "config.json"), path.join(home, ".zcode", "AGENTS.md"),
+    path.join(home, ".zcode", "skills", "megamemory", "SKILL.md"),
   ]),
   ...[process.env.APPDATA, process.env.LOCALAPPDATA].filter((dir): dir is string => Boolean(dir)).flatMap((dir) => [
     path.join(dir, "Code", "User", "globalStorage", "kilocode.kilo-code", "settings", "mcp_settings.json"),
@@ -123,6 +127,34 @@ afterEach(() => {
 });
 
 describe("runInstall", () => {
+  it.each(["opencode", "claudecode", "antigravity", "codex", "kilo", "zcode", "opencode,zcode,kilo"])(
+    "prints once-per-project reembed advice once for successful target(s) %s", async (targets) => {
+      const sandbox = makeSandbox();
+      fs.writeFileSync(path.join(sandbox.workspaceDir, "kilo.jsonc"), "{}\n", "utf8");
+      const realHashes = configHashes(realConfigPaths);
+      const { runInstall } = await loadInstallModule(sandbox);
+      expect((await runInstall(["--target", targets])).ok).toBe(true);
+      const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+      expect(printed.match(/Semantic search is off until this project's base has a vector generation/g)).toHaveLength(1);
+      expect(printed).toContain("megamemory reembed");
+      expect(printed).toContain("in the project once.");
+      expect(fs.existsSync(path.join(sandbox.root, "never-opened.db"))).toBe(false);
+      expect(configHashes(realConfigPaths)).toEqual(realHashes);
+    }
+  );
+
+  it.each([
+    { name: "dry-run", args: ["--target", "zcode", "--dry-run"], malformed: false },
+    { name: "uninstall", args: ["--target", "zcode", "--uninstall"], malformed: false },
+    { name: "failed install", args: ["--target", "antigravity"], malformed: true },
+  ])("does not print successful-install reembed advice for $name", async ({ args, malformed }) => {
+    const sandbox = makeSandbox();
+    if (malformed) fs.writeFileSync(path.join(sandbox.workspaceDir, "mcp_config.json"), '{"mcpServers": ', "utf8");
+    const { runInstall } = await loadInstallModule(sandbox);
+    expect((await runInstall(args)).ok).toBe(!malformed);
+    expect(vi.mocked(console.log).mock.calls.flat().join("\n")).not.toContain("Semantic search is off until");
+  });
+
   it.each(["kilo,opencode", "opencode,kilo", "kilo,claudecode"]) (
     "rejects mixed --dry-run targets %s before any file operation", async (targets) => {
       const sandbox = makeSandbox();
@@ -397,5 +429,62 @@ describe("runInstall", () => {
     expect(agents).toContain("## User Section");
     expect(agents).toContain("User rules stay.");
     expect(agents.match(/megamemory:instructions/g)).toHaveLength(1);
+  });
+});
+
+describe("Plan 33 A5 runReembed messages", () => {
+  const cases: Array<{ name: string; channel: VectorChannelState; recorded?: string; expected: string; forbidden: string[] }> = [
+    { name: "first generation without a model stamp", channel: { state: "off", reason: "no_generation" }, expected: "no vector generation yet — this run creates it (first run downloads the model once)", forbidden: ["model changed:", "embeddings already match"] },
+    { name: "first generation with the current model stamp", channel: { state: "off", reason: "no_generation" }, recorded: "current", expected: "no vector generation yet — this run creates it", forbidden: ["model changed:", "embeddings already match"] },
+    { name: "generation with no published vectors", channel: { state: "off", reason: "generation_without_vectors" }, recorded: "current", expected: "has no published vectors yet — reembedding eligible nodes", forbidden: ["model changed:", "embeddings already match"] },
+    { name: "matching fully indexed generation", channel: { state: "on" }, recorded: "current", expected: "embeddings already match", forbidden: ["model changed:", "no vector generation yet", "reindexing anyway"] },
+    { name: "partial vector coverage", channel: { state: "partial", missing: 3, total: 5 }, recorded: "current", expected: "is incomplete: 3/5 node(s) have no vectors — continuing reembed", forbidden: ["embeddings already match", "model changed:"] },
+    { name: "another recorded model", channel: { state: "off", reason: "model_mismatch" }, recorded: "other-model", expected: "model changed: other-model ->", forbidden: ["embeddings already match", "no vector generation yet"] },
+    { name: "same-model incompatible profile", channel: { state: "off", reason: "model_mismatch" }, recorded: "current", expected: "vector generation profile does not match", forbidden: ["model changed:", "embeddings already match"] },
+    { name: "explicit text-only mode", channel: { state: "off", reason: "text_only_mode" }, recorded: "current", expected: "semantic search remains disabled while MEGAMEMORY_SEARCH=fts", forbidden: ["model changed:", "embeddings already match", "vector search starts after"] },
+  ];
+
+  it.each(cases)("reports $name truthfully without downloading a model", async ({ channel, recorded, expected, forbidden }) => {
+    const sandbox = makeSandbox();
+    try {
+      await loadInstallModule(sandbox);
+      const { KnowledgeDB } = await import("../db.js");
+      const embeddings = await import("../embeddings.js");
+      const reembedModule = await import("../reembed.js");
+      const dbPath = path.join(sandbox.workspaceDir, "reembed.db");
+      const fixture = new KnowledgeDB(dbPath);
+      try {
+        if (recorded) fixture.setMetaValue("embed_model", recorded === "current" ? embeddings.MODEL_NAME : recorded);
+      } finally {
+        fixture.close();
+      }
+      const channelSpy = vi.spyOn(embeddings, "vectorChannelState").mockReturnValue(channel);
+      const reembedSpy = vi.spyOn(reembedModule, "reembed").mockResolvedValue({ processed: 2, total: 2, dim: 4, model: embeddings.MODEL_NAME });
+      const closeSpy = vi.spyOn(KnowledgeDB.prototype, "close");
+      const { runReembed } = await import("../reembed-cli.js");
+
+      await runReembed(["--db", dbPath, "--batch", "2"]);
+
+      const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+      expect(printed).toContain(expected);
+      for (const text of forbidden) expect(printed).not.toContain(text);
+      if (channel.state === "partial") {
+        expect(printed).toContain("vector search covers indexed nodes only");
+        expect(printed).toContain("every query word must occur");
+      }
+      expect(channelSpy).toHaveBeenCalledOnce();
+      expect(reembedSpy).toHaveBeenCalledWith(expect.any(KnowledgeDB), expect.objectContaining({ batch: 2, onProgress: expect.any(Function) }));
+      expect(closeSpy).toHaveBeenCalledOnce();
+      expect(printed).toContain("reembedded 2 node(s), dim=4");
+    } finally {
+      process.chdir(originalCwd);
+      // Mock call arguments retain the closed DB; release them before native GC.
+      vi.clearAllMocks();
+      vi.restoreAllMocks();
+      (globalThis as { gc?: () => void }).gc?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await cleanupDir(sandbox.root);
+      expect(fs.existsSync(sandbox.root), "CLI native DB sandbox must be removed").toBe(false);
+    }
   });
 });
