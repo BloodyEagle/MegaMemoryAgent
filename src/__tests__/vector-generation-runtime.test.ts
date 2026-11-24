@@ -5,7 +5,7 @@ import path from "node:path";
 import { KnowledgeDB, type VectorGeneration } from "../db.js";
 import { reembed } from "../reembed.js";
 import { hybridSearch } from "../search.js";
-import { MODEL_NAME, embedForStorage, embeddingProfile, vectorSearchEnabled } from "../embeddings.js";
+import { MODEL_NAME, embedForStorage, embeddingProfile, vectorChannelState, vectorSearchEnabled } from "../embeddings.js";
 
 vi.mock("@huggingface/transformers", () => ({
   pipeline: vi.fn(() => { throw new Error("P10_MODEL_DOWNLOAD_FORBIDDEN"); }),
@@ -292,6 +292,29 @@ describe("P10 atomic invalidation/publication and afterawait CAS", () => {
     expect(result).toEqual(vector(0, 1));
     expect(embedFn.mock.calls[0][0]).toBe(JSON.parse(before.profile).passage_prefix + "storage text");
     expect(active(db)).toEqual(before);
+  });
+
+  it("a same-model generation with dim = 0 accepts storage embeds without stamping the dimension", async () => {
+    const db = fresh([]);
+    expect((await index(db, MODEL_NAME)).processed).toBe(0);
+    expect(vectorChannelState(db)).toEqual({ state: "off", reason: "generation_without_vectors" });
+    const embedFn = vi.fn(async (_text: string) => vector(1, 0));
+    const stored = await embedForStorage(db, "storage text", { embedFn });
+    expect(stored).toEqual(vector(1, 0));
+    expect(embedFn.mock.calls[0][0]).toBe(JSON.parse(active(db).profile).passage_prefix + "storage text");
+    expect(active(db).dim).toBe(0);
+  });
+
+  it("a row published during the await fixes the dimension and keeps the pending storage embed valid", async () => {
+    const db = fresh([]);
+    await index(db, MODEL_NAME);
+    const result = await embedForStorage(db, "storage text", { embedFn: async () => {
+      db.insertNode({ id: "first", name: "first", kind: "feature", summary: "indexing text" });
+      expect(db.publishNodeEmbedding({ ...active(db), id: "first", name: "first", kind: "feature", summary: "indexing text" }, vector(1, 0))).toBe(true);
+      return vector(1, 0);
+    } });
+    expect(result).toEqual(vector(1, 0));
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
   });
 
   it("stale generation cannot stamp completion of a newer unfinished generation", async () => {

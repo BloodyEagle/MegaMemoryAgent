@@ -289,6 +289,18 @@ export interface StorageEmbeddingOptions {
 }
 
 /**
+ * Generation a write may publish into: same model and preprocessing. The
+ * dimension is learned by the first published row, so a same-model generation
+ * with dim = 0 is already writable.
+ */
+function storageGeneration(db: KnowledgeDB, model: string): VectorGeneration | null {
+  const active = db.getVectorGeneration();
+  if (!active || active.model !== model ||
+      !sameEmbeddingProfile(active.profile, embeddingProfile(model, active.dim))) return null;
+  return active;
+}
+
+/**
  * Keep the Buffer|null API; the DB publisher must additionally CAS the node
  * input and generation inside its transaction. A model switch during inference
  * returns null without stamping metadata or laundering historical vectors.
@@ -300,11 +312,14 @@ export async function embedForStorage(
 ): Promise<Buffer | null> {
   const model = opts.model ?? MODEL_NAME;
   if (model !== MODEL_NAME && !opts.embedFn) throw new Error("Alternate model requires embedFn");
-  if (!vectorSearchEnabled(db, model)) return null;
-  const expected = db.getVectorGeneration()!;
+  const expected = storageGeneration(db, model);
+  if (!expected) return null;
   const buffer = await (opts.embedFn ?? embed)(passageText(text, model));
-  if (!vectorGenerationMatches(db, expected)) return null;
-  if (!validEmbedding(buffer, expected.dim)) throw new Error("Invalid storage embedding dimension or values");
+  // The first row published during the await fixes the dimension: the
+  // generation stays current, only its dim and profile stamp move.
+  const current = storageGeneration(db, model);
+  if (!current || current.generation !== expected.generation) return null;
+  if (!validEmbedding(buffer, current.dim || dimOf(buffer))) throw new Error("Invalid storage embedding dimension or values");
   return buffer;
 }
 
