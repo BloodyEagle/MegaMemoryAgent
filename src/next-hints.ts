@@ -114,7 +114,7 @@ const KEYWORD_ONLY_WARNING =
  * План 33 A3: почему пустой ответ пуст, когда семантический канал выключен.
  * Каждая строка влезает в brief.LINE_MAX без обрезки.
  */
-export const SEARCH_WARNING: Record<Exclude<VectorChannelState, { state: "on" }>["reason"], string> = {
+export const SEARCH_WARNING: Record<Extract<VectorChannelState, { state: "off" }>["reason"], string> = {
   no_generation: KEYWORD_ONLY_WARNING,
   generation_without_vectors: KEYWORD_ONLY_WARNING,
   model_mismatch:
@@ -393,6 +393,10 @@ export function buildNextHints(input: NextHintsInput): NextHints {
   if (input.emptyReason === "no_match") {
     const channel = vectorChannelState(db);
     if (channel.state === "off") next.search_warning = SEARCH_WARNING[channel.reason];
+    if (channel.state === "partial") {
+      next.search_warning = `Векторы есть у ${channel.total - channel.missing} из ${channel.total} узлов — ` +
+        "семантический поиск неполный, `megamemory reembed` догонит.";
+    }
   }
   if (input.emptyReason) next.record = `${EMPTY_REASON_RECORD[input.emptyReason]} ${next.record}`;
   if (input.emptyReason !== "empty_base" && input.activity && input.activity.reads_since_write >= UNRECORDED_READS_THRESHOLD) {

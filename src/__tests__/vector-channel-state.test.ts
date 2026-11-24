@@ -49,6 +49,14 @@ const stages: Record<string, { prepare: (target: KnowledgeDB) => void | Promise<
     prepare: async (target) => { target.insertNode(node); await reembed(target, { embedFn }); },
     expected: { state: "on" },
   },
+  "partial coverage": {
+    prepare: async (target) => {
+      target.insertNode(node);
+      await reembed(target, { embedFn });
+      target.insertNode({ ...node, id: "pending", name: "pending" });
+    },
+    expected: { state: "partial", missing: 1, total: 2 },
+  },
   "unknown model": { prepare: (target) => { target.setMetaValue("embed_model", "unknown"); }, expected: off("model_mismatch") },
   "another recorded model": { prepare: (target) => { target.setMetaValue("embed_model", "other-model"); }, expected: off("model_mismatch") },
   "generation of another model": {
@@ -86,9 +94,9 @@ describe("vectorChannelState", () => {
     expect(vectorChannelState(target)).toEqual(expected);
   });
 
-  it.each(Object.entries(stages))("%s: on exactly when vectorSearchEnabled holds", async (_name, { prepare }) => {
+  it.each(Object.entries(stages))("%s: on or partial exactly when vectorSearchEnabled holds", async (_name, { prepare }) => {
     const target = await fresh(prepare);
-    expect(vectorChannelState(target).state === "on").toBe(vectorSearchEnabled(target));
+    expect(vectorChannelState(target).state !== "off").toBe(vectorSearchEnabled(target));
   });
 
   it("reembed on an empty base leaves dim = 0 behind", async () => {
@@ -96,7 +104,7 @@ describe("vectorChannelState", () => {
     expect(target.getVectorGeneration()?.dim).toBe(0);
   });
 
-  it.each(["no generation", "reembed on an empty base", "first row published", "another recorded model"])(
+  it.each(["no generation", "reembed on an empty base", "first row published", "partial coverage", "another recorded model"])(
     "MEGAMEMORY_SEARCH=fts overrides the %s state",
     async (name) => {
       vi.stubEnv("MEGAMEMORY_SEARCH", "fts");
@@ -104,6 +112,21 @@ describe("vectorChannelState", () => {
       expect(vectorChannelState(target)).toEqual(off("text_only_mode"));
     }
   );
+
+  it("partial coverage counts only reembed-eligible nodes", async () => {
+    const target = await fresh(stages["partial coverage"].prepare);
+    for (const id of ["removed", "inactive", "expired", "refuted", "abandoned"]) {
+      target.insertNode({ ...node, id, name: id });
+    }
+    target.softDeleteNode("removed", "fixture removed");
+    target.execSqlRun("UPDATE nodes SET status = 'deprecated' WHERE id = 'inactive'");
+    target.execSqlRun("UPDATE nodes SET valid_until = '2000-01-01' WHERE id = 'expired'");
+    target.execSqlRun("UPDATE nodes SET epistemic_status = id WHERE id IN ('refuted', 'abandoned')");
+    expect(target.getReembedEligibleCount()).toBe(2);
+    expect(vectorChannelState(target)).toEqual({ state: "partial", missing: 1, total: 2 });
+    target.execSqlRun("UPDATE nodes SET embedding = NULL WHERE id = 'first'");
+    expect(vectorChannelState(target)).toEqual({ state: "partial", missing: 2, total: 2 });
+  });
 
   it("judges against the expected model, not only the package default", async () => {
     const target = await fresh(stages["generation of another model"].prepare);

@@ -76,6 +76,19 @@ describe("doctor: the embedding model line follows the vector channel", () => {
     });
   });
 
+  it("partial coverage reports H/T and remains informational", async () => {
+    const target = await fresh(async (inner) => {
+      inner.insertNode(node);
+      await reembed(inner, { embedFn });
+      inner.insertNode({ ...node, id: "pending", name: "pending" });
+    });
+    expect(check(target, "embedding model")).toEqual({
+      name: "embedding model",
+      ok: true,
+      detail: `${MODEL_NAME} (vectors 1/2, vector search partial — run 'megamemory reembed')`,
+    });
+  });
+
   it.each(["unknown", "other-model"])("a recorded %s model stays a problem", async (model) => {
     const target = await fresh((inner) => { inner.setMetaValue("embed_model", model); });
     const line = check(target, "embedding model");

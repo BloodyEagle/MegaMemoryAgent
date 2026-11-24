@@ -243,9 +243,10 @@ export function vectorSearchEnabled(db: KnowledgeDB, model: string = MODEL_NAME)
   catch { return false; }
 }
 
-/** Whether the semantic channel answers; `on` holds exactly when `vectorSearchEnabled` does. */
+/** Whether the semantic channel is disabled, complete or missing eligible vectors. */
 export type VectorChannelState =
   | { state: "on" }
+  | { state: "partial"; missing: number; total: number }
   | {
       state: "off";
       reason: "text_only_mode" | "no_generation" | "generation_without_vectors" | "model_mismatch";
@@ -255,7 +256,7 @@ export type VectorChannelState =
  * One verdict about the vector channel for every surface that reports it.
  * @param db - knowledge base
  * @param model - model the caller expects; defaults to the package model
- * @returns `on`, or the first reason found why the channel is off
+ * @returns `on`, partial coverage, or the first reason why the channel is off
  */
 export function vectorChannelState(db: KnowledgeDB, model = MODEL_NAME): VectorChannelState {
   if (isTextOnlySearchMode()) return { state: "off", reason: "text_only_mode" };
@@ -272,6 +273,13 @@ export function vectorChannelState(db: KnowledgeDB, model = MODEL_NAME): VectorC
   }
   // No row published yet: reembed ran on an empty base or stopped before its first row.
   if (active.dim === 0) return { state: "off", reason: "generation_without_vectors" };
+  const coverage = db.execSqlFirst(
+    `SELECT COUNT(*) AS total, COALESCE(SUM(embedding IS NULL), 0) AS missing FROM nodes
+     WHERE removed_at IS NULL AND status = 'active'
+       AND COALESCE(epistemic_status, '') NOT IN ('refuted', 'abandoned')
+       AND (valid_until IS NULL OR julianday(valid_until) >= julianday('now'))`
+  ) as { missing: number; total: number };
+  if (coverage.missing > 0) return { state: "partial", missing: coverage.missing, total: coverage.total };
   return { state: "on" };
 }
 

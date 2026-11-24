@@ -753,8 +753,8 @@ export interface NextHints {
    */
   stale_warning?: string;
   /**
-   * План 33 A3: одна строка, только когда ответ пуст (reason = no_match) и
-   * семантический канал выключен — поиск шёл только по словам.
+   * План 33: при no_match и выключенном или неполном
+   * семантическом канале объясняет ограничение поиска.
    */
   search_warning?: string;
   /** Last complete observed session; omitted when its beginning is outside the timeline sample. */

@@ -2707,7 +2707,10 @@ export function listRoots(
       ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
       : undefined;
   const channel = vectorChannelState(db);
-  const searchHint = channel.state === "off" ? LIST_ROOTS_SEARCH_HINT : undefined;
+  const searchHint = channel.state === "on" ? undefined
+    : channel.state === "partial"
+      ? `Semantic search is partial (vectors ${channel.total - channel.missing}/${channel.total}): run \`megamemory reembed\` to finish indexing.`
+      : LIST_ROOTS_SEARCH_HINT;
 
   // План 09 (R-06a): корни читаются страницами под бюджет ответа, а не целиком
   // с последней порезкой в памяти. Как только корневая секция перестаёт

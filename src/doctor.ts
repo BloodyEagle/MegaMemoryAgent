@@ -159,6 +159,14 @@ export function embeddingModelCheck(
       detail: `${MODEL_NAME} (dim=${db.getVectorGeneration()!.dim}, vectors ${vectors.have}/${vectors.total}, vector search on)`,
     };
   }
+  if (channel.state === "partial") {
+    return {
+      name: EMBEDDING_MODEL_CHECK,
+      ok: true,
+      detail: `${MODEL_NAME} (vectors ${channel.total - channel.missing}/${channel.total}, ` +
+        "vector search partial — run 'megamemory reembed')",
+    };
+  }
   switch (channel.reason) {
     case "no_generation":
       return {
@@ -271,7 +279,7 @@ export function runDoctor(db: KnowledgeDB): {
     true, // informational — reembed pending is a normal state, not an error
     pending === 0
       ? "all active nodes have vectors"
-      : `${pending} node(s) await reembed (${vectorChannelState(db).state === "on"
+      : `${pending} node(s) await reembed (${vectorChannelState(db).state !== "off"
           ? "vector search covers indexed nodes, FTS covers the rest"
           : "search is keyword-only: every query word must occur"})`
   );

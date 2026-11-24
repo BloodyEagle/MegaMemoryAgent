@@ -230,6 +230,7 @@ describe("understand search_warning (plan 33 A3)", () => {
     await reembed(db, { embedFn });
     db.softDeleteNode("gone", "fixture removed");
     seedMiss();
+    db.execSqlRun("UPDATE nodes SET status = 'deprecated' WHERE id = 'stored'");
     expect(vectorChannelState(db)).toEqual({ state: "on" });
     for (const mode of ["compact", "full", "brief"] as const) {
       const out = await understand(db, { query: MISS, mode });
@@ -243,6 +244,23 @@ describe("understand search_warning (plan 33 A3)", () => {
     vi.stubEnv("MEGAMEMORY_SEARCH", "hybrid");
     expect(buildNextHints({ db, cards: [], emptyReason: "no_match" }).search_warning)
       .toBe(SEARCH_WARNING.no_generation);
+  });
+
+  it.each(["compact", "full", "brief"] as const)("partial coverage warns in %s", async (mode) => {
+    vi.stubEnv("MEGAMEMORY_SEARCH", "vector");
+    await reembed(db, { embedFn });
+    // A published generation stays dimensioned after its only indexed node is removed.
+    const first = { id: "indexed", name: "indexed", kind: "module", summary: "Indexed node carries a valid vector." };
+    db.insertNode(first);
+    db.setMetaValue("embed_model", MODEL_NAME);
+    await reembed(db, { embedFn });
+    db.softDeleteNode("indexed", "fixture removed");
+    seedMiss();
+    expect(vectorChannelState(db)).toEqual({ state: "partial", missing: 1, total: 1 });
+    const out = await understand(db, { query: MISS, mode });
+    expect(out.meta!.reason).toBe("no_match");
+    expect(out.next!.search_warning).toBe("Векторы есть у 0 из 1 узлов — семантический поиск неполный, `megamemory reembed` догонит.");
+    expect(out.meta!.tokens_estimated).toBe(measureMcpPayload(out));
   });
 
   it("an answered search carries no warning", async () => {
