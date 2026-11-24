@@ -111,7 +111,8 @@ describe("reembed", () => {
     let calls = 0;
     const failing = async (text: string): Promise<Buffer> => {
       calls += 1;
-      if (calls > 3) throw new Error("interrupted");
+      // One warmup plus three published rows before interruption.
+      if (calls > 4) throw new Error("interrupted");
       const vec = new Float32Array(FAKE_DIM).fill(calls);
       return Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
     };

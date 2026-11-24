@@ -5,7 +5,7 @@ import path from "node:path";
 import { KnowledgeDB, type VectorGeneration } from "../db.js";
 import { reembed } from "../reembed.js";
 import { hybridSearch } from "../search.js";
-import { MODEL_NAME, embedForStorage, embeddingProfile, vectorChannelState, vectorSearchEnabled } from "../embeddings.js";
+import { MODEL_NAME, embedForStorage, embeddingProfile, passageText, vectorChannelState, vectorSearchEnabled } from "../embeddings.js";
 
 vi.mock("@huggingface/transformers", () => ({
   pipeline: vi.fn(() => { throw new Error("P10_MODEL_DOWNLOAD_FORBIDDEN"); }),
@@ -52,7 +52,9 @@ function snapshot(db: KnowledgeDB) {
   return {
     meta: db.execSqlAll("SELECT key,value FROM meta ORDER BY key"),
     canonical: db.execSqlAll("SELECT id,hex(embedding) AS embedding,embedding_generation FROM nodes ORDER BY id"),
-    native: db.execSqlAll("SELECT id,hex(embedding) AS embedding,generation FROM nodes_vec ORDER BY id"),
+    native: db.execSqlFirst("SELECT name FROM sqlite_master WHERE name='nodes_vec'")
+      ? db.execSqlAll("SELECT id,hex(embedding) AS embedding,generation FROM nodes_vec ORDER BY id")
+      : null,
   };
 }
 
@@ -85,17 +87,127 @@ afterAll(async () => {
   console.info(`P10_PARENT_CLEANUP_REQUIRED ${[...deferredCleanup].join(",")}`);
 });
 
+describe("D02 reembed warmup before generation changes", () => {
+  it.each(["indexed", "fresh", "empty"])("warmup failure leaves %s generation and both projections unchanged", async (state) => {
+    const db = fresh(state === "empty" ? [] : ["first", "second"]);
+    if (state === "indexed") await index(db, "p10-old");
+    const beforeGeneration = db.getVectorGeneration();
+    const before = snapshot(db);
+    if (state === "indexed") {
+      expect(beforeGeneration?.model).toBe("p10-old");
+      expect(before.canonical).toHaveLength(2);
+      expect(ids(db.getAllActiveNodesWithEmbeddings())).toEqual(["first", "second"]);
+      expect(before.native).toHaveLength(2);
+    } else {
+      expect(beforeGeneration).toBeNull();
+      expect(db.getMetaValue("vector_generation_counter")).toBeUndefined();
+    }
+    const begin = vi.spyOn(db, "beginVectorGeneration");
+    const embedFn = vi.fn(async (_text: string): Promise<Buffer> => {
+      expect(snapshot(db)).toEqual(before);
+      expect(begin).not.toHaveBeenCalled();
+      throw new Error("D02_WARMUP_FAILURE");
+    });
+
+    await expect(reembed(db, { embedFn })).rejects.toThrow("D02_WARMUP_FAILURE");
+
+    expect(embedFn).toHaveBeenCalledTimes(1);
+    expect(embedFn).toHaveBeenCalledWith(passageText("warmup", MODEL_NAME));
+    expect(begin).not.toHaveBeenCalled();
+    expect(db.getVectorGeneration()).toEqual(beforeGeneration);
+    expect(snapshot(db)).toEqual(before);
+    if (state !== "indexed") expect(db.getVectorGeneration()).toBeNull();
+  });
+
+  it("awaits prefixed warmup before switching and learns dimension only from actual rows", async () => {
+    const db = fresh();
+    await index(db, "p10-old");
+    const beforeGeneration = active(db);
+    const before = snapshot(db);
+    const begin = vi.spyOn(db, "beginVectorGeneration");
+    let calls = 0;
+    const embedFn = vi.fn(async (_text: string): Promise<Buffer> => {
+      if (++calls === 1) {
+        await Promise.resolve();
+        expect(begin).not.toHaveBeenCalled();
+        expect(active(db)).toEqual(beforeGeneration);
+        expect(snapshot(db)).toEqual(before);
+        return vector(1, 0, 0);
+      }
+      expect(begin).toHaveBeenCalledTimes(1);
+      expect(active(db).model).toBe(MODEL_NAME);
+      return vector(0, 1);
+    });
+
+    expect(await reembed(db, { embedFn })).toEqual({ processed: 2, total: 2, dim: 2, model: MODEL_NAME });
+
+    expect(embedFn).toHaveBeenCalledTimes(3);
+    expect(embedFn.mock.calls[0][0]).toBe(passageText("warmup", MODEL_NAME));
+    expect(embedFn.mock.calls.slice(1).every(([text]) => text.startsWith("passage: "))).toBe(true);
+    expect(active(db).generation).toBeGreaterThan(beforeGeneration.generation);
+    expect(active(db).dim).toBe(2);
+    const after = snapshot(db);
+    expect(after.canonical).not.toEqual(before.canonical);
+    expect(after.native).not.toEqual(before.native);
+    expect(after.native).toHaveLength(2);
+    await parity(db, MODEL_NAME, [0, 1], ["first", "second"]);
+  });
+
+  it("successful warmup of an empty database leaves generation dimension unknown", async () => {
+    const db = fresh([]);
+    const before = snapshot(db);
+    expect(db.getVectorGeneration()).toBeNull();
+    const embedFn = vi.fn(async (_text: string): Promise<Buffer> => vector(1, 0, 0));
+
+    expect(await reembed(db, { embedFn })).toEqual({ processed: 0, total: 0, dim: 0, model: MODEL_NAME });
+
+    expect(embedFn).toHaveBeenCalledTimes(1);
+    expect(embedFn).toHaveBeenCalledWith(passageText("warmup", MODEL_NAME));
+    expect(active(db).dim).toBe(0);
+    expect(JSON.parse(active(db).profile).dim).toBe(0);
+    expect(db.getMetaValue("embed_dim")).toBe("0");
+    expect(snapshot(db).canonical).toEqual(before.canonical);
+    expect(snapshot(db).native).toEqual(before.native);
+    expect(vectorChannelState(db)).toEqual({ state: "off", reason: "generation_without_vectors" });
+  });
+
+  it("validates arguments before warmup or generation writes", async () => {
+    const db = fresh();
+    await index(db, "p10-old");
+    const beforeGeneration = active(db);
+    const before = snapshot(db);
+    const begin = vi.spyOn(db, "beginVectorGeneration");
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+
+    await expect(reembed(db, { batch: 0, embedFn })).rejects.toThrow("Invalid reembed batch");
+    await expect(reembed(db, { model: "p10-new" })).rejects.toThrow("Alternate model requires embedFn");
+
+    expect(embedFn).not.toHaveBeenCalled();
+    expect(begin).not.toHaveBeenCalled();
+    expect(active(db)).toEqual(beforeGeneration);
+    expect(snapshot(db)).toEqual(before);
+  });
+});
+
 describe("P10 generation switch, partial coverage and resume", () => {
   it.each([2, 3])("model switch to dimension %i fails second, serves only current rows, resumes without laundering", async (dim) => {
     const db = fresh();
     await index(db, "p10-old");
     const old = active(db);
+    const before = snapshot(db);
+    expect(before.canonical).toHaveLength(2);
+    expect(before.native).toHaveLength(2);
     const values = dim === 2 ? [0, 1] : [0, 1, 0];
     let calls = 0;
     await expect(reembed(db, { model: "p10-new", batch: 2, embedFn: async () => {
-      if (++calls === 2) throw new Error("P10_SECOND_EMBED_FAILURE");
+      if (++calls === 3) throw new Error("P10_SECOND_EMBED_FAILURE");
       return vector(...values);
     } })).rejects.toThrow("P10_SECOND_EMBED_FAILURE");
+    expect(calls).toBe(3);
+    const after = snapshot(db);
+    expect(after.canonical).not.toEqual(before.canonical);
+    expect(after.native).not.toEqual(before.native);
+    expect(after.native).toHaveLength(dim === 2 ? 1 : 0);
     const partial = active(db);
     expect(partial.generation).toBeGreaterThan(old.generation);
     expect(partial.model).toBe("p10-new");
@@ -121,10 +233,28 @@ describe("P10 generation switch, partial coverage and resume", () => {
   it("failure on the first row keeps both projections invalid and dim unknown until resume", async () => {
     const db = fresh();
     await index(db, "p10-old");
-    await expect(reembed(db, { model: "p10-new", embedFn: async () => { throw new Error("P10_FIRST_FAILURE"); } })).rejects.toThrow("P10_FIRST_FAILURE");
+    const old = active(db);
+    const before = snapshot(db);
+    expect(before.canonical).toHaveLength(2);
+    expect(before.native).toHaveLength(2);
+    let calls = 0;
+    await expect(reembed(db, { model: "p10-new", embedFn: async () => {
+      if (++calls === 2) throw new Error("P10_FIRST_FAILURE");
+      return vector(1, 0);
+    } })).rejects.toThrow("P10_FIRST_FAILURE");
+    expect(calls).toBe(2);
+    const after = snapshot(db);
+    expect(after.canonical).not.toEqual(before.canonical);
+    expect(after.native).toEqual([]);
+    expect(active(db).generation).toBeGreaterThan(old.generation);
+    expect(active(db).model).toBe("p10-new");
     expect(active(db).dim).toBe(0);
     expect(db.getAllActiveNodesWithEmbeddings()).toEqual([]);
     expect(db.execSqlAll("SELECT id FROM nodes_vec")).toEqual([]);
+    expect(db.execSqlAll("SELECT embedding,embedding_generation FROM nodes ORDER BY id")).toEqual([
+      { embedding: null, embedding_generation: null },
+      { embedding: null, embedding_generation: null },
+    ]);
     const generation = active(db).generation;
     expect((await index(db, "p10-new")).processed).toBe(2);
     expect(active(db).generation).toBe(generation);
@@ -214,10 +344,13 @@ describe("P10 atomic invalidation/publication and afterawait CAS", () => {
 
   it("generation switch while reembedding rejects publication and leaves new generation empty", async () => {
     const db = fresh(["first"]);
+    let calls = 0;
     await expect(reembed(db, { model: "p10-first", embedFn: async () => {
+      if (++calls === 1) return vector(1, 0);
       db.beginVectorGeneration({ model: "p10-second", profile: embeddingProfile("p10-second"), dim: 0 });
       return vector(1, 0);
     } })).rejects.toThrow(/generation changed/);
+    expect(calls).toBe(2);
     expect(active(db).model).toBe("p10-second");
     expect(db.getAllActiveNodesWithEmbeddings()).toEqual([]);
     expect(db.getMetaValue("last_reembed")).toBeUndefined();
@@ -225,33 +358,45 @@ describe("P10 atomic invalidation/publication and afterawait CAS", () => {
 
   it.each(["name", "kind", "summary"])("concurrent %s edit rejects the captured embedding then resume embeds current text", async (field) => {
     const db = fresh(["first"]);
+    let calls = 0;
     await expect(reembed(db, { model: "p10-new", embedFn: async () => {
+      if (++calls === 1) return vector(1, 0);
       db.execSqlRun(`UPDATE nodes SET ${field}=@value WHERE id='first'`, { value: "new input" });
       return vector(1, 0);
     } })).rejects.toThrow(/input or vector generation changed/);
+    expect(calls).toBe(2);
     expect(db.getNode("first")?.embedding).toBeNull();
     const embedFn = vi.fn(async (_text: string) => vector(0, 1));
     expect((await reembed(db, { model: "p10-new", embedFn })).processed).toBe(1);
-    expect(embedFn.mock.calls[0][0]).toContain("new input");
+    expect(embedFn).toHaveBeenCalledTimes(2);
+    expect(embedFn.mock.calls[0][0]).toBe(passageText("warmup", "p10-new"));
+    expect(embedFn.mock.calls[1][0]).toContain("new input");
   });
 
   it("soft-delete during inference rejects publish and resume does not embed removed nodes", async () => {
     const db = fresh(["first"]);
+    let calls = 0;
     await expect(reembed(db, { model: "p10-new", embedFn: async () => {
+      if (++calls === 1) return vector(1, 0);
       db.softDeleteNode("first", "P10_TEST_REMOVE");
       return vector(1, 0);
     } })).rejects.toThrow(/input or vector generation changed/);
-    const embedFn = vi.fn(async () => vector(1, 0));
+    expect(calls).toBe(2);
+    const embedFn = vi.fn(async (_text: string) => vector(1, 0));
     expect(await reembed(db, { model: "p10-new", embedFn })).toMatchObject({ processed: 0, total: 0 });
-    expect(embedFn).not.toHaveBeenCalled();
+    expect(embedFn).toHaveBeenCalledTimes(1);
+    expect(embedFn).toHaveBeenCalledWith(passageText("warmup", "p10-new"));
   });
 
   it("a captured publication cannot target an id that was renamed during inference", async () => {
     const db = fresh(["first"]);
+    let calls = 0;
     await expect(reembed(db, { model: "p10-new", embedFn: async () => {
+      if (++calls === 1) return vector(1, 0);
       db.execSql("UPDATE nodes SET id='renamed' WHERE id='first'");
       return vector(1, 0);
     } })).rejects.toThrow(/input or vector generation changed/);
+    expect(calls).toBe(2);
     expect(db.getNode("renamed")?.embedding).toBeNull();
     expect(db.getNode("first")).toBeUndefined();
     expect((await index(db, "p10-new")).processed).toBe(1);
