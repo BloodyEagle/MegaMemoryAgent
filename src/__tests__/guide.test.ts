@@ -66,6 +66,7 @@ describe("гвард объёма, формы и ядра сниппета (пл
     // «одной гигантской строки».
     expect(SNIPPET.length, `SNIPPET.length = ${SNIPPET.length}`).toBeLessThanOrEqual(3000);
     const lines = SNIPPET.split("\n").length;
+    console.info(`[33/D-04] SNIPPET.length=${SNIPPET.length}; lines=${lines}`);
     expect(lines, `строк = ${lines}`).toBeLessThanOrEqual(35);
   });
 
@@ -83,6 +84,7 @@ describe("гвард объёма, формы и ядра сниппета (пл
       "supersedes",
       "lawfully record nothing",
       "megamemory guide --workflow",
+      "Empty search: 2–3 exact terms or an id, then `include_inactive: true`.",
     ];
     for (const marker of markers) {
       expect(SNIPPET, marker).toContain(marker);
