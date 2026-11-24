@@ -1,6 +1,6 @@
 import type { KnowledgeDB } from "./db.js";
 import { SCHEMA_VERSION } from "./db.js";
-import { MODEL_NAME, isModelLoaded, vectorSearchEnabled } from "./embeddings.js";
+import { MODEL_NAME, isModelLoaded, vectorChannelState } from "./embeddings.js";
 import { MIGRATION_TARGET_SCHEMA_VERSION } from "./migrate-schema.js";
 import { isBrokenId } from "./migrate.js";
 import { D3_CDN_FALLBACK_NOTE, d3Source } from "./d3-asset.js";
@@ -137,6 +137,65 @@ export function healthReport(db: KnowledgeDB): HealthReport {
   };
 }
 
+const EMBEDDING_MODEL_CHECK = "embedding model";
+
+/**
+ * The "embedding model" line: the text follows `vectorChannelState`, so a
+ * model stamp without a generation never reads as "vector search on". A
+ * missing generation is the normal state of a fresh base, not a problem.
+ * @param db - knowledge base
+ * @param vectors - live node vector counts, already collected by the caller
+ * @returns the check to add to the report
+ */
+export function embeddingModelCheck(
+  db: KnowledgeDB,
+  vectors: { have: number; total: number }
+): DoctorCheck {
+  const channel = vectorChannelState(db);
+  if (channel.state === "on") {
+    return {
+      name: EMBEDDING_MODEL_CHECK,
+      ok: true,
+      detail: `${MODEL_NAME} (dim=${db.getVectorGeneration()!.dim}, vectors ${vectors.have}/${vectors.total}, vector search on)`,
+    };
+  }
+  switch (channel.reason) {
+    case "no_generation":
+      return {
+        name: EMBEDDING_MODEL_CHECK,
+        ok: true,
+        detail: "vector search OFF — no generation: run 'megamemory reembed' (keyword search matches ALL query words)",
+      };
+    case "generation_without_vectors":
+      return {
+        name: EMBEDDING_MODEL_CHECK,
+        ok: true,
+        detail: "vector search OFF — generation without vectors (reembed ran on an empty base or stopped before its first row): " +
+          "run 'megamemory reembed' (keyword search matches ALL query words)",
+      };
+    case "text_only_mode":
+      return {
+        name: EMBEDDING_MODEL_CHECK,
+        ok: true,
+        detail: "MEGAMEMORY_SEARCH=fts — keyword search only (configured)",
+      };
+    case "model_mismatch": {
+      // F10: unknown-model vectors are a problem, not a note — exit 1 makes CI
+      // and the acceptance flow catch a mixed vector space before it is served.
+      const model = db.getMetaValue("embed_model");
+      return {
+        name: EMBEDDING_MODEL_CHECK,
+        ok: false,
+        detail: model === "unknown"
+          ? `model unknown · vectors ${vectors.have}/${vectors.total} · run 'megamemory reembed'`
+          : model
+            ? `${model} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`
+            : "not recorded — run 'megamemory migrate --apply'",
+      };
+    }
+  }
+}
+
 export function runDoctor(db: KnowledgeDB): {
   checks: DoctorCheck[];
   problems: number;
@@ -179,24 +238,8 @@ export function runDoctor(db: KnowledgeDB): {
       : "missing — run 'megamemory migrate --apply'"
   );
 
-  // embedding model
-  const model = db.getMetaValue("embed_model");
-  const dim = db.getMetaValue("embed_dim");
-  const vectorOk = vectorSearchEnabled(db);
-  // F10: unknown-model vectors are a problem, not a note — exit 1 makes CI
-  // and the acceptance flow catch a mixed vector space before it is served.
   const vectors = healthReport(db).vectors;
-  add(
-    "embedding model",
-    model === MODEL_NAME,
-    model === "unknown"
-      ? `model unknown · vectors ${vectors.have}/${vectors.total} · run 'megamemory reembed'`
-      : model
-        ? model === MODEL_NAME
-          ? `${model} (dim=${dim ?? "?"}, vector search on)`
-          : `${model} != current ${MODEL_NAME} — vector search off, run 'megamemory reembed'`
-        : "not recorded — run 'megamemory migrate --apply'"
-  );
+  checks.push(embeddingModelCheck(db, vectors));
 
   // Shared bounded read-only MATCH probe; external-content counts are not evidence.
   const ftsHealth = probeFtsHealth(db);
@@ -228,7 +271,9 @@ export function runDoctor(db: KnowledgeDB): {
     true, // informational — reembed pending is a normal state, not an error
     pending === 0
       ? "all active nodes have vectors"
-      : `${pending} node(s) await reembed (search still works via FTS)`
+      : `${pending} node(s) await reembed (${vectorChannelState(db).state === "on"
+          ? "vector search covers indexed nodes, FTS covers the rest"
+          : "search is keyword-only: every query word must occur"})`
   );
 
   // orphan edges

@@ -40,6 +40,7 @@ vi.mock("../embeddings.js", () => ({
   findTopK: vi.fn(),
   embedForStorage: vi.fn(async () => null),
   vectorSearchEnabled: vi.fn(() => false),
+  vectorChannelState: vi.fn(() => ({ state: "off", reason: "no_generation" })),
   cosineSimilarity: vi.fn(() => 0),
   queryText: vi.fn((q: string) => q),
   MODEL_NAME: "test-model",
