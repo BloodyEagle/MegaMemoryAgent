@@ -10,10 +10,13 @@ you noticed, or intent the user shared.
 
 Call `megamemory:list_roots` to see what's already recorded. Read the budgeted
 `roots_compact` index (`id`, `name`, `kind`, `child_count`, `valid_until`) plus
-`slots`, `board_top`, `hint`, `meta` (`returned`, `dropped`, `tokens_estimated`,
+`slots`, `board_top`, `hint`, optional top-level `hint_search`, `meta` (`returned`,
+`dropped`, `tokens_estimated`,
 `truncated`, `dropped_slots`, `dropped_board_top`), `stats`, and wrapper fields
 (`instructions_stale`, `instructions_version`, `server_version`). Legacy
 `roots` is empty for compatibility; the response does not return children. If `meta.truncated` is true, the visible list is not complete.
+If `hint_search` is present, follow its channel guidance; it is independent of
+`hint` and does not change the legacy string/record-object shape.
 Understanding the current state prevents duplicates and helps you decide what
 to update vs create.
 
@@ -29,8 +32,20 @@ Think about what happened this session. Consider:
 
 ## Step 3: Search for overlap
 
-Before creating anything new, call `megamemory:understand` with queries based on
-what you worked on this session. Compact is the default; use `mode:"full"` for
+Before creating anything new, call `megamemory:understand` with short queries
+based on what you worked on: 2–5 exact terms or identifiers in the language of
+the stored nodes. Keyword matching defaults to `match: "all"`; explicitly use
+`match: "any"` only for intentional OR expansion. Vectors are unchanged;
+`meta.match` appears only for an explicit choice. Semantic matching requires an
+available vector channel. Distinguish `meta.reason=empty_base|no_match|budget`:
+for `no_match`, retry with 2–3 exact terms or an id; for `budget`, first raise
+`max_tokens`. Follow `next.search_warning` for an `off` or `partial` channel;
+partial coverage leaves some nodes keyword-only, so a miss is not proof of no overlap.
+First-generation initialization runs in the background by default on successful
+node writes or MCP startup with eligible nodes. `MEGAMEMORY_AUTO_REEMBED=0` opts out;
+manual `megamemory reembed` remains useful for partial coverage or model mismatch.
+First model use may download about 120 MB; failures allow another eligible trigger
+after a 10-minute cooldown. Compact is the default; use `mode:"full"` for
 verbose cards or `mode:"brief"` for at most 8 orientation lines without cards.
 Every answer includes a mandatory `next`: read every `must_read` ref (mandatory
 sources, not proof of whole-file coverage) and execute every `followup` exactly

@@ -107,12 +107,12 @@ export function auditFixture() {
     const localAppData = path.join(home, "AppData", "Local");
     fs.mkdirSync(appData, { recursive: true });
     fs.mkdirSync(localAppData, { recursive: true });
-    return { home, env: { ...process.env, HOME: home, USERPROFILE: home, APPDATA: appData, LOCALAPPDATA: localAppData } };
+    return { home, env: { ...process.env, MEGAMEMORY_AUTO_REEMBED: "0", HOME: home, USERPROFILE: home, APPDATA: appData, LOCALAPPDATA: localAppData } };
   }
 
   function isolateHome() {
     const isolated = profile();
-    const keys = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] as const;
+    const keys = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "MEGAMEMORY_AUTO_REEMBED"] as const;
     const previous = keys.map((key) => [key, process.env[key]] as const);
     for (const key of keys) process.env[key] = isolated.env[key];
     restorers.push(() => {

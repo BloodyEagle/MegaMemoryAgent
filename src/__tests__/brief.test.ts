@@ -10,7 +10,7 @@ import {
   statusDigestOf,
 } from "../support-baselines.js";
 import { BRIEF_EMPTY_TEXT, RECORD_MAX, renderBrief } from "../brief.js";
-import { buildNextHints, EMPTY_REASON_RECORD, RECORD_FACT, UNRECORDED_READS_THRESHOLD } from "../next-hints.js";
+import { buildNextHints, EMPTY_REASON_RECORD, RECORD_FACT, SEARCH_WARNING, UNRECORDED_READS_THRESHOLD } from "../next-hints.js";
 import type { BriefOutput, UnderstandInput } from "../types.js";
 
 // План 13 §2.2: режим brief в understand — до 8 строк текста плюс блок next,
@@ -302,5 +302,20 @@ describe("План 13 §2.2: режим brief в understand", () => {
       expect(nudged.record.length).toBeLessThanOrEqual(RECORD_MAX);
       expect(renderBrief([{ name: "проверенный узел", kind: "feature", fileRefs: [] }], nudged).split("\n").at(-1)).toBe(nudged.record);
     }
+  });
+});
+
+describe("План 33 A3: search_warning в brief", () => {
+  it("каждая строка предупреждения влезает в строку брифа без обрезки", () => {
+    // 240 — brief.LINE_MAX: потолок одной строки брифа.
+    for (const warning of Object.values(SEARCH_WARNING)) {
+      expect(warning.length).toBeLessThanOrEqual(240);
+      const next = { ...buildNextHints({ db, cards: [] }), search_warning: warning };
+      expect(renderBrief([], next).split("\n")).toEqual([BRIEF_EMPTY_TEXT, warning]);
+    }
+  });
+
+  it("без предупреждения пустой brief остаётся одной строкой", () => {
+    expect(renderBrief([], buildNextHints({ db, cards: [] }))).toBe(BRIEF_EMPTY_TEXT);
   });
 });

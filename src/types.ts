@@ -314,6 +314,8 @@ export interface UnderstandOutput {
 
 export interface UnderstandInput {
   query: string;
+  /** Keyword conjunction: all by default; any explicitly expands with OR. */
+  match?: "all" | "any";
   top_k?: number;
   /** Token budget for the answer (default 4000). */
   max_tokens?: number;
@@ -565,6 +567,8 @@ export interface UnderstandCandidate {
 }
 
 export interface UnderstandMeta {
+  /** Present only when the caller explicitly chose keyword matching. */
+  match?: "all" | "any";
   /** Compact: visible candidates; full/brief retain their legacy count. */
   returned: number;
   /** Compact cards, not candidate-only matches. */
@@ -752,6 +756,11 @@ export interface NextHints {
    * после записи узла; перечитай ref, прежде чем опираться.
    */
   stale_warning?: string;
+  /**
+   * План 33: при no_match/budget и выключенном или неполном
+   * семантическом канале объясняет ограничение поиска.
+   */
+  search_warning?: string;
   /** Last complete observed session; omitted when its beginning is outside the timeline sample. */
   previous_session?: {
     had_understand: boolean;
@@ -1069,6 +1078,8 @@ export interface ListRootsOutput {
   slots?: Array<{ role: string; node_id: string; node_name: string }>;
   /** Plan 2 §3: top-5 of the open column by rot. */
   board_top?: Array<{ id: string; name: string; rot?: number; due_at?: string | null }>;
+  /** План 33 D-06: состояние поиска отдельно от прежнего hint. */
+  hint_search?: string;
   meta?: ListRootsMeta;
 }
 

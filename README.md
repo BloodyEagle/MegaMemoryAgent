@@ -6,7 +6,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20.10-brightgreen?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-2.12.4-orange?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-2.13.0-orange?style=flat-square" />
 </p>
 
 <p align="center">
@@ -175,6 +175,31 @@ megamemory install --target codex
 megamemory install --target kilo
 megamemory install --target zcode
 ```
+
+**First semantic setup is automatic by default.** A fresh base without a vector
+generation (including one without an `embed_model` stamp) is normal, not broken:
+until vectors are ready, keyword search uses `match: "all"` by default.
+Successful node writes and MCP startup schedule a missing first generation in the
+background when eligible nodes exist. This also covers a generation with no
+vectors yet; it does not repair model mismatches or partial coverage.
+
+Set `MEGAMEMORY_AUTO_REEMBED=0` to disable only this automatic initialization.
+The first use of the embedding model may download it (about 120 MB); subsequent
+uses load it from the local cache. Background work does not delay the tool's
+response. Failure is reported to stderr and the timeline; another eligible trigger
+can retry after a 10-minute cooldown, not by an automatic retry timer.
+
+Manual setup or recovery remains available in the project directory (or pass
+`--db PATH` for another base):
+
+```bash
+megamemory reembed
+```
+
+On an empty base it creates a generation with `dim = 0`; the first published node
+vector fixes the dimension. New nodes then receive vectors as they are written.
+`megamemory doctor` reports whether vector search is on, off, or partial; resume
+`reembed` for partial coverage, model changes, or explicitly disabled initialization.
 
 There is deliberately **no universal manual JSON snippet**: the clients use
 different schemas. `install` writes the correct form and the client-specific
@@ -384,7 +409,8 @@ megamemory doctor               # health check, exit code 1 on problems
   (or resumes) an explicit vector generation; switching generations atomically
   invalidates node blobs and the native `nodes_vec` projection, then republishes
   every eligible node. Only rows already published in the current generation
-  become vector hits; FTS covers the rest. Run `reembed` after a
+  become vector hits; unpublished nodes are keyword-only, where the default
+  `match: "all"` requires every query word. Run `reembed` after a
   model/preprocessing change and after migrating vectors of unknown origin.
 - The exporter owns no directory: `export --check` only reports differing,
   missing and extra `.md` files and exits nonzero on drift; it never deletes
@@ -748,7 +774,20 @@ proves neither that the agent saw it nor that it wrote knowledge.
 **Empty results** carry `meta.reason`: `empty_base` means no live nodes;
 `no_match` means live nodes exist but none pass the search/filters; `budget`
 means matches exist but no minimal qualified card fits — never interpret it as
-`no_match`. In `compact`, `full`, and `brief`, the first explanatory sentence
+`no_match`. When `meta.reason` is `no_match` or `budget` and the vector channel is
+`off` or `partial`, the answer carries `next.search_warning`. With `off` (no vector
+generation or usable vectors, another model, or `MEGAMEMORY_SEARCH=fts`), search is
+keyword-only: `match: "all"` requires every query word by default. With `partial`,
+vectors cover only some eligible nodes (`missing`/`total`); the rest are keyword-only.
+For `no_match`, retry with 2–3 exact terms or an id; keyword-only warnings also
+suggest explicit `match: "any"` when intentional OR expansion is appropriate. This changes
+only keyword matching, not vector matching. `meta.match` is present only when
+`match` was explicitly supplied (including `"all"`); omission keeps the all-word
+default without a tag. Follow the channel's next step; for `budget`, first raise
+`max_tokens` — this is a budget limit, not evidence
+of missing knowledge. Successful results, `empty_base`, and a fully working `on`
+channel carry no such field; in `brief` the warning is a separate line below the
+empty-result message. In `compact`, `full`, and `brief`, the first explanatory sentence
 and the full `next.record` contract are mandatory and never trimmed; if the
 required envelope cannot fit, the request is refused with an explicit error
 asking for a larger budget. The record line rendered in `brief` has its own
@@ -789,7 +828,10 @@ budget can be refused. `get_concept.hint.record` reads: «Узел уже ест
 evidence в том же вызове.» The `list_roots` hint instead reminds the agent
 that this is an overview: record the result for a specific branch as a
 separate node, not by editing the root. A hint is not an automatic write or a
-requirement to invent new knowledge.
+requirement to invent new knowledge. `list_roots` also has an independent,
+optional top-level `hint_search` about vector-channel readiness and the next
+step. It does not change `hint` into another shape or add `hint.search`, and is
+included in the same final `max_tokens` budget.
 
 **Stored kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest` · `task` · `journal`
 
@@ -918,6 +960,7 @@ Runtime controls read by MegaMemory itself:
 | `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Database fallback after `--db`; resolved from the process cwd. |
 | `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Transformers.js ONNX model identity; changing it requires `reembed`. |
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid`, `fts`, or `vector`; vector mode falls back to FTS when no valid current generation exists. |
+| `MEGAMEMORY_AUTO_REEMBED` | enabled | Exact value `0` disables automatic first-generation setup on node writes/MCP startup; manual `reembed` and an existing generation are unchanged. Model mismatches and partial coverage are never repaired automatically. |
 | `MEGAMEMORY_FTS_TOKENIZER` | unset | Exact value `trigram` requests the companion CJK FTS table/triggers. |
 | `MEGAMEMORY_EMBED_IDLE_MS` | `300000` | Idle milliseconds before unloading the model; `0` disables unload. Read when the module starts. |
 | `MEGAMEMORY_EMBED_THREADS` | `1` | ONNX intra-op thread count; inter-op remains 1. Read when the module starts. |

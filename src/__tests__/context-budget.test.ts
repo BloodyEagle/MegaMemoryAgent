@@ -55,7 +55,7 @@ describe("estimateTokens / trimSummary", () => {
 });
 
 describe("understand compact mode budget", () => {
-  it("keeps the hard cap: no card fits — empty answer with an explicit budget reason", async () => {
+  it("keeps the hard cap: nothing above budget; an empty answer names budget", async () => {
     const db = freshDb();
     insertFatNodes(db, 20);
 
@@ -86,19 +86,26 @@ describe("understand compact mode budget", () => {
     }
 
     expect(result.meta).toBeDefined();
-    // Бюджет — жёсткий потолок, а не пожелание: карточка сверх лимита не
-    // отдаётся. Пустой ответ обязан называть причину, иначе он читается как
-    // «ничего не нашлось» — это и было регрессом.
-    expect(result.compact!).toHaveLength(0);
-    expect(result.meta!.cards).toBe(0);
+    // Бюджет — жёсткий потолок: карточка сверх лимита не отдаётся. План 33
+    // добавил в конверт обязательный search_warning, и прежнее окно «ниже
+    // минимума и без карточек» сжалось: на минимуме сервер возвращает либо
+    // пустой ответ с reason=budget, либо одну минимальную карточку без
+    // summary (zh-контракт «optional summary уступить можно»). Регресс
+    // «пустой ответ без причины» ловит условие ниже.
+    expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(budget);
+    if (result.compact!.length === 0) {
+      expect(result.meta!.reason).toBe("budget");
+      expect(result.meta!.cards).toBe(0);
+    } else {
+      expect(result.meta!.reason).toBeUndefined();
+      expect(result.compact!.every((m) => !m.summary)).toBe(true);
+    }
     expect(result.meta!.returned).toBe(result.candidates!.length);
     expect(result.meta!.truncated).toBe(true);
-    expect(result.meta!.reason).toBe("budget");
     // Discovery не является карточкой, но видимый кандидат уже не dropped.
     expect(result.meta!.dropped).toBe(20 - result.candidates!.length);
     expect(result.next!.record).toBeTruthy();
-    expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
-    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(budget);
     // U6: the explorer derives "saved vs full" from this pair.
     expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);
   });
@@ -190,7 +197,7 @@ function listRootsForTest(db: KnowledgeDB) {
 }
 
 describe("patches v1.1: zh budget (А6/В15) and edges_between (В14)", () => {
-  it("20 chinese nodes, max_tokens=500: estimate holds", async () => {
+  it("20 chinese nodes, max_tokens=600: estimate holds", async () => {
     const db = freshDb();
     const fat = "支付模块设计说明".repeat(260); // ~2080 chars = ~6240 bytes
     for (let i = 1; i <= 20; i++) {
@@ -201,7 +208,11 @@ describe("patches v1.1: zh budget (А6/В15) and edges_between (В14)", () => {
         summary: fat + "标记" + i,
       });
     }
-    const result = await understand(db, { query: "支付", top_k: 20, max_tokens: 500 });
+    // План 33: обязательный search_warning поднял минимум пустого конверта
+    // с ~465 до 544 — бюджет 500 больше не помещает даже его, поэтому тест
+    // честности оценки идёт с запасом 600, а не подгонкой под старое число.
+    const cap = 600;
+    const result = await understand(db, { query: "支付", top_k: 20, max_tokens: cap });
     // Optional summary может уступить место минимальной квалифицированной
     // карточке. Discovery и карточки считаются отдельно, wire-cap — без льгот.
     expect(result.meta!.returned).toBe(result.candidates!.length);
@@ -234,9 +245,9 @@ describe("patches v1.1: zh budget (А6/В15) and edges_between (В14)", () => {
       expect(result.meta!.reason).toBeUndefined();
       if (result.meta!.dropped > 0) expect(result.brief).toBeTruthy();
     }
-    expect(result.meta!.estimated_full_tokens).toBeGreaterThan(500);
+    expect(result.meta!.estimated_full_tokens).toBeGreaterThan(cap);
     expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
-    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(500);
+    expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(cap);
     expect(result.meta!.truncated).toBe(true);
   });
 

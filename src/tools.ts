@@ -10,6 +10,7 @@ import {
   findTopK,
   queryText,
   vectorSearchEnabled,
+  vectorChannelState,
 } from "./embeddings.js";
 import { basicSearch, ftsSearch, hybridSearch, type SearchVia } from "./search.js";
 import { normalizeName, normalizeNameForDedupe } from "./norm.js";
@@ -42,7 +43,8 @@ import type {
   NodeKind,
   EdgeRow,
 } from "./types.js";
-import { buildNextHints, type NextHintsCard } from "./next-hints.js";
+import { buildNextHints, LIST_ROOTS_SEARCH_HINT, type NextHintsCard } from "./next-hints.js";
+import { scheduleFirstGeneration } from "./auto-reembed.js";
 import { timelineActivity } from "./timeline.js";
 import { renderBrief, renderDroppedText, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
@@ -696,7 +698,7 @@ export async function understand(
   const viaById = new Map<string, SearchVia>();
 
   if (mode === "hybrid") {
-    const hits = await hybridSearch(db, input.query, { topK: searchPool });
+    const hits = await hybridSearch(db, input.query, { topK: searchPool, match: input.match });
     topMatches = hits.map((h) => ({ id: h.id, similarity: h.score }));
     for (const h of hits) viaById.set(h.id, h.via);
   } else if (mode === "vector" && vectorSearchEnabled(db)) {
@@ -712,7 +714,7 @@ export async function understand(
       topMatches = findTopK(queryEmbedding, candidates, searchPool);
     }
   } else {
-    topMatches = basicSearch(db, input.query, searchPool);
+    topMatches = basicSearch(db, input.query, searchPool, { any: input.match === "any" });
   }
 
   activity = timelineActivity(db);
@@ -862,6 +864,7 @@ export async function understand(
       refuted: refutedForNext,
       activity,
       emptyReason: reason,
+      match: input.match,
     });
 
     // Полный режим по тем же сырым строкам, что и в compact-ветке (см. ниже):
@@ -885,6 +888,7 @@ export async function understand(
       inactive_excluded: inactiveExcluded,
       truncated: trunc,
       ...(reason ? { reason } : {}),
+      ...(input.match ? { match: input.match } : {}),
     });
 
     /** Тот объект, который уйдёт по проводу (brief + next + meta + extra). */
@@ -955,6 +959,7 @@ export async function understand(
       refuted: refuted.map((r) => ({ name: r.name, reason: r.refuted_reason ?? null })),
       activity,
       emptyReason: reason,
+      match: input.match,
     });
     const output: UnderstandOutput = {
       matches,
@@ -967,6 +972,7 @@ export async function understand(
         stale_excluded: staleExcluded,
         inactive_excluded: inactiveExcluded,
         ...(reason ? { reason } : {}),
+        ...(input.match ? { match: input.match } : {}),
       },
       next: fullNext,
     };
@@ -1191,6 +1197,7 @@ export async function understand(
       ...(staleRefsTotal > 0 ? { stale_refs_total: staleRefsTotal } : {}),
       ...(staleRefsMissing > 0 ? { stale_refs_missing: staleRefsMissing } : {}),
       ...(reason ? { reason } : {}),
+      ...(input.match ? { match: input.match } : {}),
     };
   };
 
@@ -1208,11 +1215,16 @@ export async function understand(
       refuted: refuted.map((card) => ({ name: card.name, reason: card.refuted_reason ?? null })),
       activity,
       emptyReason: meta.reason,
+      match: input.match,
     });
     // План 26 §3: одна строка, только при непустых stale_refs.
     if (staleRefsShown.length > 0) {
       next.stale_warning = "файл менялся после записи: перечитай ref, прежде чем опираться";
     }
+    // План 33 D-11/D-12: рекомендательная строка о канале едет в реальных
+    // ответах (в том числе budget), но не в теоретическом минимуме конверта:
+    // floor служит порогом отказа, и advisory не обязан его завышать.
+    if (floor) delete next.search_warning;
     const taskContext = taskPlan ? buildTaskContext(db, taskPlan, { compact, refuted, next }) : null;
     if (taskContext) {
       taskContext.duplicates_dropped = taskDuplicates;
@@ -2346,6 +2358,7 @@ export async function createConcept(
     ? ` Срок годности: ${validUntil} — после этой даты узел выпадет из выдачи.`
     : "";
 
+  void scheduleFirstGeneration(db);
   return {
     id,
     message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}${confirmNote}${validNote}`,
@@ -2547,6 +2560,7 @@ export async function updateConcept(
     if (!updated && !epistemicWrite) noChanges = true;
   });
 
+  void scheduleFirstGeneration(db);
   if (noChanges) {
     return { message: `No changes applied to "${input.id}"` };
   }
@@ -2705,6 +2719,13 @@ export function listRoots(
     stats.nodes === 0
       ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
       : undefined;
+  // План 33 D-06: состояние поиска — отдельное поле; пустой граф уже объяснён
+  // исходным hint, и лишние prepare на нём недопустимы (контракт R-06a).
+  const channel = stats.nodes === 0 ? undefined : vectorChannelState(db);
+  const searchHint = !channel || channel.state === "on" ? undefined
+    : channel.state === "partial"
+      ? `Semantic search is partial (vectors ${channel.total - channel.missing}/${channel.total}): run \`megamemory reembed\` to finish indexing.`
+      : LIST_ROOTS_SEARCH_HINT;
 
   // План 09 (R-06a): корни читаются страницами под бюджет ответа, а не целиком
   // с последней порезкой в памяти. Как только корневая секция перестаёт
@@ -2780,6 +2801,7 @@ export function listRoots(
     slots: slotsCut,
     board_top: boardCut,
     ...(hint ? { hint } : {}),
+    ...(searchHint ? { hint_search: searchHint } : {}),
     meta: {
       returned: roots.length,
       // Полное число корней (COUNT), не прочитанное: страницы могут быть

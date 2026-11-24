@@ -6,6 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it } from "vitest";
+import { AGENTS_MD_SNIPPET } from "../guide.js";
 
 const indexUrl = new URL("../index.ts", import.meta.url);
 const source = readFileSync(indexUrl, "utf8");
@@ -35,6 +36,27 @@ function sourceInstructions(version: string): string {
   return instructions;
 }
 
+function sourceHookContext(): string {
+  const installSource = readFileSync(new URL("../install.ts", import.meta.url), "utf8");
+  const expression = installSource.match(
+    /const ZCODE_HOOK_CONTEXT = ("(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`);/
+  )?.[1];
+  if (!expression) throw new Error("ZCODE_HOOK_CONTEXT initializer not found");
+  const context: unknown = runInNewContext(expression);
+  if (typeof context !== "string") throw new Error("Hook context must be a string");
+  return context;
+}
+
+function sourceToolDescription(name: string): string {
+  for (const match of source.matchAll(/\btool\(\s*"([^"]+)",\s*("(?:\\.|[^"\\])*")/g)) {
+    if (match[1] !== name) continue;
+    const description: unknown = JSON.parse(match[2]);
+    if (typeof description !== "string") throw new Error(`Description for ${name} must be a string`);
+    return description;
+  }
+  throw new Error(`Tool description for ${name} not found`);
+}
+
 function sourceServer(version: string, instructions: string): McpServer {
   const expression = source.match(/const server = (new McpServer\([\s\S]*?\));/)?.[1];
   if (!expression) throw new Error("McpServer initializer not found");
@@ -61,6 +83,56 @@ async function initialize(server: McpServer): Promise<{
     try { await client.close(); } finally { await server.close(); }
   }
 }
+
+describe("Agent instruction surface matrix (plan33 D03)", () => {
+  it.each([
+    {
+      surface: "MCP_INSTRUCTIONS",
+      read: (): string => sourceInstructions(sourceVersion()),
+      required: ["understand", "create_concept", "evidence"],
+    },
+    {
+      surface: "ZCODE_HOOK_CONTEXT",
+      read: sourceHookContext,
+      required: ["understand", "create_concept", "evidence"],
+    },
+    {
+      surface: "AGENTS_MD_SNIPPET",
+      read: (): string => AGENTS_MD_SNIPPET,
+      required: ["understand", "evidence", "confirm_supports"],
+    },
+  ])("keeps the required guidance in $surface", ({ read, required }) => {
+    const text = read();
+    for (const token of required) expect(text).toContain(token);
+  });
+});
+
+describe("Tool when-to-call descriptions (plan33 C3)", () => {
+  it.each([
+    {
+      name: "list_roots",
+      prefix: "Call for a one-screen orientation when you have no specific query yet (new project, new session) or when you need the board and slots — not a mandatory start ritual.",
+    },
+    {
+      name: "confirm_supports",
+      prefix: "Вызывай после того, как опора прочитана и ты фиксируешь, что прочитанная версия подтверждает решение; никогда — автоматически.",
+    },
+    {
+      name: "check_artifacts",
+      prefix: "Вызывай явно, когда `support_check` равен `unknown` или `changed` либо снимок старше 7 дней: узнать, менялся ли файл или git-объект опоры. Сам ничего не читает.",
+    },
+    {
+      name: "check_freshness",
+      prefix: "Вызывай после правок кода и перед следующей правкой — для файлов, которые затронешь: отчёт покажет, какие записи зависят от изменившихся источников. Знаний не пишет.",
+    },
+    {
+      name: "link",
+      prefix: "Вызывай, когда связь двух узлов не выражена `evidence` в `create_concept`; для `informed_by` нужен rationale.",
+    },
+  ])("prepends when-to-call guidance for $name", ({ name, prefix }) => {
+    expect(sourceToolDescription(name).startsWith(`${prefix} `)).toBe(true);
+  });
+});
 
 describe("MCP initialize instructions", () => {
   it("reads the source VERSION from package.json rather than duplicating it", () => {

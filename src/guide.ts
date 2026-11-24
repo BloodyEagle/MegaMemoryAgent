@@ -51,7 +51,7 @@ You have no memory of this project between sessions: this graph is your continui
 
 **When memory and code disagree:** investigate scope, versions and rationale first. Current code is the fact of implementation, not an automatic refutation of the decision.
 
-**After verified work:** record only new knowledge, a fix of an old node, or needed history — pure reading and successful reuse lawfully record nothing. One idea — one node, at most 3 levels. Replacement is \`supersedes\`, never deletion; an empty search retries with \`include_inactive: true\`. Commit and PR memory: \`memory: <id>\` or \`memory: нечего — <причина>\` (docs/commits.md).
+**After verified work:** record only new knowledge, a fix of an old node, or needed history — pure reading and successful reuse lawfully record nothing. One idea — one node, at most 3 levels. Replacement is \`supersedes\`, never deletion. Empty search: 2–3 exact terms or an id, then \`include_inactive: true\`. Commit and PR memory: \`memory: <id>\` or \`memory: нечего — <причина>\` (docs/commits.md).
 
 **Claims resting on code:** pass \`evidence: [{node | ref, why}]\` in the call that creates the node; \`why\` names what exactly backs it — e.g. \`evidence: [{ref: "src/x.ts:120-180", why}]\`. A file ref is an anchor (a file-named node with a template summary) — a support, not
 a new node and not a stub: create a support node only for a thought a link cannot express. \`file_refs\` alone are not supports; supports derived by \`auto_ground\` are a draft, not a check. Git refs work too: \`evidence: [{ref: "git:tag:v2.1.11", why}]\`, \`git:commit:<sha>\`.

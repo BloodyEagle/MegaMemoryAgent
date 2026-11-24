@@ -21,6 +21,26 @@ describe("F-06 shared read-only FTS health", () => {
     } finally { await fixture.close(); }
   });
 
+  it("equal row counts cannot hide one stale row even when another row matches its current token", async () => {
+    const fixture = auditFixture();
+    try {
+      const db = fixture.db(); ensureSchema(db);
+      addNode(db, "stale", { name: "Oldtoken", summary: "Old indexed wording" });
+      addNode(db, "healthy", { name: "Freshmarker", summary: "Other row already matches the new token" });
+      db.execSqlRun("DROP TRIGGER nodes_au");
+      db.execSqlRun("UPDATE nodes SET name = 'Freshmarker' WHERE id = 'stale'");
+      const before = sqlState(db);
+      const report = healthReport(db).fts;
+      expect(report.rows).toBe(2);
+      expect(report.nodes).toBe(2);
+      expect(report.checked).toBe(2);
+      expect(report.misses).toBe(1);
+      expect(report.status).toBe("out_of_sync");
+      expect(ftsCheck(db).ok).toBe(false);
+      expect(sqlState(db)).toEqual(before);
+    } finally { await fixture.close(); }
+  });
+
   it("healthy, absent and rebuilt indexes share doctor and machine verdicts", async () => {
     const fixture = auditFixture();
     try {

@@ -43,6 +43,8 @@ export interface SearchHit {
 export interface HybridSearchOptions {
   topK?: number;
   poolSize?: number;
+  /** Keyword tokens use AND by default; "any" explicitly selects OR. */
+  match?: "all" | "any";
   /** RRF smoothing constant. */
   k?: number;
   /** Injectable query embedder for tests. */
@@ -81,12 +83,12 @@ function trigramTableAvailable(db: KnowledgeDB): boolean {
  * inner quotes doubled, prefix-enabled (М3: '"ток"*' compensates the missing
  * russian stemmer and lets short CJK match longer runs, А4).
  */
-export function buildFtsMatch(query: string): string {
+export function buildFtsMatch(query: string, options: { any?: boolean } = {}): string {
   return query
     .split(/\s+/)
     .filter(Boolean)
     .map((token) => `"${token.replace(/"/g, '""')}"*`)
-    .join(" ");
+    .join(options.any ? " OR " : " ");
 }
 
 /**
@@ -97,7 +99,8 @@ export function buildFtsMatch(query: string): string {
 export function ftsSearch(
   db: KnowledgeDB,
   query: string,
-  limit: number
+  limit: number,
+  options: { any?: boolean } = {}
 ): Array<{ id: string; via: SearchVia }> {
   const trimmed = query.trim();
   if (!trimmed) return [];
@@ -108,7 +111,7 @@ export function ftsSearch(
     ) !== undefined;
 
   if (ftsAvailable) {
-    const match = buildFtsMatch(trimmed);
+    const match = buildFtsMatch(trimmed, options);
     const rows = db.execSqlAll(
       `SELECT n.id FROM nodes_fts f
        JOIN nodes n ON n.rowid = f.rowid
@@ -152,6 +155,28 @@ export function ftsSearch(
   const hasNorm = (db.pragma("table_info(nodes)") as Array<{ name: string }>).some(
     (c) => c.name === "name_norm"
   );
+  if (options.any) {
+    // Explicit OR also applies without FTS; LIKE wildcards remain literal tokens.
+    const tokens = trimmed.split(/\s+/).filter(Boolean);
+    const conditions = tokens.map(() =>
+      `(${hasNorm ? "name_norm" : "name"} LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR why LIKE ? ESCAPE '\\')`
+    ).join(" OR ");
+    const parameters = tokens.flatMap((token) => {
+      const raw = token.replace(/[\\%_]/g, "\\$&");
+      const name = (hasNorm ? normalizeName(token) : token).replace(/[\\%_]/g, "\\$&");
+      return [`%${name}%`, `%${raw}%`, `%${raw}%`];
+    });
+    const rows = db.execSqlAll(
+      `SELECT id FROM nodes
+       WHERE ${conditions}
+       ORDER BY id
+       LIMIT ?`,
+      ...parameters,
+      limit
+    ) as Array<{ id: string }>;
+    return rows.map((row) => ({ id: row.id, via: "fts" }));
+  }
+
   const likeRaw = `%${trimmed}%`;
   const rows = hasNorm
     ? (db.execSqlAll(
@@ -224,12 +249,13 @@ export async function hybridSearch(
   const topK = opts.topK ?? 10;
   const poolSize = opts.poolSize ?? 50;
   const k = opts.k ?? 60;
+  const ftsOptions = { any: opts.match === "any" };
   const mode = process.env.MEGAMEMORY_SEARCH ?? "hybrid";
 
   const pools: Array<{ hits: Array<{ id: string }>; via: SearchVia }> = [];
 
   if (mode !== "vector") {
-    pools.push({ hits: ftsSearch(db, query, poolSize), via: "fts" });
+    pools.push({ hits: ftsSearch(db, query, poolSize, ftsOptions), via: "fts" });
   }
 
   const model = opts.model ?? MODEL_NAME;
@@ -256,9 +282,9 @@ export async function hybridSearch(
       vectorHits = null;
     }
     if (vectorHits !== null) pools.push({ hits: vectorHits, via: "vector" });
-    else if (mode === "vector") pools.push({ hits: ftsSearch(db, query, poolSize), via: "fts" });
+    else if (mode === "vector") pools.push({ hits: ftsSearch(db, query, poolSize, ftsOptions), via: "fts" });
   } else if (mode === "vector") {
-    pools.push({ hits: ftsSearch(db, query, poolSize), via: "fts" });
+    pools.push({ hits: ftsSearch(db, query, poolSize, ftsOptions), via: "fts" });
   }
 
   if (pools.length === 0) return [];
@@ -295,8 +321,9 @@ export async function hybridSearch(
 export function basicSearch(
   db: KnowledgeDB,
   query: string,
-  topK: number
+  topK: number,
+  options: { any?: boolean } = {}
 ): Array<{ id: string; similarity: number }> {
-  const hits = ftsSearch(db, query, topK);
+  const hits = ftsSearch(db, query, topK, options);
   return hits.map((h, i) => ({ id: h.id, similarity: 1 - i / (topK + 1) }));
 }

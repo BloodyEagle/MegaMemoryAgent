@@ -1,11 +1,14 @@
-import { describe, it, expect, afterEach, afterAll } from "vitest";
+import { describe, it, expect, afterEach, afterAll, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
+import ts from "typescript";
 import { KnowledgeDB } from "../db.js";
-import { hybridSearch, rrfMerge, hasCjk } from "../search.js";
+import { basicSearch, buildFtsMatch, ftsSearch, hybridSearch, rrfMerge, hasCjk } from "../search.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { reembed } from "../reembed.js";
+import { measureMcpPayload, understand } from "../tools.js";
 
 let tmpDir: string;
 let db: KnowledgeDB | undefined;
@@ -25,6 +28,7 @@ function freshDb(withTrigram = false): KnowledgeDB {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   delete process.env.MEGAMEMORY_SEARCH;
   db?.close();
   db = undefined;
@@ -110,6 +114,162 @@ describe("hybridSearch (vector enabled)", () => {
     const alpha = hits.find((h) => h.id === "alpha");
     expect(alpha).toBeDefined();
     expect(alpha!.via).toBe("both");
+  });
+});
+
+describe("C1 understand match metadata", () => {
+  it.each(
+    (["hybrid", "fts", "vector"] as const).flatMap((searchMode) =>
+      (["compact", "full", "brief"] as const).map((mode) => ({ searchMode, mode }))
+    )
+  )("preserves opt-in and no_match in $searchMode/$mode", async ({ searchMode, mode }) => {
+    const db = freshDb();
+    insertNode(db, "alpha", "Alpha", "alpha pipeline configuration");
+    insertNode(db, "beta", "Beta", "beta migration hooks");
+    process.env.MEGAMEMORY_SEARCH = searchMode;
+    // No generation: even vector-only mode exercises keyword fallback without inference.
+    expect(db.getVectorGeneration()).toBeFalsy();
+    const input = { query: "alpha beta", top_k: 5, max_tokens: 20000, mode };
+
+    const defaultResult = await understand(db, input);
+    expect(defaultResult.meta).toMatchObject({ reason: "no_match", returned: 0 });
+    expect(defaultResult.meta).not.toHaveProperty("match");
+    expect(defaultResult.meta!.tokens_estimated).toBe(measureMcpPayload(defaultResult));
+
+    const all = await understand(db, { ...input, match: "all" });
+    expect(all.meta).toMatchObject({ reason: "no_match", returned: 0, match: "all" });
+    expect(all.meta!.tokens_estimated).toBe(measureMcpPayload(all));
+
+    const any = await understand(db, { ...input, match: "any" });
+    expect(any.meta).toMatchObject({ returned: 2, match: "any" });
+    expect(any.meta).not.toHaveProperty("reason");
+    expect(any.meta!.tokens_estimated).toBe(measureMcpPayload(any));
+
+    const positiveDefault = await understand(db, { ...input, query: "alpha" });
+    expect(positiveDefault.meta).toMatchObject({ returned: 1 });
+    expect(positiveDefault.meta).not.toHaveProperty("match");
+    expect(positiveDefault.meta).not.toHaveProperty("reason");
+    expect(positiveDefault.meta!.tokens_estimated).toBe(measureMcpPayload(positiveDefault));
+
+    for (const match of [undefined, "all", "any"] as const) {
+      const miss = await understand(db, {
+        ...input, query: "zzmissing zzabsent", ...(match ? { match } : {}),
+      });
+      expect(miss.meta).toMatchObject({ reason: "no_match", returned: 0 });
+      if (match) expect(miss.meta!.match).toBe(match);
+      else expect(miss.meta).not.toHaveProperty("match");
+      expect(miss.meta!.tokens_estimated).toBe(measureMcpPayload(miss));
+    }
+  });
+});
+
+describe("C1 explicit keyword match", () => {
+  it("keeps the default AND expression and quotes each OR token", () => {
+    expect(buildFtsMatch("  alpha   beta  ")).toBe('"alpha"* "beta"*');
+    expect(buildFtsMatch("alpha beta", { any: false })).toBe(buildFtsMatch("alpha beta"));
+    expect(buildFtsMatch('alpha OR "beta"', { any: true })).toBe('"alpha"* OR "OR"* OR """beta"""*');
+  });
+
+  it("keeps default search byte-identical to explicit all", async () => {
+    const db = freshDb();
+    insertNode(db, "joint", "Joint", "alpha beta");
+    insertNode(db, "partial", "Partial", "alpha");
+    expect(ftsSearch(db, "alpha beta", 5, { any: false })).toEqual(ftsSearch(db, "alpha beta", 5));
+    expect(basicSearch(db, "alpha beta", 5, { any: false })).toEqual(basicSearch(db, "alpha beta", 5));
+    const defaultHits = await hybridSearch(db, "alpha beta", { topK: 5 });
+    expect(defaultHits.map((hit) => hit.id)).toEqual(["joint"]);
+    expect(JSON.stringify(await hybridSearch(db, "alpha beta", { topK: 5, match: "all" })))
+      .toBe(JSON.stringify(defaultHits));
+  });
+
+  it("returns OR candidates only when any is explicitly requested", async () => {
+    const db = freshDb();
+    insertNode(db, "alpha", "Alpha", "pipeline");
+    insertNode(db, "beta", "Beta", "configuration");
+    insertNode(db, "other", "Other", "unrelated");
+    expect(await hybridSearch(db, "alpha beta", { match: "all" })).toEqual([]);
+    expect(await hybridSearch(db, "alpha beta")).toEqual([]);
+    const hits = await hybridSearch(db, "alpha beta", { match: "any" });
+    expect(hits.map((hit) => hit.id).sort()).toEqual(["alpha", "beta"]);
+    expect(hits.every((hit) => hit.via === "fts")).toBe(true);
+    expect(basicSearch(db, "alpha beta", 5, { any: true }).map((hit) => hit.id).sort())
+      .toEqual(["alpha", "beta"]);
+    expect(await hybridSearch(db, "zzmissing zzabsent", { match: "any" })).toEqual([]);
+  });
+
+  it.each([true, false])("ORs literal LIKE tokens without FTS (name_norm=%s)", (hasNorm) => {
+    const db = freshDb();
+    insertNode(db, "alpha", "Книга", "alpha");
+    insertNode(db, "beta", "Beta", "beta");
+    insertNode(db, "other", "Other", "unrelated");
+    db.execSql("DROP TABLE nodes_fts");
+    if (!hasNorm) vi.spyOn(db, "pragma").mockReturnValue([]);
+    expect(ftsSearch(db, "alpha beta", 5)).toEqual([]);
+    expect(ftsSearch(db, "alpha beta", 5, { any: false })).toEqual([]);
+    expect(ftsSearch(db, "alpha beta", 5, { any: true }).map((hit) => hit.id))
+      .toEqual(["alpha", "beta"]);
+    expect(ftsSearch(db, "alpha beta", 1, { any: true }).map((hit) => hit.id)).toEqual(["alpha"]);
+    expect(ftsSearch(db, "zzmissing zzabsent", 5, { any: true })).toEqual([]);
+    expect(ftsSearch(db, "% _ \\", 5, { any: true })).toEqual([]);
+    if (hasNorm) expect(ftsSearch(db, "КНИГА zzmissing", 5, { any: true })[0]?.id).toBe("alpha");
+  });
+
+  it.each(["hybrid", "vector"] as const)("keeps %s vector query and ranking unchanged", async (mode) => {
+    const db = freshDb();
+    insertNode(db, "alpha", "Alpha", "pipeline");
+    insertNode(db, "beta", "Beta", "configuration");
+    await reembed(db, { embedFn: async (text) =>
+      fakeEmbed(text.includes("Alpha") ? [1, 0, 0, 0] : [0, 1, 0, 0])() });
+    process.env.MEGAMEMORY_SEARCH = mode;
+    const embedFn = vi.fn(async (_text: string): Promise<Buffer> => fakeEmbed([1, 0, 0, 0])());
+    const query = mode === "vector" ? "alpha beta" : "zzmissing zzabsent";
+    const options = { topK: 5, embedFn };
+    const original = await hybridSearch(db, query, options);
+    expect(original[0]?.id).toBe("alpha");
+    expect(original.every((hit) => hit.via === "vector")).toBe(true);
+    expect(await hybridSearch(db, query, { ...options, match: "all" })).toEqual(original);
+    expect(await hybridSearch(db, query, { ...options, match: "any" })).toEqual(original);
+    const expectedQuery = embedFn.mock.calls[0][0];
+    expect(expectedQuery).toContain(query);
+    expect(embedFn.mock.calls.map(([text]) => text)).toEqual([expectedQuery, expectedQuery, expectedQuery]);
+  });
+
+  it("preserves explicit any when vector-only mode falls back to keyword search", async () => {
+    const db = freshDb();
+    insertNode(db, "alpha", "Alpha", "pipeline");
+    insertNode(db, "beta", "Beta", "configuration");
+    process.env.MEGAMEMORY_SEARCH = "vector";
+    expect(await hybridSearch(db, "alpha beta")).toEqual([]);
+    expect((await hybridSearch(db, "alpha beta", { match: "any" })).map((hit) => hit.id).sort())
+      .toEqual(["alpha", "beta"]);
+  });
+
+  it("does not forward a match query parameter from /api/search", async () => {
+    const source = fs.readFileSync(new URL("../web.ts", import.meta.url), "utf8");
+    const ast = ts.createSourceFile("web.ts", source, ts.ScriptTarget.Latest, true);
+    let route = "";
+    function visit(node: ts.Node): void {
+      if (ts.isIfStatement(node) && node.expression.getText(ast) === 'pathname === "/api/search" && req.method === "GET"') {
+        route = node.getText(ast);
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(ast);
+    expect(route).not.toBe("");
+    const db = freshDb();
+    const search = vi.fn(async () => ({ compact: [] }));
+    const respond = vi.fn();
+    const url = new URL("http://127.0.0.1:8765/api/search?q=alpha%20beta&top_k=5&match=any");
+    const script = ts.transpileModule(`(async () => { ${route} })()`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    await vm.runInNewContext(script, {
+      url, pathname: url.pathname, req: { method: "GET" }, res: {}, db,
+      embeddingsReady: false, isTextOnlySearchMode: () => true,
+      vectorSearchEnabled: () => false, understand: search, json: respond,
+    });
+    expect(search).toHaveBeenCalledWith(db, { query: "alpha beta", top_k: 5 });
+    expect(respond).toHaveBeenCalledWith({}, { matches: [], meta: null });
   });
 });
 

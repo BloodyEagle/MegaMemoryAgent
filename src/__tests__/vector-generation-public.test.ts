@@ -48,7 +48,7 @@ describe("P10 public reembed A-01", () => {
     expect(db.vectorTableCount()).toBe(2);
     let calls = 0;
     await expect(reembed(db, { embedFn: async () => {
-      if (++calls === 2) throw new Error("P10_SECOND_EMBED_FAILURE");
+      if (++calls === 3) throw new Error("P10_SECOND_EMBED_FAILURE");
       return vector(0, 1);
     } })).rejects.toThrow("P10_SECOND_EMBED_FAILURE");
     expect(db.getNode("second")?.embedding).toBeNull();

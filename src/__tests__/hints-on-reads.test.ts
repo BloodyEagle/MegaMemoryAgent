@@ -5,6 +5,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureSchema } from "../migrate-schema.js";
 import { buildNodeWithContext, currentDigestsOf, getConcept } from "../tools.js";
+import { MODEL_NAME } from "../embeddings.js";
+import { reembed } from "../reembed.js";
+import { LIST_ROOTS_SEARCH_HINT } from "../next-hints.js";
 import { addNode, auditFixture, type AuditFixture } from "./helpers/audit.js";
 import { startAuditHttpSrc } from "./helpers/audit-http-src.js";
 
@@ -12,7 +15,7 @@ const RECORD = "Узел уже есть — уточняй его через up
 const OVERVIEW = "Это обзор; итог работы по конкретной ветке — отдельный узел, а не правка корня.";
 const repository = fileURLToPath(new URL("../../", import.meta.url));
 type Response = Awaited<ReturnType<Client["callTool"]>>;
-type Payload = { hint?: string | { record: string }; id?: string; unchanged?: boolean; batch?: Array<{ id: string; status: string }>; meta?: { tokens_estimated?: number; version?: string; reason?: string; continuation?: string } };
+type Payload = { hint?: string | { record: string }; hint_search?: string; id?: string; unchanged?: boolean; batch?: Array<{ id: string; status: string }>; meta?: { tokens_estimated?: number; version?: string; reason?: string; continuation?: string } };
 let fixture: AuditFixture;
 let client: Client | undefined;
 
@@ -21,12 +24,21 @@ afterEach(async () => {
   try { await client?.close(); } finally { client = undefined; await fixture.close(); }
 });
 
-async function start(seed = true): Promise<Client> {
+/** `seed === "vectors"`: непустая база с рабочим поколением векторов, сервер в hybrid-режиме. */
+async function start(seed: boolean | "vectors" = true): Promise<Client> {
   const db = fixture.db("read.db");
   try {
     ensureSchema(db);
     db.setMetaValue("embed_model", "read-hints-disabled-vector-space");
     if (seed) addNode(db, "read-hints", { summary: "Read hints preserve the existing card and its evidence." });
+    if (seed === "vectors") {
+      db.setMetaValue("embed_model", MODEL_NAME);
+      await reembed(db, { embedFn: async () => {
+        const buffer = Buffer.alloc(8);
+        buffer.writeFloatLE(1, 0);
+        return buffer;
+      } });
+    }
   } finally { await fixture.release(db); }
   const profile = fixture.profile();
   const env = Object.fromEntries(Object.entries(profile.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
@@ -35,7 +47,7 @@ async function start(seed = true): Promise<Client> {
     args: ["--import", pathToFileURL(path.join(repository, "node_modules/tsx/dist/loader.mjs")).href,
       path.join(repository, "src/index.ts"), "--db", fixture.file("read.db")],
     cwd: fixture.root, stderr: "pipe",
-    env: { ...env, NODE_OPTIONS: "", MEGAMEMORY_SEARCH: "fts", MEGAMEMORY_AUTO_MIGRATE: "0", MEGAMEMORY_AUTO_DIGEST: "0",
+    env: { ...env, NODE_OPTIONS: "", MEGAMEMORY_SEARCH: seed === "vectors" ? "hybrid" : "fts", MEGAMEMORY_AUTO_MIGRATE: "0", MEGAMEMORY_AUTO_DIGEST: "0",
       MEGAMEMORY_TELEMETRY_PATH: "", XDG_CONFIG_HOME: fixture.file("config"), XDG_CACHE_HOME: fixture.file("cache"),
       XDG_DATA_HOME: fixture.file("data"), HF_HOME: fixture.file("hf"), HF_HUB_OFFLINE: "1", TRANSFORMERS_OFFLINE: "1" },
   });
@@ -115,10 +127,20 @@ describe("MCP-only record hints on reads", () => {
     expect(second.hint).toBeUndefined();
   });
 
-  it("adds its separate overview hint to nonempty list_roots", async () => {
+  it("names keyword-only search in hint_search without changing hint", async () => {
     const source = await start();
     const response = await source.callTool({ name: "list_roots", arguments: { max_tokens: 1500 } });
-    expect(assertBudget(response, 1500).hint).toEqual({ record: OVERVIEW });
+    const payload = assertBudget(response, 1500);
+    expect(payload.hint).toEqual({ record: OVERVIEW });
+    expect(payload.hint_search).toBe(LIST_ROOTS_SEARCH_HINT);
+  });
+
+  it("omits hint_search once the vector channel is on", async () => {
+    const source = await start("vectors");
+    const response = await source.callTool({ name: "list_roots", arguments: { max_tokens: 1500 } });
+    const payload = assertBudget(response, 1500);
+    expect(payload.hint).toEqual({ record: OVERVIEW });
+    expect(payload).not.toHaveProperty("hint_search");
   });
 
   it("preserves the original empty-graph hint rather than adding a record hint", async () => {
@@ -143,6 +165,18 @@ describe("MCP-only record hints on reads", () => {
     const payload = assertBudget(response, 4000);
     expect(payload.hint).toEqual({ record: RECORD });
     expect(payload.batch).toMatchObject([{ id: "read-hints", status: "ok" }, { id: "missing", status: "error" }]);
+  });
+
+  it("advertises and accepts optional keyword matching through tools/list", async () => {
+    const source = await start();
+    const { tools } = await source.listTools();
+    const schema = tools.find((tool) => tool.name === "understand")!.inputSchema;
+    expect(schema.properties?.match).toMatchObject({ type: "string", enum: ["all", "any"] });
+    expect(schema.required).not.toContain("match");
+    expect(schema.properties?.query).toMatchObject({ description: expect.stringContaining("by default") });
+    const response = await source.callTool({ name: "understand", arguments: { query: "read-hints zzmissingzz", match: "any" } });
+    const payload = assertBudget(response, 4000);
+    expect(payload.meta).toMatchObject({ match: "any" });
   });
 
   it("keeps input schemas unchanged and JSON valid for a client unaware of hints", async () => {

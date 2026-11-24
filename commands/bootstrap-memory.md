@@ -14,10 +14,13 @@ count — the biggest files are where the core logic lives.
 
 Call `megamemory:list_roots` to see what's already recorded. This is a token-budgeted
 index: inspect `roots_compact` (`id`, `name`, `kind`, `child_count`, `valid_until`),
-`slots`, `board_top`, `hint`, `meta` (`returned`, `dropped`, `tokens_estimated`,
+`slots`, `board_top`, `hint`, optional top-level `hint_search`, `meta` (`returned`,
+`dropped`, `tokens_estimated`,
 `truncated`, `dropped_slots`, `dropped_board_top`), `stats`, and wrapper fields
 (`instructions_stale`, `instructions_version`, `server_version`). Legacy
 `roots` is empty for compatibility; the response does not return children. If `meta.truncated` is true, do not treat the visible roots as complete.
+If `hint_search` is present, follow its channel guidance; it is independent of
+`hint` and does not change the legacy string/record-object shape.
 If the graph has good coverage, report what's there and ask if I want to fill in
 specific areas.
 
@@ -31,8 +34,19 @@ Think in terms of:
 
 ## Step 3: Read and create root concepts
 
-For each major module, query `megamemory:understand` first. It is compact by
-default; `mode:"full"` returns verbose cards and `mode:"brief"` returns at most
+For each major module, query `megamemory:understand` first with 2–5 exact terms
+or identifiers in the language of the stored nodes. Keyword matching defaults to
+`match: "all"`; explicitly pass `match: "any"` only for intentional OR expansion.
+Vector matching is unchanged; `meta.match` appears only for an explicit choice.
+Distinguish `meta.reason=empty_base|no_match|budget`: for `no_match`, retry with
+2–3 exact terms or an id; for `budget`, first raise `max_tokens`.
+Follow `next.search_warning` for an `off` or `partial` channel. Successful node
+writes and MCP startup with eligible nodes initialize a missing first generation
+in the background by default. `MEGAMEMORY_AUTO_REEMBED=0` disables only this setup;
+model mismatches and partial coverage still need manual `megamemory reembed`.
+First model use may download about 120 MB; after failure, another eligible trigger
+can retry following a 10-minute cooldown. It is compact by default;
+`mode:"full"` returns verbose cards and `mode:"brief"` returns at most
 8 orientation lines without cards. Every mode returns a mandatory `next` block:
 read all `must_read` refs (mandatory sources, not proof of whole-file coverage)
 before editing/recording and execute every `followup` exactly with its supplied
