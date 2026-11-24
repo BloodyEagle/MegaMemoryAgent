@@ -44,6 +44,7 @@ import type {
   EdgeRow,
 } from "./types.js";
 import { buildNextHints, LIST_ROOTS_SEARCH_HINT, type NextHintsCard } from "./next-hints.js";
+import { scheduleFirstGeneration } from "./auto-reembed.js";
 import { timelineActivity } from "./timeline.js";
 import { renderBrief, renderDroppedText, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
@@ -2347,6 +2348,7 @@ export async function createConcept(
     ? ` Срок годности: ${validUntil} — после этой даты узел выпадет из выдачи.`
     : "";
 
+  void scheduleFirstGeneration(db);
   return {
     id,
     message: `Created concept "${id}"${supersededNote}${duplicateNote}${supportNote}${autoNote}${confirmNote}${validNote}`,
@@ -2548,6 +2550,7 @@ export async function updateConcept(
     if (!updated && !epistemicWrite) noChanges = true;
   });
 
+  void scheduleFirstGeneration(db);
   if (noChanges) {
     return { message: `No changes applied to "${input.id}"` };
   }

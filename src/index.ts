@@ -286,6 +286,7 @@ async function startMcpServer() {
   const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
   const { checkArtifacts } = await import("./artifacts.js");
   const { checkFreshness } = await import("./freshness.js");
+  const { scheduleFirstGeneration } = await import("./auto-reembed.js");
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
@@ -355,6 +356,7 @@ async function startMcpServer() {
     process.exit(1);
   }
 
+  void scheduleFirstGeneration(db);
   const timeline = createTimelineLogger(db);
 
   let dbClosed = false;

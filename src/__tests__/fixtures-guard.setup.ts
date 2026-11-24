@@ -13,6 +13,9 @@ import { fileURLToPath } from "url";
  * фикстуру (легитимное обновление обязано обновить и sha256sums.txt —
  * repo-hygiene).
  */
+// B2: model-backed background work is opt-in in tests and inherited subprocesses.
+process.env.MEGAMEMORY_AUTO_REEMBED = "0";
+
 process.env.MEGAMEMORY_FIXTURES_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../fixtures"
