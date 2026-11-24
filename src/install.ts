@@ -1077,15 +1077,26 @@ function setupZcodeHook(dryRun: boolean): void {
   const events = isObject(hooks.events) ? hooks.events : {};
   if ("UserPromptSubmit" in events && !Array.isArray(events.UserPromptSubmit)) throw formatConfigReadError(ZCODE_CONFIG_PATH, "'hooks.events.UserPromptSubmit' must be an array");
   const groups = Array.isArray(events.UserPromptSubmit) ? events.UserPromptSubmit : [];
-  if (groups.some(isMegamemoryHookGroup)) {
+  const managed = groups.map((group, index) => ({ group, index })).filter(({ group }) => isMegamemoryHookGroup(group));
+  const script = zcodeHookScript();
+  const outdated = managed.filter(({ group }) => {
+    if (!isObject(group) || !Array.isArray(group.hooks)) return true;
+    return group.hooks.some((entry: unknown) => isObject(entry) && Array.isArray(entry.args) &&
+      entry.args.some((arg: unknown) => typeof arg === "string" && arg.includes(ZCODE_HOOK_MARKER) && arg !== script));
+  });
+  if (managed.length > 0 && outdated.length === 0) {
     skip("Prompt hook already up to date");
     return;
   }
   const group = zcodeHookGroup();
   let updated = editKiloConfig(text, ["hooks", "enabled"], true);
-  updated = groups.length > 0
-    ? editKiloConfig(updated, ["hooks", "events", "UserPromptSubmit", -1], group)
-    : editKiloConfig(updated, ["hooks", "events", "UserPromptSubmit"], [group]);
+  if (managed.length > 0) {
+    for (const { index } of outdated) updated = editKiloConfig(updated, ["hooks", "events", "UserPromptSubmit", index], group);
+  } else {
+    updated = groups.length > 0
+      ? editKiloConfig(updated, ["hooks", "events", "UserPromptSubmit", -1], group)
+      : editKiloConfig(updated, ["hooks", "events", "UserPromptSubmit"], [group]);
+  }
   if (hooks.enabled === false) warn("hooks.enabled was false; configuration-file hooks run only with hooks.enabled: true.");
   writeKiloFile(ZCODE_CONFIG_PATH, updated, dryRun);
   info("UserPromptSubmit hook injects a one-line MegaMemory reminder into every prompt.");
@@ -1119,9 +1130,9 @@ function uninstallZcodeHook(): boolean {
     let start = node.offset;
     let end = node.offset + node.length;
     // Eat the trailing separator when our entry is not the last element;
-    // otherwise eat the preceding comma and whitespace. Install always
-    // appends, so our entry is the last one and the back-scan reverses the
-    // insertion byte-for-byte.
+    // otherwise eat the preceding comma and whitespace. Fresh install appends,
+    // while refresh keeps the existing position; the back-scan reverses a
+    // last-entry insertion byte-for-byte.
     const after = updated.slice(end).match(/^\s*/)?.[0].length ?? 0;
     if (updated.charAt(end + after) === ",") {
       end = end + after + 1;

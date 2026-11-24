@@ -137,6 +137,10 @@ describe("Plan 28 ZCode target", () => {
     expect(script).toContain("hookEventName:\"UserPromptSubmit\"");
     expect(script).toContain("additionalContext");
     expect(script).toContain("megamemory-user-prompt-hook");
+    const contextLiteral = /additionalContext:("(?:\\.|[^"\\])*")/.exec(script)?.[1];
+    expect(contextLiteral).toBeDefined();
+    const context = JSON.parse(contextLiteral!) as string;
+    for (const token of ["understand", "create_concept", "evidence"]) expect(context).toContain(token);
     const entry = (config.hooks?.events?.UserPromptSubmit?.filter((group) => JSON.stringify(group).includes("megamemory-user-prompt-hook"))[0].hooks as Array<Record<string, unknown>>)[0];
     expect(entry.type).toBe("process");
     expect(entry.statusMessage).toBe("MegaMemory");
@@ -162,6 +166,53 @@ describe("Plan 28 ZCode target", () => {
     expect(agents.match(/## Project Knowledge Graph/g)).toHaveLength(1);
     const config = readConfig(configPath);
     expect(hookEntryArgs(config)).toHaveLength(2);
+  });
+
+  it.each([0, 1, 2])("refreshes the outdated managed hook at position %s without touching foreign groups", async (position) => {
+    const oldContext = "MegaMemory: устаревшее напоминание из предыдущей версии.";
+    const oldScript = `process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:${JSON.stringify(oldContext)}}}));/* megamemory-user-prompt-hook */`;
+    const foreignFirst = '{ "matcher": "foreign-first", "hooks": [{ "type": "process", "command": "keep-first", "args": ["--foreign"] }] }';
+    const foreignLast = '{"matcher":"foreign-last","hooks":[{"type":"process","command":"keep-last","args":[]}]}';
+    const groups = [foreignFirst, foreignLast];
+    groups.splice(position, 0, JSON.stringify({ hooks: [{ type: "process", command: "old-node", args: ["-e", oldScript], timeoutMs: 10000, statusMessage: "MegaMemory" }] }));
+    writeFixture(configPath, [
+      "// user comment: preserve me",
+      "{",
+      `  "mcp": { "servers": { "megamemory": ${JSON.stringify(completeRecord())} } },`,
+      '  "hooks": { "enabled": true, "events": { "UserPromptSubmit": [',
+      "    // group order is user-owned",
+      groups.join(",\n"),
+      "  ] } }",
+      "}",
+      "",
+    ].join("\n"));
+
+    expect((await install()).ok).toBe(true);
+    const updated = fs.readFileSync(configPath, "utf8");
+    const config = readConfig(configPath);
+    const refreshed = config.hooks?.events?.UserPromptSubmit ?? [];
+    expect(refreshed).toHaveLength(3);
+    const args = hookEntryArgs(config);
+    expect(args[1]).not.toBe(oldScript);
+    expect(JSON.stringify(refreshed[position])).toContain("megamemory-user-prompt-hook");
+    expect(refreshed.filter((_, index) => index !== position)).toEqual([JSON.parse(foreignFirst), JSON.parse(foreignLast)]);
+    for (const preserved of [foreignFirst, foreignLast, "// user comment: preserve me", "// group order is user-owned"]) expect(updated).toContain(preserved);
+    expect(output.join("\n")).not.toContain("Prompt hook already up to date");
+
+    output = [];
+    expect((await install()).ok).toBe(true);
+    expect(fs.readFileSync(configPath, "utf8")).toBe(updated);
+    expect(output.join("\n")).toContain("Prompt hook already up to date");
+  });
+
+  it("dry-run leaves an outdated managed hook untouched", async () => {
+    const stale = { hooks: [{ type: "process", command: "old-node", args: ["-e", "old reminder /* megamemory-user-prompt-hook */"] }] };
+    writeFixture(configPath, `${JSON.stringify({ mcp: { servers: { megamemory: completeRecord() } }, hooks: { enabled: true, events: { UserPromptSubmit: [stale] } } }, null, 2)}\n`);
+    const before = treeSnapshot([root]);
+    expect((await install("--dry-run")).ok).toBe(true);
+    expect(treeSnapshot([root])).toEqual(before);
+    expect(output.join("\n")).not.toContain("Prompt hook already up to date");
+    expect(output.join("\n")).not.toContain("Semantic search is off until");
   });
 
   it("fills missing fields of a user-owned megamemory record and preserves foreign servers and comments", async () => {
