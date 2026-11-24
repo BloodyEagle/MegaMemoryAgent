@@ -314,6 +314,8 @@ export interface UnderstandOutput {
 
 export interface UnderstandInput {
   query: string;
+  /** Keyword conjunction: all by default; any explicitly expands with OR. */
+  match?: "all" | "any";
   top_k?: number;
   /** Token budget for the answer (default 4000). */
   max_tokens?: number;
@@ -565,6 +567,8 @@ export interface UnderstandCandidate {
 }
 
 export interface UnderstandMeta {
+  /** Present only when the caller explicitly chose keyword matching. */
+  match?: "all" | "any";
   /** Compact: visible candidates; full/brief retain their legacy count. */
   returned: number;
   /** Compact cards, not candidate-only matches. */
@@ -753,7 +757,7 @@ export interface NextHints {
    */
   stale_warning?: string;
   /**
-   * План 33: при no_match и выключенном или неполном
+   * План 33: при no_match/budget и выключенном или неполном
    * семантическом канале объясняет ограничение поиска.
    */
   search_warning?: string;

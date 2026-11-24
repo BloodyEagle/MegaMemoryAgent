@@ -167,6 +167,18 @@ describe("MCP-only record hints on reads", () => {
     expect(payload.batch).toMatchObject([{ id: "read-hints", status: "ok" }, { id: "missing", status: "error" }]);
   });
 
+  it("advertises and accepts optional keyword matching through tools/list", async () => {
+    const source = await start();
+    const { tools } = await source.listTools();
+    const schema = tools.find((tool) => tool.name === "understand")!.inputSchema;
+    expect(schema.properties?.match).toMatchObject({ type: "string", enum: ["all", "any"] });
+    expect(schema.required).not.toContain("match");
+    expect(schema.properties?.query).toMatchObject({ description: expect.stringContaining("by default") });
+    const response = await source.callTool({ name: "understand", arguments: { query: "read-hints zzmissingzz", match: "any" } });
+    const payload = assertBudget(response, 4000);
+    expect(payload.meta).toMatchObject({ match: "any" });
+  });
+
   it("keeps input schemas unchanged and JSON valid for a client unaware of hints", async () => {
     const source = await start();
     const { tools } = await source.listTools();

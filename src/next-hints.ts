@@ -108,7 +108,7 @@ export const RECORD_DECISION =
   'После правки запиши решение: create_concept kind=decision, evidence: [{ref|node, why: "что подтверждает"}] — это и есть informed_by; file_refs связей не даёт. Состояние — с valid_until.';
 
 const KEYWORD_ONLY_WARNING =
-  "Поиск только по словам: векторный канал выключен, сопоставляются ВСЕ слова запроса. Повтори 2–3 точными терминами или id на языке записей. Семантический поиск включит `megamemory reembed` — один раз для базы.";
+  'Векторный канал выключен: поиск по ВСЕМ словам запроса. Повтори 2–3 точными терминами или id на языке записей, либо с `match: "any"`. Семантику включит `megamemory reembed` — один раз для базы.';
 
 /**
  * План 33 A3: почему пустой ответ пуст, когда семантический канал выключен.
@@ -118,14 +118,14 @@ export const SEARCH_WARNING: Record<Extract<VectorChannelState, { state: "off" }
   no_generation: KEYWORD_ONLY_WARNING,
   generation_without_vectors: KEYWORD_ONLY_WARNING,
   model_mismatch:
-    "Поиск только по словам: модель векторов не совпадает с текущей. Повтори 2–3 точными терминами или id. Вернёт семантику `megamemory reembed`.",
+    'Поиск только по словам: модель векторов не совпадает с текущей. Повтори 2–3 точными терминами или id, либо с `match: "any"`. Вернёт семантику `megamemory reembed`.',
   text_only_mode:
-    "Поиск только по словам (MEGAMEMORY_SEARCH=fts): сопоставляются ВСЕ слова запроса. Повтори 2–3 точными терминами или id.",
+    'Поиск только по словам (MEGAMEMORY_SEARCH=fts): сопоставляются ВСЕ слова запроса. Повтори 2–3 точными терминами или id, либо с `match: "any"`.',
 };
 
 /** Строка hint_search в list_roots, отдельно от прежнего hint. */
 export const LIST_ROOTS_SEARCH_HINT =
-  "Search is keyword-only (all query words must match): run `megamemory reembed` to enable semantic search.";
+  "Search is keyword-only (all query words must match by default): run `megamemory reembed` to enable semantic search.";
 
 /** Follow-ups тоже не более трёх: каждый исполняется дословно. */
 export const FOLLOWUPS_LIMIT = 3;
@@ -171,6 +171,8 @@ export interface NextHintsInput {
   activity?: TimelineActivity;
   /** Причина пустого ответа — перед формой записи, без нуджа для пустой базы. */
   emptyReason?: UnderstandMeta["reason"];
+  /** Explicit keyword expansion chosen by the caller. */
+  match?: "all" | "any";
   /**
    * План 13.1 (F6): бюджет проверки support_check при сборе followups.
    * Дефолт — боевые DEFAULT_MAX_CHECK_*; тесты inject'ят малый лимит,
@@ -392,7 +394,11 @@ export function buildNextHints(input: NextHintsInput): NextHints {
   // All understand modes use this builder; the warning participates in their wire budgets.
   if (input.emptyReason === "no_match" || input.emptyReason === "budget") {
     const channel = vectorChannelState(db);
-    if (channel.state === "off") next.search_warning = SEARCH_WARNING[channel.reason];
+    if (channel.state === "off") {
+      next.search_warning = input.match === "any"
+        ? "Поиск только по словам: выбран `match: \"any\"` — достаточно одного слова. Совпадений нет среди доступных записей. Уточни термины или id; векторный канал выключен."
+        : SEARCH_WARNING[channel.reason];
+    }
     if (channel.state === "partial") {
       next.search_warning = `Векторы есть у ${channel.total - channel.missing} из ${channel.total} узлов — ` +
         "семантический поиск неполный, `megamemory reembed` догонит.";

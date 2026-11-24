@@ -698,7 +698,7 @@ export async function understand(
   const viaById = new Map<string, SearchVia>();
 
   if (mode === "hybrid") {
-    const hits = await hybridSearch(db, input.query, { topK: searchPool });
+    const hits = await hybridSearch(db, input.query, { topK: searchPool, match: input.match });
     topMatches = hits.map((h) => ({ id: h.id, similarity: h.score }));
     for (const h of hits) viaById.set(h.id, h.via);
   } else if (mode === "vector" && vectorSearchEnabled(db)) {
@@ -714,7 +714,7 @@ export async function understand(
       topMatches = findTopK(queryEmbedding, candidates, searchPool);
     }
   } else {
-    topMatches = basicSearch(db, input.query, searchPool);
+    topMatches = basicSearch(db, input.query, searchPool, { any: input.match === "any" });
   }
 
   activity = timelineActivity(db);
@@ -864,6 +864,7 @@ export async function understand(
       refuted: refutedForNext,
       activity,
       emptyReason: reason,
+      match: input.match,
     });
 
     // Полный режим по тем же сырым строкам, что и в compact-ветке (см. ниже):
@@ -887,6 +888,7 @@ export async function understand(
       inactive_excluded: inactiveExcluded,
       truncated: trunc,
       ...(reason ? { reason } : {}),
+      ...(input.match ? { match: input.match } : {}),
     });
 
     /** Тот объект, который уйдёт по проводу (brief + next + meta + extra). */
@@ -957,6 +959,7 @@ export async function understand(
       refuted: refuted.map((r) => ({ name: r.name, reason: r.refuted_reason ?? null })),
       activity,
       emptyReason: reason,
+      match: input.match,
     });
     const output: UnderstandOutput = {
       matches,
@@ -969,6 +972,7 @@ export async function understand(
         stale_excluded: staleExcluded,
         inactive_excluded: inactiveExcluded,
         ...(reason ? { reason } : {}),
+        ...(input.match ? { match: input.match } : {}),
       },
       next: fullNext,
     };
@@ -1193,6 +1197,7 @@ export async function understand(
       ...(staleRefsTotal > 0 ? { stale_refs_total: staleRefsTotal } : {}),
       ...(staleRefsMissing > 0 ? { stale_refs_missing: staleRefsMissing } : {}),
       ...(reason ? { reason } : {}),
+      ...(input.match ? { match: input.match } : {}),
     };
   };
 
@@ -1210,6 +1215,7 @@ export async function understand(
       refuted: refuted.map((card) => ({ name: card.name, reason: card.refuted_reason ?? null })),
       activity,
       emptyReason: meta.reason,
+      match: input.match,
     });
     // План 26 §3: одна строка, только при непустых stale_refs.
     if (staleRefsShown.length > 0) {
