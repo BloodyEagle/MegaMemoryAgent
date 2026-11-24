@@ -73,5 +73,15 @@ describe("B1: storage write into a generation with dim = 0", () => {
     expect(db.getVectorGeneration()?.dim).toBe(2);
     expect(vectorChannelState(db)).toEqual({ state: "on" });
     expect(vectorSearchEnabled(db)).toBe(true);
+
+    const second = await createConcept(db, {
+      name: "Second Node",
+      kind: "module",
+      summary: "The second node uses the dimension established by the first publication.",
+      force: true,
+    });
+    expect(second.id).toBe("second-node");
+    expect(storedHex(second.id!)).toBe(vector().toString("hex").toUpperCase());
+    expect(db.getVectorGeneration()?.dim).toBe(2);
   });
 });
