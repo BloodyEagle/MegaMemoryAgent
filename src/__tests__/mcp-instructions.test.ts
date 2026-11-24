@@ -35,6 +35,16 @@ function sourceInstructions(version: string): string {
   return instructions;
 }
 
+function sourceToolDescription(name: string): string {
+  for (const match of source.matchAll(/\btool\(\s*"([^"]+)",\s*("(?:\\.|[^"\\])*")/g)) {
+    if (match[1] !== name) continue;
+    const description: unknown = JSON.parse(match[2]);
+    if (typeof description !== "string") throw new Error(`Description for ${name} must be a string`);
+    return description;
+  }
+  throw new Error(`Tool description for ${name} not found`);
+}
+
 function sourceServer(version: string, instructions: string): McpServer {
   const expression = source.match(/const server = (new McpServer\([\s\S]*?\));/)?.[1];
   if (!expression) throw new Error("McpServer initializer not found");
@@ -61,6 +71,33 @@ async function initialize(server: McpServer): Promise<{
     try { await client.close(); } finally { await server.close(); }
   }
 }
+
+describe("Tool when-to-call descriptions (plan33 C3)", () => {
+  it.each([
+    {
+      name: "list_roots",
+      prefix: "Call for a one-screen orientation when you have no specific query yet (new project, new session) or when you need the board and slots — not a mandatory start ritual.",
+    },
+    {
+      name: "confirm_supports",
+      prefix: "Вызывай после того, как опора прочитана и ты фиксируешь, что прочитанная версия подтверждает решение; никогда — автоматически.",
+    },
+    {
+      name: "check_artifacts",
+      prefix: "Вызывай явно, когда `support_check` равен `unknown` или `changed` либо снимок старше 7 дней: узнать, менялся ли файл или git-объект опоры. Сам ничего не читает.",
+    },
+    {
+      name: "check_freshness",
+      prefix: "Вызывай после правок кода и перед следующей правкой — для файлов, которые затронешь: отчёт покажет, какие записи зависят от изменившихся источников. Знаний не пишет.",
+    },
+    {
+      name: "link",
+      prefix: "Вызывай, когда связь двух узлов не выражена `evidence` в `create_concept`; для `informed_by` нужен rationale.",
+    },
+  ])("prepends when-to-call guidance for $name", ({ name, prefix }) => {
+    expect(sourceToolDescription(name).startsWith(`${prefix} `)).toBe(true);
+  });
+});
 
 describe("MCP initialize instructions", () => {
   it("reads the source VERSION from package.json rather than duplicating it", () => {
