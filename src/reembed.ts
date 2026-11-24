@@ -16,6 +16,8 @@ export interface ReembedOptions {
   embedFn?: (text: string) => Promise<Buffer>;
   /** Alternate model identity requires an injected embedder. */
   model?: string;
+  /** Internal automatic-init guard: must synchronously throw to abort after warmup, before generation writes. */
+  beforeGeneration?: () => void;
   onProgress?: (done: number, total: number) => void;
 }
 
@@ -42,6 +44,7 @@ export async function reembed(
   const embedFn = opts.embedFn ?? embed;
   // Loading/inference must succeed before invalidating the previous generation.
   await embedFn(passageText("warmup", model));
+  opts.beforeGeneration?.();
   let generation = db.beginVectorGeneration({ model, profile: embeddingProfile(model), dim: 0 });
   const assertCurrent = () => {
     const active = db.getVectorGeneration();

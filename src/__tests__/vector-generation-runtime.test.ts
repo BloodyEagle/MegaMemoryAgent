@@ -828,6 +828,44 @@ describe("B2 automatic first-generation reembed", () => {
     expect(db.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toEqual([]);
   });
 
+  it("B2 preserves generation published between warmup guard and generation begin", async () => {
+    const db = fresh(["first"]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const queued = background();
+    const warmup = deferred<Buffer>();
+    const eligible = vi.spyOn(db, "getReembedEligibleCount");
+    const begin = vi.spyOn(db, "beginVectorGeneration");
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    let calls = 0;
+    const embedFn = vi.fn((_text: string): Promise<Buffer> =>
+      ++calls === 1 ? warmup.promise : Promise.resolve(vector(1, 0)));
+    const pending = scheduleFirstGeneration(db, { defer: queued.defer, embedFn });
+    queued.run();
+    let foreign!: VectorGeneration;
+    let before!: ReturnType<typeof snapshot>;
+    // Registered after the wrapper's await: runs after its guard, before reembed resumes.
+    const published = warmup.promise.then(() => {
+      expect(eligible).toHaveBeenCalledTimes(3);
+      expect(begin).not.toHaveBeenCalled();
+      const generation = db.beginVectorGeneration({ model: "b2-foreign", profile: embeddingProfile("b2-foreign"), dim: 0 });
+      expect(db.publishNodeEmbedding({ ...generation, id: "first", name: "first", kind: "feature", summary: "indexing text" }, vector(0, 1))).toBe(true);
+      foreign = active(db);
+      expect(db.finishVectorGeneration(foreign)).toBe(true);
+      before = snapshot(db);
+    });
+
+    warmup.resolve(vector(1, 0));
+    await published;
+    await pending;
+
+    expect(active(db)).toEqual(foreign);
+    expect(snapshot(db)).toEqual(before);
+    expect(begin).toHaveBeenCalledTimes(1);
+    expect(embedFn).toHaveBeenCalledTimes(1);
+    expect(stderr).not.toHaveBeenCalled();
+    expect(db.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toEqual([]);
+  });
+
   it.each(["before_dispatch", "during_warmup"])("closing the DB %s safely ends background work without mutations", async (when) => {
     const source = fresh(["first"]);
     vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");

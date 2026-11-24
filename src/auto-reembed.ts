@@ -109,15 +109,19 @@ export function scheduleFirstGeneration(
       if (!canStart(db)) return;
       let warmed = false;
       const embedFn = opts.embedFn ?? embed;
-      await reembed(db, { embedFn: async (text): Promise<Buffer> => {
-        const buffer = await embedFn(text);
-        if (!warmed) {
-          warmed = true;
-          // Do not replace a generation another caller published during warmup.
-          if (!canStart(db)) throw superseded;
-        }
-        return buffer;
-      } });
+      await reembed(db, {
+        // Runs in reembed's own continuation, with no await before the generation switch.
+        beforeGeneration: () => { if (!canStart(db)) throw superseded; },
+        embedFn: async (text): Promise<Buffer> => {
+          const buffer = await embedFn(text);
+          if (!warmed) {
+            warmed = true;
+            // Do not replace a generation another caller published during warmup.
+            if (!canStart(db)) throw superseded;
+          }
+          return buffer;
+        },
+      });
       // One successful attempt per process/base, even if metadata is later reset.
       attempt.succeeded = true;
     } catch (error) {
