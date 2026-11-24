@@ -1074,6 +1074,8 @@ export interface ListRootsOutput {
   slots?: Array<{ role: string; node_id: string; node_name: string }>;
   /** Plan 2 §3: top-5 of the open column by rot. */
   board_top?: Array<{ id: string; name: string; rot?: number; due_at?: string | null }>;
+  /** План 33 D-06: состояние поиска отдельно от прежнего hint. */
+  hint_search?: string;
   meta?: ListRootsMeta;
 }
 

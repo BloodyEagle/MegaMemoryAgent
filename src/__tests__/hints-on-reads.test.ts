@@ -15,7 +15,7 @@ const RECORD = "Узел уже есть — уточняй его через up
 const OVERVIEW = "Это обзор; итог работы по конкретной ветке — отдельный узел, а не правка корня.";
 const repository = fileURLToPath(new URL("../../", import.meta.url));
 type Response = Awaited<ReturnType<Client["callTool"]>>;
-type Payload = { hint?: string | { record: string; search?: string }; id?: string; unchanged?: boolean; batch?: Array<{ id: string; status: string }>; meta?: { tokens_estimated?: number; version?: string; reason?: string; continuation?: string } };
+type Payload = { hint?: string | { record: string }; hint_search?: string; id?: string; unchanged?: boolean; batch?: Array<{ id: string; status: string }>; meta?: { tokens_estimated?: number; version?: string; reason?: string; continuation?: string } };
 let fixture: AuditFixture;
 let client: Client | undefined;
 
@@ -127,16 +127,20 @@ describe("MCP-only record hints on reads", () => {
     expect(second.hint).toBeUndefined();
   });
 
-  it("names the keyword-only search in hint.search while the vector channel is off", async () => {
+  it("names keyword-only search in hint_search without changing hint", async () => {
     const source = await start();
     const response = await source.callTool({ name: "list_roots", arguments: { max_tokens: 1500 } });
-    expect(assertBudget(response, 1500).hint).toEqual({ record: OVERVIEW, search: LIST_ROOTS_SEARCH_HINT });
+    const payload = assertBudget(response, 1500);
+    expect(payload.hint).toEqual({ record: OVERVIEW });
+    expect(payload.hint_search).toBe(LIST_ROOTS_SEARCH_HINT);
   });
 
-  it("omits hint.search once the vector channel is on", async () => {
+  it("omits hint_search once the vector channel is on", async () => {
     const source = await start("vectors");
     const response = await source.callTool({ name: "list_roots", arguments: { max_tokens: 1500 } });
-    expect(assertBudget(response, 1500).hint).toEqual({ record: OVERVIEW });
+    const payload = assertBudget(response, 1500);
+    expect(payload.hint).toEqual({ record: OVERVIEW });
+    expect(payload).not.toHaveProperty("hint_search");
   });
 
   it("preserves the original empty-graph hint rather than adding a record hint", async () => {
@@ -172,10 +176,7 @@ describe("MCP-only record hints on reads", () => {
       expect(tool.inputSchema.required ?? []).not.toContain("hint");
       expect(tool.outputSchema).toBeUndefined();
       const payload = parse(await source.callTool({ name, arguments: name === "get_concept" ? { id: "read-hints" } : {} }));
-      expect(payload.hint).toEqual({
-        record: name === "get_concept" ? RECORD : OVERVIEW,
-        ...(name === "list_roots" ? { search: LIST_ROOTS_SEARCH_HINT } : {}),
-      });
+      expect(payload.hint).toEqual({ record: name === "get_concept" ? RECORD : OVERVIEW });
     }
   });
 

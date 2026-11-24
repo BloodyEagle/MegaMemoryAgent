@@ -14,10 +14,13 @@ count — the biggest files are where the core logic lives.
 
 Call `megamemory:list_roots` to see what's already recorded. This is a token-budgeted
 index: inspect `roots_compact` (`id`, `name`, `kind`, `child_count`, `valid_until`),
-`slots`, `board_top`, `hint`, `meta` (`returned`, `dropped`, `tokens_estimated`,
+`slots`, `board_top`, `hint`, optional top-level `hint_search`, `meta` (`returned`,
+`dropped`, `tokens_estimated`,
 `truncated`, `dropped_slots`, `dropped_board_top`), `stats`, and wrapper fields
 (`instructions_stale`, `instructions_version`, `server_version`). Legacy
 `roots` is empty for compatibility; the response does not return children. If `meta.truncated` is true, do not treat the visible roots as complete.
+If `hint_search` is present, follow its channel guidance; it is independent of
+`hint` and does not change the legacy string/record-object shape.
 If the graph has good coverage, report what's there and ask if I want to fill in
 specific areas.
 

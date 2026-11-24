@@ -10,6 +10,7 @@ import {
   findTopK,
   queryText,
   vectorSearchEnabled,
+  vectorChannelState,
 } from "./embeddings.js";
 import { basicSearch, ftsSearch, hybridSearch, type SearchVia } from "./search.js";
 import { normalizeName, normalizeNameForDedupe } from "./norm.js";
@@ -42,7 +43,7 @@ import type {
   NodeKind,
   EdgeRow,
 } from "./types.js";
-import { buildNextHints, type NextHintsCard } from "./next-hints.js";
+import { buildNextHints, LIST_ROOTS_SEARCH_HINT, type NextHintsCard } from "./next-hints.js";
 import { timelineActivity } from "./timeline.js";
 import { renderBrief, renderDroppedText, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
@@ -2705,6 +2706,8 @@ export function listRoots(
     stats.nodes === 0
       ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
       : undefined;
+  const channel = vectorChannelState(db);
+  const searchHint = channel.state === "off" ? LIST_ROOTS_SEARCH_HINT : undefined;
 
   // План 09 (R-06a): корни читаются страницами под бюджет ответа, а не целиком
   // с последней порезкой в памяти. Как только корневая секция перестаёт
@@ -2780,6 +2783,7 @@ export function listRoots(
     slots: slotsCut,
     board_top: boardCut,
     ...(hint ? { hint } : {}),
+    ...(searchHint ? { hint_search: searchHint } : {}),
     meta: {
       returned: roots.length,
       // Полное число корней (COUNT), не прочитанное: страницы могут быть

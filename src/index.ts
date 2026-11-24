@@ -286,8 +286,6 @@ async function startMcpServer() {
   const { confirmSupports, provenanceHistory } = await import("./support-baselines.js");
   const { checkArtifacts } = await import("./artifacts.js");
   const { checkFreshness } = await import("./freshness.js");
-  const { vectorChannelState } = await import("./embeddings.js");
-  const { LIST_ROOTS_SEARCH_HINT } = await import("./next-hints.js");
 
   type NodeKind = import("./types.js").NodeKind;
   type RelationType = import("./types.js").RelationType;
@@ -844,13 +842,7 @@ async function startMcpServer() {
         // тем, что обработчик добавляет сам (instructions_status, stats) —
         // оценка listRoots и фактическая выдача MCP не расходятся.
         const stats = db.getStats();
-        // План 33 A3: непустая база с выключенным семантическим каналом
-        // получает строку о keyword-поиске рядом с подсказкой об обзоре.
-        const rootsHint = {
-          ...rootsRecordHint,
-          ...(vectorChannelState(db).state === "on" ? {} : { search: LIST_ROOTS_SEARCH_HINT }),
-        };
-        const extra = { ...instructionsStatus(VERSION), stats, ...(stats.nodes > 0 ? { hint: rootsHint } : {}) };
+        const extra = { ...instructionsStatus(VERSION), stats, ...(stats.nodes > 0 ? { hint: rootsRecordHint } : {}) };
         const result = listRoots(db, { max_tokens: params.max_tokens, extra_payload: extra });
         const nonempty = !!(result.roots_compact?.length || result.slots?.length || result.board_top?.length);
         const hinted = nonempty ? { ...result, ...extra } : { ...result, ...instructionsStatus(VERSION), stats };

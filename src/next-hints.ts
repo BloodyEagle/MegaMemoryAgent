@@ -123,7 +123,7 @@ export const SEARCH_WARNING: Record<Exclude<VectorChannelState, { state: "on" }>
     "Поиск только по словам (MEGAMEMORY_SEARCH=fts): сопоставляются ВСЕ слова запроса. Повтори 2–3 точными терминами или id.",
 };
 
-/** Строка hint.search в list_roots: обзор непустой базы при выключенном канале. */
+/** Строка hint_search в list_roots, отдельно от прежнего hint. */
 export const LIST_ROOTS_SEARCH_HINT =
   "Search is keyword-only (all query words must match): run `megamemory reembed` to enable semantic search.";
 

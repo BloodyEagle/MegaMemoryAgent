@@ -789,7 +789,10 @@ budget can be refused. `get_concept.hint.record` reads: «Узел уже ест
 evidence в том же вызове.» The `list_roots` hint instead reminds the agent
 that this is an overview: record the result for a specific branch as a
 separate node, not by editing the root. A hint is not an automatic write or a
-requirement to invent new knowledge.
+requirement to invent new knowledge. `list_roots` also has an independent,
+optional top-level `hint_search` about vector-channel readiness and the next
+step. It does not change `hint` into another shape or add `hint.search`, and is
+included in the same final `max_tokens` budget.
 
 **Stored kinds:** `feature` · `module` · `pattern` · `config` · `decision` · `component` · `digest` · `task` · `journal`
 

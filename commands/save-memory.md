@@ -10,10 +10,13 @@ you noticed, or intent the user shared.
 
 Call `megamemory:list_roots` to see what's already recorded. Read the budgeted
 `roots_compact` index (`id`, `name`, `kind`, `child_count`, `valid_until`) plus
-`slots`, `board_top`, `hint`, `meta` (`returned`, `dropped`, `tokens_estimated`,
+`slots`, `board_top`, `hint`, optional top-level `hint_search`, `meta` (`returned`,
+`dropped`, `tokens_estimated`,
 `truncated`, `dropped_slots`, `dropped_board_top`), `stats`, and wrapper fields
 (`instructions_stale`, `instructions_version`, `server_version`). Legacy
 `roots` is empty for compatibility; the response does not return children. If `meta.truncated` is true, the visible list is not complete.
+If `hint_search` is present, follow its channel guidance; it is independent of
+`hint` and does not change the legacy string/record-object shape.
 Understanding the current state prevents duplicates and helps you decide what
 to update vs create.
 
