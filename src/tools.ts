@@ -1221,6 +1221,10 @@ export async function understand(
     if (staleRefsShown.length > 0) {
       next.stale_warning = "файл менялся после записи: перечитай ref, прежде чем опираться";
     }
+    // План 33 D-11/D-12: рекомендательная строка о канале едет в реальных
+    // ответах (в том числе budget), но не в теоретическом минимуме конверта:
+    // floor служит порогом отказа, и advisory не обязан его завышать.
+    if (floor) delete next.search_warning;
     const taskContext = taskPlan ? buildTaskContext(db, taskPlan, { compact, refuted, next }) : null;
     if (taskContext) {
       taskContext.duplicates_dropped = taskDuplicates;
@@ -2715,8 +2719,10 @@ export function listRoots(
     stats.nodes === 0
       ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
       : undefined;
-  const channel = vectorChannelState(db);
-  const searchHint = channel.state === "on" ? undefined
+  // План 33 D-06: состояние поиска — отдельное поле; пустой граф уже объяснён
+  // исходным hint, и лишние prepare на нём недопустимы (контракт R-06a).
+  const channel = stats.nodes === 0 ? undefined : vectorChannelState(db);
+  const searchHint = !channel || channel.state === "on" ? undefined
     : channel.state === "partial"
       ? `Semantic search is partial (vectors ${channel.total - channel.missing}/${channel.total}): run \`megamemory reembed\` to finish indexing.`
       : LIST_ROOTS_SEARCH_HINT;

@@ -10,7 +10,7 @@ import {
   edgeDigestOf,
   statusDigestOf,
 } from "../support-baselines.js";
-import { buildNextHints, emptyNextHints, EMPTY_REASON_RECORD, RECORD_FACT } from "../next-hints.js";
+import { buildNextHints, emptyNextHints, EMPTY_REASON_RECORD, RECORD_FACT, SEARCH_WARNING } from "../next-hints.js";
 import { renderDroppedText } from "../brief.js";
 import type { UnderstandOutput } from "../types.js";
 
@@ -519,11 +519,16 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(generous.next!.followups.map((followup) => followup.tool)).toEqual(["check_artifacts"]);
 
     // Two matching IDs cannot be silently omitted: pay for the complete
-    // budget reason, record and loss notice before expecting a success.
+    // budget reason, record, loss notice and the plan-33 channel warning
+    // before expecting a success. The fixture runs MEGAMEMORY_SEARCH=fts.
     const meta = { ...generous.meta!, returned: 0, cards: 0, dropped: 2, supports_inlined: 0, anchor_collapsed: 0, truncated: true, reason: "budget" as const };
     const mandatory: UnderstandOutput = {
       matches: [], compact: [], candidates: [], anchors: [], refuted: [], edges_between: [], meta,
-      next: { must_read: [], skip: [], followups: [], record: `${EMPTY_REASON_RECORD.budget} ${RECORD_FACT}` },
+      next: {
+        must_read: [], skip: [], followups: [],
+        record: `${EMPTY_REASON_RECORD.budget} ${RECORD_FACT}`,
+        search_warning: `${SEARCH_WARNING.text_only_mode} Подними \`max_tokens\`.`,
+      },
       brief: renderDroppedText(meta),
     };
     const floor = measureMcpPayload({ ...mandatory, ...extra });
