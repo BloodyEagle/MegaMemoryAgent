@@ -243,6 +243,38 @@ export function vectorSearchEnabled(db: KnowledgeDB, model: string = MODEL_NAME)
   catch { return false; }
 }
 
+/** Whether the semantic channel answers; `on` holds exactly when `vectorSearchEnabled` does. */
+export type VectorChannelState =
+  | { state: "on" }
+  | {
+      state: "off";
+      reason: "text_only_mode" | "no_generation" | "generation_without_vectors" | "model_mismatch";
+    };
+
+/**
+ * One verdict about the vector channel for every surface that reports it.
+ * @param db - knowledge base
+ * @param model - model the caller expects; defaults to the package model
+ * @returns `on`, or the first reason found why the channel is off
+ */
+export function vectorChannelState(db: KnowledgeDB, model = MODEL_NAME): VectorChannelState {
+  if (isTextOnlySearchMode()) return { state: "off", reason: "text_only_mode" };
+  // A base that never had a generation carries no model stamp: that is not a
+  // foreign model. Only a recorded stamp that differs is a mismatch.
+  const recorded = db.getMetaValue("embed_model");
+  if (recorded && recorded !== model) return { state: "off", reason: "model_mismatch" };
+  const active = db.getVectorGeneration();
+  if (!active || active.model !== model) {
+    return { state: "off", reason: active ? "model_mismatch" : "no_generation" };
+  }
+  if (!sameEmbeddingProfile(active.profile, embeddingProfile(model, active.dim))) {
+    return { state: "off", reason: "model_mismatch" };
+  }
+  // No row published yet: reembed ran on an empty base or stopped before its first row.
+  if (active.dim === 0) return { state: "off", reason: "generation_without_vectors" };
+  return { state: "on" };
+}
+
 export function vectorGenerationMatches(db: KnowledgeDB, expected: VectorGeneration): boolean {
   const active = db.getVectorGeneration();
   return active !== null && active.generation === expected.generation &&
