@@ -127,26 +127,6 @@ export const SEARCH_WARNING: Record<Exclude<VectorChannelState, { state: "on" }>
 export const LIST_ROOTS_SEARCH_HINT =
   "Search is keyword-only (all query words must match): run `megamemory reembed` to enable semantic search.";
 
-/**
- * Прикрепить к пустому ответу объяснение keyword-поиска. Найденный ответ и
- * рабочий семантический канал оставляют next байт в байт прежним.
- * @param db - база
- * @param reason - причина пустоты ответа
- * @param next - собранный блок next
- * @returns тот же объект next, с полем search_warning или без него
- */
-export function withSearchWarning(
-  db: KnowledgeDB,
-  reason: UnderstandMeta["reason"],
-  next: NextHints
-): NextHints {
-  if (reason !== "no_match") return next;
-  const channel = vectorChannelState(db);
-  if (channel.state === "on") return next;
-  next.search_warning = SEARCH_WARNING[channel.reason];
-  return next;
-}
-
 /** Follow-ups тоже не более трёх: каждый исполняется дословно. */
 export const FOLLOWUPS_LIMIT = 3;
 
@@ -409,6 +389,11 @@ export function buildNextHints(input: NextHintsInput): NextHints {
   }
 
   const next: NextHints = { must_read: mustRead, skip, followups, record: buildRecord(cardsWithKind, refuted) };
+  // All understand modes use this builder; the warning participates in their wire budgets.
+  if (input.emptyReason === "no_match") {
+    const channel = vectorChannelState(db);
+    if (channel.state === "off") next.search_warning = SEARCH_WARNING[channel.reason];
+  }
   if (input.emptyReason) next.record = `${EMPTY_REASON_RECORD[input.emptyReason]} ${next.record}`;
   if (input.emptyReason !== "empty_base" && input.activity && input.activity.reads_since_write >= UNRECORDED_READS_THRESHOLD) {
     const { reads_since_write, last_write_at } = input.activity;

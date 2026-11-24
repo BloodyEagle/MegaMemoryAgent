@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { createConcept, measureMcpPayload, understand } from "../tools.js";
-import { EMPTY_REASON_RECORD, RECORD_FACT, SEARCH_WARNING, UNRECORDED_READS_THRESHOLD } from "../next-hints.js";
+import { EMPTY_REASON_RECORD, RECORD_FACT, SEARCH_WARNING, UNRECORDED_READS_THRESHOLD, buildNextHints } from "../next-hints.js";
 import { MODEL_NAME, vectorChannelState } from "../embeddings.js";
 import { reembed } from "../reembed.js";
 import { BRIEF_EMPTY_TEXT } from "../brief.js";
@@ -236,6 +236,13 @@ describe("understand search_warning (plan 33 A3)", () => {
       expect(out.meta!.reason).toBe("no_match");
       expect(out.next).not.toHaveProperty("search_warning");
     }
+  });
+
+  it("buildNextHints alone attaches the warning for all understand callers", () => {
+    db.setMetaValue("embed_model", MODEL_NAME);
+    vi.stubEnv("MEGAMEMORY_SEARCH", "hybrid");
+    expect(buildNextHints({ db, cards: [], emptyReason: "no_match" }).search_warning)
+      .toBe(SEARCH_WARNING.no_generation);
   });
 
   it("an answered search carries no warning", async () => {
