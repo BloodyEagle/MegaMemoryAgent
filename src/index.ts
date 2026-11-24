@@ -496,6 +496,7 @@ async function startMcpServer() {
         const instructions = instructionsStatus(VERSION);
         const result = await understand(db, {
           query: params.query,
+          match: params.match,
           top_k: params.top_k,
           max_tokens: params.max_tokens,
           mode: params.mode,
