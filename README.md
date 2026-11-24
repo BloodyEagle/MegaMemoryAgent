@@ -176,22 +176,30 @@ megamemory install --target kilo
 megamemory install --target zcode
 ```
 
-**Turn on semantic search manually once per project.** A fresh base without a
-vector generation (including one without an `embed_model` stamp) is normal, not
-broken: keyword search requires every query word to occur in a node. Right after
-installing, run in the project directory (or pass `--db PATH` for another base):
+**First semantic setup is automatic by default.** A fresh base without a vector
+generation (including one without an `embed_model` stamp) is normal, not broken:
+until vectors are ready, keyword search uses `match: "all"` by default.
+Successful node writes and MCP startup schedule a missing first generation in the
+background when eligible nodes exist. This also covers a generation with no
+vectors yet; it does not repair model mismatches or partial coverage.
+
+Set `MEGAMEMORY_AUTO_REEMBED=0` to disable only this automatic initialization.
+The first use of the embedding model may download it (about 120 MB); subsequent
+uses load it from the local cache. Background work does not delay the tool's
+response. Failure is reported to stderr and the timeline; another eligible trigger
+can retry after a 10-minute cooldown, not by an automatic retry timer.
+
+Manual setup or recovery remains available in the project directory (or pass
+`--db PATH` for another base):
 
 ```bash
 megamemory reembed
 ```
 
-The first use of the embedding model may download it (about 120 MB); subsequent
-uses load it from the local cache. Running `reembed` on an empty base creates a
-generation with `dim = 0`; the first successfully embedded new node fixes the
-dimension, and subsequent nodes receive vectors as they are written. Creating
-nodes alone does not initialize the first generation: this manual step is required.
-`megamemory doctor` reports whether vector search is on, off, or has only partial
-coverage, with the next step; resume `reembed` if eligible nodes still lack vectors.
+On an empty base it creates a generation with `dim = 0`; the first published node
+vector fixes the dimension. New nodes then receive vectors as they are written.
+`megamemory doctor` reports whether vector search is on, off, or partial; resume
+`reembed` for partial coverage, model changes, or explicitly disabled initialization.
 
 There is deliberately **no universal manual JSON snippet**: the clients use
 different schemas. `install` writes the correct form and the client-specific
@@ -401,8 +409,8 @@ megamemory doctor               # health check, exit code 1 on problems
   (or resumes) an explicit vector generation; switching generations atomically
   invalidates node blobs and the native `nodes_vec` projection, then republishes
   every eligible node. Only rows already published in the current generation
-  become vector hits; unpublished nodes are keyword-only, where every query word
-  must occur in a node. Run `reembed` after a
+  become vector hits; unpublished nodes are keyword-only, where the default
+  `match: "all"` requires every query word. Run `reembed` after a
   model/preprocessing change and after migrating vectors of unknown origin.
 - The exporter owns no directory: `export --check` only reports differing,
   missing and extra `.md` files and exits nonzero on drift; it never deletes
@@ -769,10 +777,14 @@ means matches exist but no minimal qualified card fits — never interpret it as
 `no_match`. When `meta.reason` is `no_match` or `budget` and the vector channel is
 `off` or `partial`, the answer carries `next.search_warning`. With `off` (no vector
 generation or usable vectors, another model, or `MEGAMEMORY_SEARCH=fts`), search is
-keyword-only and every query word must occur in a node. With `partial`, vectors
-cover only some eligible nodes (`missing`/`total`); the rest are keyword-only.
-For `no_match`, retry with 2–3 exact terms or an id and follow the channel's next
-step; for `budget`, first raise `max_tokens` — this is a budget limit, not evidence
+keyword-only: `match: "all"` requires every query word by default. With `partial`,
+vectors cover only some eligible nodes (`missing`/`total`); the rest are keyword-only.
+For `no_match`, retry with 2–3 exact terms or an id; keyword-only warnings also
+suggest explicit `match: "any"` when intentional OR expansion is appropriate. This changes
+only keyword matching, not vector matching. `meta.match` is present only when
+`match` was explicitly supplied (including `"all"`); omission keeps the all-word
+default without a tag. Follow the channel's next step; for `budget`, first raise
+`max_tokens` — this is a budget limit, not evidence
 of missing knowledge. Successful results, `empty_base`, and a fully working `on`
 channel carry no such field; in `brief` the warning is a separate line below the
 empty-result message. In `compact`, `full`, and `brief`, the first explanatory sentence
@@ -948,6 +960,7 @@ Runtime controls read by MegaMemory itself:
 | `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Database fallback after `--db`; resolved from the process cwd. |
 | `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Transformers.js ONNX model identity; changing it requires `reembed`. |
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid`, `fts`, or `vector`; vector mode falls back to FTS when no valid current generation exists. |
+| `MEGAMEMORY_AUTO_REEMBED` | enabled | Exact value `0` disables automatic first-generation setup on node writes/MCP startup; manual `reembed` and an existing generation are unchanged. Model mismatches and partial coverage are never repaired automatically. |
 | `MEGAMEMORY_FTS_TOKENIZER` | unset | Exact value `trigram` requests the companion CJK FTS table/triggers. |
 | `MEGAMEMORY_EMBED_IDLE_MS` | `300000` | Idle milliseconds before unloading the model; `0` disables unload. Read when the module starts. |
 | `MEGAMEMORY_EMBED_THREADS` | `1` | ONNX intra-op thread count; inter-op remains 1. Read when the module starts. |
