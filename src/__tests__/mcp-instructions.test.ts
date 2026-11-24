@@ -6,6 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it } from "vitest";
+import { AGENTS_MD_SNIPPET } from "../guide.js";
 
 const indexUrl = new URL("../index.ts", import.meta.url);
 const source = readFileSync(indexUrl, "utf8");
@@ -33,6 +34,17 @@ function sourceInstructions(version: string): string {
   const instructions: unknown = runInNewContext(expression, { VERSION: version });
   if (typeof instructions !== "string") throw new Error("Instructions must be a string");
   return instructions;
+}
+
+function sourceHookContext(): string {
+  const installSource = readFileSync(new URL("../install.ts", import.meta.url), "utf8");
+  const expression = installSource.match(
+    /const ZCODE_HOOK_CONTEXT = ("(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`);/
+  )?.[1];
+  if (!expression) throw new Error("ZCODE_HOOK_CONTEXT initializer not found");
+  const context: unknown = runInNewContext(expression);
+  if (typeof context !== "string") throw new Error("Hook context must be a string");
+  return context;
 }
 
 function sourceToolDescription(name: string): string {
@@ -71,6 +83,29 @@ async function initialize(server: McpServer): Promise<{
     try { await client.close(); } finally { await server.close(); }
   }
 }
+
+describe("Agent instruction surface matrix (plan33 D03)", () => {
+  it.each([
+    {
+      surface: "MCP_INSTRUCTIONS",
+      read: (): string => sourceInstructions(sourceVersion()),
+      required: ["understand", "create_concept", "evidence"],
+    },
+    {
+      surface: "ZCODE_HOOK_CONTEXT",
+      read: sourceHookContext,
+      required: ["understand", "create_concept", "evidence"],
+    },
+    {
+      surface: "AGENTS_MD_SNIPPET",
+      read: (): string => AGENTS_MD_SNIPPET,
+      required: ["understand", "evidence", "confirm_supports"],
+    },
+  ])("keeps the required guidance in $surface", ({ read, required }) => {
+    const text = read();
+    for (const token of required) expect(text).toContain(token);
+  });
+});
 
 describe("Tool when-to-call descriptions (plan33 C3)", () => {
   it.each([
