@@ -4,6 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { KnowledgeDB, type VectorGeneration } from "../db.js";
 import { reembed } from "../reembed.js";
+import * as autoReembed from "../auto-reembed.js";
+import { createConcept, updateConcept } from "../tools.js";
+import { auditFixture, deferred } from "./helpers/audit.js";
 import { hybridSearch } from "../search.js";
 import { MODEL_NAME, embedForStorage, embeddingProfile, passageText, vectorChannelState, vectorSearchEnabled } from "../embeddings.js";
 
@@ -16,6 +19,7 @@ let dir: string | undefined;
 const profile = process.env.USERPROFILE ?? os.tmpdir();
 const managedCleanup = path.basename(profile).startsWith("mm-new6-owned-");
 const deferredCleanup = new Set<string>();
+const scheduleFirstGeneration = autoReembed.scheduleFirstGeneration;
 const vector = (...values: number[]) => {
   const buffer = Buffer.alloc(values.length * 4);
   values.forEach((value, i) => buffer.writeFloatLE(value, i * 4));
@@ -559,5 +563,335 @@ describe("P10 native/JS identical eligibility and graceful fallback", () => {
       const hits = await hybridSearch(db, "indexing", { model: "p10-new", embedFn });
       expect(hits).toMatchObject([{ id: "first", via: "fts" }]);
     }
+  });
+});
+
+describe("B2 automatic first-generation reembed", () => {
+  function background(): { defer: (run: () => void) => void; run: () => void; jobs: Array<() => void> } {
+    const jobs: Array<() => void> = [];
+    const defer = vi.fn((run: () => void): void => { jobs.push(run); });
+    return { defer, jobs, run: (): void => {
+      expect(jobs).toHaveLength(1);
+      jobs.shift()!();
+    } };
+  }
+
+  it("test opt-out schedules nothing, performs no DB reads and cannot load the model", () => {
+    const db = fresh();
+    const before = snapshot(db);
+    expect(process.env.MEGAMEMORY_AUTO_REEMBED).toBe("0");
+    const queued = background();
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+    const generation = vi.spyOn(db, "getVectorGeneration");
+    const count = vi.spyOn(db, "getReembedEligibleCount");
+
+    expect(scheduleFirstGeneration(db, { defer: queued.defer, embedFn })).toBeUndefined();
+    expect(scheduleFirstGeneration(db)).toBeUndefined();
+
+    expect(generation).not.toHaveBeenCalled();
+    expect(count).not.toHaveBeenCalled();
+    expect(queued.defer).not.toHaveBeenCalled();
+    expect(embedFn).not.toHaveBeenCalled();
+    expect(snapshot(db)).toEqual(before);
+  });
+
+  it("defers work and deduplicates repeated calls and connections to the same normalized path", async () => {
+    const db = fresh();
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const other = new KnowledgeDB(path.join(path.dirname(db.dbPath), ".", path.basename(db.dbPath)));
+    try {
+      const before = snapshot(db);
+      const queued = background();
+      const embedFn = vi.fn(async (_text: string): Promise<Buffer> => vector(1, 0));
+      const options = { defer: queued.defer, embedFn };
+      const pending = scheduleFirstGeneration(db, options);
+      expect(pending).toBeInstanceOf(Promise);
+      expect(scheduleFirstGeneration(db, options)).toBe(pending);
+      expect(scheduleFirstGeneration(other, options)).toBe(pending);
+      expect(queued.defer).toHaveBeenCalledTimes(1);
+      expect(embedFn).not.toHaveBeenCalled();
+      expect(snapshot(db)).toEqual(before);
+      expect(db.getVectorGeneration()).toBeNull();
+
+      queued.run();
+      expect(embedFn).toHaveBeenCalledTimes(1);
+      expect(db.getVectorGeneration()).toBeNull();
+      await expect(pending).resolves.toBeUndefined();
+
+      expect(embedFn).toHaveBeenCalledTimes(3);
+      expect(embedFn.mock.calls[0][0]).toBe(passageText("warmup", MODEL_NAME));
+      expect(vectorChannelState(db)).toEqual({ state: "on" });
+      expect(other.getVectorGeneration()).toEqual(active(db));
+      expect(ids(db.getAllActiveNodesWithEmbeddings())).toEqual(["first", "second"]);
+      expect(snapshot(db).canonical).not.toEqual(before.canonical);
+      expect(snapshot(db).native).toHaveLength(2);
+      expect(scheduleFirstGeneration(other, options)).toBeUndefined();
+      expect(queued.defer).toHaveBeenCalledTimes(1);
+    } finally { other.close(); }
+  });
+
+  it("retains a successful attempt for this process even if generation metadata is reset", async () => {
+    const db = fresh(["first"]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const queued = background();
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+    let now = 1000;
+    const options = { defer: queued.defer, embedFn, now: () => now };
+    const pending = scheduleFirstGeneration(db, options);
+    queued.run();
+    await pending;
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+    expect(embedFn).toHaveBeenCalledTimes(2);
+
+    db.execSql("DELETE FROM meta WHERE key IN ('active_vector_generation','vector_generation_counter','embed_model','embed_dim','embed_profile','last_reembed')");
+    expect(vectorChannelState(db)).toEqual({ state: "off", reason: "no_generation" });
+    expect(db.getReembedEligibleCount()).toBe(1);
+    const before = snapshot(db);
+    now += 10 * 60 * 1000;
+
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+
+    expect(queued.defer).toHaveBeenCalledTimes(1);
+    expect(embedFn).toHaveBeenCalledTimes(2);
+    expect(snapshot(db)).toEqual(before);
+  });
+
+  it("uses the default background immediate without embedding in the scheduling call", async () => {
+    const db = fresh(["first"]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+    const pending = scheduleFirstGeneration(db, { embedFn });
+    expect(pending).toBeInstanceOf(Promise);
+    expect(embedFn).not.toHaveBeenCalled();
+    expect(db.getVectorGeneration()).toBeNull();
+
+    await pending;
+
+    expect(embedFn).toHaveBeenCalledTimes(2);
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+  });
+
+  it("logs warmup failure without changing vectors or generation and retries only after ten minutes", async () => {
+    const db = fresh();
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const before = snapshot(db);
+    const queued = background();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    const embedFn = vi.fn(async (_text: string): Promise<Buffer> => { throw new Error("B2_WARMUP_FAILURE"); });
+    let now = 1000;
+    const options = { defer: queued.defer, embedFn, now: () => now };
+    const pending = scheduleFirstGeneration(db, options);
+    queued.run();
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(db.getVectorGeneration()).toBeNull();
+    expect(snapshot(db)).toEqual(before);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("B2_WARMUP_FAILURE"));
+    expect(db.execSqlAll("SELECT tool,is_write,is_error,result_summary FROM timeline WHERE tool='auto_reembed'")).toEqual([
+      { tool: "auto_reembed", is_write: 1, is_error: 1, result_summary: "B2_WARMUP_FAILURE" },
+    ]);
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+    now += 10 * 60 * 1000 - 1;
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+    expect(queued.defer).toHaveBeenCalledTimes(1);
+    expect(embedFn).toHaveBeenCalledTimes(1);
+
+    now += 1;
+    embedFn.mockResolvedValue(vector(1, 0));
+    const retry = scheduleFirstGeneration(db, options);
+    expect(retry).toBeInstanceOf(Promise);
+    expect(scheduleFirstGeneration(db, options)).toBe(retry);
+    queued.run();
+    await retry;
+
+    expect(queued.defer).toHaveBeenCalledTimes(2);
+    expect(embedFn).toHaveBeenCalledTimes(4);
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+    expect(db.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toHaveLength(1);
+  });
+
+  it.each(["on", "partial", "model_mismatch", "text_only"])("never schedules the %s channel", async (state) => {
+    const db = fresh();
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    if (state === "model_mismatch") await index(db, "b2-foreign");
+    else if (state !== "text_only") await index(db, MODEL_NAME);
+    if (state === "partial") db.execSql("UPDATE nodes SET embedding=NULL WHERE id='second'");
+    if (state === "text_only") vi.stubEnv("MEGAMEMORY_SEARCH", "fts");
+    const before = snapshot(db);
+    const channel = vectorChannelState(db);
+    if (state === "on") expect(channel).toEqual({ state: "on" });
+    else if (state === "partial") expect(channel).toEqual({ state: "partial", missing: 1, total: 2 });
+    else expect(channel).toEqual({ state: "off", reason: state === "text_only" ? "text_only_mode" : state });
+    const queued = background();
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+
+    expect(scheduleFirstGeneration(db, { defer: queued.defer, embedFn })).toBeUndefined();
+
+    expect(queued.defer).not.toHaveBeenCalled();
+    expect(embedFn).not.toHaveBeenCalled();
+    expect(snapshot(db)).toEqual(before);
+  });
+
+  it.each(["empty", "removed", "inactive", "expired", "refuted", "abandoned"])("does not schedule when only %s nodes remain", (state) => {
+    const db = fresh(state === "empty" ? [] : ["first"]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const patches: Record<string, string> = {
+      removed: "UPDATE nodes SET removed_at='2020-01-01'",
+      inactive: "UPDATE nodes SET status='superseded'",
+      expired: "UPDATE nodes SET valid_until='2020-01-01'",
+      refuted: "UPDATE nodes SET epistemic_status='refuted'",
+      abandoned: "UPDATE nodes SET epistemic_status='abandoned'",
+    };
+    if (state !== "empty") db.execSql(patches[state]);
+    expect(db.getReembedEligibleCount()).toBe(0);
+    const before = snapshot(db);
+    const queued = background();
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+
+    expect(scheduleFirstGeneration(db, { defer: queued.defer, embedFn })).toBeUndefined();
+
+    expect(queued.defer).not.toHaveBeenCalled();
+    expect(embedFn).not.toHaveBeenCalled();
+    expect(db.getVectorGeneration()).toBeNull();
+    expect(snapshot(db)).toEqual(before);
+  });
+
+  it("reuses a dimension-zero generation once its first eligible node appears", async () => {
+    const db = fresh([]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    await index(db, MODEL_NAME);
+    const empty = active(db);
+    expect(empty.dim).toBe(0);
+    const queued = background();
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+    const options = { defer: queued.defer, embedFn };
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+    db.insertNode({ id: "first", name: "first", kind: "feature", summary: "indexing text" });
+    const before = snapshot(db);
+
+    const pending = scheduleFirstGeneration(db, options);
+    expect(active(db)).toEqual(empty);
+    expect(snapshot(db)).toEqual(before);
+    queued.run();
+    await pending;
+
+    expect(embedFn).toHaveBeenCalledTimes(2);
+    expect(active(db).generation).toBe(empty.generation);
+    expect(active(db).dim).toBe(2);
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+    expect(snapshot(db).canonical).not.toEqual(before.canonical);
+  });
+
+  it.each(["opt_out", "removed", "foreign", "complete"])("rechecks %s before queued work starts", async (change) => {
+    const db = fresh(["first"]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const queued = background();
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+    const pending = scheduleFirstGeneration(db, { defer: queued.defer, embedFn });
+    if (change === "opt_out") vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "0");
+    if (change === "removed") db.softDeleteNode("first", "B2_QUEUED_REMOVE");
+    if (change === "foreign") await index(db, "b2-foreign");
+    if (change === "complete") await index(db, MODEL_NAME);
+    const before = snapshot(db);
+
+    queued.run();
+    await pending;
+
+    expect(embedFn).not.toHaveBeenCalled();
+    expect(snapshot(db)).toEqual(before);
+    expect(db.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toEqual([]);
+  });
+
+  it("does not replace a foreign generation published while automatic warmup is awaiting", async () => {
+    const db = fresh(["first"]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const queued = background();
+    const warmup = deferred<Buffer>();
+    const started = deferred();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    const embedFn = vi.fn(async (): Promise<Buffer> => { started.resolve(undefined); return warmup.promise; });
+    const pending = scheduleFirstGeneration(db, { defer: queued.defer, embedFn });
+    queued.run();
+    await started.promise;
+    expect(db.getVectorGeneration()).toBeNull();
+    await index(db, "b2-foreign", [0, 1]);
+    const foreign = active(db);
+    const before = snapshot(db);
+
+    warmup.resolve(vector(1, 0));
+    await pending;
+
+    expect(embedFn).toHaveBeenCalledTimes(1);
+    expect(active(db)).toEqual(foreign);
+    expect(snapshot(db)).toEqual(before);
+    expect(stderr).not.toHaveBeenCalled();
+    expect(db.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toEqual([]);
+  });
+
+  it.each(["before_dispatch", "during_warmup"])("closing the DB %s safely ends background work without mutations", async (when) => {
+    const source = fresh(["first"]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const observer = new KnowledgeDB(source.dbPath);
+    const queued = background();
+    const warmup = deferred<Buffer>();
+    const started = deferred();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    const embedFn = vi.fn(async (): Promise<Buffer> => { started.resolve(undefined); return warmup.promise; });
+    try {
+      const before = snapshot(observer);
+      const pending = scheduleFirstGeneration(source, { defer: queued.defer, embedFn });
+      if (when === "during_warmup") { queued.run(); await started.promise; }
+      source.close();
+      db = undefined;
+      if (when === "before_dispatch") queued.run();
+      warmup.resolve(vector(1, 0));
+      await expect(pending).resolves.toBeUndefined();
+
+      expect(embedFn).toHaveBeenCalledTimes(when === "during_warmup" ? 1 : 0);
+      expect(observer.getVectorGeneration()).toBeNull();
+      expect(snapshot(observer)).toEqual(before);
+      expect(observer.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toEqual([]);
+      expect(stderr).toHaveBeenCalledTimes(1);
+    } finally { observer.close(); }
+  });
+
+  it.each(["create", "update"])("%s response is unchanged and returns before its injected background attempt", async (operation) => {
+    const db = fresh(operation === "create" ? [] : ["first"]);
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const queued = background();
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+    const schedule = vi.spyOn(autoReembed, "scheduleFirstGeneration").mockImplementation((target) =>
+      scheduleFirstGeneration(target, { defer: queued.defer, embedFn }));
+    const summary = "A verified background indexing fixture with concrete generation ownership and deterministic publication.";
+
+    if (operation === "create") {
+      expect(await createConcept(db, { name: "Background Create", kind: "feature", summary })).toEqual({
+        id: "background-create", message: 'Created concept "background-create"',
+      });
+    } else {
+      expect(await updateConcept(db, { id: "first", changes: { summary } })).toEqual({ message: 'Updated concept "first".' });
+    }
+
+    expect(schedule).toHaveBeenCalledTimes(1);
+    expect(queued.defer).toHaveBeenCalledTimes(1);
+    expect(embedFn).not.toHaveBeenCalled();
+    expect(db.getVectorGeneration()).toBeNull();
+    expect(db.getReembedEligibleCount()).toBe(1);
+    queued.run();
+    await schedule.mock.results[0].value;
+    expect(embedFn).toHaveBeenCalledTimes(2);
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+  });
+
+  it("audit profiles force subprocess opt-out and isolated home restores the prior setting", async () => {
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const fixture = auditFixture();
+    try {
+      expect(fixture.profile().env.MEGAMEMORY_AUTO_REEMBED).toBe("0");
+      expect(process.env.MEGAMEMORY_AUTO_REEMBED).toBe("1");
+      expect(fixture.isolateHome().env.MEGAMEMORY_AUTO_REEMBED).toBe("0");
+      expect(process.env.MEGAMEMORY_AUTO_REEMBED).toBe("0");
+    } finally { await fixture.close(); }
+    expect(process.env.MEGAMEMORY_AUTO_REEMBED).toBe("1");
   });
 });
