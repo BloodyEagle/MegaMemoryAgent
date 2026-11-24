@@ -1,4 +1,5 @@
 import type { KnowledgeDB } from "./db.js";
+import { vectorChannelState, type VectorChannelState } from "./embeddings.js";
 import {
   CheckBudget,
   DEFAULT_MAX_CHECK_BYTES,
@@ -105,6 +106,46 @@ export const RECORD_FACT =
 /** Форма записи решения: влезает в brief.LINE_MAX без обрезки. */
 export const RECORD_DECISION =
   'После правки запиши решение: create_concept kind=decision, evidence: [{ref|node, why: "что подтверждает"}] — это и есть informed_by; file_refs связей не даёт. Состояние — с valid_until.';
+
+const KEYWORD_ONLY_WARNING =
+  "Поиск только по словам: векторный канал выключен, сопоставляются ВСЕ слова запроса. Повтори 2–3 точными терминами или id на языке записей. Семантический поиск включит `megamemory reembed` — один раз для базы.";
+
+/**
+ * План 33 A3: почему пустой ответ пуст, когда семантический канал выключен.
+ * Каждая строка влезает в brief.LINE_MAX без обрезки.
+ */
+export const SEARCH_WARNING: Record<Exclude<VectorChannelState, { state: "on" }>["reason"], string> = {
+  no_generation: KEYWORD_ONLY_WARNING,
+  generation_without_vectors: KEYWORD_ONLY_WARNING,
+  model_mismatch:
+    "Поиск только по словам: модель векторов не совпадает с текущей. Повтори 2–3 точными терминами или id. Вернёт семантику `megamemory reembed`.",
+  text_only_mode:
+    "Поиск только по словам (MEGAMEMORY_SEARCH=fts): сопоставляются ВСЕ слова запроса. Повтори 2–3 точными терминами или id.",
+};
+
+/** Строка hint.search в list_roots: обзор непустой базы при выключенном канале. */
+export const LIST_ROOTS_SEARCH_HINT =
+  "Search is keyword-only (all query words must match): run `megamemory reembed` to enable semantic search.";
+
+/**
+ * Прикрепить к пустому ответу объяснение keyword-поиска. Найденный ответ и
+ * рабочий семантический канал оставляют next байт в байт прежним.
+ * @param db - база
+ * @param reason - причина пустоты ответа
+ * @param next - собранный блок next
+ * @returns тот же объект next, с полем search_warning или без него
+ */
+export function withSearchWarning(
+  db: KnowledgeDB,
+  reason: UnderstandMeta["reason"],
+  next: NextHints
+): NextHints {
+  if (reason !== "no_match") return next;
+  const channel = vectorChannelState(db);
+  if (channel.state === "on") return next;
+  next.search_warning = SEARCH_WARNING[channel.reason];
+  return next;
+}
 
 /** Follow-ups тоже не более трёх: каждый исполняется дословно. */
 export const FOLLOWUPS_LIMIT = 3;

@@ -752,6 +752,11 @@ export interface NextHints {
    * после записи узла; перечитай ref, прежде чем опираться.
    */
   stale_warning?: string;
+  /**
+   * План 33 A3: одна строка, только когда ответ пуст (reason = no_match) и
+   * семантический канал выключен — поиск шёл только по словам.
+   */
+  search_warning?: string;
   /** Last complete observed session; omitted when its beginning is outside the timeline sample. */
   previous_session?: {
     had_understand: boolean;

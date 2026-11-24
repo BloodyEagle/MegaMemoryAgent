@@ -91,7 +91,12 @@ function nodeOfArgs(args: Record<string, unknown>): string {
  * и блок не расходятся: обе части рендерятся из одного и того же объекта.
  */
 export function renderBrief(nodes: BriefNodeInfo[], next: NextHints): string {
-  if (nodes.length === 0) return BRIEF_EMPTY_TEXT;
+  // План 33 A3: пустой ответ отдельной строкой объясняет keyword-поиск.
+  if (nodes.length === 0) {
+    return next.search_warning
+      ? `${BRIEF_EMPTY_TEXT}\n${clip(oneLine(next.search_warning), LINE_MAX)}`
+      : BRIEF_EMPTY_TEXT;
+  }
 
   const lines: string[] = [];
 

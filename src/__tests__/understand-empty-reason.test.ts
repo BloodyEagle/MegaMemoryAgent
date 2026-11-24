@@ -2,9 +2,27 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { KnowledgeDB } from "../db.js";
 import { ensureSchema } from "../migrate-schema.js";
 import { createConcept, measureMcpPayload, understand } from "../tools.js";
-import { EMPTY_REASON_RECORD, RECORD_FACT, UNRECORDED_READS_THRESHOLD } from "../next-hints.js";
+import { EMPTY_REASON_RECORD, RECORD_FACT, SEARCH_WARNING, UNRECORDED_READS_THRESHOLD } from "../next-hints.js";
+import { MODEL_NAME, vectorChannelState } from "../embeddings.js";
+import { reembed } from "../reembed.js";
+import { BRIEF_EMPTY_TEXT } from "../brief.js";
+import type { BriefOutput } from "../types.js";
 import { createTimelineLogger, type TimelineLogger } from "../timeline.js";
 import { addNode, auditFixture, type AuditFixture } from "./helpers/audit.js";
+
+// Only inference is replaced: the vector channel state stays real, so the
+// "channel on" cases below run the production state checks.
+vi.mock("../embeddings.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../embeddings.js")>();
+  return {
+    ...actual,
+    embed: vi.fn(async () => {
+      const buffer = Buffer.alloc(8);
+      buffer.writeFloatLE(1, 0);
+      return buffer;
+    }),
+  };
+});
 
 let fixture: AuditFixture;
 let db: KnowledgeDB;
@@ -142,5 +160,88 @@ describe("understand empty reasons", () => {
     expect(out.next!.record).not.toContain("С последней записи");
     expect(out.next).not.toHaveProperty("unrecorded");
     expect(out.next!.record).toBe(`${EMPTY_REASON_RECORD.empty_base} ${RECORD_FACT}`);
+  });
+});
+
+describe("understand search_warning (plan 33 A3)", () => {
+  const MISS = "zzmissingzz";
+  const vector = () => {
+    const buffer = Buffer.alloc(8);
+    buffer.writeFloatLE(1, 0);
+    return buffer;
+  };
+  const embedFn = async () => vector();
+  function seedMiss(): void {
+    addNode(db, "stored", { name: "Existing module", summary: "Existing module has concrete stored implementation evidence." });
+  }
+
+  it.each([
+    ["no model stamp", (target: KnowledgeDB) => { target.execSqlRun("DELETE FROM meta WHERE key='embed_model'"); }],
+    ["a stamp without a generation", (target: KnowledgeDB) => { target.setMetaValue("embed_model", MODEL_NAME); }],
+  ])("a miss with %s names the keyword-only search in every mode", async (_name, prepare) => {
+    vi.unstubAllEnvs();
+    prepare(db);
+    seedMiss();
+    expect(vectorChannelState(db)).toEqual({ state: "off", reason: "no_generation" });
+    for (const mode of ["compact", "full", "brief"] as const) {
+      const out = await understand(db, { query: MISS, mode });
+      expect(out.meta!.reason).toBe("no_match");
+      expect(out.next!.search_warning).toBe(SEARCH_WARNING.no_generation);
+      expect(out.meta!.tokens_estimated).toBe(measureMcpPayload(out));
+    }
+  });
+
+  it("brief renders the warning as its own line under the empty answer", async () => {
+    vi.unstubAllEnvs();
+    db.setMetaValue("embed_model", MODEL_NAME);
+    seedMiss();
+    const out = (await understand(db, { query: MISS, mode: "brief" })) as unknown as BriefOutput;
+    expect(out.brief).toBe(`${BRIEF_EMPTY_TEXT}\n${SEARCH_WARNING.no_generation}`);
+  });
+
+  it("a generation without vectors gives the same advice", async () => {
+    vi.unstubAllEnvs();
+    db.setMetaValue("embed_model", MODEL_NAME);
+    await reembed(db, { embedFn });
+    seedMiss();
+    expect(vectorChannelState(db)).toEqual({ state: "off", reason: "generation_without_vectors" });
+    const out = await understand(db, { query: MISS });
+    expect(out.meta!.reason).toBe("no_match");
+    expect(out.next!.search_warning).toBe(SEARCH_WARNING.generation_without_vectors);
+  });
+
+  it("another recorded model names the mismatch", async () => {
+    vi.unstubAllEnvs();
+    seedMiss();
+    const out = await understand(db, { query: MISS });
+    expect(out.next!.search_warning).toBe(SEARCH_WARNING.model_mismatch);
+  });
+
+  it("text-only mode names its switch", async () => {
+    seedMiss();
+    const out = await understand(db, { query: MISS });
+    expect(out.next!.search_warning).toBe(SEARCH_WARNING.text_only_mode);
+  });
+
+  it("keeps the miss without the warning when the semantic channel is on", async () => {
+    vi.unstubAllEnvs();
+    db.setMetaValue("embed_model", MODEL_NAME);
+    addNode(db, "gone", { summary: "Gone node carried the only vector of the base before removal." });
+    await reembed(db, { embedFn });
+    db.softDeleteNode("gone", "fixture removed");
+    seedMiss();
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+    for (const mode of ["compact", "full", "brief"] as const) {
+      const out = await understand(db, { query: MISS, mode });
+      expect(out.meta!.reason).toBe("no_match");
+      expect(out.next).not.toHaveProperty("search_warning");
+    }
+  });
+
+  it("an answered search carries no warning", async () => {
+    seedMiss();
+    const out = await understand(db, { query: "Existing module" });
+    expect(out.meta).not.toHaveProperty("reason");
+    expect(out.next).not.toHaveProperty("search_warning");
   });
 });

@@ -42,7 +42,7 @@ import type {
   NodeKind,
   EdgeRow,
 } from "./types.js";
-import { buildNextHints, type NextHintsCard } from "./next-hints.js";
+import { buildNextHints, withSearchWarning, type NextHintsCard } from "./next-hints.js";
 import { timelineActivity } from "./timeline.js";
 import { renderBrief, renderDroppedText, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
@@ -856,13 +856,13 @@ export async function understand(
     }));
 
     const reason = emptyReason(nodes.length > 0 || refutedNodes.length > 0, eligible.length > 0);
-    const next: NextHints = buildNextHints({
+    const next: NextHints = withSearchWarning(db, reason, buildNextHints({
       db,
       cards: nodes.map(({ node }) => ({ id: node.id, visibleSupports: 0 })),
       refuted: refutedForNext,
       activity,
       emptyReason: reason,
-    });
+    }));
 
     // Полный режим по тем же сырым строкам, что и в compact-ветке (см. ниже):
     // сигнал «сколько сэкономил brief» относительно mode: "full".
@@ -945,7 +945,7 @@ export async function understand(
     });
     // Full preserves every selected card and next action, refusing budgets that cannot fit.
     const reason = emptyReason(matches.length > 0 || refuted.length > 0, eligible.length > 0);
-    const fullNext = buildNextHints({
+    const fullNext = withSearchWarning(db, reason, buildNextHints({
       db,
       cards: matches.map((m) => ({
         id: m.id,
@@ -955,7 +955,7 @@ export async function understand(
       refuted: refuted.map((r) => ({ name: r.name, reason: r.refuted_reason ?? null })),
       activity,
       emptyReason: reason,
-    });
+    }));
     const output: UnderstandOutput = {
       matches,
       compact: undefined,
@@ -1213,6 +1213,9 @@ export async function understand(
     if (staleRefsShown.length > 0) {
       next.stale_warning = "файл менялся после записи: перечитай ref, прежде чем опираться";
     }
+    // План 33 A3: пустой ответ при выключенном семантическом канале
+    // объясняет, что поиск шёл только по словам; найденный ответ не меняется.
+    withSearchWarning(db, meta.reason, next);
     const taskContext = taskPlan ? buildTaskContext(db, taskPlan, { compact, refuted, next }) : null;
     if (taskContext) {
       taskContext.duplicates_dropped = taskDuplicates;
