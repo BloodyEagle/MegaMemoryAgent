@@ -390,12 +390,15 @@ export function buildNextHints(input: NextHintsInput): NextHints {
 
   const next: NextHints = { must_read: mustRead, skip, followups, record: buildRecord(cardsWithKind, refuted) };
   // All understand modes use this builder; the warning participates in their wire budgets.
-  if (input.emptyReason === "no_match") {
+  if (input.emptyReason === "no_match" || input.emptyReason === "budget") {
     const channel = vectorChannelState(db);
     if (channel.state === "off") next.search_warning = SEARCH_WARNING[channel.reason];
     if (channel.state === "partial") {
       next.search_warning = `Векторы есть у ${channel.total - channel.missing} из ${channel.total} узлов — ` +
         "семантический поиск неполный, `megamemory reembed` догонит.";
+    }
+    if (next.search_warning && input.emptyReason === "budget") {
+      next.search_warning += " Подними `max_tokens`.";
     }
   }
   if (input.emptyReason) next.record = `${EMPTY_REASON_RECORD[input.emptyReason]} ${next.record}`;

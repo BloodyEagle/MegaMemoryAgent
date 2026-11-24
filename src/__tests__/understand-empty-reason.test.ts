@@ -246,6 +246,19 @@ describe("understand search_warning (plan 33 A3)", () => {
       .toBe(SEARCH_WARNING.no_generation);
   });
 
+  it("budget on a base without a generation explains search and asks for max_tokens", async () => {
+    db.setMetaValue("embed_model", MODEL_NAME);
+    seedBudget();
+    const out = await understand(db, { query: "Budget", max_tokens: 600 });
+    expect(out.meta!.reason).toBe("budget");
+    expect(out.next!.search_warning).toBe(`${SEARCH_WARNING.text_only_mode} Подними \`max_tokens\`.`);
+    expect(out.meta!.tokens_estimated).toBe(measureMcpPayload(out));
+    expect(out.meta!.tokens_estimated).toBeLessThanOrEqual(600);
+    vi.stubEnv("MEGAMEMORY_SEARCH", "hybrid");
+    expect(buildNextHints({ db, cards: [], emptyReason: "budget" }).search_warning)
+      .toBe(`${SEARCH_WARNING.no_generation} Подними \`max_tokens\`.`);
+  });
+
   it.each(["compact", "full", "brief"] as const)("partial coverage warns in %s", async (mode) => {
     vi.stubEnv("MEGAMEMORY_SEARCH", "vector");
     await reembed(db, { embedFn });
