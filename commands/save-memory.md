@@ -32,8 +32,14 @@ Think about what happened this session. Consider:
 
 ## Step 3: Search for overlap
 
-Before creating anything new, call `megamemory:understand` with queries based on
-what you worked on this session. Compact is the default; use `mode:"full"` for
+Before creating anything new, call `megamemory:understand` with short queries
+based on what you worked on: 2–5 exact terms or identifiers in the language of
+the stored nodes. Keyword matching requires every query word; semantic matching
+requires an available vector channel. Distinguish `meta.reason=empty_base|no_match|budget`:
+for `no_match`, retry with 2–3 exact terms or an id; for `budget`, first raise
+`max_tokens`. Follow `next.search_warning` for an `off` or `partial` channel;
+partial coverage leaves some nodes keyword-only, so a miss is not proof of no overlap.
+Compact is the default; use `mode:"full"` for
 verbose cards or `mode:"brief"` for at most 8 orientation lines without cards.
 Every answer includes a mandatory `next`: read every `must_read` ref (mandatory
 sources, not proof of whole-file coverage) and execute every `followup` exactly

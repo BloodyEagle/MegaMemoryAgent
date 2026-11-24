@@ -176,6 +176,23 @@ megamemory install --target kilo
 megamemory install --target zcode
 ```
 
+**Turn on semantic search manually once per project.** A fresh base without a
+vector generation (including one without an `embed_model` stamp) is normal, not
+broken: keyword search requires every query word to occur in a node. Right after
+installing, run in the project directory (or pass `--db PATH` for another base):
+
+```bash
+megamemory reembed
+```
+
+The first use of the embedding model may download it (about 120 MB); subsequent
+uses load it from the local cache. Running `reembed` on an empty base creates a
+generation with `dim = 0`; the first successfully embedded new node fixes the
+dimension, and subsequent nodes receive vectors as they are written. Creating
+nodes alone does not initialize the first generation: this manual step is required.
+`megamemory doctor` reports whether vector search is on, off, or has only partial
+coverage, with the next step; resume `reembed` if eligible nodes still lack vectors.
+
 There is deliberately **no universal manual JSON snippet**: the clients use
 different schemas. `install` writes the correct form and the client-specific
 workflow files; if configuring by hand, register the stdio command
@@ -384,7 +401,8 @@ megamemory doctor               # health check, exit code 1 on problems
   (or resumes) an explicit vector generation; switching generations atomically
   invalidates node blobs and the native `nodes_vec` projection, then republishes
   every eligible node. Only rows already published in the current generation
-  become vector hits; FTS covers the rest. Run `reembed` after a
+  become vector hits; unpublished nodes are keyword-only, where every query word
+  must occur in a node. Run `reembed` after a
   model/preprocessing change and after migrating vectors of unknown origin.
 - The exporter owns no directory: `export --check` only reports differing,
   missing and extra `.md` files and exits nonzero on drift; it never deletes
@@ -748,7 +766,16 @@ proves neither that the agent saw it nor that it wrote knowledge.
 **Empty results** carry `meta.reason`: `empty_base` means no live nodes;
 `no_match` means live nodes exist but none pass the search/filters; `budget`
 means matches exist but no minimal qualified card fits — never interpret it as
-`no_match`. In `compact`, `full`, and `brief`, the first explanatory sentence
+`no_match`. When `meta.reason` is `no_match` or `budget` and the vector channel is
+`off` or `partial`, the answer carries `next.search_warning`. With `off` (no vector
+generation or usable vectors, another model, or `MEGAMEMORY_SEARCH=fts`), search is
+keyword-only and every query word must occur in a node. With `partial`, vectors
+cover only some eligible nodes (`missing`/`total`); the rest are keyword-only.
+For `no_match`, retry with 2–3 exact terms or an id and follow the channel's next
+step; for `budget`, first raise `max_tokens` — this is a budget limit, not evidence
+of missing knowledge. Successful results, `empty_base`, and a fully working `on`
+channel carry no such field; in `brief` the warning is a separate line below the
+empty-result message. In `compact`, `full`, and `brief`, the first explanatory sentence
 and the full `next.record` contract are mandatory and never trimmed; if the
 required envelope cannot fit, the request is refused with an explicit error
 asking for a larger budget. The record line rendered in `brief` has its own

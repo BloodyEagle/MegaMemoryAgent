@@ -34,8 +34,16 @@ Think in terms of:
 
 ## Step 3: Read and create root concepts
 
-For each major module, query `megamemory:understand` first. It is compact by
-default; `mode:"full"` returns verbose cards and `mode:"brief"` returns at most
+For each major module, query `megamemory:understand` first with 2–5 exact terms
+or identifiers in the language of the stored nodes. Keyword matching requires
+every query word; semantic matching requires an available vector channel.
+Distinguish `meta.reason=empty_base|no_match|budget`: for `no_match`, retry with
+2–3 exact terms or an id; for `budget`, first raise `max_tokens`.
+Follow `next.search_warning` for an `off` or `partial` channel. Initial semantic
+setup requires one manual `megamemory reembed` per project; running it on an empty
+base prepares the generation for vectors from later node writes.
+It is compact by default; `mode:"full"` returns verbose cards and `mode:"brief"`
+returns at most
 8 orientation lines without cards. Every mode returns a mandatory `next` block:
 read all `must_read` refs (mandatory sources, not proof of whole-file coverage)
 before editing/recording and execute every `followup` exactly with its supplied
