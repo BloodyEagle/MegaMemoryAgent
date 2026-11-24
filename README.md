@@ -181,13 +181,16 @@ generation (including one without an `embed_model` stamp) is normal, not broken:
 until vectors are ready, keyword search uses `match: "all"` by default.
 Successful node writes and MCP startup schedule a missing first generation in the
 background when eligible nodes exist. This also covers a generation with no
-vectors yet; it does not repair model mismatches or partial coverage.
+vectors yet and a partial index: the active generation is kept and only the
+missing node vectors are rebuilt; model mismatches are not repaired.
 
 Set `MEGAMEMORY_AUTO_REEMBED=0` to disable only this automatic initialization.
 The first use of the embedding model may download it (about 120 MB); subsequent
 uses load it from the local cache. Background work does not delay the tool's
-response. Failure is reported to stderr and the timeline; another eligible trigger
-can retry after a 10-minute cooldown, not by an automatic retry timer.
+response. Failure is reported to stderr and the timeline; the cooldown after a
+failed attempt doubles from 10 up to 60 minutes, and after three failed attempts
+the automation pauses for this process with a stderr note — manual `megamemory
+reembed` remains the way forward. There is no automatic retry timer.
 
 Manual setup or recovery remains available in the project directory (or pass
 `--db PATH` for another base):
@@ -199,7 +202,8 @@ megamemory reembed
 On an empty base it creates a generation with `dim = 0`; the first published node
 vector fixes the dimension. New nodes then receive vectors as they are written.
 `megamemory doctor` reports whether vector search is on, off, or partial; resume
-`reembed` for partial coverage, model changes, or explicitly disabled initialization.
+`reembed` for model changes, explicitly disabled initialization, or when the
+automatic catch-up is paused after repeated failures.
 
 There is deliberately **no universal manual JSON snippet**: the clients use
 different schemas. `install` writes the correct form and the client-specific
@@ -960,7 +964,7 @@ Runtime controls read by MegaMemory itself:
 | `MEGAMEMORY_DB_PATH` | `./.megamemory/knowledge.db` | Database fallback after `--db`; resolved from the process cwd. |
 | `MEGAMEMORY_EMBED_MODEL` | `Xenova/multilingual-e5-small` | Transformers.js ONNX model identity; changing it requires `reembed`. |
 | `MEGAMEMORY_SEARCH` | `hybrid` | `hybrid`, `fts`, or `vector`; vector mode falls back to FTS when no valid current generation exists. |
-| `MEGAMEMORY_AUTO_REEMBED` | enabled | Exact value `0` disables automatic first-generation setup on node writes/MCP startup; manual `reembed` and an existing generation are unchanged. Model mismatches and partial coverage are never repaired automatically. |
+| `MEGAMEMORY_AUTO_REEMBED` | enabled | Exact value `0` disables automatic first-generation setup on node writes/MCP startup; manual `reembed` and an existing generation are unchanged. A partial index is caught up automatically; model mismatches are never repaired automatically, and after three failed attempts the automation pauses for the process. |
 | `MEGAMEMORY_FTS_TOKENIZER` | unset | Exact value `trigram` requests the companion CJK FTS table/triggers. |
 | `MEGAMEMORY_EMBED_IDLE_MS` | `300000` | Idle milliseconds before unloading the model; `0` disables unload. Read when the module starts. |
 | `MEGAMEMORY_EMBED_THREADS` | `1` | ONNX intra-op thread count; inter-op remains 1. Read when the module starts. |

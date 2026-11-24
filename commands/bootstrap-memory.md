@@ -42,10 +42,11 @@ Distinguish `meta.reason=empty_base|no_match|budget`: for `no_match`, retry with
 2–3 exact terms or an id; for `budget`, first raise `max_tokens`.
 Follow `next.search_warning` for an `off` or `partial` channel. Successful node
 writes and MCP startup with eligible nodes initialize a missing first generation
-in the background by default. `MEGAMEMORY_AUTO_REEMBED=0` disables only this setup;
-model mismatches and partial coverage still need manual `megamemory reembed`.
-First model use may download about 120 MB; after failure, another eligible trigger
-can retry following a 10-minute cooldown. It is compact by default;
+in the background by default and catch up a partial index without wiping it.
+`MEGAMEMORY_AUTO_REEMBED=0` disables only this setup; model mismatches still
+need manual `megamemory reembed`. First model use may download about 120 MB;
+after failure the cooldown doubles from 10 up to 60 minutes, and after three
+failures the automation pauses with a stderr note. It is compact by default;
 `mode:"full"` returns verbose cards and `mode:"brief"` returns at most
 8 orientation lines without cards. Every mode returns a mandatory `next` block:
 read all `must_read` refs (mandatory sources, not proof of whole-file coverage)
