@@ -220,14 +220,21 @@ describe("understand include_source (план 26 §2)", () => {
     const blockCost =
       measureMcpPayload({ compact: [{ source: { ref: "src/x.ts:1-10", start_line: 1, lines: TEN_LINES.replace(/\n$/, "").split("\n"), truncated: false } }] })
       - measureMcpPayload({ compact: [{}] });
-    const output = await query("source-budget", {
-      include_source: true,
-      max_tokens: minimum + Math.max(1, Math.floor(blockCost / 2)),
-    });
+    let budget = minimum + Math.max(1, Math.floor(blockCost / 2));
+    let output: Output;
+    try {
+      output = await query("source-budget", { include_source: true, max_tokens: budget });
+    } catch (err) {
+      // План 33: обязательный search_warning поднял минимум честного ответа —
+      // повторяем ровно с названным сервером вторым минимумом; source-блок
+      // при этом всё ещё не помещается, что и проверяют ассерты ниже.
+      budget = Number(/minimum (\d+)/.exec(err instanceof Error ? err.message : String(err))?.[1]);
+      output = await query("source-budget", { include_source: true, max_tokens: budget });
+    }
     expect(JSON.stringify(output)).not.toContain('"source":');
     expect(output.meta!.source_cards ?? 0).toBe(0);
     if (output.meta!.source_skipped !== undefined) expect(output.meta!.source_skipped).toBe("budget");
-    expect(output.meta!.tokens_estimated).toBeLessThanOrEqual(minimum + Math.max(1, Math.floor(blockCost / 2)));
+    expect(output.meta!.tokens_estimated).toBeLessThanOrEqual(budget);
   });
 
   it("full mode refuses include_source explicitly", async () => {
