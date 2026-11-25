@@ -113,4 +113,14 @@ describe("D: understand MCP source description matches retrieval contracts", () 
     expect(registration.description).toMatch(/collapse_ref_anchors defaults to true in compact/i);
     expect(registration.description).toMatch(/path[^.]*exact full path/i);
   });
+
+  it("describes the stale_refs display cap and the separate missing axis honestly (2.14.1/35 T3)", () => {
+    const { description } = understandRegistration();
+    expect(description).toMatch(/stale_refs shows the first 3 of stale_refs_total/);
+    expect(description).toMatch(/on returned cards/);
+    expect(description).toMatch(/hidden stale entries are total minus shown/);
+    expect(description).toMatch(/stale_refs_missing counts refs of returned cards whose file is absent from disk/);
+    expect(description).toContain("a separate axis, not a change");
+    expect(description).not.toContain("carry the full counts");
+  });
 });
