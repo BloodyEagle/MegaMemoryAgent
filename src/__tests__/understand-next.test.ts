@@ -591,6 +591,13 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(tight.meta!.tokens_estimated).toBeLessThanOrEqual(floor);
   });
 
+  it("бюджет: имена кандидатов и карточек не сжимаются до пустой строки (2.14.1/35 T2)", async () => {
+    seedBudget();
+    const out = await understand(db, { query: "ответа wire", top_k: 5, max_tokens: 900 });
+    for (const candidate of out.candidates ?? []) expect(candidate.name).not.toBe("");
+    for (const card of out.compact ?? []) expect(card.name).not.toBe("");
+  });
+
   it("бюджет: followups режутся раньше must_read и record", async () => {
     seedSmallBudget();
     // Isolate one qualified card so its optional followup, rather than
@@ -603,7 +610,9 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(generous.next!.followups[0].args).toEqual({ node_ids: ["b-dec"] });
 
     const minimal = JSON.parse(JSON.stringify(generous)) as UnderstandOutput;
-    minimal.compact = minimal.compact!.map(({ summary: _summary, children: _children, edges: _edges, ...card }) => ({ ...card, name: "" }));
+    // Полы 2.14.1/35 T2: имя не сжимается до пустой строки, поэтому witness
+    // несёт настоящее имя карточки, а сводку и вложение отпускает целиком.
+    minimal.compact = minimal.compact!.map(({ summary: _summary, children: _children, edges: _edges, ...card }) => card);
     minimal.candidates = [];
     minimal.meta = { ...minimal.meta!, returned: 0, cards: 1, dropped: 0, truncated: true };
     minimal.next!.followups = [];

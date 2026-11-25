@@ -140,6 +140,30 @@ describe("D: candidates are discovery, cards are qualified detail", () => {
     }
   });
 
+  it("narrow window keeps every visible entry named and above the floors (2.14.1/35 T2)", async () => {
+    const name = "Regional address normalization rule ".repeat(5) + "KEEP-THIS-TAIL";
+    const ids = Array.from({ length: 8 }, (_item, index) => index === 0 ? "tail-" + "x".repeat(85) : `tail-${index}`);
+    ids.forEach(id => addNode(db, id, {
+      name, summary: "Правило нормализации адреса проверяет регион до сохранения результата и не подменяет идентификатор совпадением имени.".repeat(4),
+    }));
+    rank(ids);
+    const out = await understand(db, { query: "address", max_tokens: 700 });
+
+    expect(out.meta!.truncated).toBe(true);
+    expect(out.candidates!.length).toBeGreaterThan(0);
+    for (const candidate of out.candidates!) {
+      expect(candidate.name).not.toBe("");
+      expect(candidate.name.length).toBeGreaterThanOrEqual(12);
+    }
+    for (const card of out.compact ?? []) {
+      expect(card.summary === undefined || card.summary === "" || card.summary.length >= 40).toBe(true);
+    }
+    const visible = new Set([...out.candidates!.map(c => c.id), ...(out.compact ?? []).map(c => c.id)]);
+    expect(out.meta!.returned).toBe(out.candidates!.length);
+    expect(out.meta!.dropped).toBe(8 - visible.size);
+    expectTieredCap(out, 700);
+  });
+
   it("keeps a pathological 120+ character id exact when its entry fits, and get_concept resolves it", async () => {
     vi.stubEnv("MEGAMEMORY_SEARCH", "fts");
     const id = "exact-" + "x".repeat(124);

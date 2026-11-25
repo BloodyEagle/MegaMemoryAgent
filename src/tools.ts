@@ -1008,6 +1008,11 @@ export async function understand(
   const CARDS_MAX = Math.min(topK, 3);
   const CANDIDATE_SOFT = 40;
   const CANDIDATE_HARD = 90;
+  // Полы сжатия (2.14.1/35 T2): имя и сводка не сжимаются до пустой строки —
+  // запись под тесным бюджетом лучше отпустить (meta.truncated), чем показать
+  // безымянной.
+  const NAME_FLOOR = 12;
+  const SUMMARY_FLOOR = 40;
   const candidateTarget = Math.floor(maxTokens / 4);
   let candidates: UnderstandCandidate[] = [];
   // Independently reproducible wire-ish cost, including pretty JSON and MCP escaping.
@@ -1383,16 +1388,20 @@ export async function understand(
     if (fits()) return true;
     const initial = JSON.stringify(card);
     if (card.support_evidence === undefined) {
-      while (card.summary.length > 0 && !fits()) {
-        const limit = Math.max(0, card.summary.length - 24);
-        card.summary = limit === 0 ? "" : trimSummary(card.summary, limit);
-        if (card.summary === "…") card.summary = "";
+      // Пол SUMMARY_FLOOR: граница слова в trimSummary может недобрать — ниже
+      // пола не опускаемся; всё равно не влезает — сводка снимается целиком
+      // (serializeCard удалит поле), карточка остаётся.
+      while (card.summary.length > SUMMARY_FLOOR && !fits()) {
+        const next = trimSummary(card.summary, Math.max(SUMMARY_FLOOR, card.summary.length - 24));
+        if (next.length < SUMMARY_FLOOR) break;
+        card.summary = next;
       }
+      if (!fits()) card.summary = "";
     }
     if (!fits()) delete card.children;
     if (!fits()) delete card.edges;
-    while (card.name.length > 0 && !fits()) {
-      card.name = tailName(card.name, Math.max(0, card.name.length - 8));
+    while (card.name.length > NAME_FLOOR && !fits()) {
+      card.name = tailName(card.name, Math.max(NAME_FLOOR, card.name.length - 8));
     }
     if (JSON.stringify(card) !== initial) {
       squeezedCards.add(card.id);
@@ -1460,8 +1469,8 @@ export async function understand(
       delete list[i].summary_short;
     }
     for (let i = list.length - 1; i >= 0 && !fits(); i -= 1) {
-      while (list[i].name.length > 0 && !fits()) {
-        list[i].name = tailName(list[i].name, Math.max(0, list[i].name.length - 8));
+      while (list[i].name.length > NAME_FLOOR && !fits()) {
+        list[i].name = tailName(list[i].name, Math.max(NAME_FLOOR, list[i].name.length - 8));
         truncated = true;
       }
     }
