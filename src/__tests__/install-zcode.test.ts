@@ -141,6 +141,10 @@ describe("Plan 28 ZCode target", () => {
     expect(contextLiteral).toBeDefined();
     const context = JSON.parse(contextLiteral!) as string;
     for (const token of ["understand", "create_concept", "evidence"]) expect(context).toContain(token);
+    // 2.14.1/35 T9: имя инструмента — в клиентской форме ZCode, короткая
+    // форма megamemory_understand в хук не попадает.
+    expect(context).toContain("mcp__megamemory__understand");
+    expect(context).not.toContain("megamemory_understand");
     const entry = (config.hooks?.events?.UserPromptSubmit?.filter((group) => JSON.stringify(group).includes("megamemory-user-prompt-hook"))[0].hooks as Array<Record<string, unknown>>)[0];
     expect(entry.type).toBe("process");
     expect(entry.statusMessage).toBe("MegaMemory");
