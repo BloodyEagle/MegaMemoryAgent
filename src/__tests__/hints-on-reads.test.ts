@@ -153,7 +153,10 @@ describe("MCP-only record hints on reads", () => {
   it("preserves the original empty-graph hint rather than adding a record hint", async () => {
     const source = await start(false);
     const payload = assertBudget(await source.callTool({ name: "list_roots", arguments: {} }), 1500);
-    expect(payload.hint).toBe("Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work.");
+    // 2.14.1/35 T8: слэш-команда в подсказке не нужна — она ставится не всем
+    // клиентам; форма записи универсальна.
+    expect(payload.hint).toBe("Graph is empty. Record findings as you work: create_concept(kind, summary, evidence).");
+    expect(payload.hint).not.toContain("/user:");
   });
 
   it("does not add a record hint to an absent concept or an all-error batch", async () => {

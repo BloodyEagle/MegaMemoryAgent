@@ -2726,7 +2726,9 @@ export function listRoots(
   const stats = db.getStats();
   const hint =
     stats.nodes === 0
-      ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
+      // 2.14.1/35 T8: без слэш-команды — установщик ставит её не всем клиентам;
+      // универсальная форма записи работает везде.
+      ? "Graph is empty. Record findings as you work: create_concept(kind, summary, evidence)."
       : undefined;
   // План 33 D-06: состояние поиска — отдельное поле; пустой граф уже объяснён
   // исходным hint, и лишние prepare на нём недопустимы (контракт R-06a).
