@@ -776,7 +776,9 @@ function validateContextEpoch(epoch: string | undefined): void {
 }
 
 function budgetError(target: number, minimum: number): Error {
-  return Object.assign(new Error(`get_concept: max_tokens=${target} cannot fit the required response (minimum ${minimum}).`), { meta: { reason: "budget" } });
+  // «budget refusal» — общий маркер бюджетных отказов (2.14.1/35 T5), как в
+  // обработчике get_concept (src/index.ts) и оборонительном отказе list_roots.
+  return Object.assign(new Error(`get_concept: max_tokens=${target} cannot fit the required response (budget refusal, minimum ${minimum}).`), { meta: { reason: "budget" } });
 }
 
 function fitWire(result: unknown, target: number | undefined): void {

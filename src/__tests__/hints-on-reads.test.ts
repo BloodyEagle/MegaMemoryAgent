@@ -100,7 +100,7 @@ describe("MCP-only record hints on reads", () => {
     expect(response.isError).toBe(true);
     expect(response.meta).toEqual({ reason: "budget" });
     expect(textContent(response)).toMatchObject({ type: "text", text: expect.stringContaining("MEGAMEMORY_ERROR") });
-    expect(textContent(response).text).toMatch(/max_tokens=100 cannot fit the required response \(minimum \d+\)\./);
+    expect(textContent(response).text).toMatch(/max_tokens=100 cannot fit the required response \(budget refusal, minimum \d+\)\./);
     expect(response.content).not.toHaveProperty("0.hint");
   });
 
