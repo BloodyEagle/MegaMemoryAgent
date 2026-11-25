@@ -152,6 +152,8 @@ describe("MCP initialize instructions", () => {
     for (const name of ["understand", "create_concept", "evidence", "link", "next.record", "include_source", "stale_warning"]) {
       expect(expected).toContain(name);
     }
+    // 2.14.1/35 T6: next.record — инструкция из ответа understand, а не отдельный вызов.
+    expect(expected).toContain("следуй инструкции next.record из последнего understand");
     // Пояснение причин пустой выдачи дублирует meta.reason ответа — в тексте ему не место.
     expect(expected).not.toContain("reason=");
     for (const name of ["remove_concept", "merge", "resolve_conflict", "expire", "consolidate"]) {
