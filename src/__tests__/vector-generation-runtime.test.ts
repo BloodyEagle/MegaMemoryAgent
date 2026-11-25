@@ -710,17 +710,163 @@ describe("B2 automatic first-generation reembed", () => {
     expect(db.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toHaveLength(1);
   });
 
-  it.each(["on", "partial", "model_mismatch", "text_only"])("never schedules the %s channel", async (state) => {
+  it("catches up a partial channel and embeds only the missing node", async () => {
+    const db = fresh();
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    await index(db, MODEL_NAME);
+    db.execSql("UPDATE nodes SET embedding=NULL WHERE id='second'");
+    expect(vectorChannelState(db)).toEqual({ state: "partial", missing: 1, total: 2 });
+    const before = snapshot(db);
+    const queued = background();
+    const embedFn = vi.fn(async (_text: string): Promise<Buffer> => vector(1, 0));
+
+    const pending = scheduleFirstGeneration(db, { defer: queued.defer, embedFn });
+    expect(pending).toBeInstanceOf(Promise);
+    expect(snapshot(db)).toEqual(before);
+    queued.run();
+    await pending;
+
+    expect(queued.defer).toHaveBeenCalledTimes(1);
+    // Warmup plus exactly one missing node — published vectors are not recomputed.
+    expect(embedFn).toHaveBeenCalledTimes(2);
+    expect(embedFn.mock.calls[0][0]).toBe(passageText("warmup", MODEL_NAME));
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+    expect(ids(db.getAllActiveNodesWithEmbeddings())).toEqual(["first", "second"]);
+  });
+
+  it("keeps published vectors and waits out the cooldown when a partial catch-up fails", async () => {
+    const db = fresh();
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    await index(db, MODEL_NAME);
+    db.execSql("UPDATE nodes SET embedding=NULL WHERE id='second'");
+    const queued = background();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    let now = 1000;
+    let calls = 0;
+    const embedFn = vi.fn((_text: string): Promise<Buffer> =>
+      ++calls === 1 ? Promise.resolve(vector(1, 0)) : Promise.reject(new Error("B2_PARTIAL_FAILURE")));
+    const options = { defer: queued.defer, embedFn, now: () => now };
+    const pending = scheduleFirstGeneration(db, options);
+    queued.run();
+    await expect(pending).resolves.toBeUndefined();
+
+    // The generation and the published vector survive the failed catch-up.
+    expect(vectorChannelState(db)).toEqual({ state: "partial", missing: 1, total: 2 });
+    expect(db.execSqlFirst("SELECT embedding IS NOT NULL AS has FROM nodes WHERE id='first'")).toMatchObject({ has: 1 });
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("B2_PARTIAL_FAILURE"));
+    expect(db.execSqlAll("SELECT tool,is_write,is_error,result_summary FROM timeline WHERE tool='auto_reembed'")).toEqual([
+      { tool: "auto_reembed", is_write: 1, is_error: 1, result_summary: "B2_PARTIAL_FAILURE" },
+    ]);
+
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+    now += 10 * 60 * 1000 - 1;
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+    expect(queued.defer).toHaveBeenCalledTimes(1);
+    expect(embedFn).toHaveBeenCalledTimes(2);
+
+    now += 1;
+    embedFn.mockResolvedValue(vector(1, 0));
+    const retry = scheduleFirstGeneration(db, options);
+    expect(retry).toBeInstanceOf(Promise);
+    queued.run();
+    await retry;
+
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+    expect(ids(db.getAllActiveNodesWithEmbeddings())).toEqual(["first", "second"]);
+  });
+
+  it("pauses after three failures, doubling the cooldown up to the cap", async () => {
+    const db = fresh();
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    const queued = background();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    const embedFn = vi.fn(async (): Promise<Buffer> => { throw new Error("B2_STRIKE"); });
+    let now = 1000;
+    const options = { defer: queued.defer, embedFn, now: () => now };
+
+    for (let strike = 1; strike <= 3; strike += 1) {
+      const pending = scheduleFirstGeneration(db, options);
+      expect(pending).toBeInstanceOf(Promise);
+      queued.run();
+      await expect(pending).resolves.toBeUndefined();
+      // The next attempt waits out the doubled cooldown: 10, 20, 40 minutes.
+      now += 10 * 60 * 1000 * 2 ** (strike - 1) - 1;
+      expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+      now += 1;
+    }
+
+    expect(queued.defer).toHaveBeenCalledTimes(3);
+    expect(embedFn).toHaveBeenCalledTimes(3);
+    expect(stderr).toHaveBeenCalledTimes(3);
+
+    // Three strikes pause the automatic catch-up for this process: every
+    // further trigger says so on stderr and schedules nothing.
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+    expect(queued.defer).toHaveBeenCalledTimes(3);
+    expect(embedFn).toHaveBeenCalledTimes(3);
+    expect(stderr).toHaveBeenCalledTimes(5);
+    expect(stderr.mock.calls.filter((call) => String(call).includes("paused after 3 failures"))).toHaveLength(2);
+    expect(stderr.mock.calls.filter((call) => String(call).includes("run 'megamemory reembed' manually"))).toHaveLength(2);
+  });
+
+  it("retries after the cooldown when a finished run still leaves the channel partial", async () => {
+    const db = fresh();
+    vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
+    await index(db, MODEL_NAME);
+    db.execSql("UPDATE nodes SET embedding=NULL WHERE id='second'");
+    const queued = background();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    const realFinish = db.finishVectorGeneration.bind(db);
+    let registered = false;
+    const finish = vi.spyOn(db, "finishVectorGeneration").mockImplementation((generation) => {
+      const ok = realFinish(generation);
+      if (!registered) {
+        registered = true;
+        // A node registered while the run was publishing: the index is partial again.
+        db.insertNode({ id: "third", name: "third", kind: "feature", summary: "indexing text" });
+      }
+      return ok;
+    });
+    let now = 1000;
+    const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));
+    const options = { defer: queued.defer, embedFn, now: () => now };
+    const pending = scheduleFirstGeneration(db, options);
+    queued.run();
+    await pending;
+
+    // The run itself is clean — no error report — but it was not successful:
+    // the next eligible trigger may retry after the cooldown.
+    expect(finish).toHaveBeenCalledTimes(1);
+    expect(stderr).not.toHaveBeenCalled();
+    expect(db.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toEqual([]);
+    expect(vectorChannelState(db)).toEqual({ state: "partial", missing: 1, total: 3 });
+    expect(scheduleFirstGeneration(db, options)).toBeUndefined();
+
+    now += 10 * 60 * 1000;
+    const retry = scheduleFirstGeneration(db, options);
+    expect(retry).toBeInstanceOf(Promise);
+    queued.run();
+    await retry;
+
+    expect(vectorChannelState(db)).toEqual({ state: "on" });
+    expect(ids(db.getAllActiveNodesWithEmbeddings())).toEqual(["first", "second", "third"]);
+    // Both runs stay clean: no failed attempt hides behind the data-level state.
+    expect(stderr).not.toHaveBeenCalled();
+    expect(db.execSqlAll("SELECT tool FROM timeline WHERE tool='auto_reembed'")).toEqual([]);
+  });
+
+  // Plan 34: a partial channel now schedules (catch-up tests above), so it is
+  // no longer part of this list.
+  it.each(["on", "model_mismatch", "text_only"])("never schedules the %s channel", async (state) => {
     const db = fresh();
     vi.stubEnv("MEGAMEMORY_AUTO_REEMBED", "1");
     if (state === "model_mismatch") await index(db, "b2-foreign");
     else if (state !== "text_only") await index(db, MODEL_NAME);
-    if (state === "partial") db.execSql("UPDATE nodes SET embedding=NULL WHERE id='second'");
     if (state === "text_only") vi.stubEnv("MEGAMEMORY_SEARCH", "fts");
     const before = snapshot(db);
     const channel = vectorChannelState(db);
     if (state === "on") expect(channel).toEqual({ state: "on" });
-    else if (state === "partial") expect(channel).toEqual({ state: "partial", missing: 1, total: 2 });
     else expect(channel).toEqual({ state: "off", reason: state === "text_only" ? "text_only_mode" : state });
     const queued = background();
     const embedFn = vi.fn(async (): Promise<Buffer> => vector(1, 0));

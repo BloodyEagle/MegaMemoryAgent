@@ -42,10 +42,11 @@ for `no_match`, retry with 2–3 exact terms or an id; for `budget`, first raise
 `max_tokens`. Follow `next.search_warning` for an `off` or `partial` channel;
 partial coverage leaves some nodes keyword-only, so a miss is not proof of no overlap.
 First-generation initialization runs in the background by default on successful
-node writes or MCP startup with eligible nodes. `MEGAMEMORY_AUTO_REEMBED=0` opts out;
-manual `megamemory reembed` remains useful for partial coverage or model mismatch.
-First model use may download about 120 MB; failures allow another eligible trigger
-after a 10-minute cooldown. Compact is the default; use `mode:"full"` for
+node writes or MCP startup with eligible nodes, and a partial index is caught up
+without wiping published vectors. `MEGAMEMORY_AUTO_REEMBED=0` opts out;
+manual `megamemory reembed` remains useful for model mismatch. First model use
+may download about 120 MB; after failure the cooldown doubles from 10 up to
+60 minutes, and after three failures the automation pauses with a stderr note. Compact is the default; use `mode:"full"` for
 verbose cards or `mode:"brief"` for at most 8 orientation lines without cards.
 Every answer includes a mandatory `next`: read every `must_read` ref (mandatory
 sources, not proof of whole-file coverage) and execute every `followup` exactly

@@ -55,7 +55,7 @@ describe("estimateTokens / trimSummary", () => {
 });
 
 describe("understand compact mode budget", () => {
-  it("keeps the hard cap: nothing above budget; an empty answer names budget", async () => {
+  it("at the honest minimum a summary-less card may take the room", async () => {
     const db = freshDb();
     insertFatNodes(db, 20);
 
@@ -108,6 +108,62 @@ describe("understand compact mode budget", () => {
     expect(result.next!.record).toBeTruthy();
     // U6: the explorer derives "saved vs full" from this pair.
     expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);
+  });
+
+  // План 34 дельта 5 §3: пин на «названное число работает». Гейт — floor;
+  // сжатые ответы на 482–543 легальны и гейтом дельты 3 были почти потеряны.
+  // Число из второго отказа — достаточный бюджет, не минимальный (на жирной
+  // фикстуре оно 544, а дешёвая сжатая форма стоит 482): проверяется только,
+  // что на нём ответ помещается.
+  it("pins the hard cap: the floor refuses, squeezed answers fit below the second refusal's number", async () => {
+    const db = freshDb();
+    insertFatNodes(db, 20);
+
+    let floor = 0;
+    try {
+      await understand(db, { query: "Слово", top_k: 20, max_tokens: 1 });
+      expect.unreachable("understand must refuse a floor-sized budget");
+    } catch (error) {
+      floor = Number(String(error).match(/ниже минимума (\d+)/)?.[1]);
+    }
+    expect(floor).toBeGreaterThan(0);
+    await expect(understand(db, { query: "Слово", top_k: 20, max_tokens: floor })).rejects.toThrow(/cannot fit/);
+    await expect(understand(db, { query: "Слово", top_k: 20, max_tokens: 450 })).rejects.toThrow(/cannot fit/);
+
+    // Дешёвые сжатые ответы: одна карточка без summary дешевле пустой формы.
+    const squeezed = await understand(db, { query: "Слово", top_k: 20, max_tokens: 500 });
+    expect(squeezed.meta!.tokens_estimated).toBe(measureMcpPayload(squeezed));
+    expect(squeezed.meta!.tokens_estimated).toBeLessThanOrEqual(500);
+
+    for (const budget of [543, 544]) {
+      const result = await understand(db, { query: "Слово", top_k: 20, max_tokens: budget });
+      expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
+      expect(result.meta!.tokens_estimated).toBeLessThanOrEqual(budget);
+      const compact = result.compact!;
+      expect(compact.length === 0 || compact.length === 1).toBe(true);
+      if (compact.length === 0) {
+        expect(result.meta!.reason).toBe("budget");
+      } else {
+        expect(compact[0]).not.toHaveProperty("summary");
+        expect(result.meta!.reason).toBeUndefined();
+      }
+      expect(result.meta!.cards).toBe(compact.length);
+    }
+  });
+
+  // Ответ на свободном бюджете совпадает с фикстурой — барьер против мутаций
+  // выдачи замерами бюджета (план 34, дельты 2–5).
+  it("the served answer keeps the full fixture shape on a generous budget", async () => {
+    const db = freshDb();
+    insertFatNodes(db, 20);
+
+    const result = await understand(db, { query: "Слово", top_k: 20, max_tokens: 8000 });
+
+    expect(result.candidates!).toHaveLength(20);
+    expect(result.compact!).toHaveLength(3);
+    expect(result.meta!.cards).toBe(3);
+    expect(result.meta!.reason).toBeUndefined();
+    expect(result.meta!.tokens_estimated).toBe(measureMcpPayload(result));
   });
 
   it("places cards when the budget has room and never claims a budget reason", async () => {
