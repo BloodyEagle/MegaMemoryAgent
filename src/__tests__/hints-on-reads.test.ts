@@ -94,26 +94,24 @@ describe("MCP-only record hints on reads", () => {
     expect(assertBudget(response, 4000).hint).toEqual({ record: RECORD });
   });
 
-  it("does not add a hint to a budget refusal", async () => {
+  it("does not add a hint to a budget refusal and names the card minimum", async () => {
     const source = await start();
     const response = await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "orientation", max_tokens: 100 } });
     expect(response.isError).toBe(true);
     expect(response.meta).toEqual({ reason: "budget" });
     expect(textContent(response)).toMatchObject({ type: "text", text: expect.stringContaining("MEGAMEMORY_ERROR") });
+    expect(textContent(response).text).toMatch(/max_tokens=100 cannot fit the required response \(minimum \d+\)\./);
     expect(response.content).not.toHaveProperty("0.hint");
   });
 
-  it("refuses rather than overflowing when the card fits but its hint does not", async () => {
+  it("returns the card without its hint when only the hint exceeds the budget", async () => {
     const source = await start();
-    const first = await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "full", max_tokens: 4000 } });
-    const { hint, meta, ...card } = parse(first);
-    expect(hint).toEqual({ record: RECORD });
-    const cap = Math.ceil(Buffer.byteLength(JSON.stringify({ content: [{ type: "text", text: JSON.stringify(card, null, 2) }] }), "utf8") / 3);
-    const response = await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "full", max_tokens: cap } });
-    expect(response.isError).toBe(true);
-    expect(response.meta).toEqual({ reason: "budget" });
-    expect(textContent(response)).toMatchObject({ type: "text", text: expect.stringContaining("MEGAMEMORY_ERROR") });
-    expect(response.content).not.toHaveProperty("0.hint");
+    const first = await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "orientation", max_tokens: 4000 } });
+    const hinted = parse(first);
+    expect(hinted.hint).toEqual({ record: RECORD });
+    const cap = hinted.meta!.tokens_estimated! - 1;
+    const payload = assertBudget(await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "orientation", max_tokens: cap } }), cap);
+    expect(payload.hint).toBeUndefined();
   });
 
   it("does not repeat the hint for an unchanged delta", async () => {

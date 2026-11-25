@@ -299,16 +299,21 @@ async function startMcpServer() {
   };
 
   // Подсказка — только MCP-поле: ядро карточки и HTTP-форма остаются прежними.
+  // Бюджет (2.14.1/35 T4): отказ мерит ответ без hint; когда ответ влезает,
+  // а hint нет — ответ уходит без hint, а не отказом.
   function conceptReadPayload(result: ConceptReadOutput, maxTokens?: number): ConceptReadOutput & { hint?: typeof conceptRecordHint } {
     const nonempty = "batch" in result ? result.batch.some(item => item.status === "ok") : !("unchanged" in result && result.unchanged);
-    const payload = nonempty ? { ...result, hint: conceptRecordHint } : result;
     const profile = "meta" in result ? result.meta.profile : "profile" in result ? result.profile : "full";
     const target = maxTokens ?? ("batch" in result ? BATCH_DEFAULT_TOKENS : profile === "orientation" ? ORIENTATION_DEFAULT_TOKENS : profile === "evidence" ? EVIDENCE_DEFAULT_TOKENS : undefined);
-    const tokens = measureMcpPayload(payload);
-    if (target !== undefined && tokens > target) {
-      throw Object.assign(new Error(`get_concept: max_tokens=${target} cannot fit the required response with hint (minimum ${tokens}).`), { meta: { reason: "budget" } });
+    const baseTokens = measureMcpPayload(result);
+    if (target !== undefined && baseTokens > target) {
+      throw Object.assign(new Error(`get_concept: max_tokens=${target} cannot fit the required response (budget refusal, minimum ${baseTokens}).`), { meta: { reason: "budget" } });
     }
-    if ("meta" in payload) payload.meta.tokens_estimated = tokens;
+    const withHint = nonempty ? { ...result, hint: conceptRecordHint } : result;
+    const tokens = measureMcpPayload(withHint);
+    const fits = target === undefined || tokens <= target;
+    const payload = fits ? withHint : result;
+    if ("meta" in payload) payload.meta.tokens_estimated = fits ? tokens : baseTokens;
     return payload;
   }
 
