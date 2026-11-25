@@ -1384,17 +1384,24 @@ export async function understand(
 
   // Optional presentation gives way before a qualified card, its refs or evidence.
   const squeezedCards = new Set<string>();
+  // Пол сводки: срез по границе слова может недобрать до SUMMARY_FLOOR —
+  // тогда добираем срезом по границе символа (2.14.1/35 T2), не разрывая
+  // суррогатную пару; иначе срез «залипает» в полосе выше пола и съедает
+  // бюджет discovery.
+  const floorCutSummary = (text: string): string => {
+    let cut = SUMMARY_FLOOR - 1;
+    if (text.charCodeAt(cut) >= 0xdc00 && text.charCodeAt(cut) <= 0xdfff) cut -= 1;
+    return text.slice(0, cut) + "…";
+  };
   const squeezeCard = (card: CompactMatch, fits: () => boolean): boolean => {
     if (fits()) return true;
     const initial = JSON.stringify(card);
     if (card.support_evidence === undefined) {
-      // Пол SUMMARY_FLOOR: граница слова в trimSummary может недобрать — ниже
-      // пола не опускаемся; всё равно не влезает — сводка снимается целиком
+      // Пол SUMMARY_FLOOR: всё равно не влезает — сводка снимается целиком
       // (serializeCard удалит поле), карточка остаётся.
       while (card.summary.length > SUMMARY_FLOOR && !fits()) {
         const next = trimSummary(card.summary, Math.max(SUMMARY_FLOOR, card.summary.length - 24));
-        if (next.length < SUMMARY_FLOOR) break;
-        card.summary = next;
+        card.summary = next.length < SUMMARY_FLOOR ? floorCutSummary(card.summary) : next;
       }
       if (!fits()) card.summary = "";
     }
@@ -1413,7 +1420,6 @@ export async function understand(
     if (top.some((card) => card.id === entry.node.id)) return false;
     const previousNested = nestedByHost;
     const previousFolded = foldedIds;
-    const previousTruncated = truncated;
     const candidate = compactMatch(db, entry.node, {
       score: entry.score,
       via: entry.via,
@@ -1440,7 +1446,10 @@ export async function understand(
       top.pop();
       nestedByHost = previousNested;
       foldedIds = previousFolded;
-      truncated = previousTruncated;
+      // 2.14.1/35 T2: с половами сжатие чаще ничего не снимает — не влезшая
+      // целиком карточка больше не помечается попутной усечкой, поэтому
+      // усечка отмечается здесь: матч потерял квалифицированную карточку.
+      truncated = true;
       squeezedCards.delete(candidate.id);
       return false;
     }
