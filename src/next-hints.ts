@@ -211,12 +211,20 @@ function daysGenitive(n: number): string {
   return pluralRu(n, "дня", "дней", "дней");
 }
 
-/** Суть узла для why: одна строка, обрезка по границе пробела. */
+/** Суть узла для why: одна строка; срез по последнему пробелу в пределах
+ * ESSENCE_MAX - 1 (2.14.1/35 T10), без пробела — по границе символа, не
+ * разрывая суррогатную пару; «…» на конце. */
 function shortEssence(summary: string | null | undefined): string {
   const text = (summary ?? "").replace(/\s+/g, " ").trim();
   if (!text) return "";
   if (text.length <= ESSENCE_MAX) return text;
-  return text.slice(0, ESSENCE_MAX - 1).trimEnd() + "…";
+  const space = text.lastIndexOf(" ", ESSENCE_MAX - 1);
+  let cut = space > 0 ? space : ESSENCE_MAX - 1;
+  // Срез не должен кончаться верхним суррогатом: пара рвётся срезом по cut,
+  // если cut-1 — верхний суррогат, а cut — его нижняя половина.
+  const low = text.charCodeAt(cut - 1);
+  if (low >= 0xd800 && low <= 0xdbff) cut -= 1;
+  return text.slice(0, cut).trimEnd() + "…";
 }
 
 /** Почему читать: узел-источник с именем и сутью. */

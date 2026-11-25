@@ -598,6 +598,25 @@ describe("План 13 §2.1: блок next в understand", () => {
     for (const card of out.compact ?? []) expect(card.name).not.toBe("");
   });
 
+  it("shortEssence режет по границе слова, не по символу (2.14.1/35 T10)", () => {
+    const source = "ab ".repeat(30) + "x".repeat(100);
+    db.insertNode({
+      id: "essence-cut", name: "essence-cut", kind: "feature", created_via: "agent",
+      summary: source,
+      file_refs: ["src/essence.ts"],
+    });
+    const hints = buildNextHints({ db, cards: [{ id: "essence-cut", kind: "feature" }] });
+    const why = hints.must_read[0].why;
+    const essence = why.slice(why.indexOf(": ") + 2);
+    expect(essence.endsWith("…")).toBe(true);
+    expect(essence.length).toBeLessThanOrEqual(80);
+    const prefix = essence.slice(0, -1); // без «…»
+    expect(source.startsWith(prefix)).toBe(true);
+    // Префикс оборван на пробеле исходника, а не внутри слова (80-й символ
+    // в этом исходнике — буква внутри «слова» из x).
+    expect(source[prefix.length]).toBe(" ");
+  });
+
   it("бюджет: followups режутся раньше must_read и record", async () => {
     seedSmallBudget();
     // Isolate one qualified card so its optional followup, rather than
