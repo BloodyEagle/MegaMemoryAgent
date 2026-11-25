@@ -11,7 +11,7 @@ import { LIST_ROOTS_SEARCH_HINT } from "../next-hints.js";
 import { addNode, auditFixture, type AuditFixture } from "./helpers/audit.js";
 import { startAuditHttpSrc } from "./helpers/audit-http-src.js";
 
-const RECORD = "Узел уже есть — уточняй его через update_concept, а не создавай второй; опоры к решению — evidence в том же вызове.";
+const RECORD = "Знание уже в графе: дополняй/исправляй через update_concept; новое решение с опорой на этот узел — create_concept с evidence: [{node: \"<id>\", why: \"…\"}].";
 const OVERVIEW = "Это обзор; итог работы по конкретной ветке — отдельный узел, а не правка корня.";
 const repository = fileURLToPath(new URL("../../", import.meta.url));
 type Response = Awaited<ReturnType<Client["callTool"]>>;
@@ -109,7 +109,16 @@ describe("MCP-only record hints on reads", () => {
     const first = await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "orientation", max_tokens: 4000 } });
     const hinted = parse(first);
     expect(hinted.hint).toEqual({ record: RECORD });
-    const cap = hinted.meta!.tokens_estimated! - 1;
+    const withHint = hinted.meta!.tokens_estimated!;
+    // Минимум ответа без hint сервер называет в отказе; cap берём посередине
+    // между «влезает без hint» и «влезает с hint» — устойчиво к эху
+    // max_tokens в meta и к длине подсказки (2.14.1/35 T7).
+    const refusal = await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "orientation", max_tokens: 100 } });
+    expect(refusal.isError).toBe(true);
+    const base = Number(/minimum (\d+)/.exec(textContent(refusal).text)?.[1]);
+    expect(base).toBeGreaterThan(0);
+    expect(base).toBeLessThan(withHint);
+    const cap = Math.floor((base + withHint) / 2);
     const payload = assertBudget(await source.callTool({ name: "get_concept", arguments: { id: "read-hints", profile: "orientation", max_tokens: cap } }), cap);
     expect(payload.hint).toBeUndefined();
   });

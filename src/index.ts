@@ -292,7 +292,7 @@ async function startMcpServer() {
   type RelationType = import("./types.js").RelationType;
   type ConceptReadOutput = import("./types.js").NodeWithContext | import("./types.js").ConceptProfileOutput | import("./types.js").ConceptDeltaOutput | import("./types.js").ConceptBatchOutput;
   const conceptRecordHint = {
-    record: "Узел уже есть — уточняй его через update_concept, а не создавай второй; опоры к решению — evidence в том же вызове.",
+    record: "Знание уже в графе: дополняй/исправляй через update_concept; новое решение с опорой на этот узел — create_concept с evidence: [{node: \"<id>\", why: \"…\"}].",
   };
   const rootsRecordHint = {
     record: "Это обзор; итог работы по конкретной ветке — отдельный узел, а не правка корня.",
