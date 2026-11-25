@@ -776,8 +776,9 @@ function validateContextEpoch(epoch: string | undefined): void {
 }
 
 function budgetError(target: number, minimum: number): Error {
-  // «budget refusal» — общий маркер бюджетных отказов (2.14.1/35 T5), как в
-  // обработчике get_concept (src/index.ts) и оборонительном отказе list_roots.
+  // «budget refusal» — маркер именно здесь (решение по отчёту 2.14.1/35 T5):
+  // при явном max_tokens fitWire бросает budgetError раньше оборонительной
+  // ветки обработчика в src/index.ts, это наблюдаемый путь отказа get_concept.
   return Object.assign(new Error(`get_concept: max_tokens=${target} cannot fit the required response (budget refusal, minimum ${minimum}).`), { meta: { reason: "budget" } });
 }
 

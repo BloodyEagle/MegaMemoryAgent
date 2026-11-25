@@ -858,7 +858,7 @@ async function startMcpServer() {
         const tokens = measureMcpPayload(hinted);
         const target = params.max_tokens ?? 1500;
         if (tokens > target) {
-          throw new Error(`list_roots: max_tokens=${target} cannot fit the required response (budget refusal, minimum ${tokens}).`);
+          throw new Error(`list_roots: max_tokens=${target} cannot fit the required response with hint (minimum ${tokens}).`);
         }
         const payload = { ...hinted, meta: { ...hinted.meta, tokens_estimated: tokens } };
         const returned = result.meta?.returned ?? result.roots.length;
