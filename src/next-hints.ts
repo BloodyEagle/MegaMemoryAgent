@@ -7,6 +7,7 @@ import {
   computeSupportCheck,
 } from "./support-baselines.js";
 import { parseTimelineTs, sessionize, timelineTsString } from "./sessions.js";
+import { parseRef } from "./refs.js";
 import type {
   NextHintFollowup,
   NextHintRead,
@@ -276,14 +277,15 @@ export function emptyNextHints(): NextHints {
 /**
  * Собрать блок next из карточек, попавших в ответ understand.
  *
- * must_read — до 3 дословных file_refs узлов ответа (верхний уровень в
- * ранговом порядке, затем вложенные опоры), с дедупликацией; почему — узел и
- * его суть. skip сохраняется пустым: refs и summary не доказывают полного
- * покрытия файла. followups — до 3 готовых
+ * must_read — до 3 дословных файловых file_refs узлов ответа (верхний уровень
+ * в ранговом порядке, затем вложенные опоры), с дедупликацией; git-refs не
+ * попадают; почему — узел и его суть. skip сохраняется пустым: refs и summary
+ * не доказывают полного покрытия файла. followups — до 3 готовых
  * вызовов по приоритету плана: check_artifacts для устаревших снимков
- * подтверждения, get_concept для решений с невидимыми в ответе опорами,
- * provenance_trace для решений с нечистым (unknown/incomplete) support_check;
- * один узел — не более одного follow-up. record — форма записи по содержимому.
+ * подтверждения, check_artifacts для узлов с git-refs, get_concept для
+ * решений с невидимыми в ответе опорами, provenance_trace для решений с
+ * нечистым (unknown/incomplete) support_check; один узел — не более одного
+ * follow-up. record — форма записи по содержимому.
  */
 export function buildNextHints(input: NextHintsInput): NextHints {
   const { db } = input;
@@ -304,7 +306,9 @@ export function buildNextHints(input: NextHintsInput): NextHints {
     isDecision: rowById.get(c.id)?.kind === "decision" || c.kind === "decision",
   }));
 
-  // ---- must_read: до 3 дословных file_refs узлов ответа ----
+  // ---- must_read: до 3 дословных файловых file_refs узлов ответа ----
+  // git-refs (HEAD:path, git:tag:…) в must_read не попадают: Read их не
+  // откроет. Узел с git-refs получает followup check_artifacts (приоритет 1b).
   const mustRead: NextHintRead[] = [];
   const seenRefs = new Set<string>();
   for (const card of cards) {
@@ -313,6 +317,7 @@ export function buildNextHints(input: NextHintsInput): NextHints {
     if (!row) continue;
     for (const ref of fileRefsOf(row.file_refs)) {
       if (mustRead.length >= MUST_READ_LIMIT) break;
+      if (parseRef(ref).kind !== "file") continue;
       if (seenRefs.has(ref)) continue;
       seenRefs.add(ref);
       mustRead.push({ ref, why: readWhy(row), node_id: row.id });
@@ -341,6 +346,23 @@ export function buildNextHints(input: NextHintsInput): NextHints {
       tool: "check_artifacts",
       args: { node_ids: [card.id] },
       why: `снимок подтверждения старше ${ageDays} ${daysGenitive(ageDays)}`,
+    });
+  }
+
+  // Приоритет 1b (2.14.1/35 T1): у узла есть git-refs — их не прочитать
+  // Read'ом, а must_read несёт только файловые refs. Такой узел получает
+  // check_artifacts; решения пропускаются — их слоты остаются под
+  // get_concept/provenance_trace.
+  for (const card of cardsWithKind) {
+    if (followups.length >= FOLLOWUPS_LIMIT) break;
+    if (followupNode.has(card.id) || card.isDecision) continue;
+    const refs = fileRefsOf(rowById.get(card.id)?.file_refs);
+    if (!refs.some((ref) => parseRef(ref).kind !== "file")) continue;
+    followupNode.add(card.id);
+    followups.push({
+      tool: "check_artifacts",
+      args: { node_ids: [card.id] },
+      why: "refs узла — git-объекты: читать через check_artifacts",
     });
   }
 

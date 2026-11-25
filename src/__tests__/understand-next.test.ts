@@ -427,6 +427,46 @@ describe("План 13 §2.1: блок next в understand", () => {
     ]);
   });
 
+  it("followups: узел только с git-refs — must_read пуст, followup check_artifacts (2.14.1/35 T1)", () => {
+    db.insertNode({
+      id: "git-only", name: "git-only", kind: "journal", created_via: "agent",
+      summary: "Git-only node cites a commit blob and a release tag",
+      file_refs: ["HEAD:src/merge.ts", "git:tag:v2.14.0"],
+    });
+    const hints = buildNextHints({ db, cards: [{ id: "git-only", kind: "journal" }] });
+    expect(hints.must_read).toEqual([]);
+    expect(hints.followups).toHaveLength(1);
+    expect(hints.followups[0].tool).toBe("check_artifacts");
+    expect(hints.followups[0].args).toEqual({ node_ids: ["git-only"] });
+    expect(hints.followups[0].why).toBe("refs узла — git-объекты: читать через check_artifacts");
+  });
+
+  it("followups: смешанный узел — в must_read только файл, git-refs уходят в followup (2.14.1/35 T1)", () => {
+    db.insertNode({
+      id: "mixed-refs", name: "mixed-refs", kind: "feature", created_via: "agent",
+      summary: "Mixed node cites a file range next to a commit blob",
+      file_refs: ["src/db.ts:10-20", "HEAD:src/db.ts"],
+    });
+    const hints = buildNextHints({ db, cards: [{ id: "mixed-refs", kind: "feature" }] });
+    expect(hints.must_read.map((m) => m.ref)).toEqual(["src/db.ts:10-20"]);
+    expect(hints.followups).toHaveLength(1);
+    expect(hints.followups[0].tool).toBe("check_artifacts");
+    expect(hints.followups[0].args).toEqual({ node_ids: ["mixed-refs"] });
+  });
+
+  it("followups: решение с git-refs — нового check_artifacts не появляется (2.14.1/35 T1)", () => {
+    db.insertNode({
+      id: "git-decision", name: "git-decision", kind: "decision", created_via: "agent",
+      summary: "Решение опирается на git-объекты: blob по sha и тег релиза",
+      file_refs: ["git:tag:v2.14.0"],
+    });
+    const hints = buildNextHints({ db, cards: [{ id: "git-decision", kind: "decision", visibleSupports: 0 }] });
+    // Слоты решения остаются за get_concept/provenance_trace: git-followup у
+    // решения не появляется.
+    expect(hints.followups.some((f) => f.tool === "check_artifacts")).toBe(false);
+    expect(hints.must_read).toEqual([]);
+  });
+
   it("skip только при честном покрытии: заглушечное, короткое и слабое саммари файл не покрывают", async () => {
     seedHonesty();
     const out = await understand(db, { query: "D1 mark", top_k: 6, max_tokens: 3000 });
