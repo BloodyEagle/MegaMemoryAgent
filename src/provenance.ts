@@ -688,8 +688,10 @@ function idListForNote(ids: string[]): string {
 }
 
 /** D2.3: hard guarantee — no record's note exceeds MAX_NOTE_CHARS. */
-function clampNote(note: string): string {
-  return note.length <= MAX_NOTE_CHARS ? note : note.slice(0, MAX_NOTE_CHARS - 1).trimEnd() + "…";
+export function clampNote(note: string): string {
+  // План 37 T2: жёсткий срез (не по слову) той же формулой clipText —
+  // гарантия «не длиннее 300» сохраняется, добавился guard суррогатной пары.
+  return note.length <= MAX_NOTE_CHARS ? note : clipText(note, MAX_NOTE_CHARS, { wordBoundary: false });
 }
 
 /** Serialized size of the array without building intermediate strings twice. */

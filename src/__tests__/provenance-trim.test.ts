@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { clipText } from "../text-clip.js";
-import { trimRationale } from "../provenance.js";
+import { clampNote, trimRationale } from "../provenance.js";
 
-// План 37 T1: trimRationale (provenance.ts:219-223) — оставшийся сайт обрезки
-// сводки с собственной арифметикой без guard суррогатной пары — сводится к
-// clipText(text, RATIONALE_TRIM, { wordBoundary: false }). Поведение
-// байт-в-байт кроме guard: cut = RATIONALE_TRIM-1, trimEnd, «…».
+// План 37 T1/T2: оставшиеся сайты обрезки сводятся к одной формуле clipText
+// (T1 trimRationale, T2 clampNote; поведение байт-в-байт кроме guard
+// суррогатной пары). T3 — shortEssence (next-hints.ts) отдельным файлом
+// не вынесен: его случай живёт в text-clip.test.ts? Нет — его случай здесь же,
+// см. plan37-t3.test.ts. Здесь только T1/T2.
 
 describe("plan 37 T1 trimRationale", () => {
   it("T1: строка длиннее 80 режется до 80 с «…» (формула clipText)", () => {
@@ -28,5 +29,25 @@ describe("plan 37 T1 trimRationale", () => {
     expect(out).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out)).toBe(false);
     expect(out.length).toBeLessThanOrEqual(80);
+  });
+});
+
+describe("plan 37 T2 clampNote", () => {
+  it("T2: note длиннее 300 режется до ≤300 с «…» на конце", () => {
+    const note = "n".repeat(350);
+    const out = clampNote(note);
+    expect(out.length).toBeLessThanOrEqual(300);
+    expect(out.endsWith("…")).toBe(true);
+    expect(clampNote("short note")).toBe("short note");
+  });
+
+  it("T2: эмодзи на срезе clampNote не рвёт суррогатную пару", () => {
+    // cut=299: guard clipText (low на cut) опускает cut при попадании на пару.
+    const note = "x".repeat(298) + "😀" + "z".repeat(60);
+    expect(note.length).toBeGreaterThan(300);
+    const out = clampNote(note);
+    expect(out).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out)).toBe(false);
+    expect(out.length).toBeLessThanOrEqual(300);
   });
 });
