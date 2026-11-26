@@ -3,6 +3,7 @@ import type { KnowledgeDB } from "./db.js";
 import { isNodeExpired } from "./db.js";
 import { embeddingText, embedForStorage } from "./embeddings.js";
 import { makeId } from "./tools.js";
+import { clipText } from "./text-clip.js";
 import { computeDigestPriority } from "./digest-priority.js";
 import type { NodeRow } from "./types.js";
 
@@ -206,13 +207,16 @@ export async function buildDigest(
   const name = digestName(module.name);
   const digestId = makeId(name, moduleId);
 
-  // Summary: name — truncated summary per child, capped.
-  const parts = children.map(
-    (c) => `${c.name} — ${c.summary.replace(/\s+/g, " ").slice(0, DIGEST_CHILD_SUMMARY_CAP)}`
-  );
+  // Summary: name — truncated summary per child, capped. The whitespace
+  // normalization stays BEFORE the clip (plan 36 T1): one clipText formula
+  // now owns the char cut, the ellipsis and the surrogate guard.
+  const parts = children.map((c) => {
+    const normalized = c.summary.replace(/\s+/g, " ");
+    return `${c.name} — ${clipText(normalized, DIGEST_CHILD_SUMMARY_CAP, { wordBoundary: false })}`;
+  });
   let summary = `${children.length} concepts: ${parts.join("; ")}`;
   if (summary.length > DIGEST_MAX_SUMMARY) {
-    summary = summary.slice(0, DIGEST_MAX_SUMMARY - 1).trimEnd() + "…";
+    summary = clipText(summary, DIGEST_MAX_SUMMARY, { wordBoundary: false });
   }
 
   // Union of children's file_refs, max 10.
