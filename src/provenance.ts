@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import type { KnowledgeDB } from "./db.js";
+import { clipText } from "./text-clip.js";
 import { isNodeExpired } from "./db.js";
 import type { NodeRow } from "./types.js";
 import type {
@@ -216,10 +217,13 @@ export function compareIds(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function trimRationale(text: string | null): string | null {
+export function trimRationale(text: string | null): string | null {
   if (!text) return null;
   if (text.length <= RATIONALE_TRIM) return text;
-  return text.slice(0, RATIONALE_TRIM - 1).trimEnd() + "…";
+  // План 37 T1: одна формула обрезки (clipText), срез жёсткий (пол
+  // RATIONALE_TRIM, не граница слова — как было), добавился guard
+  // суррогатной пары; поведение байт-в-байт кроме guard.
+  return clipText(text, RATIONALE_TRIM, { wordBoundary: false });
 }
 
 /**
