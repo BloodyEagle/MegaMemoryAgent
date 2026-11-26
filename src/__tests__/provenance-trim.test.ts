@@ -3,11 +3,8 @@ import { clipText } from "../text-clip.js";
 import { clampNote, trimRationale } from "../provenance.js";
 import { shortEssence } from "../next-hints.js";
 
-// План 37 T1/T2: оставшиеся сайты обрезки сводятся к одной формуле clipText
-// (T1 trimRationale, T2 clampNote; поведение байт-в-байт кроме guard
-// суррогатной пары). T3 — shortEssence (next-hints.ts) отдельным файлом
-// не вынесен: его случай живёт в text-clip.test.ts? Нет — его случай здесь же,
-// см. plan37-t3.test.ts. Здесь только T1/T2.
+// План 37: T1 trimRationale и T2 clampNote делегируют clipText (поведение
+// прежнее, добавлен guard суррогатной пары); T3 shortEssence — отдельное правило.
 
 describe("plan 37 T1 trimRationale", () => {
   it("T1: строка длиннее 80 режется до 80 с «…» (формула clipText)", () => {
