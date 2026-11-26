@@ -213,8 +213,20 @@ function daysGenitive(n: number): string {
 
 /** Суть узла для why: одна строка; срез по последнему пробелу в пределах
  * ESSENCE_MAX - 1 (2.14.1/35 T10), без пробела — по границе символа, не
- * разрывая суррогатную пару; «…» на конце. */
-function shortEssence(summary: string | null | undefined): string {
+ * разрывая суррогатную пару; «…» на конце.
+ *
+ * План 37 T3: ОТДЕЛЬНОЕ правило, не clipText — clipText откатывается к
+ * пробелу только когда пробел лежит во второй половине окна (space >
+ * maxChars/2); здесь откат к ЛЮБОМУ пробелу (lastIndexOf(" ", ESSENCE_MAX-1),
+ * space > 0). Для 80-символьного текста правило clipText режет посреди слова
+ * там, где текущий код отдаёт целое слово — менять текст why в understand
+ * ради единообразия это ухудшение, не рефакторинг.
+ *
+ * Guard проверяет high на cut-1: эквивалент проверки low на cut из clipText,
+ * выраженный с другой стороны — пара рвётся только срезом по cut, когда
+ * cut-1 — high, а cut — его low. Инвариант при смене любой из формул:
+ * результат не должен кончаться между high и low. */
+export function shortEssence(summary: string | null | undefined): string {
   const text = (summary ?? "").replace(/\s+/g, " ").trim();
   if (!text) return "";
   if (text.length <= ESSENCE_MAX) return text;
