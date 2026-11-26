@@ -291,7 +291,13 @@ describe("E3: include_evidence: true — подтверждаемые верси
       compact: [richFiller!],
       edges_between: [],
       meta: { ...rich.meta!, cards: 1, evidence_matches: 1, evidence_supports: 0, dropped: 0 },
-      next: { ...rich.next!, followups: [] },
+      next: {
+        ...rich.next!,
+        // 2.14.1/35 T2: полы сохраняют имена, поэтому witness обязан нести и
+        // реалистичный next: решение не показано карточкой — невидимые опоры
+        // дают followup get_concept (раньше бюджет добирал из обзывания имён).
+        followups: [{ tool: "get_concept" as const, args: { id: "dec-refresh" }, why: "у решения 3 опоры, в ответе видно 0" }],
+      },
     };
     const tight = Math.max(measureMcpPayload(fillerPayload), discoveryTokens * 4);
     expect(measureMcpPayload(fillerPayload)).toBeLessThanOrEqual(tight);

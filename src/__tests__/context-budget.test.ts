@@ -103,8 +103,13 @@ describe("understand compact mode budget", () => {
     }
     expect(result.meta!.returned).toBe(result.candidates!.length);
     expect(result.meta!.truncated).toBe(true);
-    // Discovery не является карточкой, но видимый кандидат уже не dropped.
-    expect(result.meta!.dropped).toBe(20 - result.candidates!.length);
+    // Discovery не является карточкой; dropped — только полностью скрытые
+    // матчи: видимое = объединение кандидатов и карточек. Кандидаты включают
+    // id размещённых карточек, но после отпания хвоста discovery карточка
+    // может остаться единственным видимым (раскладка зависит от env: fts-pin
+    // CI даёт returned 0, cards 1; локальный hybrid — returned 1).
+    const visibleIds = new Set([...result.candidates!.map(c => c.id), ...result.compact!.map(c => c.id)]);
+    expect(result.meta!.dropped).toBe(20 - visibleIds.size);
     expect(result.next!.record).toBeTruthy();
     // U6: the explorer derives "saved vs full" from this pair.
     expect(result.meta!.estimated_full_tokens).toBeGreaterThan(result.meta!.tokens_estimated);

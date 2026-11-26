@@ -427,6 +427,46 @@ describe("План 13 §2.1: блок next в understand", () => {
     ]);
   });
 
+  it("followups: узел только с git-refs — must_read пуст, followup check_artifacts (2.14.1/35 T1)", () => {
+    db.insertNode({
+      id: "git-only", name: "git-only", kind: "journal", created_via: "agent",
+      summary: "Git-only node cites a commit blob and a release tag",
+      file_refs: ["HEAD:src/merge.ts", "git:tag:v2.14.0"],
+    });
+    const hints = buildNextHints({ db, cards: [{ id: "git-only", kind: "journal" }] });
+    expect(hints.must_read).toEqual([]);
+    expect(hints.followups).toHaveLength(1);
+    expect(hints.followups[0].tool).toBe("check_artifacts");
+    expect(hints.followups[0].args).toEqual({ node_ids: ["git-only"] });
+    expect(hints.followups[0].why).toBe("refs узла — git-объекты: читать через check_artifacts");
+  });
+
+  it("followups: смешанный узел — в must_read только файл, git-refs уходят в followup (2.14.1/35 T1)", () => {
+    db.insertNode({
+      id: "mixed-refs", name: "mixed-refs", kind: "feature", created_via: "agent",
+      summary: "Mixed node cites a file range next to a commit blob",
+      file_refs: ["src/db.ts:10-20", "HEAD:src/db.ts"],
+    });
+    const hints = buildNextHints({ db, cards: [{ id: "mixed-refs", kind: "feature" }] });
+    expect(hints.must_read.map((m) => m.ref)).toEqual(["src/db.ts:10-20"]);
+    expect(hints.followups).toHaveLength(1);
+    expect(hints.followups[0].tool).toBe("check_artifacts");
+    expect(hints.followups[0].args).toEqual({ node_ids: ["mixed-refs"] });
+  });
+
+  it("followups: решение с git-refs — нового check_artifacts не появляется (2.14.1/35 T1)", () => {
+    db.insertNode({
+      id: "git-decision", name: "git-decision", kind: "decision", created_via: "agent",
+      summary: "Решение опирается на git-объекты: blob по sha и тег релиза",
+      file_refs: ["git:tag:v2.14.0"],
+    });
+    const hints = buildNextHints({ db, cards: [{ id: "git-decision", kind: "decision", visibleSupports: 0 }] });
+    // Слоты решения остаются за get_concept/provenance_trace: git-followup у
+    // решения не появляется.
+    expect(hints.followups.some((f) => f.tool === "check_artifacts")).toBe(false);
+    expect(hints.must_read).toEqual([]);
+  });
+
   it("skip только при честном покрытии: заглушечное, короткое и слабое саммари файл не покрывают", async () => {
     seedHonesty();
     const out = await understand(db, { query: "D1 mark", top_k: 6, max_tokens: 3000 });
@@ -551,6 +591,32 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(tight.meta!.tokens_estimated).toBeLessThanOrEqual(floor);
   });
 
+  it("бюджет: имена кандидатов и карточек не сжимаются до пустой строки (2.14.1/35 T2)", async () => {
+    seedBudget();
+    const out = await understand(db, { query: "ответа wire", top_k: 5, max_tokens: 900 });
+    for (const candidate of out.candidates ?? []) expect(candidate.name).not.toBe("");
+    for (const card of out.compact ?? []) expect(card.name).not.toBe("");
+  });
+
+  it("shortEssence режет по границе слова, не по символу (2.14.1/35 T10)", () => {
+    const source = "ab ".repeat(30) + "x".repeat(100);
+    db.insertNode({
+      id: "essence-cut", name: "essence-cut", kind: "feature", created_via: "agent",
+      summary: source,
+      file_refs: ["src/essence.ts"],
+    });
+    const hints = buildNextHints({ db, cards: [{ id: "essence-cut", kind: "feature" }] });
+    const why = hints.must_read[0].why;
+    const essence = why.slice(why.indexOf(": ") + 2);
+    expect(essence.endsWith("…")).toBe(true);
+    expect(essence.length).toBeLessThanOrEqual(80);
+    const prefix = essence.slice(0, -1); // без «…»
+    expect(source.startsWith(prefix)).toBe(true);
+    // Префикс оборван на пробеле исходника, а не внутри слова (80-й символ
+    // в этом исходнике — буква внутри «слова» из x).
+    expect(source[prefix.length]).toBe(" ");
+  });
+
   it("бюджет: followups режутся раньше must_read и record", async () => {
     seedSmallBudget();
     // Isolate one qualified card so its optional followup, rather than
@@ -563,7 +629,9 @@ describe("План 13 §2.1: блок next в understand", () => {
     expect(generous.next!.followups[0].args).toEqual({ node_ids: ["b-dec"] });
 
     const minimal = JSON.parse(JSON.stringify(generous)) as UnderstandOutput;
-    minimal.compact = minimal.compact!.map(({ summary: _summary, children: _children, edges: _edges, ...card }) => ({ ...card, name: "" }));
+    // Полы 2.14.1/35 T2: имя не сжимается до пустой строки, поэтому witness
+    // несёт настоящее имя карточки, а сводку и вложение отпускает целиком.
+    minimal.compact = minimal.compact!.map(({ summary: _summary, children: _children, edges: _edges, ...card }) => card);
     minimal.candidates = [];
     minimal.meta = { ...minimal.meta!, returned: 0, cards: 1, dropped: 0, truncated: true };
     minimal.next!.followups = [];

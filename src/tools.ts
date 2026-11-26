@@ -1008,6 +1008,11 @@ export async function understand(
   const CARDS_MAX = Math.min(topK, 3);
   const CANDIDATE_SOFT = 40;
   const CANDIDATE_HARD = 90;
+  // Полы сжатия (2.14.1/35 T2): имя и сводка не сжимаются до пустой строки —
+  // запись под тесным бюджетом лучше отпустить (meta.truncated), чем показать
+  // безымянной.
+  const NAME_FLOOR = 12;
+  const SUMMARY_FLOOR = 40;
   const candidateTarget = Math.floor(maxTokens / 4);
   let candidates: UnderstandCandidate[] = [];
   // Independently reproducible wire-ish cost, including pretty JSON and MCP escaping.
@@ -1379,20 +1384,31 @@ export async function understand(
 
   // Optional presentation gives way before a qualified card, its refs or evidence.
   const squeezedCards = new Set<string>();
+  // Пол сводки: срез по границе слова может недобрать до SUMMARY_FLOOR —
+  // тогда добираем срезом по границе символа (2.14.1/35 T2), не разрывая
+  // суррогатную пару; иначе срез «залипает» в полосе выше пола и съедает
+  // бюджет discovery.
+  const floorCutSummary = (text: string): string => {
+    let cut = SUMMARY_FLOOR - 1;
+    if (text.charCodeAt(cut) >= 0xdc00 && text.charCodeAt(cut) <= 0xdfff) cut -= 1;
+    return text.slice(0, cut) + "…";
+  };
   const squeezeCard = (card: CompactMatch, fits: () => boolean): boolean => {
     if (fits()) return true;
     const initial = JSON.stringify(card);
     if (card.support_evidence === undefined) {
-      while (card.summary.length > 0 && !fits()) {
-        const limit = Math.max(0, card.summary.length - 24);
-        card.summary = limit === 0 ? "" : trimSummary(card.summary, limit);
-        if (card.summary === "…") card.summary = "";
+      // Пол SUMMARY_FLOOR: всё равно не влезает — сводка снимается целиком
+      // (serializeCard удалит поле), карточка остаётся.
+      while (card.summary.length > SUMMARY_FLOOR && !fits()) {
+        const next = trimSummary(card.summary, Math.max(SUMMARY_FLOOR, card.summary.length - 24));
+        card.summary = next.length < SUMMARY_FLOOR ? floorCutSummary(card.summary) : next;
       }
+      if (!fits()) card.summary = "";
     }
     if (!fits()) delete card.children;
     if (!fits()) delete card.edges;
-    while (card.name.length > 0 && !fits()) {
-      card.name = tailName(card.name, Math.max(0, card.name.length - 8));
+    while (card.name.length > NAME_FLOOR && !fits()) {
+      card.name = tailName(card.name, Math.max(NAME_FLOOR, card.name.length - 8));
     }
     if (JSON.stringify(card) !== initial) {
       squeezedCards.add(card.id);
@@ -1404,7 +1420,6 @@ export async function understand(
     if (top.some((card) => card.id === entry.node.id)) return false;
     const previousNested = nestedByHost;
     const previousFolded = foldedIds;
-    const previousTruncated = truncated;
     const candidate = compactMatch(db, entry.node, {
       score: entry.score,
       via: entry.via,
@@ -1431,7 +1446,10 @@ export async function understand(
       top.pop();
       nestedByHost = previousNested;
       foldedIds = previousFolded;
-      truncated = previousTruncated;
+      // 2.14.1/35 T2: с половами сжатие чаще ничего не снимает — не влезшая
+      // целиком карточка больше не помечается попутной усечкой, поэтому
+      // усечка отмечается здесь: матч потерял квалифицированную карточку.
+      truncated = true;
       squeezedCards.delete(candidate.id);
       return false;
     }
@@ -1460,8 +1478,8 @@ export async function understand(
       delete list[i].summary_short;
     }
     for (let i = list.length - 1; i >= 0 && !fits(); i -= 1) {
-      while (list[i].name.length > 0 && !fits()) {
-        list[i].name = tailName(list[i].name, Math.max(0, list[i].name.length - 8));
+      while (list[i].name.length > NAME_FLOOR && !fits()) {
+        list[i].name = tailName(list[i].name, Math.max(NAME_FLOOR, list[i].name.length - 8));
         truncated = true;
       }
     }
@@ -2717,7 +2735,9 @@ export function listRoots(
   const stats = db.getStats();
   const hint =
     stats.nodes === 0
-      ? "Graph is empty. Run /user:bootstrap-memory to populate, or create concepts as you work."
+      // 2.14.1/35 T8: без слэш-команды — установщик ставит её не всем клиентам;
+      // универсальная форма записи работает везде.
+      ? "Graph is empty. Record findings as you work: create_concept(kind, summary, evidence)."
       : undefined;
   // План 33 D-06: состояние поиска — отдельное поле; пустой граф уже объяснён
   // исходным hint, и лишние prepare на нём недопустимы (контракт R-06a).

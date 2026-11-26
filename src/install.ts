@@ -102,7 +102,10 @@ const ZCODE_SKILL_PATH = path.join(ZCODE_DIR, "skills", "megamemory", "SKILL.md"
 // Mirrors the wording of MCP_INSTRUCTIONS (src/index.ts) so the per-prompt
 // reminder cannot drift from the server instructions; index.ts cannot be
 // imported here (cycle), so the texts cross-reference each other in comments.
-const ZCODE_HOOK_CONTEXT = "MegaMemory: перед задачей вызови megamemory_understand, после работы запиши вывод через create_concept с evidence.";
+// 2.14.1/35 T9: имя инструмента — в клиентской форме ZCode
+// (mcp__megamemory__understand), поэтому отличается от MCP_INSTRUCTIONS,
+// где оно названо коротко (understand).
+const ZCODE_HOOK_CONTEXT = "MegaMemory: перед задачей вызови mcp__megamemory__understand, после работы запиши вывод через create_concept с evidence.";
 // Marker embedded in the hook script: the installer recognises its own
 // UserPromptSubmit entry by this substring (idempotency + uninstall).
 const ZCODE_HOOK_MARKER = "megamemory-user-prompt-hook";
