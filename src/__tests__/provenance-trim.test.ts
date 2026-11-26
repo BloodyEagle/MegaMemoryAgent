@@ -12,7 +12,7 @@ import { shortEssence } from "../next-hints.js";
 describe("plan 37 T1 trimRationale", () => {
   it("T1: строка длиннее 80 режется до 80 с «…» (формула clipText)", () => {
     const long = "r".repeat(100);
-    const out = trimRationale(long);
+    const out = trimRationale(long) as string;
     expect(out).toBe("r".repeat(79) + "…");
     expect(out.length).toBe(80);
     expect(out.endsWith("…")).toBe(true);
@@ -26,7 +26,7 @@ describe("plan 37 T1 trimRationale", () => {
     // guard опускает cut до 78 — пара целиком за срезом.
     const text = "x".repeat(78) + "😀" + "z".repeat(30);
     expect(text.length).toBeGreaterThan(80);
-    const out = trimRationale(text);
+    const out = trimRationale(text) as string;
     expect(out).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out)).toBe(false);
     expect(out.length).toBeLessThanOrEqual(80);
@@ -36,7 +36,7 @@ describe("plan 37 T1 trimRationale", () => {
 describe("plan 37 T2 clampNote", () => {
   it("T2: note длиннее 300 режется до ≤300 с «…» на конце", () => {
     const note = "n".repeat(350);
-    const out = clampNote(note);
+    const out = clampNote(note) as string;
     expect(out.length).toBeLessThanOrEqual(300);
     expect(out.endsWith("…")).toBe(true);
     expect(clampNote("short note")).toBe("short note");
@@ -46,7 +46,7 @@ describe("plan 37 T2 clampNote", () => {
     // cut=299: guard clipText (low на cut) опускает cut при попадании на пару.
     const note = "x".repeat(298) + "😀" + "z".repeat(60);
     expect(note.length).toBeGreaterThan(300);
-    const out = clampNote(note);
+    const out = clampNote(note) as string;
     expect(out).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out)).toBe(false);
     expect(out.length).toBeLessThanOrEqual(300);
