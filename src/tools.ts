@@ -47,7 +47,7 @@ import { buildNextHints, LIST_ROOTS_SEARCH_HINT, type NextHintsCard } from "./ne
 import { scheduleFirstGeneration } from "./auto-reembed.js";
 import { timelineActivity } from "./timeline.js";
 import { renderBrief, renderDroppedText, type BriefNodeInfo } from "./brief.js";
-import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
+import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge-conflicts.js";
 import { clipText } from "./text-clip.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
 import {
