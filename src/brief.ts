@@ -1,4 +1,5 @@
 import { pluralRu } from "./next-hints.js";
+import { clipText } from "./text-clip.js";
 import type { NextHints, UnderstandMeta } from "./types.js";
 
 // ---- План 13 §2.2: режим brief в understand ----
@@ -65,16 +66,10 @@ function oneLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
-/** Обрезка одной строки по границе слова с многоточием (алгоритм trimSummary). */
+/** Обрезка одной строки по границе слова с многоточием (алгоритм trimSummary).
+ *  Делегирует единой формуле в text-clip.ts (план 36 T1); поведение прежнее. */
 function clip(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  let cut = maxChars - 1;
-  // Не резать внутри суррогатной пары.
-  const low = text.charCodeAt(cut);
-  if (low >= 0xdc00 && low <= 0xdfff) cut -= 1;
-  const space = text.lastIndexOf(" ", cut);
-  if (space > maxChars / 2) cut = space;
-  return text.slice(0, cut).trimEnd() + "…";
+  return clipText(text, maxChars);
 }
 
 /** Узел follow-up из его готовых аргументов (node_ids | id | node_id). */

@@ -48,6 +48,7 @@ import { scheduleFirstGeneration } from "./auto-reembed.js";
 import { timelineActivity } from "./timeline.js";
 import { renderBrief, renderDroppedText, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge.js";
+import { clipText } from "./text-clip.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
 import {
   readProvenanceConfig,
@@ -411,17 +412,12 @@ export function measureMcpPayload(payload: unknown): number {
 
 /**
  * Truncate to maxChars at a word boundary with an ellipsis. Operates on
- * UTF-16 code units but never splits a surrogate pair.
+ * UTF-16 code units but never splits a surrogate pair. Plan 36 T1: the single
+ * formula now lives in text-clip.ts (clipText); this stays exported with its
+ * default 240 and delegates.
  */
 export function trimSummary(text: string, maxChars = 240): string {
-  if (text.length <= maxChars) return text;
-  let cut = maxChars - 1;
-  // Do not cut inside a surrogate pair.
-  const low = text.charCodeAt(cut);
-  if (low >= 0xdc00 && low <= 0xdfff) cut -= 1;
-  const space = text.lastIndexOf(" ", cut);
-  if (space > maxChars / 2) cut = space;
-  return text.slice(0, cut).trimEnd() + "…";
+  return clipText(text, maxChars);
 }
 
 /**
@@ -1388,11 +1384,10 @@ export async function understand(
   // тогда добираем срезом по границе символа (2.14.1/35 T2), не разрывая
   // суррогатную пару; иначе срез «залипает» в полосе выше пола и съедает
   // бюджет discovery.
-  const floorCutSummary = (text: string): string => {
-    let cut = SUMMARY_FLOOR - 1;
-    if (text.charCodeAt(cut) >= 0xdc00 && text.charCodeAt(cut) <= 0xdfff) cut -= 1;
-    return text.slice(0, cut) + "…";
-  };
+  // Пол сводки (2.14.1/35 T2): жёсткий срез по символу — добирает до пола,
+  // а не до слова; иначе срез «залипает» в полосе выше пола. Одна формула
+  // с clipText (план 36 T1), wordBoundary: false. trimEnd теперь общий.
+  const floorCutSummary = (text: string): string => clipText(text, SUMMARY_FLOOR, { wordBoundary: false });
   const squeezeCard = (card: CompactMatch, fits: () => boolean): boolean => {
     if (fits()) return true;
     const initial = JSON.stringify(card);

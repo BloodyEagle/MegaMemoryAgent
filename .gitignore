@@ -15,6 +15,7 @@ npm-ci.log
 .idea/
 graph-deps.json
 .graph-deps-cache.json
+runs.json
 .kilo-edit-body.txt
 kilo.json
 *.db-shm

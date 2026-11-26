@@ -82,7 +82,7 @@ describe("P09 C06 digest payload version", () => {
     for (const id of ["z", "b", "a"]) addNode(db, id, { name: id.toUpperCase(), parent_id: "module", summary: "x".repeat(150), file_refs: id === "a" ? Array.from({ length: 9 }, (_, i) => `${i}.ts`) : [`${id}.ts`] });
     const { digestId } = await buildDigest(db, "module", { embed: false });
     expect(digestSourceChildren(db, digestId).children.map((child) => child.id)).toEqual(["a", "b", "z"]);
-    expect(db.getNode(digestId)!.summary).toBe(`3 concepts: A — ${"x".repeat(120)}; B — ${"x".repeat(120)}; Z — ${"x".repeat(120)}`);
+    expect(db.getNode(digestId)!.summary).toBe(`3 concepts: A — ${"x".repeat(119)}…; B — ${"x".repeat(119)}…; Z — ${"x".repeat(119)}…`);
     expect(JSON.parse(db.getNode(digestId)!.file_refs!)).toEqual(["0.ts", "1.ts", "2.ts", "3.ts", "4.ts", "5.ts", "6.ts", "7.ts", "8.ts", "b.ts"]);
   });
   it("invalid source refs stay unavailable rather than gaining a fabricated fresh version", async () => {
