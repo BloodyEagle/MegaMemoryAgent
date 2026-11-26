@@ -53,8 +53,6 @@ describe("clipText", () => {
       const out = clipText(text, maxChars, { wordBoundary: false });
       // Ни одного low-суррогата без предшествующего high (одинокая половинка).
       expect(out).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
-      // Пара не разорвана: «средний» UTF-16 элемент — всегда целое число пар.
-      expect(out.length % 1).toBe(0);
       const loneHigh = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out);
       expect(loneHigh).toBe(false);
     }
