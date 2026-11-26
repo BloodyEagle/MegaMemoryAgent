@@ -16,7 +16,6 @@ import {
 export {
   MERGE_SUFFIX_LEFT,
   MERGE_SUFFIX_RIGHT,
-  conflictEdgeMatches,
   hasMergeSuffix,
   resolveEdgeConflicts,
   stripMergeSuffix,
