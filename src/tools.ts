@@ -50,6 +50,7 @@ import { renderBrief, renderDroppedText, type BriefNodeInfo } from "./brief.js";
 import { stripMergeSuffix, MERGE_SUFFIX_LEFT, MERGE_SUFFIX_RIGHT, resolveEdgeConflicts } from "./merge-conflicts.js";
 import { clipText } from "./text-clip.js";
 import { moveNodeEdges, transferNodeIdentity } from "./consolidate.js";
+import { estimateTokens } from "./tokens.js";
 import {
   readProvenanceConfig,
   REQUIRE_SUPPORT_MESSAGE,
@@ -381,16 +382,10 @@ export function buildNodeWithContext(
 
 // ---- Tool handlers ----
 
-/**
- * Conservative token estimate: ~3 chars per token. Cyrillic/CJK encode
- * worse than English in most tokenizers, so this stays on the safe side.
- */
-export function estimateTokens(text: string): number {
-  // Bytes, not JS chars (patch А6): CJK is ~1 token per char but 3 bytes,
-  // so chars/3 underestimates ~3x for Chinese. In bytes the estimate is
-  // conservative for every script (latin ~4 B/token, cyrillic ~5, CJK ~3).
-  return Math.ceil(Buffer.byteLength(text, "utf8") / 3);
-}
+// Plan 40 T1: estimateTokens moved verbatim to src/tokens.ts (leaf module,
+// no imports) to break the task-context ↔ tools cycle; re-export keeps the
+// public name in tools.js (context-budget.test.ts:37-45 pins 7 for "привет мир").
+export { estimateTokens } from "./tokens.js";
 
 /**
  * Actual MCP content wrapper, including pretty JSON escaping and its own
