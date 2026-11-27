@@ -31,7 +31,7 @@
 
 import fs from "node:fs";
 import type { KnowledgeDB } from "./db.js";
-import { digestEligibleChildren, digestSourceChildren, existingDigestId } from "./digest.js";
+import { digestEligibleChildren, digestSourceChildren, existingDigestId } from "./digest-sources.js";
 
 export interface DigestUseCounters {
   /** Успешные открытия get_concept узлов области (узел области + дети). */
