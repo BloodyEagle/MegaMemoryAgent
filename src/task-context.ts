@@ -34,7 +34,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isNodeExpired, type KnowledgeDB } from "./db.js";
-import { estimateTokens } from "./tools.js";
+import { estimateTokens } from "./tokens.js";
 import { isUngrounded } from "./provenance.js";
 import { parseRef } from "./refs.js";
 import type {

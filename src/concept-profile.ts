@@ -51,10 +51,11 @@ import type {
   NodeWithContext,
   RelationType,
 } from "./types.js";
+import { estimateTokens } from "./tokens.js";
+
 import {
   buildNodeWithContext,
   currentDigestsOf,
-  estimateTokens,
   evidenceSupportOf,
   measureMcpPayload,
   parseFileRefs,
