@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.14.2 (2026-11-27)
+
+### Behaviour changes
+
+- Digest child summaries are now capped at 120 UTF-16 code units, including an
+  ellipsis when truncated, instead of being cut without an ellipsis. Existing
+  digests keep their stored text until rebuilt.
+
+### Fixed
+
+- Budget refusals interpolate the computed minimum; a test now pins that form (no hardcoded numbers).
+- `trimRationale` and `clampNote` use the shared truncation helper and never split
+  a surrogate pair.
+- CI's `typecheck:tests` gate covers the new tests without weakening assertions.
+
+### Internal
+
+- One `clipText` implementation (`src/text-clip.ts`) replaces four copies.
+- Extracted `src/merge-conflicts.ts`, `src/tokens.ts`, and `src/digest-sources.ts`
+  to break three dependency cycles. `tools.ts` and `digest.ts` re-export the
+  token estimator and digest source helpers, respectively.
+- `runs.json` is ignored by Git.
+
 ## 2.14.1 (2026-11-25)
 
 ### Changed
